@@ -3,6 +3,7 @@
 pub mod pod;
 pub mod process;
 pub mod spec;
+pub mod store;
 pub mod tls;
 
 /// Package version from Cargo.toml.
