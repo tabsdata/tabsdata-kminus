@@ -629,3 +629,532 @@ async fn execute_tcp_probe(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::pod::{ExecAction, HttpGetAction, TcpSocketAction};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // -- helpers -------------------------------------------------------------
+
+    fn shutdown_pair() -> (watch::Sender<()>, watch::Receiver<()>) {
+        watch::channel(())
+    }
+
+    fn stop_pair() -> (watch::Sender<bool>, watch::Receiver<bool>) {
+        watch::channel(false)
+    }
+
+    /// Bind a listener on an ephemeral port and return (listener, port).
+    async fn bind_ephemeral() -> (TcpListener, u16) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, port)
+    }
+
+    /// Accept one connection, read the request, write `response`, close.
+    fn spawn_http_once(listener: TcpListener, response: &'static [u8]) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(response).await;
+            let _ = sock.shutdown().await;
+        })
+    }
+
+    // -- probe_kind_from_str -------------------------------------------------
+
+    #[test]
+    fn probe_kind_from_str_startup() {
+        assert!(matches!(probe_kind_from_str(PROBE_STARTUP), Some(ProbeKind::Startup)));
+    }
+
+    #[test]
+    fn probe_kind_from_str_liveness() {
+        assert!(matches!(probe_kind_from_str(PROBE_LIVENESS), Some(ProbeKind::Liveness)));
+    }
+
+    #[test]
+    fn probe_kind_from_str_readiness() {
+        assert!(matches!(probe_kind_from_str(PROBE_READINESS), Some(ProbeKind::Readiness)));
+    }
+
+    #[test]
+    fn probe_kind_from_str_unknown() {
+        assert!(probe_kind_from_str("bogus").is_none());
+        assert!(probe_kind_from_str("").is_none());
+    }
+
+    // -- execute_tcp_probe ---------------------------------------------------
+
+    #[tokio::test]
+    async fn tcp_probe_connects_to_listening_port() {
+        let (listener, port) = bind_ephemeral().await;
+        // Keep the listener alive and accepting for the duration of the probe.
+        let accept = tokio::spawn(async move { listener.accept().await });
+
+        let action = TcpSocketAction { port: Some(port), host: "127.0.0.1".to_string() };
+        assert!(execute_tcp_probe(&action, Duration::from_secs(1)).await);
+        accept.abort();
+    }
+
+    #[tokio::test]
+    async fn tcp_probe_defaults_host_to_loopback_when_empty() {
+        let (listener, port) = bind_ephemeral().await;
+        let accept = tokio::spawn(async move { listener.accept().await });
+
+        // Empty host → code uses 127.0.0.1.
+        let action = TcpSocketAction { port: Some(port), host: String::new() };
+        assert!(execute_tcp_probe(&action, Duration::from_secs(1)).await);
+        accept.abort();
+    }
+
+    #[tokio::test]
+    async fn tcp_probe_fails_on_closed_port() {
+        // Bind then drop to get an almost-certainly-free port.
+        let (listener, port) = bind_ephemeral().await;
+        drop(listener);
+
+        let action = TcpSocketAction { port: Some(port), host: "127.0.0.1".to_string() };
+        assert!(!execute_tcp_probe(&action, Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn tcp_probe_times_out() {
+        // Connecting to a blackhole IP: 10.255.255.1 is typically unroutable
+        // locally, but behavior varies. Use a non-routable TEST-NET address
+        // and a very short timeout. If the OS returns an immediate error
+        // instead of hanging, the probe still returns false.
+        let action = TcpSocketAction {
+            port: Some(1),
+            host: "192.0.2.1".to_string(), // TEST-NET-1 (RFC 5737)
+        };
+        let start = tokio::time::Instant::now();
+        let ok = execute_tcp_probe(&action, Duration::from_millis(100)).await;
+        // Either timed out (< ~200ms) or got an immediate error — both must be false.
+        assert!(!ok);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    // -- execute_http_probe --------------------------------------------------
+
+    #[tokio::test]
+    async fn http_probe_2xx_is_success() {
+        let (listener, port) = bind_ephemeral().await;
+        let server = spawn_http_once(listener, b"HTTP/1.0 200 OK\r\n\r\nbody");
+
+        let action = HttpGetAction {
+            path: "/".to_string(),
+            port: Some(port),
+            host: "127.0.0.1".to_string(),
+        };
+        assert!(execute_http_probe(&action, Duration::from_secs(1)).await);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_probe_3xx_is_success() {
+        let (listener, port) = bind_ephemeral().await;
+        let server = spawn_http_once(
+            listener,
+            b"HTTP/1.0 301 Moved Permanently\r\nLocation: /new\r\n\r\n",
+        );
+
+        let action = HttpGetAction { path: "/old".to_string(), port: Some(port), host: String::new() };
+        assert!(execute_http_probe(&action, Duration::from_secs(1)).await);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_probe_4xx_is_failure() {
+        let (listener, port) = bind_ephemeral().await;
+        let server = spawn_http_once(listener, b"HTTP/1.0 404 Not Found\r\n\r\n");
+
+        let action = HttpGetAction { path: "/".to_string(), port: Some(port), host: String::new() };
+        assert!(!execute_http_probe(&action, Duration::from_secs(1)).await);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_probe_5xx_is_failure() {
+        let (listener, port) = bind_ephemeral().await;
+        let server = spawn_http_once(listener, b"HTTP/1.0 500 Internal Server Error\r\n\r\n");
+
+        let action = HttpGetAction { path: "/".to_string(), port: Some(port), host: String::new() };
+        assert!(!execute_http_probe(&action, Duration::from_secs(1)).await);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_probe_connection_refused_is_failure() {
+        let (listener, port) = bind_ephemeral().await;
+        drop(listener);
+
+        let action = HttpGetAction {
+            path: "/".to_string(),
+            port: Some(port),
+            host: "127.0.0.1".to_string(),
+        };
+        assert!(!execute_http_probe(&action, Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn http_probe_times_out_when_server_never_responds() {
+        let (listener, port) = bind_ephemeral().await;
+        // Accept but never write a response. Keep the socket alive so the
+        // reader actually waits for data rather than seeing EOF immediately.
+        let held = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            // Park for longer than the probe timeout.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            drop(sock);
+        });
+
+        let action = HttpGetAction {
+            path: "/".to_string(),
+            port: Some(port),
+            host: "127.0.0.1".to_string(),
+        };
+        let start = tokio::time::Instant::now();
+        let ok = execute_http_probe(&action, Duration::from_millis(200)).await;
+        assert!(!ok);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        held.abort();
+    }
+
+    #[tokio::test]
+    async fn http_probe_defaults_path_to_slash_when_empty() {
+        let (listener, port) = bind_ephemeral().await;
+        let got_request = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let got_request_clone = Arc::clone(&got_request);
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = sock.read(&mut buf).await.unwrap();
+            got_request_clone.lock().await.extend_from_slice(&buf[..n]);
+            let _ = sock.write_all(b"HTTP/1.0 200 OK\r\n\r\n").await;
+        });
+
+        let action = HttpGetAction { path: String::new(), port: Some(port), host: String::new() };
+        assert!(execute_http_probe(&action, Duration::from_secs(1)).await);
+        server.await.unwrap();
+
+        let req = got_request.lock().await;
+        let req_str = String::from_utf8_lossy(&req);
+        // Empty path must be rewritten to "/".
+        assert!(req_str.starts_with("GET / HTTP/1.0"), "got: {:?}", req_str);
+    }
+
+    #[tokio::test]
+    async fn http_probe_malformed_response_is_failure() {
+        let (listener, port) = bind_ephemeral().await;
+        let server = spawn_http_once(listener, b"garbage not-an-http-response\r\n\r\n");
+
+        let action = HttpGetAction {
+            path: "/".to_string(),
+            port: Some(port),
+            host: "127.0.0.1".to_string(),
+        };
+        assert!(!execute_http_probe(&action, Duration::from_secs(1)).await);
+        server.await.unwrap();
+    }
+
+    // -- execute_network_probe -----------------------------------------------
+
+    #[tokio::test]
+    async fn network_probe_routes_to_http() {
+        let (listener, port) = bind_ephemeral().await;
+        let server = spawn_http_once(listener, b"HTTP/1.0 200 OK\r\n\r\n");
+
+        let probe = Probe {
+            http_get: Some(HttpGetAction {
+                path: "/".to_string(),
+                port: Some(port),
+                host: "127.0.0.1".to_string(),
+            }),
+            ..Default::default()
+        };
+        assert!(execute_network_probe(&probe, Duration::from_secs(1)).await);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn network_probe_routes_to_tcp() {
+        let (listener, port) = bind_ephemeral().await;
+        let accept = tokio::spawn(async move { listener.accept().await });
+
+        let probe = Probe {
+            tcp_socket: Some(TcpSocketAction {
+                port: Some(port),
+                host: "127.0.0.1".to_string(),
+            }),
+            ..Default::default()
+        };
+        assert!(execute_network_probe(&probe, Duration::from_secs(1)).await);
+        accept.abort();
+    }
+
+    #[tokio::test]
+    async fn network_probe_no_action_returns_success() {
+        let probe = Probe::default();
+        assert!(execute_network_probe(&probe, Duration::from_secs(1)).await);
+    }
+
+    // -- execute_exec_probe_interruptible ------------------------------------
+    //
+    // Exec probes shell out to `sh`, so the whole block is Unix-only.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_probe_exit_zero_is_success() {
+        let (_sh_tx, mut shutdown_rx) = shutdown_pair();
+        let (_st_tx, mut stop_rx) = stop_pair();
+
+        let result = execute_exec_probe_interruptible(
+            &["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+            "c", "", PROBE_LIVENESS, None,
+            Duration::from_secs(5),
+            &mut shutdown_rx, &mut stop_rx,
+        ).await;
+        assert_eq!(result, Some(true));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_probe_exit_nonzero_is_failure() {
+        let (_sh_tx, mut shutdown_rx) = shutdown_pair();
+        let (_st_tx, mut stop_rx) = stop_pair();
+
+        let result = execute_exec_probe_interruptible(
+            &["sh".to_string(), "-c".to_string(), "exit 1".to_string()],
+            "c", "", PROBE_LIVENESS, None,
+            Duration::from_secs(5),
+            &mut shutdown_rx, &mut stop_rx,
+        ).await;
+        assert_eq!(result, Some(false));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_probe_empty_command_is_failure() {
+        let (_sh_tx, mut shutdown_rx) = shutdown_pair();
+        let (_st_tx, mut stop_rx) = stop_pair();
+
+        let result = execute_exec_probe_interruptible(
+            &[], "c", "", PROBE_LIVENESS, None,
+            Duration::from_secs(1),
+            &mut shutdown_rx, &mut stop_rx,
+        ).await;
+        assert_eq!(result, Some(false));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_probe_spawn_failure_is_failure() {
+        let (_sh_tx, mut shutdown_rx) = shutdown_pair();
+        let (_st_tx, mut stop_rx) = stop_pair();
+
+        // A command that doesn't exist anywhere in PATH or at the given path.
+        let result = execute_exec_probe_interruptible(
+            &["/no/such/binary-xyz-12345".to_string()],
+            "c", "", PROBE_LIVENESS, None,
+            Duration::from_secs(1),
+            &mut shutdown_rx, &mut stop_rx,
+        ).await;
+        assert_eq!(result, Some(false));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_probe_timeout_kills_and_fails() {
+        let (_sh_tx, mut shutdown_rx) = shutdown_pair();
+        let (_st_tx, mut stop_rx) = stop_pair();
+
+        let start = tokio::time::Instant::now();
+        let result = execute_exec_probe_interruptible(
+            &["sh".to_string(), "-c".to_string(), "sleep 10".to_string()],
+            "c", "", PROBE_LIVENESS, None,
+            Duration::from_millis(200),
+            &mut shutdown_rx, &mut stop_rx,
+        ).await;
+        let elapsed = start.elapsed();
+        assert_eq!(result, Some(false));
+        assert!(elapsed < Duration::from_secs(3), "timeout did not fire promptly: {:?}", elapsed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_probe_stop_signal_returns_none() {
+        let (_sh_tx, mut shutdown_rx) = shutdown_pair();
+        let (stop_tx, mut stop_rx) = stop_pair();
+
+        // Fire the stop signal shortly after the probe starts.
+        let signal = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = stop_tx.send(true);
+        });
+
+        let start = tokio::time::Instant::now();
+        let result = execute_exec_probe_interruptible(
+            &["sh".to_string(), "-c".to_string(), "sleep 10".to_string()],
+            "c", "", PROBE_LIVENESS, None,
+            Duration::from_secs(30),
+            &mut shutdown_rx, &mut stop_rx,
+        ).await;
+        let elapsed = start.elapsed();
+        signal.await.unwrap();
+        assert!(result.is_none(), "expected None on stop interrupt, got {:?}", result);
+        assert!(elapsed < Duration::from_secs(3), "stop did not interrupt promptly: {:?}", elapsed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_probe_shutdown_signal_returns_none() {
+        let (sh_tx, mut shutdown_rx) = shutdown_pair();
+        let (_st_tx, mut stop_rx) = stop_pair();
+
+        let signal = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = sh_tx.send(());
+        });
+
+        let start = tokio::time::Instant::now();
+        let result = execute_exec_probe_interruptible(
+            &["sh".to_string(), "-c".to_string(), "sleep 10".to_string()],
+            "c", "", PROBE_LIVENESS, None,
+            Duration::from_secs(30),
+            &mut shutdown_rx, &mut stop_rx,
+        ).await;
+        let elapsed = start.elapsed();
+        signal.await.unwrap();
+        assert!(result.is_none(), "expected None on shutdown interrupt, got {:?}", result);
+        assert!(elapsed < Duration::from_secs(3), "shutdown did not interrupt promptly: {:?}", elapsed);
+    }
+
+    // -- execute_probe_interruptible -----------------------------------------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interruptible_dispatches_to_exec() {
+        let (_sh_tx, mut shutdown_rx) = shutdown_pair();
+        let (_st_tx, mut stop_rx) = stop_pair();
+
+        let probe = Probe {
+            exec_action: Some(ExecAction {
+                command: vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+            }),
+            ..Default::default()
+        };
+        let result = execute_probe_interruptible(
+            &probe, "c", "", PROBE_READINESS, None,
+            Duration::from_secs(5),
+            &mut shutdown_rx, &mut stop_rx,
+        ).await;
+        assert_eq!(result, Some(true));
+    }
+
+    #[tokio::test]
+    async fn interruptible_dispatches_to_network_tcp() {
+        let (listener, port) = bind_ephemeral().await;
+        let accept = tokio::spawn(async move { listener.accept().await });
+
+        let (_sh_tx, mut shutdown_rx) = shutdown_pair();
+        let (_st_tx, mut stop_rx) = stop_pair();
+
+        let probe = Probe {
+            tcp_socket: Some(TcpSocketAction {
+                port: Some(port),
+                host: "127.0.0.1".to_string(),
+            }),
+            ..Default::default()
+        };
+        let result = execute_probe_interruptible(
+            &probe, "c", "", PROBE_READINESS, None,
+            Duration::from_secs(1),
+            &mut shutdown_rx, &mut stop_rx,
+        ).await;
+        assert_eq!(result, Some(true));
+        accept.abort();
+    }
+
+    #[tokio::test]
+    async fn interruptible_network_stop_returns_none() {
+        // Connect to a blackhole TEST-NET address so the future hangs long
+        // enough for the stop signal to win the select!.
+        let (_sh_tx, mut shutdown_rx) = shutdown_pair();
+        let (stop_tx, mut stop_rx) = stop_pair();
+
+        let signal = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = stop_tx.send(true);
+        });
+
+        let probe = Probe {
+            tcp_socket: Some(TcpSocketAction {
+                port: Some(1),
+                host: "192.0.2.1".to_string(),
+            }),
+            ..Default::default()
+        };
+        let start = tokio::time::Instant::now();
+        let result = execute_probe_interruptible(
+            &probe, "c", "", PROBE_READINESS, None,
+            Duration::from_secs(30),
+            &mut shutdown_rx, &mut stop_rx,
+        ).await;
+        let elapsed = start.elapsed();
+        signal.await.unwrap();
+        assert!(result.is_none(), "expected None on stop interrupt, got {:?}", result);
+        assert!(elapsed < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn interruptible_network_shutdown_returns_none() {
+        let (sh_tx, mut shutdown_rx) = shutdown_pair();
+        let (_st_tx, mut stop_rx) = stop_pair();
+
+        let signal = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = sh_tx.send(());
+        });
+
+        let probe = Probe {
+            tcp_socket: Some(TcpSocketAction {
+                port: Some(1),
+                host: "192.0.2.1".to_string(),
+            }),
+            ..Default::default()
+        };
+        let start = tokio::time::Instant::now();
+        let result = execute_probe_interruptible(
+            &probe, "c", "", PROBE_READINESS, None,
+            Duration::from_secs(30),
+            &mut shutdown_rx, &mut stop_rx,
+        ).await;
+        let elapsed = start.elapsed();
+        signal.await.unwrap();
+        assert!(result.is_none());
+        assert!(elapsed < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn interruptible_no_action_returns_success() {
+        let (_sh_tx, mut shutdown_rx) = shutdown_pair();
+        let (_st_tx, mut stop_rx) = stop_pair();
+
+        let probe = Probe::default(); // no exec, http, or tcp
+        let result = execute_probe_interruptible(
+            &probe, "c", "", PROBE_READINESS, None,
+            Duration::from_secs(1),
+            &mut shutdown_rx, &mut stop_rx,
+        ).await;
+        assert_eq!(result, Some(true));
+    }
+}
