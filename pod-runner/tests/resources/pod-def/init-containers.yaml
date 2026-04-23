@@ -1,0 +1,24 @@
+# Pod with init containers that run sequentially before the main container.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: init-containers
+  namespace: default
+
+spec:
+  nodeName: tdknode
+  restartPolicy: Never
+  initContainers:
+    - name: init-a
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["echo 'init-a done'"]
+    - name: init-b
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["echo 'init-b done'"]
+  containers:
+    - name: app
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["echo 'app started after inits'"]

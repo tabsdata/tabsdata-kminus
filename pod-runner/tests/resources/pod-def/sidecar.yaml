@@ -1,0 +1,23 @@
+# Pod with a sidecar (init container with restartPolicy: Always).
+# The sidecar runs alongside the main container and is terminated
+# after the main container exits.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sidecar
+  namespace: default
+
+spec:
+  nodeName: virtual-node
+  restartPolicy: Never
+  initContainers:
+    - name: sidecar-proxy
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["while true; do sleep 1; done"]
+      restartPolicy: Always
+  containers:
+    - name: app
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["echo 'app with sidecar'"]

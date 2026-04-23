@@ -1,0 +1,48 @@
+# Kitchen-sink pod exercising multiple features at once:
+# init container, sidecar, main containers, literal env vars,
+# volume mounts (hostPath + emptyDir), and exec probes.
+#
+# Does NOT include secrets or configmaps so it can run through
+# the standard server/serverless entry points without resolvers.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kitchen-sink
+  namespace: default
+
+spec:
+  nodeName: virtual-node
+  restartPolicy: Never
+  initContainers:
+    - name: setup
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["echo 'init-setup done'"]
+    - name: sidecar-logger
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["while true; do sleep 1; done"]
+      restartPolicy: Always
+  containers:
+    - name: main
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["echo \"MSG=$MSG\" && echo 'main wrote' > $PR_POD_ROOT/mounts/scratch/main.txt && sleep 2 && echo 'main done'"]
+      env:
+        - name: MSG
+          value: kitchen-sink-test
+      volumeMounts:
+        - name: scratch
+          mountPath: /mounts/scratch
+      readinessProbe:
+        exec:
+          command: ["true"]
+        initialDelaySeconds: 0
+        periodSeconds: 1
+    - name: helper
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["echo 'helper done'"]
+  volumes:
+    - name: scratch
+      emptyDir: {}

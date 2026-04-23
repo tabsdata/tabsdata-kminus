@@ -1,0 +1,34 @@
+# Pod with hostPath and emptyDir volume mounts.
+# The hostPath directory and emptyDir are set up at test time.
+# Mount paths must be under /mounts (PR constraint).
+#
+# Commands use $PR_POD_ROOT (injected during resolution) to access
+# the resolved mount paths — since absolute K8s paths like /mounts/input
+# get rewritten to <container_root>/mounts/input during preparation.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mounts
+  namespace: default
+
+spec:
+  nodeName: virtual-node
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["cat $PR_POD_ROOT/mounts/input/data.txt && echo 'wrote' > $PR_POD_ROOT/mounts/scratch/output.txt"]
+      volumeMounts:
+        - name: input-vol
+          mountPath: /mounts/input
+          readOnly: true
+        - name: scratch-vol
+          mountPath: /mounts/scratch
+  volumes:
+    - name: input-vol
+      hostPath:
+        path: "{{HOST_PATH}}"
+        type: Directory
+    - name: scratch-vol
+      emptyDir: {}

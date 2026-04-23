@@ -1,0 +1,20 @@
+# Pod with literal environment variables.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: env-literal
+  namespace: default
+
+spec:
+  nodeName: virtual-node
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["echo \"GREETING=$GREETING MODE=$MODE\""]
+      env:
+        - name: GREETING
+          value: hello-world
+        - name: MODE
+          value: test

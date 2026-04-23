@@ -1,0 +1,15 @@
+# Minimal pod: one container with command and args.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: single-container
+  namespace: default
+
+spec:
+  nodeName: virtual-node
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["echo 'hello from single-container'"]

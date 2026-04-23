@@ -1,0 +1,15 @@
+# Pod with OnFailure restart policy.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: on-failure-restart
+  namespace: default
+
+spec:
+  nodeName: virtual-node
+  restartPolicy: OnFailure
+  containers:
+    - name: app
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["echo 'on-failure pod'"]

@@ -1,0 +1,23 @@
+# Pod with multiple main containers running concurrently.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: multi-container
+  namespace: default
+
+spec:
+  nodeName: virtual-node
+  restartPolicy: Never
+  containers:
+    - name: writer
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["echo 'output-from-writer'"]
+    - name: reader
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["echo 'output-from-reader'"]
+    - name: worker
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["echo 'output-from-worker'"]

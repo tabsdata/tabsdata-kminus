@@ -1,0 +1,26 @@
+# Pod that references configmaps via env valueFrom.configMapKeyRef
+# and via envFrom.configMapRef (bulk loading).
+# Requires a ConfigMapResolver to be configured at create time.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: configmaps
+  namespace: default
+
+spec:
+  nodeName: virtual-node
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["echo \"DB_HOST=$DB_HOST FEATURE_X=$FEATURE_X\""]
+      env:
+        - name: DB_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: db-config
+              key: host
+      envFrom:
+        - configMapRef:
+            name: feature-flags

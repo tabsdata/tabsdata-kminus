@@ -1,0 +1,31 @@
+# Pod with exec-based liveness and readiness probes.
+# Uses exec probes since they work with process-based execution
+# (no real network stack for httpGet/tcpSocket in tests).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: probes
+  namespace: default
+
+spec:
+  nodeName: virtual-node
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["echo 'healthy' && sleep 3 && echo 'done'"]
+      livenessProbe:
+        exec:
+          command: ["true"]
+        initialDelaySeconds: 0
+        periodSeconds: 1
+        timeoutSeconds: 5
+        failureThreshold: 3
+      readinessProbe:
+        exec:
+          command: ["true"]
+        initialDelaySeconds: 0
+        periodSeconds: 1
+        timeoutSeconds: 5
+        successThreshold: 1
