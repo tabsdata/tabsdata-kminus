@@ -3,6 +3,7 @@
 pub mod pod;
 pub mod process;
 pub mod spec;
+pub mod tls;
 
 /// Package version from Cargo.toml.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
