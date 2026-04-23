@@ -1,0 +1,64 @@
+# Copyright 2026 Tabsdata Inc.
+
+[package]
+name = "pod-runner"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.0"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+file-rotate = "0.7"
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+async-trait = "0.1"
+base64 = "0.22"
+flate2 = "1"
+tar = "0.4"
+rustls = "0.23"
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+rcgen = "0.14"
+time = "0.3"
+memory-stats = "1"
+prometheus = "0.14"
+kube = { version = "3.1", features = ["runtime", "derive", "client"] }
+k8s-openapi = { version = "0.27" }
+chrono = "0.4"
+reqwest = { version = "0.13", features = ["rustls", "stream", "json", "query"], default-features = false }
+uuid = { version = "1", features = ["v4"] }
+futures-util = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["signal", "process"] }
+
+[features]
+default = ["k8s-openapi/v1_31"]
+
+[[bin]]
+name = "pod-runner"
+path = "src/server/main.rs"
+
+[[bin]]
+name = "kpr"
+path = "src/client/main.rs"
+
+[dev-dependencies]
+chrono = "0.4"
+data-encoding = "2"
+filetime = "0.2.27"
+libc = "0.2"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+rstest = "0.26"
+serial_test = "3"
