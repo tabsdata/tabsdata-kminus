@@ -1,5 +1,6 @@
 // Copyright 2026 Tabsdata Inc.
 
+pub mod metrics;
 pub mod pod;
 pub mod process;
 pub mod spec;
