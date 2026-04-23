@@ -1,8 +1,10 @@
 // Copyright 2026 Tabsdata Inc.
 
+pub mod logic;
 pub mod metrics;
 pub mod pod;
 pub mod process;
+pub mod server;
 pub mod spec;
 pub mod store;
 pub mod tls;
