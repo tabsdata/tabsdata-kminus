@@ -1,6 +1,7 @@
 // Copyright 2026 Tabsdata Inc.
 
 pub mod process;
+pub mod spec;
 
 /// Package version from Cargo.toml.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
