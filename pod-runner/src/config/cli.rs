@@ -1,0 +1,112 @@
+// Copyright 2026 Tabsdata Inc.
+
+//! CLI argument parsing.
+
+use clap::Parser;
+
+/// Default config directory (under cwd when standalone).
+pub const DEFAULT_CONFIGDIR: &str = "config";
+/// Default working directory.
+/// `data/pod-runner/` is created under this.
+pub const DEFAULT_WORKDIR: &str = ".";
+/// Default log directory (under cwd when standalone).
+pub const DEFAULT_LOGDIR: &str = "log";
+
+/// Pod Runner — executes pods as local processes.
+#[derive(Parser, Debug)]
+#[command(
+    name = "pod-runner",
+    version = crate::VERSION,
+    about = "pod-runner — executes pods as local processes.",
+    long_about = format!(
+        "pod-runner — executes pods as local processes.\n\n{}\n{}",
+        crate::COPYRIGHT,
+        crate::LICENSE,
+    ),
+)]
+pub struct CliArgs {
+    /// Path to kubeconfig file. Falls back to KUBECONFIG env var.
+    #[arg(long)]
+    pub kubeconfig: Option<String>,
+
+    /// Directory for config files (prconfig.yaml).
+    /// If prconfig.yaml doesn't exist, auto-generates PKI and configs.
+    /// Default: ./config
+    #[arg(long)]
+    pub configdir: Option<String>,
+
+    /// Working directory. `data/pod-runner/` is created under this.
+    /// Default: .
+    #[arg(long)]
+    pub workdir: Option<String>,
+
+    /// Log directory. Contains pod-runner's own rotating log file
+    /// (`pod-runner.log`) and per-pod container log subdirectories.
+    /// Default: ./log
+    #[arg(long)]
+    pub logdir: Option<String>,
+
+    /// Max size of a single pod-runner log file (MB) before rotation.
+    #[arg(long, default_value_t = 100)]
+    pub logmaxsizemb: u32,
+
+    /// Max number of rotated pod-runner log files to keep.
+    #[arg(long, default_value_t = 3)]
+    pub logmaxfiles: u32,
+
+    /// Server port (only used when auto-generating prconfig.yaml).
+    /// Default: 3000
+    #[arg(long)]
+    pub port: Option<u16>,
+
+    /// Metrics server port (only used when auto-generating prconfig.yaml).
+    /// Set to 0 to disable metrics. Default: 3001
+    #[arg(long)]
+    pub metrics_port: Option<u16>,
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_no_args() {
+        let args = CliArgs::try_parse_from(["prog"]).unwrap();
+        assert!(args.kubeconfig.is_none());
+        assert!(args.configdir.is_none());
+        assert!(args.workdir.is_none());
+        assert!(args.logdir.is_none());
+        assert!(args.port.is_none());
+        assert!(args.metrics_port.is_none());
+    }
+
+    #[test]
+    fn parse_all_args() {
+        let args = CliArgs::try_parse_from([
+            "prog",
+            "--kubeconfig", "/etc/kube/config",
+            "--configdir", "/etc/pr",
+            "--workdir", "/var/pr",
+            "--logdir", "/var/log/pr",
+            "--port", "9000",
+            "--metrics-port", "9001",
+        ])
+        .unwrap();
+        assert_eq!(args.kubeconfig.as_deref(), Some("/etc/kube/config"));
+        assert_eq!(args.configdir.as_deref(), Some("/etc/pr"));
+        assert_eq!(args.port, Some(9000));
+        assert_eq!(args.metrics_port, Some(9001));
+        assert_eq!(args.workdir.as_deref(), Some("/var/pr"));
+        assert_eq!(args.logdir.as_deref(), Some("/var/log/pr"));
+    }
+
+    #[test]
+    fn parse_unknown_arg_fails() {
+        let result = CliArgs::try_parse_from(["prog", "--unknown"]);
+        assert!(result.is_err());
+    }
+}
