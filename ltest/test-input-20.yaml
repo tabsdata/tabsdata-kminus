@@ -1,0 +1,45 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+# Load test configuration for kminus — 20 pods.
+#
+
+# Total number of pods to generate
+pod_count: 20
+
+# Throttling: max pods dispatched per second
+dispatch_rate: 10
+
+# Container counts per pod
+containers:
+  min: 1
+  max: 3
+
+init_containers:
+  min: 0
+  max: 2
+
+sidecars:
+  min: 0
+  max: 1
+
+# Duration of each container's command (seconds)
+duration:
+  min: 1
+  max: 10
+
+# Probability that a container fails (exits non-zero)
+failure_probability: 0.1
+
+# Probability that a container has an exec readiness probe
+probe_probability: 0.3
+
+# Probe settings (seconds)
+probe_initial_delay: 0
+probe_period: 1
+
+# Timeout for the entire test run (seconds)
+test_timeout: 300
+
+# Process monitoring interval (seconds)
+monitor_interval: 2

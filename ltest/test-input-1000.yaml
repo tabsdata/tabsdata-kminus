@@ -1,0 +1,33 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+# Load test configuration for kminus — 1000 pods.
+#
+
+pod_count: 1000
+
+dispatch_rate: 30
+
+containers:
+  min: 1
+  max: 3
+
+init_containers:
+  min: 0
+  max: 2
+
+sidecars:
+  min: 0
+  max: 1
+
+duration:
+  min: 1
+  max: 10
+
+failure_probability: 0.1
+probe_probability: 0.3
+probe_initial_delay: 0
+probe_period: 1
+
+test_timeout: 900
+monitor_interval: 5

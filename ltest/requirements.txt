@@ -1,0 +1,8 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+# Dependencies for the kminus load test framework.
+#
+psutil>=5.9
+pyyaml>=6.0
+kubernetes>=29.0
