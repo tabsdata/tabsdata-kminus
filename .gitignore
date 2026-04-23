@@ -1,0 +1,22 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+setup-cache/
+__pycache__/
+__pypackages__/
+
+.DS_Store
+
+.eggs/
+.idea/
+
+*.egg
+*.egg-info/
+
+.claude/
+
+target/
+**/cache/
+ltest-run-*/
+ltest/r*/
