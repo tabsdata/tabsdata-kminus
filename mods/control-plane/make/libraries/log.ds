@@ -1,0 +1,158 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+severities = map
+map_put ${severities} "none"      0
+map_put ${severities} "critical" 10
+map_put ${severities} "fatal"    20
+map_put ${severities} "error"    30
+map_put ${severities} "warn"     40
+map_put ${severities} "info"     50
+map_put ${severities} "debug"    60
+map_put ${severities} "trace"    70
+
+colors = map
+map_put ${colors} "none"     white
+map_put ${colors} "critical" bright_magenta
+map_put ${colors} "fatal"    purple
+map_put ${colors} "error"    red
+map_put ${colors} "warn"     yellow
+map_put ${colors} "info"     green
+map_put ${colors} "debug"    cyan
+map_put ${colors} "trace"    blue
+
+fn log
+    level = trim ${1}
+    message = set ${2}
+
+    ok = map_contains_key ${severities} ${level}
+    if ${ok}
+        severity = map_get ${severities} ${level}
+    else
+        severity = map_get ${severities} "info"
+    end
+
+    ok = map_contains_key ${colors} ${level}
+    if ${ok}
+        color = map_get ${colors} ${level}
+    else
+        color = map_get ${colors} "info"
+    end
+
+    _gt = greater_than ${log_severity} ${severity}
+    _eq = eq ${log_severity} ${severity}
+    _ok = set ${_gt} or ${_eq}
+    if ${_ok}
+        println -c ${color} "[${level}] ${message}"
+    end
+end
+
+fn critical
+    log critical ${1}
+end
+
+fn fatal
+    log fatal ${1}
+end
+
+fn error
+    log error ${1}
+end
+
+fn warn
+    log warn ${1}
+end
+
+fn info
+    log info ${1}
+end
+
+fn debug
+    log debug ${1}
+end
+
+fn trace
+    log trace ${1}
+end
+
+fn is_level
+    level = trim ${1}
+
+    ok = map_contains_key ${severities} ${level}
+    if ${ok}
+        severity = map_get ${severities} ${level}
+    else
+        severity = map_get ${severities} "info"
+    end
+
+    _gt = greater_than ${log_severity} ${severity}
+    _eq = eq ${log_severity} ${severity}
+    _ok = set ${_gt} or ${_eq}
+    return ${_ok}
+end
+
+fn is_critical
+    result = is_level critical
+    return ${result}
+end
+
+fn is_fatal
+    result = is_level fatal
+    return ${result}
+end
+
+fn is_error
+    result = is_level error
+    return ${result}
+end
+
+fn is_warn
+    result = is_level warn
+    return ${result}
+end
+
+fn is_info
+    result = is_level info
+    return ${result}
+end
+
+fn is_debug
+    result = is_level debug
+    return ${result}
+end
+
+fn is_trace
+    result = is_level trace
+    return ${result}
+end
+
+log_level = set ${DUCKSCRIPT_LOG_LEVEL}
+ok = map_contains_key ${severities} ${log_level}
+if ${ok}
+    log_severity = map_get ${severities} ${log_level}
+else
+    log_severity = map_get ${severities} "info"
+end
+
+on_ga = get_env TD_ON_GA
+on_ga_true = eq ${on_ga} "true"
+
+if not ${on_ga_true}
+    responsive_make = get_env TD_RESPONSIVE_MAKE
+    responsive_make_true = eq ${responsive_make} "true"
+
+    if ${responsive_make_true}
+        km_root = get_env KM_ROOT
+        debug "📐 Root from environment: '${km_root}'"
+
+        td_width_output = exec python ${km_root}/make/libraries/term.py
+        td_width = trim ${td_width_output.stdout}
+        debug "📐 Width from python: '${td_width}'"
+
+        set_env CARGO_TERM_PROGRESS_WHEN "always"
+        set_env CARGO_TERM_PROGRESS_WIDTH "${td_width}"
+    end
+end
+
+trace "📌 Duckscript 'log' library loaded with '${log_level}' level & '${log_severity}' severity"

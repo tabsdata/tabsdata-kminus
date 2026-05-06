@@ -1,0 +1,122 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+[tasks.start]
+plugin = "td-task-tracker"
+category = "90 - Lifecycle"
+description = "Handle make tasks start"
+private = false
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/libraries/log.ds
+
+    km_root = get_env KM_ROOT
+    ko = starts_with ${km_root} "\${"
+    if ${ko}
+        exit 0
+    end
+
+    os = os_family
+    debug "🏈 Current os: ${os}"
+    if eq ${os} "windows"
+        temp = temp_dir
+        marker = join_path ${temp} .td.make
+        debug "🍐 The marker temp file is ${marker}"
+        exists = is_path_exists ${marker}
+        if ${exists}
+            debug "🍅 Marker for make exists. Skipping setup."
+            ok = rm ${marker}
+            exit 0
+        end
+        debug "🍏 Marker for make does not exist. Resuming setup."
+        ok = touch ${marker}
+    else
+        pid = pid
+        debug "🏀 Current proces id: ${pid}"
+        output = exec ps -o ppid= -p ${pid}
+        ppid = trim ${output.stdout}
+        debug "🥎 Parent process id: ${ppid}"
+        temp = temp_dir
+        pid_marker = join_path ${temp} .td.pid.${pid}
+        ppid_marker = join_path ${temp} .td.pid.${ppid}
+        debug "🍊 The pid temp file is ${pid_marker}"
+        debug "🍋 The ppid temp file is ${ppid_marker}"
+        exists = is_path_exists ${pid_marker}
+        if ${exists}
+            debug "🍅 Marker for pid exists. Skipping setup."
+            ok = rm ${pid_marker}
+            exit 0
+        end
+        debug "🍏 Marker for pid does not exist. Resuming setup."
+        ok = touch ${ppid_marker}
+    end
+
+    make_banners = get_env TD_MAKE_BANNERS
+    make_banners_true = eq ${make_banners} "true"
+    if ${make_banners_true}
+        cm_run_task banner
+    end
+
+    info "🐢 Running task: ${CARGO_MAKE_TASK}"
+    if is_info
+        echo ""
+    end
+
+    user_home = get_env HOME
+    info "🏠 User HOME: ${HOME}"
+    if is_info
+        echo ""
+    end
+
+    no_user_home = eq ${user_home} ""
+    if ${no_user_home}
+        error "🚷 Environment variable HOME is not defined. Please set it before running this script."
+        error "🚷 The USERPROFILE Windows environment variable will not work. Use HOME instead."
+        echo ""
+        exit 1
+    end
+
+    user_home_exists = is_path_exists ${user_home}
+    if not ${user_home_exists}
+        error "🚷 Environment variable HOME points to a non-existing path: ${user_home}"
+        echo ""
+        exit 1
+    end
+
+    user_home_is_folder = is_dir ${user_home}
+    if not ${user_home_is_folder}
+        error "🚷 Environment variable HOME points to a non-folder path: ${user_home}"
+        echo ""
+        exit 1
+    end
+
+    PATH = get_env PATH
+    debug "✅ Real PATH: ${PATH}"
+
+    on_ga = get_env TD_ON_GA
+    on_ga_true = eq ${on_ga} "true"
+    if ${on_ga_true}
+        td_vcore_path = get_env TD_VCORE_PATH
+        if eq ${td_vcore_path} ""
+            noop
+        else
+            echo "🐵 CI python virtual environment is set: ${td_vcore_path}"
+
+            # source ${td_vcore_path}
+
+            python_version = exec python --version
+            python_version = trim ${python_version.stdout}
+            echo "🐵 CI Core python version: ${python_version}"
+
+            python_path = exec which python
+            python_path = trim ${python_path.stdout}
+            echo "🐵 CI python path: ${python_path}"
+
+            pip_path = exec which pip
+            pip_path = trim ${pip_path.stdout}
+            echo "🐵 CI pip path: ${pip_path}"
+        end
+    end
+    ''']

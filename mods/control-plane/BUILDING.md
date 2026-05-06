@@ -1,0 +1,69 @@
+<!--
+  Copyright 2026 Tabsdata Inc.
+-->
+
+# control-plane Build
+
+The control-plane binary requires four Kubernetes binaries at runtime:
+**kube-apiserver**, **kube-controller-manager**, **etcd**, and **kubectl**.
+
+These are fetched automatically during `cargo make build` (run either from
+the project root or from `mods/control-plane/`) and cached locally so
+subsequent builds don't re-download or re-compile them.
+
+## Cache Layout
+
+The cache lives at `mods/control-plane/cache/`. Only the host platform
+folder is populated — there is no cross-compilation:
+
+```
+mods/control-plane/cache/
+├── k8s-source/                   K8s source (cloned once, shared)
+│   └── kubernetes/
+└── <os>-<arch>/                  host-platform binaries (e.g. darwin-arm64)
+    ├── kube-apiserver
+    ├── kube-controller-manager
+    ├── etcd
+    └── kubectl
+```
+
+After `cargo make build` succeeds, the four binaries are copied into
+`mods/control-plane/target/` alongside the `control-plane` binary.
+
+## How Binaries Are Obtained
+
+| Binary                    | Source                                                                                                                                                  |
+|---------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------|
+| kube-apiserver            | Downloaded via [setup-envtest](https://pkg.go.dev/sigs.k8s.io/controller-runtime/tools/setup-envtest)                                                   |
+| etcd                      | Downloaded via setup-envtest                                                                                                                            |
+| kubectl                   | Downloaded via setup-envtest                                                                                                                            |
+| kube-controller-manager   | Built from source — the Kubernetes repo is shallow-cloned into `cache/k8s-source/kubernetes/` and the binary is compiled with `CGO_ENABLED=0`           |
+
+The K8s version is configured by `K8S_VERSION` in the root `Makeroot.toml`
+(default `1.29`). setup-envtest resolves it to the latest patch release
+(e.g. `v1.29.5`), and the K8s source clone uses the same exact tag.
+
+`make/scripts/fetch_k8s_deps.py` detects the host OS / arch automatically
+(`darwin-arm64`, `linux-amd64`, …) and skips work entirely when the cache
+already contains the binaries for that platform.
+
+## Cache Behavior
+
+- **`cargo make build`** — fetches binaries for the current platform if not
+  cached, then copies them into `mods/control-plane/target/`.
+- **`cargo make assembly`** — the top-level `assembly` task copies the
+  cached host-platform K8s binaries into the root `target/dist/` along
+  with the built module binaries.
+- **`cargo make clean`** — removes `mods/control-plane/target/` but
+  **preserves** the cache.
+- **`cargo make clean -- --all`** — removes both `target/` and `cache/`.
+
+The cache is gitignored and safe to delete at any time; the next build
+will re-populate it.
+
+## Prerequisites
+
+- **Go 1.23+** — for building control-plane and kube-controller-manager
+- **Git** — for cloning the Kubernetes source
+- **setup-envtest** — installed automatically on first build via
+  `go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.19`

@@ -1,0 +1,29 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+[tasks.__km__itest_go_control_plane]
+plugin = "td-task-tracker"
+category = "04 - Test"
+description = "Task 'itest' for control-plane project"
+dependencies = [
+    "__km__build_go_control_plane",
+]
+cwd = "${KM_ROOT}/mods/control-plane/src/itest"
+script_runner = "@duckscript"
+script = '''
+    km_root = get_env KM_ROOT
+    test_folder = get_env KM_TEST_FOLDER
+    bin_folder = concat ${km_root} "/mods/control-plane/target"
+
+    target_subfolder = pwd
+    target_subfolder = concat ${target_subfolder} "/bin"
+    if is_dir ${target_subfolder}
+        set_env TD_BIN_FOLDER ${bin_folder}
+        set_env PYTHONPATH ${test_folder}
+        runner = concat ${test_folder} "/pytest-noop.sh"
+        exec --fail-on-error ${runner} bin/ -v
+    else
+        echo (control-plane: no integration tests -- skipping)
+    end
+'''

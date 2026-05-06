@@ -1,0 +1,83 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+[tasks.__km__permit_rs]
+plugin = "td-task-tracker"
+category = "80 - Verify"
+description = "Task 'permit' for Python projects"
+private = true
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/libraries/log.ds
+
+    tabsdata_rust_version = set 1.94.0
+    set_env TABSDATA_RUST_VERSION ${tabsdata_rust_version}
+
+    info "♻️️ Checking if the required Rust version is installed..."
+
+    rustc = which rustc
+    if equals ${rustc} ""
+        error "🚫🚫🚫🚫🚫 Rust is not available. Make aborted."
+        assert_fail
+    end
+
+    result = exec rustc --version
+    code = set ${result.code}
+    if not equals ${code} "0"
+        error "🚫🚫🚫🚫🚫 Rust is available but unusable. Make aborted."
+        assert_fail
+    end
+
+    version = trim ${result.stdout}
+    info "❇️ Rust version: ${version}"
+
+    result = exec python -c "import os, sys, subprocess; v = tuple(map(int, os.environ['TABSDATA_RUST_VERSION'].split('.'))); r = subprocess.check_output(['rustc', '--version']).decode().split()[1]; rv = tuple(map(int, r.split('.'))); sys.exit(0 if rv >= v else 1)"
+    code = set ${result.code}
+    if not equals ${code} "0"
+        error "🚫🚫🚫🚫🚫 The Rust version is lesser than requited Rust version < ${tabsdata_rust_version} >. Make aborted."
+        assert_fail
+    end
+
+    on_ga = get_env TD_ON_GA
+    on_ga_true = eq ${on_ga} "true"
+    if ${on_ga_true}
+        debug "♻️️ Delegating installation of required cargo plugins to the continuos integration system."
+    else
+        components_array = array
+        array_push ${components_array} "clippy"
+        array_push ${components_array} "rustfmt"
+        components = array_join ${components_array} " "
+
+        crates_array = array
+        array_push ${crates_array} "cargo-audit"
+        array_push ${crates_array} "cargo-deny"
+        array_push ${crates_array} "cargo-edit"
+        array_push ${crates_array} "cargo-license"
+        array_push ${crates_array} "cargo-machete"
+        array_push ${crates_array} "cargo-make"
+        array_push ${crates_array} "cargo-nextest"
+        array_push ${crates_array} "cargo-outdated"
+        # array_push ${crates_array} "cargo-pants"
+        array_push ${crates_array} "cargo-update"
+        array_push ${crates_array} "cargo-upgrades"
+        array_push ${crates_array} "cargo-workspaces"
+        array_push ${crates_array} "cross"
+        array_push ${crates_array} "mdbook"
+        array_push ${crates_array} "mdbook-d2"
+        array_push ${crates_array} "mdbook-mermaid"
+        crates = array_join ${crates_array} " "
+
+        td_cargo_install_jobs = get_env TD_CARGO_INSTALL_JOBS
+        td_cargo_install_jobs_is_empty = is_empty ${td_cargo_install_jobs}
+        if ${td_cargo_install_jobs_is_empty}
+            td_cargo_install_jobs = set "8"
+        end
+
+        exec --fail-on-error rustup component add %{components}
+        exec --fail-on-error cargo install --quiet --locked --jobs ${td_cargo_install_jobs} %{crates}
+
+        exec --fail-on-error cargo install --quiet --locked --git https://github.com/tabsdata/cargo-pants --branch main
+    end
+    ''']

@@ -1,0 +1,54 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+extend = [
+    { path = "./make/fragments/plugins/tasks.toml", relative = "git" },
+
+    { path = "./make/fragments/tasks/permit_py.toml", relative = "git" },
+    { path = "./make/fragments/tasks/permit_rs.toml", relative = "git" },
+    { path = "./make/fragments/tasks/permit_go.toml", relative = "git" },
+
+    { path = "./make/fragments/common/permit.toml", relative = "git" },
+
+    { path = "./mods/control-plane/make/fragments/tasks/clean_go.toml", relative = "git" },
+    { path = "./mods/control-plane/make/fragments/tasks/lock_go.toml", relative = "git" },
+    { path = "./mods/control-plane/make/fragments/tasks/build_go.toml", relative = "git" },
+    { path = "./mods/control-plane/make/fragments/tasks/test_go.toml", relative = "git" },
+    { path = "./mods/control-plane/make/fragments/tasks/itest_go.toml", relative = "git" },
+
+    { path = "./make/fragments/hooks/banner.toml", relative = "git" },
+    { path = "./make/fragments/hooks/start.toml", relative = "git" },
+    { path = "./make/fragments/hooks/stop.toml", relative = "git" },
+    { path = "./make/fragments/hooks/failure.toml", relative = "git" },
+]
+
+[tasks.clean]
+plugin = "td-task-tracker"
+category = "01 - Clean"
+description = "Clean control-plane (use --all to also wipe K8s dependency cache)"
+alias = "__km__clean_go_control_plane"
+
+[tasks.lock]
+plugin = "td-task-tracker"
+category = "02 - Tidy"
+description = "Regenerate control-plane lockfiles"
+alias = "__km__lock_go_control_plane"
+
+[tasks.build]
+plugin = "td-task-tracker"
+category = "03 - Build"
+description = "Build control-plane"
+alias = "__km__build_go_control_plane"
+
+[tasks.test]
+plugin = "td-task-tracker"
+category = "04 - Test"
+description = "Test control-plane"
+alias = "__km__test_go_control_plane"
+
+[tasks.itest]
+plugin = "td-task-tracker"
+category = "04 - Test"
+description = "Run control-plane integration tests"
+alias = "__km__itest_go_control_plane"

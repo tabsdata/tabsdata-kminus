@@ -1,0 +1,19 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+[tasks.__km__arguments]
+private = true
+plugin = "td-task-tracker"
+category = "100 - Setup"
+description = "Parse application arguments"
+script_runner = "@duckscript"
+script = '''
+    set_env KM_CLEAN_ALL "false"
+    args = split ${CARGO_MAKE_TASK_ARGS} ;
+    for arg in ${args}
+        if eq ${arg} "--all"
+            set_env KM_CLEAN_ALL "true"
+        end
+    end
+'''

@@ -1,0 +1,205 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+extend = [
+    { path = "./make/fragments/shared/Maketask.toml", relative = "git" },
+]
+
+[tasks.clean]
+plugin = "td-task-tracker"
+category = "01 - Clean"
+description = "Clean all modules (use --all to also wipe caches)"
+dependencies = [
+    "clean_go",
+    "clean_rs",
+    "clean_root",
+]
+
+[tasks.clean_go]
+plugin = "td-task-tracker"
+category = "01 - Clean"
+description = "Task 'clean' for Go projects (use --all to also wipe caches)"
+dependencies = [
+    "__km__clean_go_control_plane",
+    "__km__clean_go_virtual_kubelet",
+]
+
+[tasks.clean_rs]
+plugin = "td-task-tracker"
+category = "01 - Clean"
+description = "Task 'clean' for Rust projects (use --all to also wipe caches)"
+dependencies = [
+    "__km__clean_rs_pod_runner",
+    "__km__clean_rs_kminus",
+]
+
+[tasks.clean_root]
+plugin = "td-task-tracker"
+category = "01 - Clean"
+description = "Task 'clean' for the Root project (use --all to also wipe caches)"
+dependencies = [
+    "__km__clean_root",
+]
+
+[tasks.lock]
+plugin = "td-task-tracker"
+category = "02 - Tidy"
+description = "Regenerate lockfiles across all modules"
+dependencies = [
+    "lock_go",
+    "lock_rs",
+]
+
+[tasks.lock_go]
+plugin = "td-task-tracker"
+category = "02 - Tidy"
+description = "Task 'lock' for Go projects"
+dependencies = [
+    "__km__lock_go_control_plane",
+    "__km__lock_go_virtual_kubelet",
+]
+
+[tasks.lock_rs]
+plugin = "td-task-tracker"
+category = "02 - Tidy"
+description = "Task 'lock' for Rust projects"
+dependencies = [
+    "__km__lock_rs_pod_runner",
+    "__km__lock_rs_kminus",
+]
+
+[tasks.build]
+plugin = "td-task-tracker"
+category = "03 - Build"
+description = "Build all modules"
+dependencies = [
+    "build_go",
+    "build_rs",
+]
+
+[tasks.build_go]
+plugin = "td-task-tracker"
+category = "03 - Build"
+description = "Task 'build' for Go projects"
+dependencies = [
+    "__km__build_go_control_plane",
+    "__km__build_go_virtual_kubelet",
+]
+
+[tasks.build_rs]
+plugin = "td-task-tracker"
+category = "03 - Build"
+description = "Task 'build' for Rust projects"
+dependencies = [
+    "__km__build_rs_pod_runner",
+    "__km__build_rs_kminus",
+]
+
+[tasks.test]
+plugin = "td-task-tracker"
+category = "04 - Test"
+description = "Test all modules"
+dependencies = [
+    "test_go",
+    "test_rs",
+]
+
+[tasks.test_go]
+plugin = "td-task-tracker"
+category = "04 - Test"
+description = "Task 'test' for Go projects"
+dependencies = [
+    "__km__test_go_control_plane",
+    "__km__test_go_virtual_kubelet",
+]
+
+[tasks.test_rs]
+plugin = "td-task-tracker"
+category = "04 - Test"
+description = "Task 'test' for Rust projects"
+dependencies = [
+    "__km__test_rs_pod_runner",
+    "__km__test_rs_kminus",
+]
+
+[tasks.itest]
+plugin = "td-task-tracker"
+category = "04 - Test"
+description = "Run all integration tests"
+dependencies = [
+    "build",
+    "itest_go",
+    "itest_rs",
+]
+
+[tasks.itest_go]
+plugin = "td-task-tracker"
+category = "04 - Test"
+description = "Task 'itest' for Go projects"
+dependencies = [
+    "build_go",
+    "__km__itest_go_control_plane",
+    "__km__itest_go_virtual_kubelet",
+]
+
+[tasks.itest_rs]
+plugin = "td-task-tracker"
+category = "04 - Test"
+description = "Task 'itest' for Rust projects"
+dependencies = [
+    "build_rs",
+    "__km__itest_rs_pod_runner",
+    "__km__itest_rs_kminus",
+]
+
+[tasks.assembly]
+plugin = "td-task-tracker"
+category = "10 - Bundle"
+description = "Gather all final binaries into target/dist/"
+dependencies = [
+    "build",
+    "__km__assembly_root",
+]
+
+[tasks.permit]
+plugin = "td-task-tracker"
+category = "80 - Verify"
+description = "Verify that all essential language tools are available"
+run_task = [
+    { name = [
+        "permit_py",
+        "permit_rs",
+        "permit_go",
+    ] }
+]
+
+[tasks.permit_py]
+plugin = "td-task-tracker"
+category = "80 - Verify"
+description = "Task 'permit' for Python projects"
+run_task = [
+    { name = [
+        "__km__permit_py",
+    ] }
+]
+
+[tasks.permit_rs]
+plugin = "td-task-tracker"
+category = "80 - Verify"
+description = "Task 'permit' for Rust projects"
+run_task = [
+    { name = [
+        "__km__permit_rs",
+    ] }
+]
+
+[tasks.permit_go]
+plugin = "td-task-tracker"
+category = "80 - Verify"
+description = "Task 'permit' for Go projects"
+run_task = [
+    { name = [
+        "__km__permit_go",
+    ] }
+]

@@ -1,0 +1,20 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+[tasks.__km__clean_go_virtual_kubelet]
+plugin = "td-task-tracker"
+category = "01 - Clean"
+description = "Task 'clean' for virtual-kubelet project"
+cwd = "${KM_ROOT}/mods/virtual-kubelet"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/libraries/log.ds
+
+    km_root = get_env KM_ROOT
+
+    target_folder = concat ${km_root} "/mods/virtual-kubelet/target"
+    if is_path_exists ${target_folder}
+        rm -r ${target_folder}
+    end
+'''

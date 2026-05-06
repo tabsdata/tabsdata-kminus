@@ -1,0 +1,9 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+extend = [
+    { path = "./mods/control-plane/Makeroot.toml", relative = "git" },
+
+    { path = "./mods/control-plane/Maketask.toml", relative = "git" }
+]

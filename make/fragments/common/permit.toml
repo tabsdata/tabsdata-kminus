@@ -1,0 +1,14 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+[tasks.__km__permit]
+private = true
+plugin = "td-task-tracker"
+category = "80 - Verify"
+description = "Verify all required toolchains (Python, Go, Rust) are available"
+dependencies = [
+    "__km__permit_py",
+    "__km__permit_go",
+    "__km__permit_rs",
+]

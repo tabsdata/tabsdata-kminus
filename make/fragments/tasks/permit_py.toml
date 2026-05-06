@@ -1,0 +1,91 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+[tasks.__km__permit_py]
+plugin = "td-task-tracker"
+category = "80 - Verify"
+description = "Task 'permit' for Python projects"
+private = true
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/libraries/log.ds
+
+    tabsdata_python_version = set 3.12.0
+    set_env TABSDATA_PYTHON_VERSION ${tabsdata_python_version}
+
+    info "♻️ Checking if the required Python version is installed..."
+
+    python = which python
+    if equals ${python} ""
+        error "🚫🚫🚫🚫🚫 Python is not available. Make aborted."
+        assert_fail
+    end
+
+    result = exec python --version
+    code = set ${result.code}
+    if not equals ${code} "0"
+        error "🚫🚫🚫🚫🚫 Python is available but unusable. Make aborted."
+        assert_fail
+    end
+
+    version = trim ${result.stdout}
+    info "❇️ Python version: ${version}"
+
+    result = exec python -c "import os, sys, subprocess; v = tuple(map(int, os.environ['TABSDATA_PYTHON_VERSION'].split('.'))); r = subprocess.check_output(['python', '--version']).decode().split()[1]; rv = tuple(map(int, r.split('.'))); sys.exit(0 if rv >= v else 1)"
+    code = set ${result.code}
+    if not equals ${code} "0"
+        error "🚫🚫🚫🚫🚫 The Python version is lesser than requited Python version < ${tabsdata_python_version} >. Make aborted."
+        assert_fail
+    end
+
+    python_root_folder = exec python -c "import sys; print(sys.prefix)"
+    python_root_folder = trim ${python_root_folder.stdout}
+    python_scripts_folder = exec python -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+    python_scripts_folder = trim ${python_scripts_folder.stdout}
+    info "☘️ Python root folder ${python_root_folder}"
+    info "🌺 Python scripts folder ${python_scripts_folder}"
+
+    on_ga = get_env TD_ON_GA
+    on_ga_true = eq ${on_ga} "true"
+
+    cd ${TABSDATA_ROOT}
+    virtual_env = get_env VIRTUAL_ENV
+    if is_empty ${virtual_env}
+        if ${on_ga_true}
+            debug "🚀 uv pip install --system --requirement requirements-dev.txt"
+            exec --fail-on-error uv pip install --system --requirement requirements-dev.txt
+        else
+            debug "🚀 uv pip install --system --quiet --requirement requirements-dev.txt"
+            exec --fail-on-error uv pip install --system --quiet --requirement requirements-dev.txt
+        end
+    else
+        if ${on_ga_true}
+            debug "🚀 uv pip install --requirement requirements-dev.txt"
+            exec --fail-on-error uv pip install --requirement requirements-dev.txt
+        else
+            debug "🚀 uv pip install --quiet --requirement requirements-dev.txt"
+            exec --fail-on-error uv pip install --quiet --requirement requirements-dev.txt
+        end
+    end
+
+    debug "🚀 uv pip install --quiet -e ./devutils/automation/tasks/python/tabsdata-toolkit --config-settings editable_mode=compat --no-build-isolation"
+    exec --fail-on-error uv pip install --quiet -e ./devutils/automation/tasks/python/tabsdata-toolkit --config-settings editable_mode=compat --no-build-isolation
+
+    pyenv = which pyenv
+    if not eq ${pyenv} ""
+        warn "✅ Component pyenv is available. Considering rehash."
+        os = os_family
+        info "🪴 Current os: ${os}"
+        is_windows = eq ${os} "windows"
+        if ${is_windows}
+            warn "🦧️ Operating system is Windows. Skipping rehash."
+        else
+            warn "🐙️ Component pyenv is available. Running rehash."
+            exec --fail-on-error pyenv rehash
+        end
+    else
+        warn "⚠️ Component pyenv is not available. Skipping rehash."
+    end
+    ''']

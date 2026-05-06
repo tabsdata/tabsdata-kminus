@@ -1,0 +1,29 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+[tasks.__km__build_rs_pod_runner]
+plugin = "td-task-tracker"
+category = "03 - Build"
+description = "Task 'build' for pod_runner project"
+cwd = "${KM_ROOT}/mods/pod-runner"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/libraries/log.ds
+
+    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} build %{td-rust-quiet} --locked %{td-target-token} %{td-target} --profile ${td-profile} --workspace --manifest-path ${PROJECT_RS_POD_RUNNER_CARGO_TOML} --all-features --bins --examples"
+    exec --fail-on-error ${td-cargo} %{td-toolchain-token}%{td-toolchain} build %{td-rust-quiet} --locked %{td-target-token} %{td-target} --profile ${td-profile} --workspace --manifest-path ${PROJECT_RS_POD_RUNNER_CARGO_TOML} --all-features --bins --examples
+
+    td_check_build_folder = set ${td-profile}
+    is_dev = eq ${td_check_build_folder} "dev"
+    if ${is_dev}
+        td_check_build_folder = set "debug"
+    end
+    td_target_value = get_env TD_TARGET
+    td_target_empty = is_empty ${td_target_value}
+    if not ${td_target_empty}
+        td_check_build_folder = concat ${td_target_value} "/" ${td_check_build_folder}
+    end
+    td_check_target_folder = concat ${PROJECT_RS_POD_RUNNER_CARGO_FOLDER} "target/" ${td_check_build_folder}
+    exec --fail-on-error python ${CHECK_NATIVE_LIBS_SCRIPT} cargo ${PROJECT_RS_POD_RUNNER_CARGO_TOML} ${td_check_target_folder}
+'''

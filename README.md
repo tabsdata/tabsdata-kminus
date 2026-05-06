@@ -41,7 +41,7 @@ export KUBECONFIG=./config/kubeconfig.yaml
 kubectl apply -f my-job.yaml
 ```
 
-See [BUILD_README.md](BUILD_README.md) for the full build system
+See [BUILDING.md](BUILDING.md) for the full build system
 documentation, and [docs/](docs/) for component design docs.
 
 ## License

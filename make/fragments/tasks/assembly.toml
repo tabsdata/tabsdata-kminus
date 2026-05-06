@@ -1,0 +1,69 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+[tasks.__km__assembly_root]
+private = true
+plugin = "td-task-tracker"
+category = "10 - Bundle"
+description = "Task 'assembly' for the Root project"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/libraries/log.ds
+
+    km_root = get_env KM_ROOT
+    profile = get_env profile
+
+    build_folder = set ${profile}
+    if eq ${profile} "dev"
+        build_folder = set "debug"
+    end
+
+    dist_folder = concat ${km_root} "/target/dist"
+    if is_path_exists ${dist_folder}
+        rm -r ${dist_folder}
+    end
+    mkdir ${dist_folder}
+
+    go_modules = array control-plane virtual-kubelet
+    for go_module in ${go_modules}
+        src = concat ${km_root} "/mods/" ${go_module} "/target/" ${go_module}
+        if is_file ${src}
+            dst = concat ${dist_folder} "/" ${go_module}
+            cp ${src} ${dst}
+        end
+    end
+
+    rs_modules = array pod-runner kminus
+    rs_binaries = array pod-runner km
+    rs_count = array_length ${rs_modules}
+    rs_index = set 0
+    while less_than ${rs_index} ${rs_count}
+        rs_module = array_get ${rs_modules} ${rs_index}
+        rs_binary = array_get ${rs_binaries} ${rs_index}
+        src = concat ${km_root} "/mods/" ${rs_module} "/target/" ${build_folder} "/" ${rs_binary}
+        if is_file ${src}
+            dst = concat ${dist_folder} "/" ${rs_binary}
+            cp ${src} ${dst}
+        end
+        rs_index = calc ${rs_index} + 1
+    end
+
+    k8s_deps = array kube-apiserver kube-controller-manager etcd kubectl
+    cache_folder = concat ${km_root} "/mods/control-plane/cache"
+    platform_folders = glob_array ${cache_folder}/*
+    for platform_folder in ${platform_folders}
+        is_platform = is_dir ${platform_folder}
+        if ${is_platform}
+            for k8s_dep in ${k8s_deps}
+                src = concat ${platform_folder} "/" ${k8s_dep}
+                if is_file ${src}
+                    dst = concat ${dist_folder} "/" ${k8s_dep}
+                    cp ${src} ${dst}
+                end
+            end
+        end
+    end
+
+    info 🧩 Distribution folder: ${dist_folder}
+'''

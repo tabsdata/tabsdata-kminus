@@ -1,0 +1,45 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+extend = [
+    { path = "./make/fragments/plugins/tasks.toml", relative = "git" },
+
+    { path = "./mods/control-plane/make/fragments/tasks/clean_go.toml", relative = "git" },
+    { path = "./mods/control-plane/make/fragments/tasks/lock_go.toml", relative = "git" },
+    { path = "./mods/control-plane/make/fragments/tasks/build_go.toml", relative = "git" },
+    { path = "./mods/control-plane/make/fragments/tasks/test_go.toml", relative = "git" },
+    { path = "./mods/control-plane/make/fragments/tasks/itest_go.toml", relative = "git" },
+
+    { path = "./mods/virtual-kubelet/make/fragments/tasks/clean_go.toml", relative = "git" },
+    { path = "./mods/virtual-kubelet/make/fragments/tasks/lock_go.toml", relative = "git" },
+    { path = "./mods/virtual-kubelet/make/fragments/tasks/build_go.toml", relative = "git" },
+    { path = "./mods/virtual-kubelet/make/fragments/tasks/test_go.toml", relative = "git" },
+    { path = "./mods/virtual-kubelet/make/fragments/tasks/itest_go.toml", relative = "git" },
+
+    { path = "./mods/pod-runner/make/fragments/tasks/clean_rs.toml", relative = "git" },
+    { path = "./mods/pod-runner/make/fragments/tasks/lock_rs.toml", relative = "git" },
+    { path = "./mods/pod-runner/make/fragments/tasks/build_rs.toml", relative = "git" },
+    { path = "./mods/pod-runner/make/fragments/tasks/test_rs.toml", relative = "git" },
+    { path = "./mods/pod-runner/make/fragments/tasks/itest_rs.toml", relative = "git" },
+
+    { path = "./mods/kminus/make/fragments/tasks/clean_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/fragments/tasks/lock_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/fragments/tasks/build_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/fragments/tasks/test_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/fragments/tasks/itest_rs.toml", relative = "git" },
+
+    { path = "./make/fragments/tasks/permit_py.toml", relative = "git" },
+    { path = "./make/fragments/tasks/permit_rs.toml", relative = "git" },
+    { path = "./make/fragments/tasks/permit_go.toml", relative = "git" },
+
+    { path = "./make/fragments/common/permit.toml", relative = "git" },
+
+    { path = "./make/fragments/tasks/clean.toml", relative = "git" },
+    { path = "./make/fragments/tasks/assembly.toml", relative = "git" },
+
+    { path = "./make/fragments/hooks/banner.toml", relative = "git" },
+    { path = "./make/fragments/hooks/start.toml", relative = "git" },
+    { path = "./make/fragments/hooks/stop.toml", relative = "git" },
+    { path = "./make/fragments/hooks/failure.toml", relative = "git" },
+]

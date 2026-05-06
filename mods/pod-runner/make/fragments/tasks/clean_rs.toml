@@ -1,0 +1,16 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+[tasks.__km__clean_rs_pod_runner]
+plugin = "td-task-tracker"
+category = "01 - Clean"
+description = "Task 'clean' for pod_runner project"
+cwd = "${KM_ROOT}/mods/pod-runner"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/libraries/log.ds
+
+    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} clean --locked %{td-target-token} %{td-target} --manifest-path ${PROJECT_RS_POD_RUNNER_CARGO_TOML}"
+    exec --fail-on-error ${td-cargo} %{td-toolchain-token}%{td-toolchain} clean --locked %{td-target-token} %{td-target} --manifest-path ${PROJECT_RS_POD_RUNNER_CARGO_TOML}
+'''

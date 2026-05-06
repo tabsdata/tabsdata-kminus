@@ -1,0 +1,75 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+[plugins.impl.td-task-tracker]
+script ='''
+    !include_files ./make/libraries/log.ds
+
+    is_meta_task = starts_with ${task.name} "permit"
+    if not ${is_meta_task}
+        is_meta_task = starts_with ${task.name} "__km__permit"
+    end
+    if not ${is_meta_task}
+        is_meta_task = eq ${task.name} "__km__arguments"
+    end
+
+    if not ${is_meta_task}
+        permit_done = get_env TD_PERMIT_DONE
+        if is_empty ${permit_done}
+            no_permit = set false
+            cli_args = split ${CARGO_MAKE_TASK_ARGS} ;
+            for cli_arg in ${cli_args}
+                cli_arg = trim ${cli_arg}
+                is_no_permit = eq ${cli_arg} "--no-permit"
+                if ${is_no_permit}
+                    no_permit = set true
+                end
+            end
+
+            if ${no_permit}
+                warn "✈️ Skipping permit (--no-permit)"
+                echo ""
+                set_env TD_PERMIT_DONE "true"
+            else
+                td_run_permit = get_env TD_RUN_PERMIT
+                if eq ${td_run_permit} "false"
+                    warn "✈️ Skipping permit"
+                    echo ""
+                    set_env TD_PERMIT_DONE "true"
+                else
+                    cm_run_task __km__permit
+                    set_env TD_PERMIT_DONE "true"
+                end
+            end
+        end
+
+        arguments_done = get_env TD_ARGUMENTS_DONE
+        if is_empty ${arguments_done}
+            cm_run_task __km__arguments
+            set_env TD_ARGUMENTS_DONE "true"
+        end
+    end
+
+    td_skip_env = concat "skip_" ${task.name}
+    td_skip_task = get_env ${td_skip_env}
+
+    start_ms = current_time
+
+    if is_empty ${td_skip_task}
+        cm_plugin_run_task
+    else
+        warn "Skipping task '${task.name}' as configured by environment variable '${td_skip_env}'"
+    end
+
+    end_ms = current_time
+
+    elapsed_ms = calc ${end_ms} - ${start_ms}
+    elapsed_time = exec --fail-on-error python3 -c "from datetime import timedelta; import sys; print(timedelta(milliseconds=int(sys.argv[1])))" ${elapsed_ms}
+    elapsed_time = trim ${elapsed_time.stdout}
+
+    td_monitor_make = get_env TD_MONITOR_MAKE
+    if eq ${td_monitor_make} "true"
+        info "Elapsed time: ${elapsed_time} | ${task.name}"
+    end
+    '''

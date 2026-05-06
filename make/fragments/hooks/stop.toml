@@ -1,0 +1,84 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+[tasks.stop]
+plugin = "td-task-tracker"
+category = "90 - Lifecycle"
+description = "Handle make tasks stop"
+private = false
+script_runner = "@duckscript"
+script = '''
+    os = os_family
+
+    make_banners = get_env TD_MAKE_BANNERS
+    make_banners_true = eq ${make_banners} "true"
+
+    if ${make_banners_true}
+        if eq ${os} "windows"
+            cm_run_task stop_windows
+        elseif eq ${os} "mac"
+            cm_run_task stop_mac
+        elseif eq ${os} "linux"
+            cm_run_task stop_linux
+        end
+    else
+        echo "✅ Ok!"
+    end
+'''
+
+[tasks.stop_windows]
+plugin = "td-task-tracker"
+category = "90 - Lifecycle"
+private = true
+ignore_errors = true
+condition = { env = { MAKE_SUCCESS = "true" } }
+
+[tasks.stop_linux]
+plugin = "td-task-tracker"
+category = "90 - Lifecycle"
+private = true
+ignore_errors = true
+condition = { env = { MAKE_SUCCESS = "true" } }
+
+[tasks.stop_mac]
+plugin = "td-task-tracker"
+category = "90 - Lifecycle"
+private = true
+ignore_errors = true
+condition = { env = { MAKE_SUCCESS = "true" } }
+script_runner = "@duckscript"
+script = '''
+    km_root = get_env KM_ROOT
+
+    imgcat = which imgcat
+    has_imgcat = not equals ${imgcat} ""
+    if ${has_imgcat}
+        echo ""
+        image = concat ${km_root} "/make/resources/images/gopher-happy.png"
+        exec imgcat --width 24 ${image}
+    end
+
+    lolcat = which lolcat
+    figlet = which figlet
+    has_lolcat = not equals ${lolcat} ""
+    has_figlet = not equals ${figlet} ""
+    has_both = set ${has_lolcat} and ${has_figlet}
+
+    if ${has_both}
+        echo ""
+        font = concat ${km_root} "/make/resources/fonts/3d.flf"
+        fig_out = exec figlet -f ${font} Done!
+        fig_text = set ${fig_out.stdout}
+
+        tmp_root = temp_dir
+        my_pid = pid
+        tmp_file = concat ${tmp_root} "/td-km-stop-" ${my_pid} ".txt"
+        writefile ${tmp_file} ${fig_text}
+        exec lolcat ${tmp_file}
+        rm ${tmp_file}
+        echo ""
+    else
+        echo "✅ Ok!"
+    end
+'''

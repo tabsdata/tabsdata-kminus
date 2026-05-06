@@ -1,0 +1,11 @@
+#
+# Copyright 2024 Tabs Data Inc.
+#
+
+[build]
+jobs = 16
+
+[env]
+RUST_BACKTRACE = "1"
+RUST_LOG = "error"
+RUSTDOC_LOG = "error"

@@ -1,0 +1,9 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+extend = [
+    { path = "./mods/virtual-kubelet/Makeroot.toml", relative = "git" },
+
+    { path = "./mods/virtual-kubelet/Maketask.toml", relative = "git" }
+]

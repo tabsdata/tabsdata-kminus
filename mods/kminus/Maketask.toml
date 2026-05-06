@@ -1,0 +1,54 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+extend = [
+    { path = "./make/fragments/plugins/tasks.toml", relative = "git" },
+
+    { path = "./make/fragments/tasks/permit_py.toml", relative = "git" },
+    { path = "./make/fragments/tasks/permit_rs.toml", relative = "git" },
+    { path = "./make/fragments/tasks/permit_go.toml", relative = "git" },
+
+    { path = "./make/fragments/common/permit.toml", relative = "git" },
+
+    { path = "./mods/kminus/make/fragments/tasks/clean_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/fragments/tasks/lock_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/fragments/tasks/build_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/fragments/tasks/test_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/fragments/tasks/itest_rs.toml", relative = "git" },
+
+    { path = "./make/fragments/hooks/banner.toml", relative = "git" },
+    { path = "./make/fragments/hooks/start.toml", relative = "git" },
+    { path = "./make/fragments/hooks/stop.toml", relative = "git" },
+    { path = "./make/fragments/hooks/failure.toml", relative = "git" },
+]
+
+[tasks.clean]
+plugin = "td-task-tracker"
+category = "01 - Clean"
+description = "Clean kminus (use --all to also wipe caches)"
+alias = "__km__clean_rs_kminus"
+
+[tasks.lock]
+plugin = "td-task-tracker"
+category = "02 - Tidy"
+description = "Regenerate kminus lockfile"
+alias = "__km__lock_rs_kminus"
+
+[tasks.build]
+plugin = "td-task-tracker"
+category = "03 - Build"
+description = "Build kminus"
+alias = "__km__build_rs_kminus"
+
+[tasks.test]
+plugin = "td-task-tracker"
+category = "04 - Test"
+description = "Test kminus"
+alias = "__km__test_rs_kminus"
+
+[tasks.itest]
+plugin = "td-task-tracker"
+category = "04 - Test"
+description = "Run kminus integration tests"
+alias = "__km__itest_rs_kminus"

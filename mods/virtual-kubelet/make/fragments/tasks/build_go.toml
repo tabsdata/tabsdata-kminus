@@ -1,0 +1,36 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+[tasks.__km__build_go_virtual_kubelet]
+plugin = "td-task-tracker"
+category = "03 - Build"
+description = "Task 'build' for virtual-kubelet project"
+cwd = "${KM_ROOT}/mods/virtual-kubelet"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/libraries/log.ds
+
+    binary_extension = set ""
+    os_family = os_family
+    if eq ${os_family} "windows"
+        binary_extension = set ".exe"
+    end
+
+    source_folder = set "${KM_ROOT}/mods/virtual-kubelet/src/main/go"
+    target_folder = set "${KM_ROOT}/mods/virtual-kubelet/target"
+    output_file = concat ${target_folder} "/virtual-kubelet" ${binary_extension}
+
+    mkdir ${target_folder}
+
+    cd ${source_folder}
+
+    is_assembly = eq ${td-profile} "assembly"
+    if ${is_assembly}
+        debug "🚀 go build \"-ldflags=-s -w\" -trimpath -o ${output_file} ."
+        exec --fail-on-error go build "-ldflags=-s -w" -trimpath -o ${output_file} .
+    else
+        debug "🚀 go build -o ${output_file} ."
+        exec --fail-on-error go build -o ${output_file} .
+    end
+'''

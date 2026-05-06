@@ -1,0 +1,54 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+extend = [
+    { path = "./make/fragments/plugins/tasks.toml", relative = "git" },
+
+    { path = "./make/fragments/tasks/permit_py.toml", relative = "git" },
+    { path = "./make/fragments/tasks/permit_rs.toml", relative = "git" },
+    { path = "./make/fragments/tasks/permit_go.toml", relative = "git" },
+
+    { path = "./make/fragments/common/permit.toml", relative = "git" },
+
+    { path = "./mods/virtual-kubelet/make/fragments/tasks/clean_go.toml", relative = "git" },
+    { path = "./mods/virtual-kubelet/make/fragments/tasks/lock_go.toml", relative = "git" },
+    { path = "./mods/virtual-kubelet/make/fragments/tasks/build_go.toml", relative = "git" },
+    { path = "./mods/virtual-kubelet/make/fragments/tasks/test_go.toml", relative = "git" },
+    { path = "./mods/virtual-kubelet/make/fragments/tasks/itest_go.toml", relative = "git" },
+
+    { path = "./make/fragments/hooks/banner.toml", relative = "git" },
+    { path = "./make/fragments/hooks/start.toml", relative = "git" },
+    { path = "./make/fragments/hooks/stop.toml", relative = "git" },
+    { path = "./make/fragments/hooks/failure.toml", relative = "git" },
+]
+
+[tasks.clean]
+plugin = "td-task-tracker"
+category = "01 - Clean"
+description = "Clean virtual-kubelet (use --all to also wipe caches)"
+alias = "__km__clean_go_virtual_kubelet"
+
+[tasks.lock]
+plugin = "td-task-tracker"
+category = "02 - Tidy"
+description = "Regenerate virtual-kubelet lockfiles"
+alias = "__km__lock_go_virtual_kubelet"
+
+[tasks.build]
+plugin = "td-task-tracker"
+category = "03 - Build"
+description = "Build virtual-kubelet"
+alias = "__km__build_go_virtual_kubelet"
+
+[tasks.test]
+plugin = "td-task-tracker"
+category = "04 - Test"
+description = "Test virtual-kubelet"
+alias = "__km__test_go_virtual_kubelet"
+
+[tasks.itest]
+plugin = "td-task-tracker"
+category = "04 - Test"
+description = "Run virtual-kubelet integration tests"
+alias = "__km__itest_go_virtual_kubelet"
