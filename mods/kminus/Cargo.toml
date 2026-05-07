@@ -22,6 +22,10 @@ publish = false
 repository = "https://github.com/tabsdata/tabsdata-km"
 rust-version = "1.94.0"
 
+[[bin]]
+name = "km"
+path = "src/main.rs"
+
 [profile.dev]
 codegen-units = 32
 debug = true
@@ -53,14 +57,14 @@ ignored = ["openssl"]
 
 [dependencies]
 
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4.6.0", features = ["derive"] }
 file-rotate = { version = "0.7" }
-nix = { version = "0.29", features = ["signal", "process"] }
-serde = { version = "1", features = ["derive"] }
-serde_yaml = { version = "0.9" }
-tokio = { version = "1", features = ["full"] }
-tracing = { version = "0.1" }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+nix = { version = "0.31.2", features = ["signal", "process"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_yaml = { version = "0.9.34" }
+tokio = { version = "1.50.0", features = ["full"] }
+tracing = { version = "0.1.44" }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 openssl = { version = "0.10.76", features = ["vendored"] }
