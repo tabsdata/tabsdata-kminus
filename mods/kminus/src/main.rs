@@ -522,16 +522,39 @@ fn command_start(args: StartArgs) {
         &kubeconfig,
     );
 
-    // Wait for shutdown signal.
+    // Wait for shutdown signal. On Windows, listen for both Ctrl+C and
+    // Ctrl+Break — `tdkserver stop` requests graceful shutdown via
+    // `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, ...)`, which only
+    // fires `ctrl_break`.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    rt.block_on(async {
-        tokio::signal::ctrl_c().await.ok();
-    });
+    rt.block_on(wait_for_shutdown());
 
     shutdown(&paths, &mut vk, &mut pr, &mut cp);
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    tokio::select! {
+        _ = sigterm.recv() => {}
+        _ = sigint.recv() => {}
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_shutdown() {
+    use tokio::signal::windows::{ctrl_break, ctrl_c};
+    let mut ctrlc = ctrl_c().expect("install Ctrl+C handler");
+    let mut ctrlbreak = ctrl_break().expect("install Ctrl+Break handler");
+    tokio::select! {
+        _ = ctrlc.recv() => {}
+        _ = ctrlbreak.recv() => {}
+    }
 }
 
 // ---------------------------------------------------------------------------

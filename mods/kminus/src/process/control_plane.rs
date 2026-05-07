@@ -11,7 +11,9 @@ use tracing::{error, info};
 
 use crate::config::KmSysConfig;
 use crate::system::file::wait_for_file;
-use crate::system::pid::{kill_child, pids_dir, remove_pid, write_pid};
+use crate::system::pid::{
+    apply_detached_flags, apply_subprocess_flags, kill_child, pids_dir, remove_pid, write_pid,
+};
 
 /// Binary name for the control-plane subprocess.
 pub const BIN: &str = "control-plane";
@@ -54,7 +56,8 @@ pub fn start(
     let cp_bin = bin_dir.join(BIN);
     let log_max_size = sys_cfg.log.max_size_mb.to_string();
     let log_max_files = sys_cfg.log.max_files.to_string();
-    let mut cp = Command::new(&cp_bin)
+    let mut command = Command::new(&cp_bin);
+    command
         .args([
             "-workdir",
             workdir.to_str().unwrap(),
@@ -72,7 +75,9 @@ pub fn start(
             port_kcm,
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    apply_subprocess_flags(&mut command);
+    let mut cp = command
         .spawn()
         .unwrap_or_else(|e| panic!("Failed to start {}: {}", BIN, e));
 
@@ -130,7 +135,8 @@ pub fn cleanup_stale_node_resources(bin_dir: &Path, kubeconfig: &Path) {
         return;
     }
     info!("Cleaning up stale K8s node resources...");
-    let _ = Command::new(&kubectl)
+    let mut delete_nodes = Command::new(&kubectl);
+    delete_nodes
         .args([
             "--kubeconfig",
             kubeconfig.to_str().unwrap(),
@@ -140,9 +146,12 @@ pub fn cleanup_stale_node_resources(bin_dir: &Path, kubeconfig: &Path) {
             "--ignore-not-found",
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let _ = Command::new(&kubectl)
+        .stderr(Stdio::null());
+    apply_detached_flags(&mut delete_nodes);
+    let _ = delete_nodes.status();
+
+    let mut delete_leases = Command::new(&kubectl);
+    delete_leases
         .args([
             "--kubeconfig",
             kubeconfig.to_str().unwrap(),
@@ -154,8 +163,9 @@ pub fn cleanup_stale_node_resources(bin_dir: &Path, kubeconfig: &Path) {
             "--ignore-not-found",
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+        .stderr(Stdio::null());
+    apply_detached_flags(&mut delete_leases);
+    let _ = delete_leases.status();
 }
 
 /// Query K8s for pods scheduled on `node_name`. Returns the raw
@@ -165,7 +175,8 @@ pub fn list_pods_on_node(bin_dir: &Path, kubeconfig: &Path, node_name: &str) -> 
     if !kubectl.exists() {
         return Vec::new();
     }
-    let output = Command::new(&kubectl)
+    let mut command = Command::new(&kubectl);
+    command
         .args([
             "--kubeconfig",
             kubeconfig.to_str().unwrap(),
@@ -177,8 +188,9 @@ pub fn list_pods_on_node(bin_dir: &Path, kubeconfig: &Path, node_name: &str) -> 
             "--no-headers",
         ])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
+        .stderr(Stdio::null());
+    apply_detached_flags(&mut command);
+    let output = command.output();
     let Ok(out) = output else { return Vec::new() };
     String::from_utf8_lossy(&out.stdout)
         .lines()

@@ -62,8 +62,7 @@ fn remove_pid_no_op_when_missing() {
 #[test]
 fn cleanup_stale_pids_removes_files_for_dead_processes() {
     let dir = tempdir();
-    // Use a PID guaranteed not to exist (very high number).
-    let dead_pid: i32 = 999_999;
+    let dead_pid: u32 = 999_999;
     let path = dir.join(format!("{}.zombie", dead_pid));
     fs::write(&path, dead_pid.to_string()).unwrap();
     cleanup_stale_pids(&dir);
@@ -80,14 +79,20 @@ fn cleanup_stale_pids_ignores_malformed_filenames() {
     fs::write(dir.join("not-a-pid-file"), "junk").unwrap();
     fs::write(dir.join("abc.notapid"), "junk").unwrap();
     cleanup_stale_pids(&dir);
-    // Files without "<pid>.<name>" pattern are left alone (the
-    // function only removes entries it could parse and act on).
-    // We just verify no panic.
     fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn cleanup_stale_pids_no_op_when_dir_missing() {
-    // Should not panic when the dir does not exist.
     cleanup_stale_pids(Path::new("/nonexistent/km/pids"));
+}
+
+#[test]
+fn is_alive_true_for_self() {
+    assert!(is_alive(std::process::id()));
+}
+
+#[test]
+fn is_alive_false_for_unlikely_pid() {
+    assert!(!is_alive(999_999));
 }

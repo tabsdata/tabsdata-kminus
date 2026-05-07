@@ -12,7 +12,7 @@ use tracing::{error, info};
 use crate::config::KmSysConfig;
 use crate::process::control_plane;
 use crate::system::file::wait_for_file;
-use crate::system::pid::{kill_child, remove_pid, write_pid};
+use crate::system::pid::{apply_subprocess_flags, kill_child, remove_pid, write_pid};
 
 /// Binary name for the pod-runner subprocess.
 pub const BIN: &str = "pod-runner";
@@ -58,7 +58,8 @@ pub fn start(
     let pr_bin = bin_dir.join(BIN);
     let log_max_size = sys_cfg.log.max_size_mb.to_string();
     let log_max_files = sys_cfg.log.max_files.to_string();
-    let mut pr = Command::new(&pr_bin)
+    let mut command = Command::new(&pr_bin);
+    command
         .args([
             "--kubeconfig",
             kubeconfig.to_str().unwrap(),
@@ -78,7 +79,9 @@ pub fn start(
             port_pr_metrics,
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    apply_subprocess_flags(&mut command);
+    let mut pr = command
         .spawn()
         .unwrap_or_else(|e| panic!("Failed to start {}: {}", BIN, e));
 

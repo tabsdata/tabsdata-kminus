@@ -10,7 +10,7 @@ use tracing::{info, warn};
 
 use crate::config::KmSysConfig;
 use crate::system::file::wait_for_file;
-use crate::system::pid::{pids_dir, write_pid};
+use crate::system::pid::{apply_subprocess_flags, pids_dir, write_pid};
 
 /// Binary name for the virtual-kubelet subprocess.
 pub const BIN: &str = "virtual-kubelet";
@@ -33,7 +33,8 @@ pub fn start(
     let vk_bin = bin_dir.join(BIN);
     let log_max_size = sys_cfg.log.max_size_mb.to_string();
     let log_max_files = sys_cfg.log.max_files.to_string();
-    let vk = Command::new(&vk_bin)
+    let mut command = Command::new(&vk_bin);
+    command
         .env("KUBECONFIG", vk_kubeconfig)
         .env("PRCONFIG", vk_prconfig)
         .args([
@@ -51,7 +52,9 @@ pub fn start(
             port_vk,
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    apply_subprocess_flags(&mut command);
+    let vk = command
         .spawn()
         .unwrap_or_else(|e| panic!("Failed to start {}: {}", BIN, e));
 
