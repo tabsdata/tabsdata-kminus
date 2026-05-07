@@ -9,7 +9,8 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::config::KmSysConfig;
-use crate::utils::{DATA_DIR, PIDS_DIR, wait_for_file, write_pid};
+use crate::system::file::wait_for_file;
+use crate::system::pid::{pids_dir, write_pid};
 
 /// Binary name for the virtual-kubelet subprocess.
 pub const BIN: &str = "virtual-kubelet";
@@ -67,12 +68,14 @@ pub fn start(
 
 /// The virtual-kubelet's pids directory under `<workdir>/data/<BIN>/pids`.
 pub fn pids_dir_in(workdir: &Path) -> PathBuf {
-    workdir.join(DATA_DIR).join(BIN).join(PIDS_DIR)
+    pids_dir(workdir, BIN)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::system::pid::{DATA_DIR, PIDS_DIR};
 
     #[test]
     fn pids_dir_in_under_data_vk_pids() {

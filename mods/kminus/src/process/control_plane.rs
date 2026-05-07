@@ -10,7 +10,8 @@ use std::time::Duration;
 use tracing::{error, info};
 
 use crate::config::KmSysConfig;
-use crate::utils::{DATA_DIR, PIDS_DIR, kill_child, remove_pid, wait_for_file, write_pid};
+use crate::system::file::wait_for_file;
+use crate::system::pid::{kill_child, pids_dir, remove_pid, write_pid};
 
 /// Binary name for the control-plane subprocess.
 pub const BIN: &str = "control-plane";
@@ -93,7 +94,7 @@ pub fn start(
 /// The control-plane's pids directory under
 /// `<workdir>/data/control-plane/pids/`.
 pub fn pids_dir_in(workdir: &Path) -> PathBuf {
-    workdir.join(DATA_DIR).join(BIN).join(PIDS_DIR)
+    pids_dir(workdir, BIN)
 }
 
 /// Read the control-plane's subprocess PIDs (etcd, kube-apiserver,

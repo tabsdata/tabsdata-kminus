@@ -18,16 +18,14 @@ use file_rotate::{ContentLimit, FileRotate, compression::Compression, suffix::Ap
 use tracing::{error, info};
 
 mod config;
-mod control_plane;
-mod pod_runner;
-mod utils;
-mod virtual_kubelet;
+mod process;
+mod system;
 
 use config::{KM_SYSCONFIG_FILE, KmSysConfig};
-use utils::{
-    BIN_KM, CONFIG_DIR, LOG_DIR, check_port, cleanup_stale_pids, kill_child, pid_dir, remove_pid,
-    resolve_bin_dir, write_pid,
-};
+use process::{control_plane, pod_runner, virtual_kubelet};
+use system::file::{CONFIG_DIR, LOG_DIR, resolve_bin_dir};
+use system::pid::{BIN_KM, cleanup_stale_pids, kill_child, pids_dir, remove_pid, write_pid};
+use system::port::check_port;
 
 /// Filename of km's own log file under `<logdir>/`.
 const KM_LOG_FILE: &str = "km.log";
@@ -130,7 +128,7 @@ impl Paths {
         let logdir = workdir.join(LOG_DIR);
 
         let bin_dir = resolve_bin_dir();
-        let pids = pid_dir(&workdir);
+        let pids = pids_dir(&workdir, BIN_KM);
 
         Ok(Self {
             workdir,
@@ -168,7 +166,7 @@ impl Paths {
         let logdir = logdir.canonicalize().unwrap_or(logdir);
 
         let bin_dir = resolve_bin_dir();
-        let pids = pid_dir(&workdir);
+        let pids = pids_dir(&workdir, BIN_KM);
 
         Ok(Self {
             workdir,
@@ -625,9 +623,9 @@ mod tests {
         assert!(paths.configdir.exists());
         assert!(
             paths.pids.ends_with(
-                PathBuf::from(utils::DATA_DIR)
+                PathBuf::from(system::pid::DATA_DIR)
                     .join(BIN_KM)
-                    .join(utils::PIDS_DIR)
+                    .join(system::pid::PIDS_DIR)
             )
         );
         fs::remove_dir_all(&dir).ok();

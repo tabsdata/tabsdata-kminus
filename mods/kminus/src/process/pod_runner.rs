@@ -10,8 +10,9 @@ use std::time::Duration;
 use tracing::{error, info};
 
 use crate::config::KmSysConfig;
-use crate::control_plane;
-use crate::utils::{kill_child, remove_pid, wait_for_file, write_pid};
+use crate::process::control_plane;
+use crate::system::file::wait_for_file;
+use crate::system::pid::{kill_child, remove_pid, write_pid};
 
 /// Binary name for the pod-runner subprocess.
 pub const BIN: &str = "pod-runner";

@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::utils::find_free_port;
+use crate::system::port::find_free_port;
 
 /// Filename of km's own system configuration file.
 pub const KM_SYSCONFIG_FILE: &str = "kmsysconfig.yaml";
