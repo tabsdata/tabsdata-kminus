@@ -1,48 +1,28 @@
+#
 # Copyright 2026 Tabsdata Inc.
+#
 
 [package]
+description = "Tabsdata Pod Runner: lightweight Kubernetes-style pod executor with HTTP server and CLI client."
 name = "pod-runner"
-version = "0.1.0"
 edition = "2024"
-rust-version = "1.94.0"
+version = "0.1.0"
+
+authors = [
+    "Aleix Lascorz Guiu    (tabsleix)     <aleix@tabsdata.com>",
+    "Alejandro Abdelnur    (tucu0)        <tucu@tabsdata.com>",
+    "Arvind Prabhakar      (aptabs)       <arvind@tabsdata.com>",
+    "David Sánchez Frías   (tabsdavid)    <david@tabsdata.com>",
+    "Dimas Cabré i Chacón  (aoinokimi)    <dragon@tabsdata.com>",
+    "Joaquín Bo Díaz       (joaquin041)   <joaquin@tabsdata.com>",
+    "Shreyas Vankayalapati (shreyasvan01) <shreyans@tabsdata.com>"
+]
+homepage = "https://www.tabsdata.com"
 publish = false
+repository = "https://github.com/tabsdata/tabsdata-km"
+rust-version = "1.94.0"
 
-[dependencies]
-tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
-bytes = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-file-rotate = "0.7"
-axum = "0.8"
-clap = { version = "4", features = ["derive"] }
-hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml_ng = "0.10"
-async-trait = "0.1"
-base64 = "0.22"
-flate2 = "1"
-tar = "0.4"
-rustls = "0.23"
-rustls-pemfile = "2"
-tokio-rustls = "0.26"
-rcgen = "0.14"
-time = "0.3"
-memory-stats = "1"
-prometheus = "0.14"
-kube = { version = "3.1", features = ["runtime", "derive", "client"] }
-k8s-openapi = { version = "0.27" }
-chrono = "0.4"
-reqwest = { version = "0.13", features = ["rustls", "stream", "json", "query"], default-features = false }
-uuid = { version = "1", features = ["v4"] }
-futures-util = "0.3"
-
-[target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["signal", "process"] }
-
-[features]
-default = ["k8s-openapi/v1_31"]
+[lib]
 
 [[bin]]
 name = "pod-runner"
@@ -52,16 +32,9 @@ path = "src/server/main.rs"
 name = "kpr"
 path = "src/client/main.rs"
 
-[dev-dependencies]
-chrono = "0.4"
-data-encoding = "2"
-filetime = "0.2.27"
-libc = "0.2"
-hyper = "1"
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
-http-body-util = "0.1"
-rstest = "0.26"
-serial_test = "3"
+[features]
+
+default = ["k8s-openapi/v1_31"]
 
 [profile.dev]
 codegen-units = 32
@@ -88,3 +61,56 @@ lto = "fat"
 opt-level = "z"
 panic = "abort"
 strip = "debuginfo"
+
+[package.metadata.cargo-machete]
+ignored = ["openssl"]
+
+[dependencies]
+
+async-trait = { version = "0.1" }
+axum = { version = "0.8" }
+base64 = { version = "0.22" }
+bytes = { version = "1" }
+chrono = { version = "0.4" }
+clap = { version = "4", features = ["derive"] }
+file-rotate = { version = "0.7" }
+flate2 = { version = "1" }
+futures-util = { version = "0.3" }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
+k8s-openapi = { version = "0.27" }
+kube = { version = "3.1", features = ["runtime", "derive", "client"] }
+memory-stats = { version = "1" }
+prometheus = { version = "0.14" }
+rcgen = { version = "0.14" }
+reqwest = { version = "0.13", features = ["rustls", "stream", "json", "query"], default-features = false }
+rustls = { version = "0.23" }
+rustls-pemfile = { version = "2" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+serde_yaml_ng = { version = "0.10" }
+tar = { version = "0.4" }
+time = { version = "0.3" }
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26" }
+tokio-stream = { version = "0.1" }
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+
+chrono = { version = "0.4" }
+data-encoding = { version = "2" }
+filetime = { version = "0.2.27" }
+http-body-util = { version = "0.1" }
+hyper = { version = "1" }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+libc = { version = "0.2" }
+rstest = { version = "0.26" }
+serial_test = { version = "3" }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["signal", "process"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = { version = "0.10.76", features = ["vendored"] }

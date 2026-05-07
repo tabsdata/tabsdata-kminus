@@ -1,21 +1,26 @@
+#
 # Copyright 2026 Tabsdata Inc.
+#
 
 [package]
+description = "Tabsdata kminus: stack orchestrator that launches and supervises the control-plane, pod-runner, and virtual-kubelet."
 name = "km"
-version = "0.1.0"
 edition = "2024"
-rust-version = "1.94.0"
-publish = false
+version = "0.1.0"
 
-[dependencies]
-clap = { version = "4", features = ["derive"] }
-nix = { version = "0.29", features = ["signal", "process"] }
-serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
-tokio = { version = "1", features = ["full"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-file-rotate = "0.7"
+authors = [
+    "Aleix Lascorz Guiu    (tabsleix)     <aleix@tabsdata.com>",
+    "Alejandro Abdelnur    (tucu0)        <tucu@tabsdata.com>",
+    "Arvind Prabhakar      (aptabs)       <arvind@tabsdata.com>",
+    "David Sánchez Frías   (tabsdavid)    <david@tabsdata.com>",
+    "Dimas Cabré i Chacón  (aoinokimi)    <dragon@tabsdata.com>",
+    "Joaquín Bo Díaz       (joaquin041)   <joaquin@tabsdata.com>",
+    "Shreyas Vankayalapati (shreyasvan01) <shreyans@tabsdata.com>"
+]
+homepage = "https://www.tabsdata.com"
+publish = false
+repository = "https://github.com/tabsdata/tabsdata-km"
+rust-version = "1.94.0"
 
 [profile.dev]
 codegen-units = 32
@@ -42,3 +47,20 @@ lto = "fat"
 opt-level = "z"
 panic = "abort"
 strip = "debuginfo"
+
+[package.metadata.cargo-machete]
+ignored = ["openssl"]
+
+[dependencies]
+
+clap = { version = "4", features = ["derive"] }
+file-rotate = { version = "0.7" }
+nix = { version = "0.29", features = ["signal", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = { version = "0.9" }
+tokio = { version = "1", features = ["full"] }
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = { version = "0.10.76", features = ["vendored"] }
