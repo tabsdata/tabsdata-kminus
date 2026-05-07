@@ -59,14 +59,22 @@ pub fn start(
     let log_max_files = sys_cfg.log.max_files.to_string();
     let mut pr = Command::new(&pr_bin)
         .args([
-            "--kubeconfig", kubeconfig.to_str().unwrap(),
-            "--configdir", configdir.to_str().unwrap(),
-            "--workdir", workdir.to_str().unwrap(),
-            "--logdir", logdir.to_str().unwrap(),
-            "--logmaxsizemb", &log_max_size,
-            "--logmaxfiles", &log_max_files,
-            "--port", port_pr,
-            "--metrics-port", port_pr_metrics,
+            "--kubeconfig",
+            kubeconfig.to_str().unwrap(),
+            "--configdir",
+            configdir.to_str().unwrap(),
+            "--workdir",
+            workdir.to_str().unwrap(),
+            "--logdir",
+            logdir.to_str().unwrap(),
+            "--logmaxsizemb",
+            &log_max_size,
+            "--logmaxfiles",
+            &log_max_files,
+            "--port",
+            port_pr,
+            "--metrics-port",
+            port_pr_metrics,
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -76,7 +84,10 @@ pub fn start(
     write_pid(pids, BIN, pr.id());
 
     if !wait_for_file(vk_prconfig, Duration::from_secs(30)) {
-        error!("{} did not become ready (vk-prconfig.yaml not created)", BIN);
+        error!(
+            "{} did not become ready (vk-prconfig.yaml not created)",
+            BIN
+        );
         kill_child(&mut pr, BIN);
         kill_child(cp, control_plane::BIN);
         remove_pid(pids, BIN);

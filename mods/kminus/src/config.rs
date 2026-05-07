@@ -78,22 +78,18 @@ impl KmSysConfig {
         }
     }
 
-    /// Load `kmsysconfig.yaml` from `configdir`, or create it with
-    /// defaults seeded from `portstart` if missing.
+    /// Create `kmsysconfig.yaml` in `configdir` with defaults seeded from
+    /// `portstart`. Errors with `AlreadyExists` if the file is already there.
     ///
     /// Any 0-valued port stays 0 in the file — it is replaced with a
     /// fresh random port at runtime via [`Self::resolve_random_ports`].
-    pub fn load_or_create(configdir: &Path, portstart: u16) -> std::io::Result<Self> {
+    pub fn create(configdir: &Path, portstart: u16) -> std::io::Result<Self> {
         let path = configdir.join(KM_SYSCONFIG_FILE);
         if path.exists() {
-            let data = fs::read_to_string(&path)?;
-            let cfg: Self = serde_yaml::from_str(&data).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("failed to parse {}: {e}", path.display()),
-                )
-            })?;
-            return Ok(cfg);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("{} already exists", path.display()),
+            ));
         }
         let cfg = Self::defaults(portstart);
         fs::create_dir_all(configdir)?;
@@ -104,6 +100,20 @@ impl KmSysConfig {
         let body = serde_yaml::to_string(&cfg)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         fs::write(&path, format!("{}{}", header, body))?;
+        Ok(cfg)
+    }
+
+    /// Load an existing `kmsysconfig.yaml` from `configdir`. Errors if
+    /// the file is missing or unparseable.
+    pub fn load(configdir: &Path) -> std::io::Result<Self> {
+        let path = configdir.join(KM_SYSCONFIG_FILE);
+        let data = fs::read_to_string(&path)?;
+        let cfg: Self = serde_yaml::from_str(&data).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("failed to parse {}: {e}", path.display()),
+            )
+        })?;
         Ok(cfg)
     }
 
@@ -136,9 +146,12 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir()
-            .join(format!("km-cfg-{}-{}-{}", std::process::id(),
-                          format!("{:?}", std::thread::current().id()).replace(['(', ')'], ""), n));
+        let dir = std::env::temp_dir().join(format!(
+            "km-cfg-{}-{}-{}",
+            std::process::id(),
+            format!("{:?}", std::thread::current().id()).replace(['(', ')'], ""),
+            n
+        ));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -166,23 +179,32 @@ mod tests {
     }
 
     #[test]
-    fn load_or_create_creates_when_missing() {
+    fn create_writes_when_missing() {
         let dir = tempdir();
-        let cfg = KmSysConfig::load_or_create(&dir, 11000).unwrap();
+        let cfg = KmSysConfig::create(&dir, 11000).unwrap();
         assert_eq!(cfg.ports.api, 11000);
         assert!(dir.join(KM_SYSCONFIG_FILE).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn load_or_create_reads_existing_file() {
+    fn create_errors_when_file_exists() {
         let dir = tempdir();
-        // Pre-write a file with non-default values.
+        fs::write(dir.join(KM_SYSCONFIG_FILE), "log:\n  maxSizeMB: 1\n  maxFiles: 1\nports:\n  api: 1\n  kcm: 2\n  pr: 3\n  prMetrics: 4\n  vk: 5\n").unwrap();
+        let res = KmSysConfig::create(&dir, 11000);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_reads_existing_file() {
+        let dir = tempdir();
         let yaml = "log:\n  maxSizeMB: 50\n  maxFiles: 7\n\
                     ports:\n  api: 9000\n  kcm: 9001\n  pr: 9002\n  prMetrics: 9003\n  vk: 9004\n";
         fs::write(dir.join(KM_SYSCONFIG_FILE), yaml).unwrap();
 
-        let cfg = KmSysConfig::load_or_create(&dir, 60000).unwrap();
+        let cfg = KmSysConfig::load(&dir).unwrap();
         assert_eq!(cfg.log.max_size_mb, 50);
         assert_eq!(cfg.log.max_files, 7);
         assert_eq!(cfg.ports.api, 9000);
@@ -191,10 +213,18 @@ mod tests {
     }
 
     #[test]
-    fn load_or_create_rejects_invalid_yaml() {
+    fn load_errors_when_file_missing() {
+        let dir = tempdir();
+        let res = KmSysConfig::load(&dir);
+        assert!(res.is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_rejects_invalid_yaml() {
         let dir = tempdir();
         fs::write(dir.join(KM_SYSCONFIG_FILE), "not: [valid: yaml").unwrap();
-        let res = KmSysConfig::load_or_create(&dir, 10300);
+        let res = KmSysConfig::load(&dir);
         assert!(res.is_err());
         let _ = fs::remove_dir_all(&dir);
     }

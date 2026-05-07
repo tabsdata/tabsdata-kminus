@@ -56,7 +56,10 @@ pub fn check_port(port: &str, component: &str) -> Result<(), String> {
     let addr = format!("127.0.0.1:{}", port);
     match TcpListener::bind(&addr) {
         Ok(_) => Ok(()),
-        Err(e) => Err(format!("{} port {} is already in use: {}", component, port, e)),
+        Err(e) => Err(format!(
+            "{} port {} is already in use: {}",
+            component, port, e
+        )),
     }
 }
 
@@ -307,7 +310,10 @@ mod tests {
         let path = dir.join(format!("{}.zombie", dead_pid));
         fs::write(&path, dead_pid.to_string()).unwrap();
         cleanup_stale_pids(&dir);
-        assert!(!path.exists(), "pid file for dead process should be removed");
+        assert!(
+            !path.exists(),
+            "pid file for dead process should be removed"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

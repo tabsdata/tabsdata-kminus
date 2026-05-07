@@ -2,7 +2,9 @@
 
 //! km — kminus stack orchestrator.
 //!
-//! Starts the control-plane, pod-runner, and virtual-kubelet in order,
+//! `km create` initializes a new instance folder with a default
+//! `kmsysconfig.yaml`. `km start` boots a previously created instance:
+//! starts the control-plane, pod-runner, and virtual-kubelet in order,
 //! waits for each to be ready, then stays in the foreground handling
 //! signals. On shutdown (SIGTERM / SIGINT / Ctrl+C) it stops children
 //! in reverse order: virtual-kubelet → pod-runner → control-plane.
@@ -11,10 +13,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 
-use clap::Parser;
-use file_rotate::{
-    compression::Compression, suffix::AppendCount, ContentLimit, FileRotate,
-};
+use clap::{Args, Parser, Subcommand};
+use file_rotate::{ContentLimit, FileRotate, compression::Compression, suffix::AppendCount};
 use tracing::{error, info};
 
 mod config;
@@ -23,10 +23,10 @@ mod pod_runner;
 mod utils;
 mod virtual_kubelet;
 
-use config::KmSysConfig;
+use config::{KM_SYSCONFIG_FILE, KmSysConfig};
 use utils::{
-    check_port, cleanup_stale_pids, kill_child, pid_dir, remove_pid,
-    resolve_bin_dir, write_pid, BIN_KM, CONFIG_DIR, LOG_DIR,
+    BIN_KM, CONFIG_DIR, LOG_DIR, check_port, cleanup_stale_pids, kill_child, pid_dir, remove_pid,
+    resolve_bin_dir, write_pid,
 };
 
 /// Filename of km's own log file under `<logdir>/`.
@@ -37,40 +37,61 @@ const KM_LOG_FILE: &str = "km.log";
 // ---------------------------------------------------------------------------
 
 /// km — kminus stack orchestrator.
-///
-/// Starts control-plane, pod-runner, and virtual-kubelet as child
-/// processes. All binaries are resolved from the same directory as
-/// the km binary itself.
-///
-/// Log settings and ports are stored in `kmsysconfig.yaml` in the
-/// config directory — created on first startup with defaults based
-/// on `--portstart`, user-editable thereafter. Any port set to 0 in
-/// the file is replaced with a free random port at startup.
 #[derive(Parser, Debug)]
 #[command(name = "km", version, about)]
 struct Cli {
-    /// Working directory. Component data dirs are created under this.
-    #[arg(long, default_value = ".")]
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Create a new kminus instance in `--workdir`. The folder must not exist.
+    Create(CreateArgs),
+    /// Start a previously created kminus instance from `--workdir`.
+    Start(StartArgs),
+}
+
+/// Create-time arguments. Writes `kmsysconfig.yaml` and exits.
+///
+/// `kmsysconfig.yaml` records log rotation settings and port assignments.
+/// Any port set to 0 in the file is replaced with a free random port at
+/// startup. Consecutive port assignment from `--portstart`:
+///   portstart+0 = control-plane API server (kube-apiserver)
+///   portstart+1 = kube-controller-manager
+///   portstart+2 = pod-runner
+///   portstart+3 = pod-runner metrics
+///   portstart+4 = virtual-kubelet
+#[derive(Args, Debug)]
+struct CreateArgs {
+    /// Working directory for the new instance. Must not exist.
+    #[arg(long)]
     workdir: String,
 
-    /// Config directory. Shared across all components.
+    /// Config directory. Defaults to `<workdir>/config`.
     #[arg(long)]
     configdir: Option<String>,
 
-    /// Log directory.
-    #[arg(long)]
-    logdir: Option<String>,
-
-    /// Starting port for the initial kmsysconfig.yaml (only used
-    /// when the file does not yet exist). Consecutive assignment:
-    ///   portstart+0 = control-plane API server (kube-apiserver)
-    ///   portstart+1 = kube-controller-manager
-    ///   portstart+2 = pod-runner
-    ///   portstart+3 = pod-runner metrics
-    ///   portstart+4 = virtual-kubelet
-    /// If 0, random free ports are used. Default: 10300.
+    /// Starting port for the initial `kmsysconfig.yaml`. If 0, random
+    /// free ports are used at every start. Default: 10300.
     #[arg(long, default_value_t = 10300)]
     portstart: u16,
+}
+
+/// Start-time arguments. Boots the cluster from an existing instance.
+#[derive(Args, Debug)]
+struct StartArgs {
+    /// Working directory of an existing instance.
+    #[arg(long)]
+    workdir: String,
+
+    /// Config directory. Defaults to `<workdir>/config`.
+    #[arg(long)]
+    configdir: Option<String>,
+
+    /// Log directory. Defaults to `<workdir>/log`.
+    #[arg(long)]
+    logdir: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -87,27 +108,60 @@ struct Paths {
 }
 
 impl Paths {
-    /// Resolve every directory from CLI input. Creates and canonicalizes
-    /// `workdir`, `configdir`, `logdir`. Locates the binary directory.
-    fn resolve(cli: &Cli) -> Self {
-        let workdir = fs::canonicalize(&cli.workdir).unwrap_or_else(|_| {
-            fs::create_dir_all(&cli.workdir).ok();
-            PathBuf::from(&cli.workdir)
-                .canonicalize()
-                .expect("Cannot resolve workdir")
-        });
+    /// Resolve paths for a brand-new instance. The workdir must not
+    /// exist yet — this method creates it. Errors otherwise.
+    fn for_create(workdir: &str, configdir: Option<&str>) -> Result<Self, String> {
+        let workdir = PathBuf::from(workdir);
+        if workdir.exists() {
+            return Err(format!("Folder '{}' already exists.", workdir.display()));
+        }
+        fs::create_dir_all(&workdir)
+            .map_err(|e| format!("Cannot create folder '{}': {e}", workdir.display()))?;
+        let workdir = fs::canonicalize(&workdir).unwrap_or(workdir);
 
-        let configdir = cli
-            .configdir
-            .as_deref()
+        let configdir = configdir
+            .map(PathBuf::from)
+            .unwrap_or_else(|| workdir.join(CONFIG_DIR));
+        fs::create_dir_all(&configdir)
+            .map_err(|e| format!("Cannot create config folder '{}': {e}", configdir.display()))?;
+        let configdir = configdir.canonicalize().unwrap_or(configdir);
+
+        // logdir is a runtime concern; record the default but don't create it here.
+        let logdir = workdir.join(LOG_DIR);
+
+        let bin_dir = resolve_bin_dir();
+        let pids = pid_dir(&workdir);
+
+        Ok(Self {
+            workdir,
+            configdir,
+            logdir,
+            bin_dir,
+            pids,
+        })
+    }
+
+    /// Resolve paths for starting an existing instance. The workdir
+    /// must already exist and be canonicalizable.
+    fn for_start(
+        workdir: &str,
+        configdir: Option<&str>,
+        logdir: Option<&str>,
+    ) -> Result<Self, String> {
+        let workdir = PathBuf::from(workdir);
+        if !workdir.exists() {
+            return Err(format!("Folder '{}' does not exist.", workdir.display()));
+        }
+        let workdir = fs::canonicalize(&workdir)
+            .map_err(|e| format!("Cannot resolve folder '{}': {e}", workdir.display()))?;
+
+        let configdir = configdir
             .map(PathBuf::from)
             .unwrap_or_else(|| workdir.join(CONFIG_DIR));
         fs::create_dir_all(&configdir).ok();
         let configdir = configdir.canonicalize().unwrap_or(configdir);
 
-        let logdir = cli
-            .logdir
-            .as_deref()
+        let logdir = logdir
             .map(PathBuf::from)
             .unwrap_or_else(|| workdir.join(LOG_DIR));
         fs::create_dir_all(&logdir).ok();
@@ -116,13 +170,13 @@ impl Paths {
         let bin_dir = resolve_bin_dir();
         let pids = pid_dir(&workdir);
 
-        Self {
+        Ok(Self {
             workdir,
             configdir,
             logdir,
             bin_dir,
             pids,
-        }
+        })
     }
 }
 
@@ -145,8 +199,7 @@ fn setup_logging(logdir: &Path, max_size_mb: u32, max_files: u32) -> PathBuf {
     let writer = std::sync::Mutex::new(writer);
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_writer(writer)
         .with_ansi(false)
@@ -208,7 +261,10 @@ fn print_status(
         vk.id(),
         port_vk
     );
-    println!("    {BIN_KM}                          pid={}", std::process::id());
+    println!(
+        "    {BIN_KM}                          pid={}",
+        std::process::id()
+    );
     println!();
     println!(
         "  Capacity: cpu={} memoryGB={} pods={}",
@@ -277,12 +333,7 @@ fn shutdown(paths: &Paths, vk: &mut Child, pr: &mut Child, cp: &mut Child) {
 
 /// Verify all non-randomly-allocated ports are free before launching
 /// any subprocess. Logs and exits on conflict.
-fn verify_ports_free(
-    port_api: &str,
-    port_kcm: &str,
-    port_pr: &str,
-    port_vk: &str,
-) {
+fn verify_ports_free(port_api: &str, port_kcm: &str, port_pr: &str, port_vk: &str) {
     let cp_api_label = format!("{} API server", control_plane::BIN);
     let port_checks: [(&str, &str); 4] = [
         (port_api, &cp_api_label),
@@ -325,22 +376,64 @@ fn clear_regenerated_configs(configdir: &Path) {
 }
 
 // ---------------------------------------------------------------------------
-// Main
+// Subcommands
 // ---------------------------------------------------------------------------
 
-fn main() {
-    let cli = Cli::parse();
-    let paths = Paths::resolve(&cli);
+/// Initialize a new kminus instance in `args.workdir`.
+fn command_create(args: CreateArgs) {
+    let paths = Paths::for_create(&args.workdir, args.configdir.as_deref()).unwrap_or_else(|e| {
+        eprintln!("ERROR: {e}");
+        std::process::exit(1);
+    });
 
-    // Load (or create) the system config from kmsysconfig.yaml.
-    let mut sys_cfg = KmSysConfig::load_or_create(&paths.configdir, cli.portstart)
-        .unwrap_or_else(|e| {
-            eprintln!("ERROR: {}", e);
-            std::process::exit(1);
-        });
+    if let Err(e) = KmSysConfig::create(&paths.configdir, args.portstart) {
+        eprintln!("ERROR: {e}");
+        std::process::exit(1);
+    }
+
+    println!();
+    println!("Tabsdata K- (K minus) instance created");
+    println!();
+    println!("  workdir    {}", paths.workdir.display());
+    println!("  configdir  {}", paths.configdir.display());
+    println!();
+    println!(
+        "Edit '{}' to customize ports or log settings, then run:",
+        paths.configdir.join(KM_SYSCONFIG_FILE).display()
+    );
+    println!("  km start --workdir {}", paths.workdir.display());
+}
+
+/// Boot the cluster from an existing kminus instance in `args.workdir`.
+fn command_start(args: StartArgs) {
+    let paths = Paths::for_start(
+        &args.workdir,
+        args.configdir.as_deref(),
+        args.logdir.as_deref(),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("ERROR: {e}");
+        std::process::exit(1);
+    });
+
+    let mut sys_cfg = KmSysConfig::load(&paths.configdir).unwrap_or_else(|e| {
+        eprintln!(
+            "ERROR: '{}' is not a kminus instance: {e}",
+            paths.workdir.display()
+        );
+        eprintln!(
+            "Run 'km create --workdir {}' first.",
+            paths.workdir.display()
+        );
+        std::process::exit(1);
+    });
     let random_ports_allocated = sys_cfg.resolve_random_ports();
 
-    setup_logging(&paths.logdir, sys_cfg.log.max_size_mb, sys_cfg.log.max_files);
+    setup_logging(
+        &paths.logdir,
+        sys_cfg.log.max_size_mb,
+        sys_cfg.log.max_files,
+    );
 
     let port_api = sys_cfg.ports.api.to_string();
     let port_kcm = sys_cfg.ports.kcm.to_string();
@@ -380,25 +473,54 @@ fn main() {
 
     // Start subprocesses in dependency order.
     let mut cp = control_plane::start(
-        &paths.bin_dir, &paths.workdir, &paths.configdir, &paths.logdir,
-        &paths.pids, &sys_cfg, &port_api, &port_kcm, &vk_kubeconfig,
+        &paths.bin_dir,
+        &paths.workdir,
+        &paths.configdir,
+        &paths.logdir,
+        &paths.pids,
+        &sys_cfg,
+        &port_api,
+        &port_kcm,
+        &vk_kubeconfig,
     );
     let mut pr = pod_runner::start(
-        &paths.bin_dir, &paths.workdir, &paths.configdir, &paths.logdir,
-        &paths.pids, &sys_cfg, &port_pr, &port_pr_metrics,
-        &kubeconfig, &vk_prconfig, &mut cp,
+        &paths.bin_dir,
+        &paths.workdir,
+        &paths.configdir,
+        &paths.logdir,
+        &paths.pids,
+        &sys_cfg,
+        &port_pr,
+        &port_pr_metrics,
+        &kubeconfig,
+        &vk_prconfig,
+        &mut cp,
     );
     control_plane::cleanup_stale_node_resources(&paths.bin_dir, &kubeconfig);
     let mut vk = virtual_kubelet::start(
-        &paths.bin_dir, &paths.workdir, &paths.configdir, &paths.logdir,
-        &paths.pids, &sys_cfg, &port_vk, &vk_kubeconfig, &vk_prconfig,
+        &paths.bin_dir,
+        &paths.workdir,
+        &paths.configdir,
+        &paths.logdir,
+        &paths.pids,
+        &sys_cfg,
+        &port_vk,
+        &vk_kubeconfig,
+        &vk_prconfig,
     );
 
     info!("K- ready");
 
     print_status(
-        &paths, &cp, &pr, &vk,
-        &port_api, &port_kcm, &port_pr, &port_pr_metrics, &port_vk,
+        &paths,
+        &cp,
+        &pr,
+        &vk,
+        &port_api,
+        &port_kcm,
+        &port_pr,
+        &port_pr_metrics,
+        &port_vk,
         &kubeconfig,
     );
 
@@ -412,6 +534,18 @@ fn main() {
     });
 
     shutdown(&paths, &mut vk, &mut pr, &mut cp);
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+fn main() {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Create(args) => command_create(args),
+        Command::Start(args) => command_start(args),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -449,7 +583,7 @@ mod tests {
         }
         // Files that must be preserved.
         fs::write(dir.join(pod_runner::PR_SYSCONFIG_FILE), b"keepme").unwrap();
-        fs::write(dir.join(config::KM_SYSCONFIG_FILE), b"keepme").unwrap();
+        fs::write(dir.join(KM_SYSCONFIG_FILE), b"keepme").unwrap();
 
         clear_regenerated_configs(&dir);
 
@@ -459,7 +593,7 @@ mod tests {
         assert!(!dir.join(pod_runner::VK_PR_CONFIG_FILE).exists());
         assert!(!dir.join(pod_runner::PR_CONFIG_FILE).exists());
         assert!(dir.join(pod_runner::PR_SYSCONFIG_FILE).exists());
-        assert!(dir.join(config::KM_SYSCONFIG_FILE).exists());
+        assert!(dir.join(KM_SYSCONFIG_FILE).exists());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -470,43 +604,82 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    // -- Paths::resolve -----------------------------------------------------
+    // -- Paths::for_create --------------------------------------------------
 
     #[test]
-    fn paths_resolve_creates_workdir_and_subdirs() {
+    fn for_create_errors_when_folder_already_exists() {
         let dir = tempdir();
         let workdir = dir.join("wd");
-        let cli = Cli {
-            workdir: workdir.to_string_lossy().to_string(),
-            configdir: None,
-            logdir: None,
-            portstart: 10300,
-        };
-        let paths = Paths::resolve(&cli);
-        assert!(paths.workdir.exists());
-        assert!(paths.configdir.exists());
-        assert!(paths.logdir.exists());
-        assert!(paths.pids.ends_with(
-            PathBuf::from(utils::DATA_DIR)
-                .join(BIN_KM)
-                .join(utils::PIDS_DIR)
-        ));
+        fs::create_dir_all(&workdir).unwrap();
+        let result = Paths::for_create(&workdir.to_string_lossy(), None);
+        assert!(result.is_err());
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn paths_resolve_honors_explicit_configdir_and_logdir() {
+    fn for_create_creates_workdir_and_configdir() {
+        let dir = tempdir();
+        let workdir = dir.join("wd");
+        let paths = Paths::for_create(&workdir.to_string_lossy(), None).unwrap();
+        assert!(paths.workdir.exists());
+        assert!(paths.configdir.exists());
+        assert!(
+            paths.pids.ends_with(
+                PathBuf::from(utils::DATA_DIR)
+                    .join(BIN_KM)
+                    .join(utils::PIDS_DIR)
+            )
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn for_create_honors_explicit_configdir() {
         let dir = tempdir();
         let workdir = dir.join("wd");
         let cdir = dir.join("custom-config");
+        let paths =
+            Paths::for_create(&workdir.to_string_lossy(), Some(&cdir.to_string_lossy())).unwrap();
+        assert_eq!(paths.configdir, cdir.canonicalize().unwrap());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- Paths::for_start ---------------------------------------------------
+
+    #[test]
+    fn for_start_errors_when_workdir_missing() {
+        let dir = tempdir();
+        let workdir = dir.join("does-not-exist");
+        let result = Paths::for_start(&workdir.to_string_lossy(), None, None);
+        assert!(result.is_err());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn for_start_resolves_existing_workdir() {
+        let dir = tempdir();
+        let workdir = dir.join("wd");
+        fs::create_dir_all(&workdir).unwrap();
+        let paths = Paths::for_start(&workdir.to_string_lossy(), None, None).unwrap();
+        assert_eq!(paths.workdir, workdir.canonicalize().unwrap());
+        assert!(paths.configdir.exists());
+        assert!(paths.logdir.exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn for_start_honors_explicit_configdir_and_logdir() {
+        let dir = tempdir();
+        let workdir = dir.join("wd");
+        fs::create_dir_all(&workdir).unwrap();
+        let cdir = dir.join("custom-config");
         let ldir = dir.join("custom-log");
-        let cli = Cli {
-            workdir: workdir.to_string_lossy().to_string(),
-            configdir: Some(cdir.to_string_lossy().to_string()),
-            logdir: Some(ldir.to_string_lossy().to_string()),
-            portstart: 10300,
-        };
-        let paths = Paths::resolve(&cli);
+        let paths = Paths::for_start(
+            &workdir.to_string_lossy(),
+            Some(&cdir.to_string_lossy()),
+            Some(&ldir.to_string_lossy()),
+        )
+        .unwrap();
         assert_eq!(paths.configdir, cdir.canonicalize().unwrap());
         assert_eq!(paths.logdir, ldir.canonicalize().unwrap());
         fs::remove_dir_all(&dir).ok();

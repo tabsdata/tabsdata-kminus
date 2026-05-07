@@ -9,7 +9,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::config::KmSysConfig;
-use crate::utils::{wait_for_file, write_pid, DATA_DIR, PIDS_DIR};
+use crate::utils::{DATA_DIR, PIDS_DIR, wait_for_file, write_pid};
 
 /// Binary name for the virtual-kubelet subprocess.
 pub const BIN: &str = "virtual-kubelet";
@@ -36,12 +36,18 @@ pub fn start(
         .env("KUBECONFIG", vk_kubeconfig)
         .env("PRCONFIG", vk_prconfig)
         .args([
-            "--workdir", workdir.to_str().unwrap(),
-            "--configdir", configdir.to_str().unwrap(),
-            "--logdir", logdir.to_str().unwrap(),
-            "--logmaxsizemb", &log_max_size,
-            "--logmaxfiles", &log_max_files,
-            "--kubelet-port", port_vk,
+            "--workdir",
+            workdir.to_str().unwrap(),
+            "--configdir",
+            configdir.to_str().unwrap(),
+            "--logdir",
+            logdir.to_str().unwrap(),
+            "--logmaxsizemb",
+            &log_max_size,
+            "--logmaxfiles",
+            &log_max_files,
+            "--kubelet-port",
+            port_vk,
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

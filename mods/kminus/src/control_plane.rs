@@ -10,9 +10,7 @@ use std::time::Duration;
 use tracing::{error, info};
 
 use crate::config::KmSysConfig;
-use crate::utils::{
-    kill_child, remove_pid, wait_for_file, write_pid, DATA_DIR, PIDS_DIR,
-};
+use crate::utils::{DATA_DIR, PIDS_DIR, kill_child, remove_pid, wait_for_file, write_pid};
 
 /// Binary name for the control-plane subprocess.
 pub const BIN: &str = "control-plane";
@@ -57,13 +55,20 @@ pub fn start(
     let log_max_files = sys_cfg.log.max_files.to_string();
     let mut cp = Command::new(&cp_bin)
         .args([
-            "-workdir", workdir.to_str().unwrap(),
-            "-configdir", configdir.to_str().unwrap(),
-            "-logdir", logdir.to_str().unwrap(),
-            "-logmaxsizemb", &log_max_size,
-            "-logmaxfiles", &log_max_files,
-            "-port", port_api,
-            "-kcm-port", port_kcm,
+            "-workdir",
+            workdir.to_str().unwrap(),
+            "-configdir",
+            configdir.to_str().unwrap(),
+            "-logdir",
+            logdir.to_str().unwrap(),
+            "-logmaxsizemb",
+            &log_max_size,
+            "-logmaxfiles",
+            &log_max_files,
+            "-port",
+            port_api,
+            "-kcm-port",
+            port_kcm,
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -73,7 +78,10 @@ pub fn start(
     write_pid(pids, BIN, cp.id());
 
     if !wait_for_file(vk_kubeconfig, Duration::from_secs(60)) {
-        error!("{} did not become ready (vk-kubeconfig.yaml not created)", BIN);
+        error!(
+            "{} did not become ready (vk-kubeconfig.yaml not created)",
+            BIN
+        );
         kill_child(&mut cp, BIN);
         remove_pid(pids, BIN);
         std::process::exit(1);
@@ -123,16 +131,25 @@ pub fn cleanup_stale_node_resources(bin_dir: &Path, kubeconfig: &Path) {
     info!("Cleaning up stale K8s node resources...");
     let _ = Command::new(&kubectl)
         .args([
-            "--kubeconfig", kubeconfig.to_str().unwrap(),
-            "delete", "nodes", "--all", "--ignore-not-found",
+            "--kubeconfig",
+            kubeconfig.to_str().unwrap(),
+            "delete",
+            "nodes",
+            "--all",
+            "--ignore-not-found",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
     let _ = Command::new(&kubectl)
         .args([
-            "--kubeconfig", kubeconfig.to_str().unwrap(),
-            "delete", "leases", "--all", "-n", "kube-node-lease",
+            "--kubeconfig",
+            kubeconfig.to_str().unwrap(),
+            "delete",
+            "leases",
+            "--all",
+            "-n",
+            "kube-node-lease",
             "--ignore-not-found",
         ])
         .stdout(Stdio::null())
@@ -149,9 +166,13 @@ pub fn list_pods_on_node(bin_dir: &Path, kubeconfig: &Path, node_name: &str) -> 
     }
     let output = Command::new(&kubectl)
         .args([
-            "--kubeconfig", kubeconfig.to_str().unwrap(),
-            "get", "pods", "--all-namespaces",
-            "--field-selector", &format!("spec.nodeName={}", node_name),
+            "--kubeconfig",
+            kubeconfig.to_str().unwrap(),
+            "get",
+            "pods",
+            "--all-namespaces",
+            "--field-selector",
+            &format!("spec.nodeName={}", node_name),
             "--no-headers",
         ])
         .stdout(Stdio::piped())
