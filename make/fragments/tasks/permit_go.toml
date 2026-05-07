@@ -15,7 +15,7 @@ script = [
     tabsdata_go_version = set 1.26.2
     set_env TABSDATA_GO_VERSION ${tabsdata_go_version}
 
-    info "♻️️ Checking if the required Go version is installed..."
+    debug "♻️️ Checking if the required Go version is installed..."
 
     go = which go
     if equals ${go} ""
@@ -31,7 +31,7 @@ script = [
     end
 
     version = trim ${result.stdout}
-    info "❇️ Go version: ${version}"
+    debug "❇️ Go version: ${version}"
 
     result = exec python -c "import os, sys, subprocess; v = tuple(map(int, os.environ['TABSDATA_GO_VERSION'].split('.'))); r = subprocess.check_output(['go', 'version']).decode().split()[2][2:]; rv = tuple(map(int, r.split('.'))); sys.exit(0 if rv >= v else 1)"
     code = set ${result.code}
