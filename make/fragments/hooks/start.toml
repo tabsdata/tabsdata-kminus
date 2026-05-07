@@ -60,10 +60,10 @@ script = [
     end
 
     info "🐢 Running task: ${CARGO_MAKE_TASK}"
-
     if is_info
         echo ""
     end
+
     user_home = get_env HOME
     info "🏠 User HOME: ${HOME}"
     if is_info

@@ -45,7 +45,11 @@ script = '''
         matches = glob_array ${cache_folder}/*/${binary}
         for match in ${matches}
             name = basename ${match}
-            dest = concat ${target_folder} "/" ${name}
+            dest_name = set ${name}
+            if eq ${name} "kubectl"
+                dest_name = set "kmc"
+            end
+            dest = concat ${target_folder} "/" ${dest_name}
             info "📦 Copying k8s binary ${match} -> ${dest}"
             cp ${match} ${dest}
         end
@@ -53,7 +57,11 @@ script = '''
         matches_exe = glob_array ${cache_folder}/*/${binary}.exe
         for match in ${matches_exe}
             name = basename ${match}
-            dest = concat ${target_folder} "/" ${name}
+            dest_name = set ${name}
+            if eq ${name} "kubectl.exe"
+                dest_name = set "kmc.exe"
+            end
+            dest = concat ${target_folder} "/" ${dest_name}
             info "📦 Copying k8s binary ${match} -> ${dest}"
             cp ${match} ${dest}
         end

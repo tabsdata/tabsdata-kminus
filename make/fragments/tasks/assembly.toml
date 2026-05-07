@@ -58,7 +58,11 @@ script = '''
             for k8s_dep in ${k8s_deps}
                 src = concat ${platform_folder} "/" ${k8s_dep}
                 if is_file ${src}
-                    dst = concat ${dist_folder} "/" ${k8s_dep}
+                    dst_name = set ${k8s_dep}
+                    if eq ${k8s_dep} "kubectl"
+                        dst_name = set "kmc"
+                    end
+                    dst = concat ${dist_folder} "/" ${dst_name}
                     cp ${src} ${dst}
                 end
             end

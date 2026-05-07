@@ -23,7 +23,7 @@ mod system;
 
 use config::{KM_SYSCONFIG_FILE, KmSysConfig};
 use process::{control_plane, pod_runner, virtual_kubelet};
-use system::file::{CONFIG_DIR, LOG_DIR, resolve_bin_dir};
+use system::file::{CONFIG_DIR, LOG_DIR};
 use system::pid::{BIN_KM, cleanup_stale_pids, kill_child, pids_dir, remove_pid, write_pid};
 use system::port::check_port;
 
@@ -101,7 +101,6 @@ struct Paths {
     workdir: PathBuf,
     configdir: PathBuf,
     logdir: PathBuf,
-    bin_dir: PathBuf,
     pids: PathBuf,
 }
 
@@ -127,14 +126,12 @@ impl Paths {
         // logdir is a runtime concern; record the default but don't create it here.
         let logdir = workdir.join(LOG_DIR);
 
-        let bin_dir = resolve_bin_dir();
         let pids = pids_dir(&workdir, BIN_KM);
 
         Ok(Self {
             workdir,
             configdir,
             logdir,
-            bin_dir,
             pids,
         })
     }
@@ -165,14 +162,12 @@ impl Paths {
         fs::create_dir_all(&logdir).ok();
         let logdir = logdir.canonicalize().unwrap_or(logdir);
 
-        let bin_dir = resolve_bin_dir();
         let pids = pids_dir(&workdir, BIN_KM);
 
         Ok(Self {
             workdir,
             configdir,
             logdir,
-            bin_dir,
             pids,
         })
     }
@@ -270,8 +265,8 @@ fn print_status(
     );
     println!();
 
-    // Existing pods on this node (best-effort kubectl query).
-    let pods = control_plane::list_pods_on_node(&paths.bin_dir, kubeconfig, "tdknode");
+    // Existing pods on this node (best-effort kmc query).
+    let pods = control_plane::list_pods_on_node(kubeconfig, "tdknode");
     if pods.is_empty() {
         println!("  Pods: (none)");
     } else {
@@ -455,7 +450,6 @@ fn command_start(args: StartArgs) {
         workdir = %paths.workdir.display(),
         configdir = %paths.configdir.display(),
         logdir = %paths.logdir.display(),
-        bindir = %paths.bin_dir.display(),
         "Starting K-"
     );
 
@@ -471,7 +465,6 @@ fn command_start(args: StartArgs) {
 
     // Start subprocesses in dependency order.
     let mut cp = control_plane::start(
-        &paths.bin_dir,
         &paths.workdir,
         &paths.configdir,
         &paths.logdir,
@@ -482,7 +475,6 @@ fn command_start(args: StartArgs) {
         &vk_kubeconfig,
     );
     let mut pr = pod_runner::start(
-        &paths.bin_dir,
         &paths.workdir,
         &paths.configdir,
         &paths.logdir,
@@ -494,9 +486,8 @@ fn command_start(args: StartArgs) {
         &vk_prconfig,
         &mut cp,
     );
-    control_plane::cleanup_stale_node_resources(&paths.bin_dir, &kubeconfig);
+    control_plane::cleanup_stale_node_resources(&kubeconfig);
     let mut vk = virtual_kubelet::start(
-        &paths.bin_dir,
         &paths.workdir,
         &paths.configdir,
         &paths.logdir,

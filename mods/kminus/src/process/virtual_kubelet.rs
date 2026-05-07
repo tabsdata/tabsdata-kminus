@@ -11,6 +11,7 @@ use tracing::{info, warn};
 use crate::config::KmSysConfig;
 use crate::system::file::wait_for_file;
 use crate::system::pid::{apply_subprocess_flags, pids_dir, write_pid};
+use crate::system::proc::resolve_binary;
 
 /// Binary name for the virtual-kubelet subprocess.
 pub const BIN: &str = "virtual-kubelet";
@@ -19,7 +20,6 @@ pub const BIN: &str = "virtual-kubelet";
 /// so we wait for its pids dir to appear under `<workdir>/data/` and
 /// then warm up for a few seconds.
 pub fn start(
-    bin_dir: &Path,
     workdir: &Path,
     configdir: &Path,
     logdir: &Path,
@@ -30,7 +30,7 @@ pub fn start(
     vk_prconfig: &Path,
 ) -> Child {
     info!("Starting {}...", BIN);
-    let vk_bin = bin_dir.join(BIN);
+    let vk_bin = resolve_binary(BIN);
     let log_max_size = sys_cfg.log.max_size_mb.to_string();
     let log_max_files = sys_cfg.log.max_files.to_string();
     let mut command = Command::new(&vk_bin);
