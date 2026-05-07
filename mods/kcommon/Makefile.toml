@@ -1,0 +1,9 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+extend = [
+    { path = "./mods/kcommon/Makeroot.toml", relative = "git" },
+
+    { path = "./mods/kcommon/Maketask.toml", relative = "git" }
+]

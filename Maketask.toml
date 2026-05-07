@@ -30,6 +30,7 @@ plugin = "td-task-tracker"
 category = "01 - Clean"
 description = "Task 'clean' for Rust projects (use --all to also wipe caches)"
 dependencies = [
+    "__km__clean_rs_kcommon",
     "__km__clean_rs_pod_runner",
     "__km__clean_rs_kminus",
 ]
@@ -65,6 +66,7 @@ plugin = "td-task-tracker"
 category = "02 - Tidy"
 description = "Task 'lock' for Rust projects"
 dependencies = [
+    "__km__lock_rs_kcommon",
     "__km__lock_rs_pod_runner",
     "__km__lock_rs_kminus",
 ]
@@ -92,6 +94,7 @@ plugin = "td-task-tracker"
 category = "03 - Build"
 description = "Task 'build' for Rust projects"
 dependencies = [
+    "__km__build_rs_kcommon",
     "__km__build_rs_pod_runner",
     "__km__build_rs_kminus",
 ]
@@ -119,6 +122,7 @@ plugin = "td-task-tracker"
 category = "04 - Test"
 description = "Task 'test' for Rust projects"
 dependencies = [
+    "__km__test_rs_kcommon",
     "__km__test_rs_pod_runner",
     "__km__test_rs_kminus",
 ]
@@ -149,6 +153,7 @@ category = "04 - Test"
 description = "Task 'itest' for Rust projects"
 dependencies = [
     "build_rs",
+    "__km__itest_rs_kcommon",
     "__km__itest_rs_pod_runner",
     "__km__itest_rs_kminus",
 ]

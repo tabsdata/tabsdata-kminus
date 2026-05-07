@@ -26,9 +26,11 @@ PROFILE = "${profile:dev}"
 
 K8S_VERSION = "1.29"
 
+PROJECT_RS_KCOMMON_FOLDER = { value = "${KM_ROOT}/mods/kcommon", normalize = true }
 PROJECT_RS_KMINUS_FOLDER = { value = "${KM_ROOT}/mods/kminus", normalize = true }
 PROJECT_RS_POD_RUNNER_FOLDER = { value = "${KM_ROOT}/mods/pod-runner", normalize = true }
 
+PROJECT_RS_KCOMMON_CARGO_TOML = { value = "${KM_ROOT}/mods/kcommon/Cargo.toml", normalize = true }
 PROJECT_RS_KMINUS_CARGO_TOML = { value = "${KM_ROOT}/mods/kminus/Cargo.toml", normalize = true }
 PROJECT_RS_POD_RUNNER_CARGO_TOML = { value = "${KM_ROOT}/mods/pod-runner/Cargo.toml", normalize = true }
 

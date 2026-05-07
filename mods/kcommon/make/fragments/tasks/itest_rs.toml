@@ -1,0 +1,34 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+[tasks.__km__itest_rs_kcommon]
+plugin = "td-task-tracker"
+category = "04 - Test"
+description = "Task 'itest' for kcommon project"
+dependencies = [
+    "__km__build_rs_kcommon",
+]
+cwd = "${KM_ROOT}/mods/kcommon/tests"
+script_runner = "@duckscript"
+script = '''
+    km_root = get_env KM_ROOT
+    test_folder = get_env KM_TEST_FOLDER
+    profile = get_env profile
+
+    build_folder = set ${profile}
+    if eq ${profile} "dev"
+        build_folder = set "debug"
+    end
+    bin_folder = concat ${km_root} "/mods/kcommon/target/" ${build_folder}
+
+    itest_folder = concat ${km_root} "/mods/kcommon/tests"
+    if is_dir ${itest_folder}
+        set_env TD_BIN_FOLDER ${bin_folder}
+        set_env PYTHONPATH ${test_folder}
+        runner = concat ${test_folder} "/pytest-noop.sh"
+        exec --fail-on-error ${runner} -v
+    else
+        echo (kcommon: no integration tests -- skipping)
+    end
+'''

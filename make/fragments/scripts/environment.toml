@@ -285,16 +285,25 @@ env_scripts = [
 
     is_musl = eq ${td-target} "x86_64-unknown-linux-musl"
     if ${is_musl}
+        PROJECT_RS_KCOMMON_CARGO_TOML = set "mods/kcommon/Cargo.toml"
         PROJECT_RS_KMINUS_CARGO_TOML = set "mods/kminus/Cargo.toml"
         PROJECT_RS_POD_RUNNER_CARGO_TOML = set "mods/pod-runner/Cargo.toml"
+        set_env PROJECT_RS_KCOMMON_CARGO_TOML ${PROJECT_RS_KCOMMON_CARGO_TOML}
         set_env PROJECT_RS_KMINUS_CARGO_TOML ${PROJECT_RS_KMINUS_CARGO_TOML}
         set_env PROJECT_RS_POD_RUNNER_CARGO_TOML ${PROJECT_RS_POD_RUNNER_CARGO_TOML}
     end
+    PROJECT_RS_KCOMMON_CARGO_TOML = get_env PROJECT_RS_KCOMMON_CARGO_TOML
     PROJECT_RS_KMINUS_CARGO_TOML = get_env PROJECT_RS_KMINUS_CARGO_TOML
     PROJECT_RS_POD_RUNNER_CARGO_TOML = get_env PROJECT_RS_POD_RUNNER_CARGO_TOML
+    debug "✅ Materialized PROJECT_RS_KCOMMON_CARGO_TOML: ${PROJECT_RS_KCOMMON_CARGO_TOML}"
     debug "✅ Materialized PROJECT_RS_KMINUS_CARGO_TOML: ${PROJECT_RS_KMINUS_CARGO_TOML}"
     debug "✅ Materialized PROJECT_RS_POD_RUNNER_CARGO_TOML: ${PROJECT_RS_POD_RUNNER_CARGO_TOML}"
 
+    if not is_empty ${kcommon-features}
+        kcommon-test-features = concat "dummy" "," ${kcommon-features}
+    else
+        kcommon-test-features = set "td-test"
+    end
     if not is_empty ${kminus-features}
         kminus-test-features = concat "dummy" "," ${kminus-features}
     else
@@ -306,12 +315,15 @@ env_scripts = [
         pod-runner-test-features = set "td-test"
     end
 
+    set_env kcommon-test-features ${kcommon-test-features}
     set_env kminus-test-features ${kminus-test-features}
     set_env pod-runner-test-features ${pod-runner-test-features}
 
+    kcommon-test-features = get_env kcommon-test-features
     kminus-test-features = get_env kminus-test-features
     pod-runner-test-features = get_env pod-runner-test-features
 
+    debug "✅ Using 'kcommon-test-features': ${kcommon-test-features}"
     debug "✅ Using 'kminus-test-features': ${kminus-test-features}"
     debug "✅ Using 'pod-runner-test-features': ${pod-runner-test-features}"
     ''',
