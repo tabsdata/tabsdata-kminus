@@ -42,6 +42,7 @@ extend = [
     { path = "./make/fragments/common/permit.toml", relative = "git" },
 
     { path = "./make/fragments/tasks/clean.toml", relative = "git" },
+    { path = "./make/fragments/tasks/bump.toml", relative = "git" },
     { path = "./make/fragments/tasks/assembly.toml", relative = "git" },
 
     { path = "./make/fragments/hooks/banner.toml", relative = "git" },

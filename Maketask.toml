@@ -43,6 +43,16 @@ dependencies = [
     "__km__clean_root",
 ]
 
+[tasks.bump]
+plugin = "td-task-tracker"
+category = "02 - Tidy"
+description = "Bump the version of all tabsdata projects (delegates to tabsdata-os)"
+run_task = [
+    { name = [
+        "__km__bump"
+    ] }
+]
+
 [tasks.lock]
 plugin = "td-task-tracker"
 category = "02 - Tidy"
