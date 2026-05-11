@@ -51,15 +51,11 @@ pub struct EnvFromSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
+#[derive(Default)]
 pub struct ExecAction {
     pub command: Vec<String>,
 }
 
-impl Default for ExecAction {
-    fn default() -> Self {
-        Self { command: Vec::new() }
-    }
-}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]

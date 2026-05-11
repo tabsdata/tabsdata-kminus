@@ -147,12 +147,11 @@ pub async fn resolve_k8s_values(
                 if let Some(cm_data) = resolved_configmaps.get(&cm_ref.name) {
                     env.extend(cm_data.iter().map(|(k, v)| (k.clone(), v.clone())));
                 }
-            } else if let Some(ref sec_ref) = ef.secret_ref {
-                if let Some(sec_data) = resolved_secrets.get(&sec_ref.name) {
+            } else if let Some(ref sec_ref) = ef.secret_ref
+                && let Some(sec_data) = resolved_secrets.get(&sec_ref.name) {
                     env.extend(sec_data.iter().map(|(k, v)| (k.clone(), v.clone())));
                     secret_keys.extend(sec_data.keys().cloned());
                 }
-            }
         }
 
         // 3. Individual env entries (highest priority)
@@ -161,19 +160,16 @@ pub async fn resolve_k8s_values(
                 env.insert(ev.name.clone(), value.clone());
             } else if let Some(ref vf) = ev.value_from {
                 if let Some(ref sec_ref) = vf.secret_key_ref {
-                    if let Some(sec_data) = resolved_secrets.get(&sec_ref.name) {
-                        if let Some(val) = sec_data.get(&sec_ref.key) {
+                    if let Some(sec_data) = resolved_secrets.get(&sec_ref.name)
+                        && let Some(val) = sec_data.get(&sec_ref.key) {
                             env.insert(ev.name.clone(), val.clone());
                             secret_keys.insert(ev.name.clone());
                         }
-                    }
-                } else if let Some(ref cm_ref) = vf.config_map_key_ref {
-                    if let Some(cm_data) = resolved_configmaps.get(&cm_ref.name) {
-                        if let Some(val) = cm_data.get(&cm_ref.key) {
+                } else if let Some(ref cm_ref) = vf.config_map_key_ref
+                    && let Some(cm_data) = resolved_configmaps.get(&cm_ref.name)
+                        && let Some(val) = cm_data.get(&cm_ref.key) {
                             env.insert(ev.name.clone(), val.clone());
                         }
-                    }
-                }
             }
         }
 

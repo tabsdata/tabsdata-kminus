@@ -138,12 +138,11 @@ impl FileStore {
     }
 
     fn write_json<T: serde::Serialize>(&self, path: &Path, value: &T) {
-        if let Some(parent) = path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
+        if let Some(parent) = path.parent()
+            && let Err(e) = fs::create_dir_all(parent) {
                 warn!(error = %e, path = ?path, "Failed to create directory");
                 return;
             }
-        }
         match serde_json::to_string_pretty(value) {
             Ok(json) => {
                 if let Err(e) = fs::write(path, json) {
@@ -320,11 +319,10 @@ impl PodStore for FileStore {
         // Remove only the store/ subdir — the pod dir may contain
         // work/ and log/ that cleanup/purge manage separately.
         let store = self.store_dir(id);
-        if store.exists() {
-            if let Err(e) = fs::remove_dir_all(&store) {
+        if store.exists()
+            && let Err(e) = fs::remove_dir_all(&store) {
                 warn!(error = %e, "Failed to remove pod store directory");
             }
-        }
         snap
     }
 

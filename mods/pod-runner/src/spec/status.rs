@@ -75,7 +75,7 @@ impl ContainerStatus {
     }
 
     pub fn set_running(&mut self, started_at: Option<&str>) {
-        let ts = started_at.unwrap_or_else(|| "").to_string();
+        let ts = started_at.unwrap_or("").to_string();
         let ts = if ts.is_empty() { chrono::Utc::now().to_rfc3339() } else { ts };
         self.state.clear();
         self.state.insert(

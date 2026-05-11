@@ -117,7 +117,7 @@ pub async fn create_pod_archive(
     // Add original spec
     if let Some(snap) = store.get(id, SpecView::Original).await {
         let json = serde_json::to_vec_pretty(&*snap.spec)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(|e| io::Error::other(e))?;
         let mut header = tar::Header::new_gnu();
         header.set_size(json.len() as u64);
         header.set_mode(0o644);
@@ -128,11 +128,10 @@ pub async fn create_pod_archive(
     }
 
     // Add log files
-    if let Some(log_dir) = log_dir {
-        if log_dir.is_dir() {
+    if let Some(log_dir) = log_dir
+        && log_dir.is_dir() {
             append_dir_recursive(&mut tar, log_dir, Path::new("logs"))?;
         }
-    }
 
     tar.into_inner()?.finish()?;
     debug!(pod = %id, path = ?archive_path, "Pod archive created");
@@ -231,11 +230,10 @@ pub async fn cleanup_pod(
         // Ensure it exists for the terminal-delete path (pod may not have
         // gone through monitor_pod completion yet).
         let sentinel = work_dir.join(FINISHED_SENTINEL);
-        if !sentinel.exists() {
-            if let Err(e) = fs::write(&sentinel, chrono::Utc::now().to_rfc3339()) {
+        if !sentinel.exists()
+            && let Err(e) = fs::write(&sentinel, chrono::Utc::now().to_rfc3339()) {
                 warn!(error = %e, "Failed to write FINISHED sentinel");
             }
-        }
         debug!(%phase, "Work directory kept");
     }
 }

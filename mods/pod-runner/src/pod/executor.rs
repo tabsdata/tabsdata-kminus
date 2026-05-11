@@ -862,11 +862,10 @@ async fn spawn_container(
         // Route through the lifecycle validator. The process is already
         // spawned; on reject we log and preserve state rather than
         // corrupt it further.
-        if let Some(cl) = st.lifecycle.container_by_role_mut(&container.name, role) {
-            if let Err(e) = cl.on_started(&now) {
+        if let Some(cl) = st.lifecycle.container_by_role_mut(&container.name, role)
+            && let Err(e) = cl.on_started(&now) {
                 warn!("Rejected container start transition: {}", e);
             }
-        }
         st.status()
     };
 
@@ -895,11 +894,10 @@ async fn mark_container_finished(
         let mut st = state.lock().await;
         // Route through the lifecycle validator; rejects terminating
         // a container that isn't Running (e.g. double-exit).
-        if let Some(cl) = st.lifecycle.container_by_role_mut(name, role) {
-            if let Err(e) = cl.on_exited(exit_code, &now) {
+        if let Some(cl) = st.lifecycle.container_by_role_mut(name, role)
+            && let Err(e) = cl.on_exited(exit_code, &now) {
                 warn!("Rejected container exit transition: {}", e);
             }
-        }
         let kind = if exit_code == 0 {
             PodEventKind::ContainerSucceeded { name: name.to_string() }
         } else {
@@ -1183,8 +1181,7 @@ async fn run_init_containers(
             ).await;
 
             if exit_code != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     format!("init container '{}' failed with exit code {}", container.name, exit_code),
                 ));
             }

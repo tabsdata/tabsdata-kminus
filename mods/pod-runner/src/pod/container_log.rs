@@ -66,6 +66,7 @@ pub fn resolve_log_path(
 // ---------------------------------------------------------------------------
 
 /// Options for streaming container logs.
+#[derive(Default)]
 pub struct ContainerLogOptions {
     /// Keep streaming new output until the pod terminates.
     pub follow: bool,
@@ -75,15 +76,6 @@ pub struct ContainerLogOptions {
     pub previous: bool,
 }
 
-impl Default for ContainerLogOptions {
-    fn default() -> Self {
-        Self {
-            follow: false,
-            tail_lines: None,
-            previous: false,
-        }
-    }
-}
 
 /// Read buffer size for log streaming.
 const LOG_CHUNK_SIZE: usize = 8192;

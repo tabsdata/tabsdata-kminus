@@ -25,6 +25,7 @@ pub struct ResolverConfig {
 }
 
 /// A set of resolvers used during pod preparation.
+#[derive(Default)]
 pub struct ResolverSet {
     pub secret_resolver: Option<Box<dyn secret::SecretResolver>>,
     pub config_map_resolver: Option<Box<dyn config_map::ConfigMapResolver>>,
@@ -32,15 +33,6 @@ pub struct ResolverSet {
     pub node_envs: HashMap<String, String>,
 }
 
-impl Default for ResolverSet {
-    fn default() -> Self {
-        Self {
-            secret_resolver: None,
-            config_map_resolver: None,
-            node_envs: HashMap::new(),
-        }
-    }
-}
 
 impl ResolverSet {
     /// Build a ResolverSet from configuration.

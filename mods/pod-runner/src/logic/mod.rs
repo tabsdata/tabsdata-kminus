@@ -762,11 +762,10 @@ async fn monitor_pod(
                     }
                     PodEventKind::PhaseChanged { to, .. } => {
                         debug!(phase = ?to, "Phase changed");
-                        if let Some(ref m) = metrics {
-                            if *to == crate::spec::constants::PodPhase::Running {
+                        if let Some(ref m) = metrics
+                            && *to == crate::spec::constants::PodPhase::Running {
                                 m.pods_started_total.inc();
                             }
-                        }
                     }
                     _ => {
                         debug!(kind = ?event.kind, phase = ?event.status.phase, "Event received");

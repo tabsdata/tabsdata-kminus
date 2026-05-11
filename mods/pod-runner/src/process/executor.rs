@@ -269,7 +269,7 @@ impl RollingStreamWriter {
             }
 
             // Move current → .1
-            let _ = std::fs::rename(&self.path, &self.rolled_path(1));
+            let _ = std::fs::rename(&self.path, self.rolled_path(1));
         }
 
         // Open fresh current file (truncates if max_rolled == 0)
@@ -480,15 +480,14 @@ impl OutputRedirector for DirectFileOutput {
                      use DevNullOutput to discard both streams",
                 ));
             }
-            if let (Some(out), Some(err)) = (&self.stdout_path, &self.stderr_path) {
-                if out == err {
+            if let (Some(out), Some(err)) = (&self.stdout_path, &self.stderr_path)
+                && out == err {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "DirectFileOutput: stdout and stderr paths must differ; \
                          use DirectFileOutput::merged() for a shared file",
                     ));
                 }
-            }
         }
         Ok(())
     }
@@ -819,7 +818,7 @@ impl ExecutorHandle {
         }
         let code = (&mut self.wait_handle)
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!(
+            .map_err(|e| io::Error::other(format!(
                 "process monitor task failed: {}", e
             )))?;
         self.cached_exit_code = Some(code);
@@ -834,12 +833,11 @@ impl ExecutorHandle {
         if let Some(code) = self.cached_exit_code {
             return Some(code);
         }
-        if self.wait_handle.is_finished() {
-            if let Some(Ok(code)) = now_or_never(&mut self.wait_handle) {
+        if self.wait_handle.is_finished()
+            && let Some(Ok(code)) = now_or_never(&mut self.wait_handle) {
                 self.cached_exit_code = Some(code);
                 return Some(code);
             }
-        }
         None
     }
 
