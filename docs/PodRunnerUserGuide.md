@@ -202,6 +202,48 @@ spec:
           readOnly: true
 ```
 
+### configMap
+
+Creates a directory at the mount path and writes one file per configmap key
+(filename = key, contents = value). Requires a `ConfigMapResolver` to be
+configured.
+
+**kminus only supports mounting an entire configmap as a directory.** Per-key
+selection (`configMap.items`) and per-file mounts (`volumeMount.subPath`) are
+not supported — every key in the configmap becomes a file in the mounted
+directory.
+
+**Convention:** mount configmap volumes at `/configmaps/<configmap-name>`.
+This makes the location predictable for both producers (writing pod specs)
+and consumers (reading the files at runtime).
+
+**Not refreshed at runtime.** Unlike Kubernetes — where the kubelet re-syncs
+configmap volumes when the configmap changes — kminus resolves the configmap
+**once** during pod preparation and writes the files to disk before the
+container starts. Subsequent edits to the configmap are **not** propagated to
+running pods; the pod must be recreated to pick up new values. The same
+applies to env-referenced configmaps (`configMapKeyRef` / `configMapRef`).
+
+```yaml
+spec:
+  volumes:
+    - name: config
+      configMap:
+        name: app-config
+  containers:
+    - name: app
+      image: /dev/null
+      command: ["./server"]
+      volumeMounts:
+        - name: config
+          mountPath: /configmaps/app-config
+          readOnly: true
+```
+
+Given a configmap with `data: { app.conf: "...", logging.yaml: "..." }`, the
+container sees `/configmaps/app-config/app.conf` and
+`/configmaps/app-config/logging.yaml` populated with the corresponding values.
+
 ---
 
 ## Environment Variables
@@ -348,7 +390,9 @@ Logs rotate at 100MB with up to 5 files kept per rotation.
 
 ## Secrets and ConfigMaps
 
-The pod runner resolves secrets and configmaps as environment variables (not file mounts).
+Secrets are exposed as environment variables. ConfigMaps are exposed as
+environment variables or as `configMap` volume mounts (see
+[Volumes](#configmap)).
 
 ### File-Based Resolver
 
@@ -485,7 +529,8 @@ To use custom certificates, create `prconfig.yaml` before first start with your 
 - **Local directories only** -- no container image registry pulls
 - **Single host** -- no multi-node scheduling
 - **No gRPC probes** -- exec, httpGet, and tcpSocket only
-- **No PVCs** -- hostPath and emptyDir volumes only
+- **No PVCs** -- hostPath, emptyDir, and configMap volumes only
+- **Whole-configmap mounts only** -- `configMap.items` and `volumeMount.subPath` are not supported; every key becomes a file in the mounted directory
 - **No network policies** -- all containers share the host network
 - **No resource enforcement** -- CPU/memory limits are stored but not enforced
 - **No security contexts** -- all processes run as the pod runner's user

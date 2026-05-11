@@ -6,11 +6,12 @@
 //!
 //! 1. **[`rewrite_pod_paths`]** — rewrite `workingDir` and `volumeMount.mountPath`
 //!    to physical paths under the pod working directory.
-//! 2. **[`resolve_pod_envs`]** — resolve environment variables from secrets,
-//!    config maps, and node-level envs.
+//! 2. **[`resolve_k8s_values`]** — resolve environment variables and
+//!    fetch configmap data referenced by `configMap` volumes.
 //! 3. **[`create_container_dirs`]** — create container working directories and
 //!    copy image template directories.
-//! 4. **[`setup_volumes`]** — create emptyDir directories and hostPath symlinks.
+//! 4. **[`setup_volumes`]** — create emptyDir directories, hostPath symlinks,
+//!    and configMap volume directories (one file per key).
 //!
 //! [`prepare_pod`] runs all four steps in order and returns the running spec.
 
@@ -19,7 +20,7 @@ use std::path::Path;
 
 use tracing::debug;
 
-use crate::pod::resolver::env::{resolve_envs, ResolvedEnvs};
+use crate::pod::resolver::k8s_values::{resolve_k8s_values, ResolvedK8sValues};
 use crate::pod::resolver::volume::resolve_volumes;
 use crate::pod::resolver::ResolverSet;
 use crate::spec::pod::{EnvVar, PodSpec};
@@ -50,11 +51,11 @@ pub async fn prepare_pod(
     resolvers: &ResolverSet,
 ) -> Result<PodSpec, String> {
     let mut prepared = rewrite_pod_paths(spec, pod_dir)?;
-    let resolved = resolve_pod_envs(&prepared, namespace, resolvers).await?;
+    let resolved = resolve_k8s_values(&prepared, namespace, resolvers).await?;
     apply_resolved_envs(&mut prepared, &resolved);
     inject_pr_pod_root(&mut prepared);
     create_container_dirs(&prepared, pod_dir)?;
-    setup_volumes(&prepared)?;
+    setup_volumes(&prepared, &resolved)?;
     Ok(prepared)
 }
 
@@ -114,21 +115,22 @@ pub fn is_prepared(pod: &PodSpec) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Step 2: resolve envs
+// Step 2: resolve k8s-sourced values (envs + configmap volume data)
 // ---------------------------------------------------------------------------
 
-/// Resolve environment variables from secrets, config maps, and node envs.
-pub async fn resolve_pod_envs(
+/// Resolve environment variables and configmap volume data from secrets,
+/// config maps, and node envs.
+pub async fn resolve_pod_k8s_values(
     spec: &PodSpec,
     namespace: &str,
     resolvers: &ResolverSet,
-) -> Result<ResolvedEnvs, String> {
-    resolve_envs(spec, namespace, resolvers).await
+) -> Result<ResolvedK8sValues, String> {
+    resolve_k8s_values(spec, namespace, resolvers).await
 }
 
 /// Apply resolved environment variables to the spec, replacing
 /// `valueFrom` references with literal values.
-pub fn apply_resolved_envs(spec: &mut PodSpec, resolved: &ResolvedEnvs) {
+pub fn apply_resolved_envs(spec: &mut PodSpec, resolved: &ResolvedK8sValues) {
     for c in spec.spec.all_containers_mut() {
         if let Some(ce) = resolved.containers.get(&c.name) {
             c.env = ce
@@ -235,9 +237,10 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
 // Step 4: set up volumes
 // ---------------------------------------------------------------------------
 
-/// Create emptyDir directories and hostPath symlinks.
-pub fn setup_volumes(spec: &PodSpec) -> Result<(), String> {
-    resolve_volumes(spec).map(|_| ())
+/// Create emptyDir directories, hostPath symlinks, and configMap volume
+/// directories (one file per key).
+pub fn setup_volumes(spec: &PodSpec, resolved: &ResolvedK8sValues) -> Result<(), String> {
+    resolve_volumes(spec, resolved).map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +251,8 @@ pub fn setup_volumes(spec: &PodSpec) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::spec::pod::{
-        Container, EmptyDirVolume, HostPathVolume, PodMetadata, PodSpecBody, Volume, VolumeMount,
+        ConfigMapVolume, Container, EmptyDirVolume, HostPathVolume, PodMetadata, PodSpecBody,
+        Volume, VolumeMount,
     };
 
     fn make_container(name: &str, working_dir: &str, mounts: Vec<(&str, &str)>) -> Container {
@@ -464,7 +468,7 @@ mod tests {
             ..make_pod(vec![], vec![])
         };
 
-        setup_volumes(&pod).unwrap();
+        setup_volumes(&pod, &ResolvedK8sValues::default()).unwrap();
         assert!(dir.join("work/app/mnt/data").is_dir());
     }
 
@@ -495,7 +499,7 @@ mod tests {
             ..make_pod(vec![], vec![])
         };
 
-        setup_volumes(&pod).unwrap();
+        setup_volumes(&pod, &ResolvedK8sValues::default()).unwrap();
         assert!(mount_path.is_symlink());
         assert_eq!(
             fs::read_to_string(mount_path.join("test.txt")).unwrap(),
@@ -524,6 +528,56 @@ mod tests {
         assert_eq!(
             prepared.spec.containers[0].working_dir,
             format!("{}/work/app/app", dir.display())
+        );
+    }
+
+    #[tokio::test]
+    async fn full_pipeline_with_config_map_volume() {
+        use crate::pod::resolver::config_map::FileConfigMapResolver;
+
+        let dir = temp_dir("full-pipeline-cm-vol");
+        let cm_dir = dir.join("configmaps");
+        fs::create_dir_all(&cm_dir).unwrap();
+        fs::write(
+            cm_dir.join("app-config.yaml"),
+            "data:\n  app.conf: \"setting=value\"\n  logging.yaml: \"level: info\"\n",
+        )
+        .unwrap();
+
+        let mut pod = make_pod(
+            vec![make_container("app", "/app", vec![("config", "/etc/app")])],
+            vec![],
+        );
+        pod.spec.volumes.push(Volume {
+            name: "config".to_string(),
+            config_map: Some(ConfigMapVolume {
+                name: "app-config".to_string(),
+            }),
+            ..Default::default()
+        });
+
+        let resolvers = ResolverSet {
+            config_map_resolver: Some(Box::new(FileConfigMapResolver::new(cm_dir).unwrap())),
+            ..Default::default()
+        };
+
+        let prepared = prepare_pod(&pod, &dir.to_string_lossy(), "default", &resolvers)
+            .await
+            .unwrap();
+
+        let mount = dir.join("work/app/etc/app");
+        assert_eq!(
+            prepared.spec.containers[0].volume_mounts[0].mount_path,
+            mount.to_string_lossy().to_string()
+        );
+        assert!(mount.is_dir());
+        assert_eq!(
+            fs::read_to_string(mount.join("app.conf")).unwrap(),
+            "setting=value"
+        );
+        assert_eq!(
+            fs::read_to_string(mount.join("logging.yaml")).unwrap(),
+            "level: info"
         );
     }
 
@@ -618,7 +672,7 @@ mod tests {
 
     #[test]
     fn apply_resolved_envs_replaces_refs() {
-        use crate::pod::resolver::env::{ContainerEnv, ResolvedEnvs};
+        use crate::pod::resolver::k8s_values::{ContainerEnv, ResolvedK8sValues};
         use std::collections::{HashMap, HashSet};
 
         let mut spec = make_pod(
@@ -646,7 +700,8 @@ mod tests {
             vec![],
         );
 
-        let resolved = ResolvedEnvs {
+        let resolved = ResolvedK8sValues {
+            config_map_volumes: HashMap::new(),
             containers: [(
                 "app".to_string(),
                 ContainerEnv {

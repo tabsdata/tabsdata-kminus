@@ -143,10 +143,17 @@ pub struct EmptyDirVolume {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
+pub struct ConfigMapVolume {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct Volume {
     pub name: String,
     pub host_path: Option<HostPathVolume>,
     pub empty_dir: Option<EmptyDirVolume>,
+    pub config_map: Option<ConfigMapVolume>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -274,4 +281,44 @@ pub struct PodObject {
     #[serde(flatten)]
     pub spec: PodSpec,
     pub status: super::status::PodStatus,
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_map_volume_deserializes_from_yaml() {
+        let yaml = r#"
+spec:
+  volumes:
+    - name: config
+      configMap:
+        name: app-config
+  containers:
+    - name: app
+      image: /dev/null
+      volumeMounts:
+        - name: config
+          mountPath: /etc/app
+          readOnly: true
+"#;
+
+        let pod: PodSpec = serde_yaml_ng::from_str(yaml).unwrap();
+        let vol = &pod.spec.volumes[0];
+        assert_eq!(vol.name, "config");
+        let cm = vol.config_map.as_ref().expect("config_map should be set");
+        assert_eq!(cm.name, "app-config");
+        assert!(vol.empty_dir.is_none());
+        assert!(vol.host_path.is_none());
+
+        let vm = &pod.spec.containers[0].volume_mounts[0];
+        assert_eq!(vm.name, "config");
+        assert_eq!(vm.mount_path, "/etc/app");
+        assert!(vm.read_only);
+    }
 }

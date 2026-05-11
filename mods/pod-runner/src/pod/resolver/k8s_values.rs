@@ -1,13 +1,17 @@
 // Copyright 2026 Tabsdata Inc.
 
-//! Environment resolution — collect and merge env vars for all containers.
+//! Resolution of Kubernetes-sourced pod values: env vars and configmap volumes.
 //!
-//! Resolves literal `env` values, `valueFrom.secretKeyRef`,
-//! `valueFrom.configMapKeyRef`, `envFrom.secretRef`,
-//! `envFrom.configMapRef`, and node-level env vars into a flat
-//! `HashMap<String, String>` per container.
+//! Resolves:
+//! - Literal `env` values, `valueFrom.secretKeyRef`,
+//!   `valueFrom.configMapKeyRef`, `envFrom.secretRef`, `envFrom.configMapRef`,
+//!   and node-level env vars into a flat `HashMap<String, String>` per
+//!   container.
+//! - The data of each configmap referenced by a `configMap` volume, kept aside
+//!   for [`crate::pod::resolver::volume`] to materialize as files at the
+//!   container's mount path.
 //!
-//! # Priority (lowest to highest)
+//! # Env priority (lowest to highest)
 //!
 //! 1. Node-level envs
 //! 2. `envFrom` entries (in order)
@@ -32,25 +36,30 @@ pub struct ContainerEnv {
     pub secret_keys: HashSet<String>,
 }
 
-/// Resolved environment for all containers in a pod.
-#[derive(Debug)]
-pub struct ResolvedEnvs {
+/// Resolved Kubernetes-sourced values for a pod: per-container envs plus the
+/// data of every configmap referenced by a `configMap` volume.
+#[derive(Debug, Default)]
+pub struct ResolvedK8sValues {
+    /// Per-container resolved environment.
     pub containers: HashMap<String, ContainerEnv>,
+    /// `configmap_name -> {key: value}` for configmaps mounted as volumes.
+    pub config_map_volumes: HashMap<String, HashMap<String, String>>,
 }
 
 // ---------------------------------------------------------------------------
 // Resolution
 // ---------------------------------------------------------------------------
 
-/// Resolve all environment variable references for every container.
-pub async fn resolve_envs(
+/// Resolve env references and configmap-volume data for every container.
+pub async fn resolve_k8s_values(
     pod: &PodSpec,
     namespace: &str,
     resolvers: &ResolverSet,
-) -> Result<ResolvedEnvs, String> {
+) -> Result<ResolvedK8sValues, String> {
     // Collect all referenced secret and configmap names
     let mut secret_names: Vec<String> = Vec::new();
     let mut configmap_names: Vec<String> = Vec::new();
+    let mut configmap_volume_names: Vec<String> = Vec::new();
 
     for c in pod.spec.all_containers() {
         for ev in &c.env {
@@ -71,9 +80,17 @@ pub async fn resolve_envs(
         }
     }
 
+    for v in &pod.spec.volumes {
+        if let Some(ref cm) = v.config_map {
+            configmap_names.push(cm.name.clone());
+            configmap_volume_names.push(cm.name.clone());
+        }
+    }
+
     // Dedup
     secret_names.dedup();
     configmap_names.dedup();
+    configmap_volume_names.dedup();
 
     // Batch resolve secrets
     let resolved_secrets = if !secret_names.is_empty() {
@@ -104,9 +121,18 @@ pub async fn resolve_envs(
     };
 
     // Build per-container env
-    let mut result = ResolvedEnvs {
+    let mut result = ResolvedK8sValues {
         containers: HashMap::new(),
+        config_map_volumes: HashMap::new(),
     };
+
+    // Stash configmap data referenced by volumes for the volume resolver.
+    for name in &configmap_volume_names {
+        let data = resolved_configmaps.get(name).cloned().ok_or_else(|| {
+            format!("ConfigMap '{}' referenced by a volume was not resolved", name)
+        })?;
+        result.config_map_volumes.insert(name.clone(), data);
+    }
 
     for c in pod.spec.all_containers() {
         let mut env: HashMap<String, String> = HashMap::new();
@@ -214,7 +240,7 @@ mod tests {
             ..Default::default()
         }]);
 
-        let result = resolve_envs(&pod, "default", &ResolverSet::default()).await.unwrap();
+        let result = resolve_k8s_values(&pod, "default", &ResolverSet::default()).await.unwrap();
         let app = &result.containers["app"];
         assert_eq!(app.env["FOO"], "bar");
         assert_eq!(app.env["BAZ"], "qux");
@@ -240,7 +266,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_envs(&pod, "default", &resolvers).await.unwrap();
+        let result = resolve_k8s_values(&pod, "default", &resolvers).await.unwrap();
         // Individual env overrides node env
         assert_eq!(result.containers["app"].env["KEY"], "from-spec");
     }
@@ -275,7 +301,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_envs(&pod, "default", &resolvers).await.unwrap();
+        let result = resolve_k8s_values(&pod, "default", &resolvers).await.unwrap();
         assert_eq!(result.containers["app"].env["DB_PASS"], "s3cret");
         assert!(result.containers["app"].secret_keys.contains("DB_PASS"));
     }
@@ -306,7 +332,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_envs(&pod, "default", &resolvers).await.unwrap();
+        let result = resolve_k8s_values(&pod, "default", &resolvers).await.unwrap();
         assert_eq!(result.containers["app"].env["PORT"], "8080");
         assert!(!result.containers["app"].secret_keys.contains("PORT"));
     }
@@ -334,7 +360,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_envs(&pod, "default", &resolvers).await.unwrap();
+        let result = resolve_k8s_values(&pod, "default", &resolvers).await.unwrap();
         let app = &result.containers["app"];
         assert_eq!(app.env["USER"], "admin");
         assert_eq!(app.env["PASS"], "secret");
@@ -361,7 +387,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_envs(&pod, "default", &resolvers).await.unwrap();
+        let result = resolve_k8s_values(&pod, "default", &resolvers).await.unwrap();
         assert_eq!(result.containers["app"].env["LOG_LEVEL"], "debug");
     }
 
@@ -383,8 +409,63 @@ mod tests {
             ..Default::default()
         }]);
 
-        let err = resolve_envs(&pod, "default", &ResolverSet::default()).await.unwrap_err();
+        let err = resolve_k8s_values(&pod, "default", &ResolverSet::default()).await.unwrap_err();
         assert!(err.contains("no SecretResolver"));
+    }
+
+    #[tokio::test]
+    async fn config_map_volume_data_resolved() {
+        let dir = setup_dir("cm-vol");
+        fs::write(
+            dir.join("app-config.yaml"),
+            "data:\n  app.conf: \"setting=value\"\n  log.yaml: \"level: info\"\n",
+        )
+        .unwrap();
+
+        let mut pod = make_pod_with_envs(vec![Container {
+            name: "app".to_string(),
+            volume_mounts: vec![VolumeMount {
+                name: "config".to_string(),
+                mount_path: "/etc/app".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }]);
+        pod.spec.volumes.push(Volume {
+            name: "config".to_string(),
+            config_map: Some(ConfigMapVolume {
+                name: "app-config".to_string(),
+            }),
+            ..Default::default()
+        });
+
+        let resolvers = ResolverSet {
+            config_map_resolver: Some(Box::new(FileConfigMapResolver::new(dir).unwrap())),
+            ..Default::default()
+        };
+
+        let result = resolve_k8s_values(&pod, "default", &resolvers).await.unwrap();
+        let cm = &result.config_map_volumes["app-config"];
+        assert_eq!(cm["app.conf"], "setting=value");
+        assert_eq!(cm["log.yaml"], "level: info");
+    }
+
+    #[tokio::test]
+    async fn config_map_volume_missing_resolver_errors() {
+        let mut pod = make_pod_with_envs(vec![Container {
+            name: "app".to_string(),
+            ..Default::default()
+        }]);
+        pod.spec.volumes.push(Volume {
+            name: "config".to_string(),
+            config_map: Some(ConfigMapVolume {
+                name: "missing".to_string(),
+            }),
+            ..Default::default()
+        });
+
+        let err = resolve_k8s_values(&pod, "default", &ResolverSet::default()).await.unwrap_err();
+        assert!(err.contains("no ConfigMapResolver"));
     }
 
     #[tokio::test]
@@ -399,7 +480,7 @@ mod tests {
             ..Default::default()
         }]);
 
-        let result = resolve_envs(&pod, "default", &ResolverSet::default()).await.unwrap();
+        let result = resolve_k8s_values(&pod, "default", &ResolverSet::default()).await.unwrap();
         assert_eq!(result.containers["app"].env["PLAIN"], "val");
     }
 }

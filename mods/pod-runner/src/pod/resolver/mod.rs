@@ -7,7 +7,7 @@
 //! K8s API via kubeconfig).
 
 pub mod config_map;
-pub mod env;
+pub mod k8s_values;
 pub mod secret;
 pub mod volume;
 

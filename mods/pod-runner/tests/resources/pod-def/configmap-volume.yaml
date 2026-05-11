@@ -1,0 +1,35 @@
+# Pod that mounts a configmap as a volume.
+# Each key in the configmap becomes a file in the mount directory
+# (filename = key, contents = value).
+# Requires a ConfigMapResolver to be configured at create time.
+#
+# Convention: configmaps are mounted at /configmaps/<configmap-name>.
+# kminus only supports mounting an entire configmap as a directory; per-key
+# selection (configMap.items) and per-file mounts (volumeMount.subPath) are
+# not supported.
+#
+# Note: the pod runner rewrites the absolute mount path to
+# <container_root>/<mountPath> during preparation, so the command uses
+# $PR_POD_ROOT to access the resolved location.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: configmap-volume
+  namespace: default
+
+spec:
+  nodeName: virtual-node
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["cat $PR_POD_ROOT/configmaps/db-config/host && cat $PR_POD_ROOT/configmaps/db-config/port"]
+      volumeMounts:
+        - name: config
+          mountPath: /configmaps/db-config
+          readOnly: true
+  volumes:
+    - name: config
+      configMap:
+        name: db-config

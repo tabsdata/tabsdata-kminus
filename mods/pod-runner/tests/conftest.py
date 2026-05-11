@@ -280,6 +280,65 @@ def mtls_client(pod_runner):
 
 
 # ---------------------------------------------------------------------------
+# Pod-runner fixture with file-based secret/configmap resolvers
+# ---------------------------------------------------------------------------
+#
+# A separate pod-runner instance (different work_dir, different port) that
+# starts with a pre-written prsysconfig.yaml pointing the file resolvers at
+# tests/resources/secrets/ and tests/resources/configmaps/. Used by tests
+# that submit pod-defs which reference secret/configmap data.
+
+
+@pytest.fixture(scope="session")
+def pod_runner_with_resolvers(pod_runner_bin, control_plane):
+    ts = get_session_timestamp()
+    work_dir = os.path.join(
+        TARGET_DIR, f"testrun.{ts}", "_pod_runner_resolvers"
+    )
+    os.makedirs(work_dir, exist_ok=True)
+
+    # Pre-write prsysconfig.yaml with file resolvers before pod-runner starts.
+    # Once present, pod-runner will read it instead of generating defaults.
+    configdir = os.path.join(work_dir, "config")
+    os.makedirs(configdir, exist_ok=True)
+    prsysconfig = {
+        "secretResolver": {
+            "type": "file",
+            "configs": {
+                "dir": os.path.join(RESOURCES_DIR, "secrets"),
+            },
+        },
+        "configMapResolver": {
+            "type": "file",
+            "configs": {
+                "dir": os.path.join(RESOURCES_DIR, "configmaps"),
+            },
+        },
+        "nodeEnvsResolver": {"type": "none"},
+    }
+    with open(os.path.join(configdir, "prsysconfig.yaml"), "w") as f:
+        yaml.safe_dump(prsysconfig, f)
+
+    port = find_free_port()
+    pr = PodRunnerProcess(
+        pod_runner_bin, work_dir, port,
+        kubeconfig=control_plane.kubeconfig,
+        metrics_port=0,
+    )
+    pr.start()
+    yield pr
+    pr.stop()
+
+
+@pytest.fixture(scope="session")
+def mtls_client_with_resolvers(pod_runner_with_resolvers):
+    return MtlsClient(
+        pod_runner_with_resolvers.vk_prconfig_path,
+        pod_runner_with_resolvers.work_dir,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Virtual-kubelet (session-scoped, for job/cronjob tests)
 # ---------------------------------------------------------------------------
 

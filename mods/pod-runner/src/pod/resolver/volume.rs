@@ -7,11 +7,18 @@
 //!
 //! - `emptyDir`: creates an empty directory at the mount path.
 //! - `hostPath`: creates a symlink from the mount path to the host path.
+//! - `configMap`: creates a directory at the mount path and writes one file
+//!   per configmap key (filename = key, contents = value). The configmap data
+//!   must be pre-resolved into [`ResolvedK8sValues::config_map_volumes`].
+//!   kminus mounts the entire configmap as a directory — `configMap.items`
+//!   and `volumeMount.subPath` are not supported. The convention is to mount
+//!   configmaps at `/configmaps/<configmap-name>` (not enforced).
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+use crate::pod::resolver::k8s_values::ResolvedK8sValues;
 use crate::spec::pod::PodSpec;
 
 /// Information about a resolved mount.
@@ -29,10 +36,15 @@ pub struct ResolvedVolumes {
     pub containers: HashMap<String, Vec<MountInfo>>,
 }
 
-/// Create symlinks/directories for all volume mounts.
+/// Create symlinks/directories/configmap files for all volume mounts.
 ///
-/// The pod must have been prepared first (paths rewritten).
-pub fn resolve_volumes(pod: &PodSpec) -> Result<ResolvedVolumes, String> {
+/// The pod must have been prepared first (paths rewritten) and configmap
+/// data referenced by `configMap` volumes must already be present in
+/// `resolved.config_map_volumes`.
+pub fn resolve_volumes(
+    pod: &PodSpec,
+    resolved: &ResolvedK8sValues,
+) -> Result<ResolvedVolumes, String> {
     let volume_map = pod.spec.volume_map();
     let mut result = ResolvedVolumes {
         containers: HashMap::new(),
@@ -61,6 +73,38 @@ pub fn resolve_volumes(pod: &PodSpec) -> Result<ResolvedVolumes, String> {
                     mount_path: vm.mount_path.clone(),
                     host_path: String::new(),
                     read_only: false,
+                });
+            } else if let Some(ref cm) = vol.config_map {
+                let data = resolved.config_map_volumes.get(&cm.name).ok_or_else(|| {
+                    format!(
+                        "Volume '{}' references unresolved configMap '{}'",
+                        vm.name, cm.name
+                    )
+                })?;
+
+                fs::create_dir_all(&vm.mount_path).map_err(|e| {
+                    format!(
+                        "Failed to create configMap dir '{}' at {}: {}",
+                        vm.name, vm.mount_path, e
+                    )
+                })?;
+
+                for (key, value) in data {
+                    let file_path = Path::new(&vm.mount_path).join(key);
+                    fs::write(&file_path, value).map_err(|e| {
+                        format!(
+                            "Failed to write configMap file '{}': {}",
+                            file_path.display(),
+                            e
+                        )
+                    })?;
+                }
+
+                mounts.push(MountInfo {
+                    volume_name: vm.name.clone(),
+                    mount_path: vm.mount_path.clone(),
+                    host_path: String::new(),
+                    read_only: vm.read_only,
                 });
             } else if let Some(ref hp) = vol.host_path {
                 let host = &hp.path;
@@ -177,7 +221,7 @@ mod tests {
             }],
         );
 
-        let result = resolve_volumes(&pod).unwrap();
+        let result = resolve_volumes(&pod, &ResolvedK8sValues::default()).unwrap();
         assert!(mount_path.is_dir());
         assert_eq!(result.containers["app"].len(), 1);
         assert_eq!(result.containers["app"][0].volume_name, "data");
@@ -213,7 +257,7 @@ mod tests {
             }],
         );
 
-        let result = resolve_volumes(&pod).unwrap();
+        let result = resolve_volumes(&pod, &ResolvedK8sValues::default()).unwrap();
         assert!(mount_path.is_symlink());
         assert_eq!(
             fs::read_to_string(mount_path.join("file.txt")).unwrap(),
@@ -246,7 +290,7 @@ mod tests {
             }],
         );
 
-        let err = resolve_volumes(&pod).unwrap_err();
+        let err = resolve_volumes(&pod, &ResolvedK8sValues::default()).unwrap_err();
         assert!(err.contains("hostPath does not exist"));
     }
 
@@ -265,8 +309,83 @@ mod tests {
             vec![],
         );
 
-        let err = resolve_volumes(&pod).unwrap_err();
+        let err = resolve_volumes(&pod, &ResolvedK8sValues::default()).unwrap_err();
         assert!(err.contains("unknown volume 'missing'"));
+    }
+
+    #[test]
+    fn config_map_volume_creates_files_per_key() {
+        let base = setup_dir("cm-vol");
+        let mount_path = base.join("app").join("etc").join("app");
+
+        let pod = make_pod(
+            vec![Container {
+                name: "app".to_string(),
+                volume_mounts: vec![VolumeMount {
+                    name: "config".to_string(),
+                    mount_path: mount_path.to_string_lossy().to_string(),
+                    read_only: true,
+                }],
+                ..Default::default()
+            }],
+            vec![Volume {
+                name: "config".to_string(),
+                config_map: Some(ConfigMapVolume {
+                    name: "app-config".to_string(),
+                }),
+                ..Default::default()
+            }],
+        );
+
+        let mut resolved = ResolvedK8sValues::default();
+        resolved.config_map_volumes.insert(
+            "app-config".to_string(),
+            [
+                ("app.conf".to_string(), "setting=value".to_string()),
+                ("logging.yaml".to_string(), "level: info".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let result = resolve_volumes(&pod, &resolved).unwrap();
+        assert!(mount_path.is_dir());
+        assert_eq!(
+            fs::read_to_string(mount_path.join("app.conf")).unwrap(),
+            "setting=value"
+        );
+        assert_eq!(
+            fs::read_to_string(mount_path.join("logging.yaml")).unwrap(),
+            "level: info"
+        );
+        assert_eq!(result.containers["app"][0].volume_name, "config");
+        assert!(result.containers["app"][0].read_only);
+    }
+
+    #[test]
+    fn config_map_volume_missing_data_errors() {
+        let base = setup_dir("cm-vol-missing");
+        let pod = make_pod(
+            vec![Container {
+                name: "app".to_string(),
+                volume_mounts: vec![VolumeMount {
+                    name: "config".to_string(),
+                    mount_path: base.join("mount").to_string_lossy().to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            vec![Volume {
+                name: "config".to_string(),
+                config_map: Some(ConfigMapVolume {
+                    name: "app-config".to_string(),
+                }),
+                ..Default::default()
+            }],
+        );
+
+        let err = resolve_volumes(&pod, &ResolvedK8sValues::default()).unwrap_err();
+        assert!(err.contains("unresolved configMap"));
     }
 
     #[test]
@@ -279,7 +398,7 @@ mod tests {
             vec![],
         );
 
-        let result = resolve_volumes(&pod).unwrap();
+        let result = resolve_volumes(&pod, &ResolvedK8sValues::default()).unwrap();
         assert!(result.containers.is_empty());
     }
 }

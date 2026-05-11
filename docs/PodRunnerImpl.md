@@ -246,10 +246,12 @@ Success responses return the requested object directly. Errors return `{ "error"
              |
 2. Preparation
        Rewrite paths to physical filesystem locations.
-       Resolve environment variables from secrets/configmaps.
+       Resolve environment variables and configmap-volume data from
+       secrets/configmaps.
        Create container working directories.
        Copy image directory templates.
-       Set up volume mounts (emptyDir dirs, hostPath symlinks).
+       Set up volume mounts (emptyDir dirs, hostPath symlinks, configMap
+       per-key files).
              |
 3. Init Container Phase
        Run init containers sequentially in declaration order.
@@ -307,10 +309,33 @@ relative to this directory.
 
 ### Volume Mounts
 
-| Type       | Behavior                                                       |
-|------------|----------------------------------------------------------------|
-| `emptyDir` | Creates an empty directory at the mount path                   |
-| `hostPath` | Creates a symlink from the mount path to the host directory    |
+| Type        | Behavior                                                                  |
+|-------------|---------------------------------------------------------------------------|
+| `emptyDir`  | Creates an empty directory at the mount path                              |
+| `hostPath`  | Creates a symlink from the mount path to the host directory               |
+| `configMap` | Creates a directory at the mount path; one file per key (key=name, value=contents). ConfigMap data is fetched once during pod preparation via the configured `ConfigMapResolver`. |
+
+**ConfigMap volumes — whole-configmap mounts only.** kminus only supports
+mounting a configmap as a full directory: every key in the configmap becomes a
+file in the mounted directory. `configMap.items` (per-key selection) and
+`volumeMount.subPath` (per-file mounting) are **not** supported.
+
+**ConfigMaps are not refreshed at runtime.** Unlike Kubernetes — where the
+kubelet re-syncs mounted configmap volumes when the underlying configmap
+changes — kminus resolves the configmap exactly once via the
+`ConfigMapResolver` during pod preparation and materialises the resulting
+files before the container starts. There is no watcher, no re-resolution, and
+no on-disk refresh; subsequent edits to the configmap (file backend or
+apiserver) are not propagated to running pods. The pod must be recreated to
+pick up new values. The same one-shot resolution applies to env-referenced
+configmaps (`configMapKeyRef` / `configMapRef`) and to secrets.
+
+The recommended convention is to mount configmaps at
+`/configmaps/<configmap-name>`, which gives a predictable location for both
+spec authors and the processes reading the files. This is a convention, not
+an enforced constraint — the mount path is taken verbatim from
+`volumeMount.mountPath` and rewritten under the container root during
+preparation.
 
 ### Environment Variable Resolution
 
@@ -485,8 +510,9 @@ Both stores are updated on every state change.
 | Container images         | Local directory templates only. No registry pulls.                |
 | Resource requests/limits | Stored and echoed; not enforced.                                  |
 | Namespaces               | Accepted for lookup; no isolation.                                |
-| Volumes                  | hostPath (Directory) and emptyDir only. No PVCs.                  |
-| Secrets/ConfigMaps       | Environment variables only. No file-mount support.                |
+| Volumes                  | hostPath (Directory), emptyDir, and configMap. No PVCs.           |
+| Secrets                  | Environment variables only. No file-mount support.                |
+| ConfigMaps               | Environment variables, plus whole-configmap volume mounts (one file per key). No `items` or `subPath`. |
 | Probes                   | exec, httpGet, tcpSocket. No gRPC.                                |
 | Restart policies         | Never, OnFailure. No Always (except for sidecar init containers). |
 | Networking               | Host network only. No pod networking or service mesh.             |
