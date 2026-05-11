@@ -45,6 +45,7 @@ async fn main() {
         AppendCount::new(max_files - 1),
         ContentLimit::Bytes(max_size),
         Compression::None,
+        #[cfg(unix)]
         None,
     );
     // Wrap in a Mutex so tracing's MakeWriter can clone a guard per
