@@ -17,13 +17,6 @@ extend = [
     { path = "./mods/pod-runner/make/fragments/tasks/test_rs.toml", relative = "git" },
     { path = "./mods/pod-runner/make/fragments/tasks/itest_rs.toml", relative = "git" },
 
-    # itest needs the Go binaries (control-plane, virtual-kubelet)
-    # alongside pod-runner; bring in their build tasks plus the assembly
-    # copy step so `cargo make itest` works without manual binary plumbing.
-    { path = "./mods/control-plane/make/fragments/tasks/build_go.toml", relative = "git" },
-    { path = "./mods/virtual-kubelet/make/fragments/tasks/build_go.toml", relative = "git" },
-    { path = "./make/fragments/tasks/assembly.toml", relative = "git" },
-
     { path = "./make/fragments/hooks/banner.toml", relative = "git" },
     { path = "./make/fragments/hooks/start.toml", relative = "git" },
     { path = "./make/fragments/hooks/stop.toml", relative = "git" },

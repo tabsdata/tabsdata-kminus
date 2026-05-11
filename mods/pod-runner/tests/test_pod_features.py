@@ -113,16 +113,11 @@ class TestMounts:
 class TestSecrets:
     """Pod that resolves secret values via env valueFrom and envFrom."""
 
-    def test_secrets_resolve(
-        self, pod_runner_with_resolvers, mtls_client_with_resolvers,
-    ):
+    def test_secrets_resolve(self, pod_runner, mtls_client):
         pod = load_pod_def("secrets")
-        name, ns = submit_pod(
-            mtls_client_with_resolvers, pod_runner_with_resolvers, pod,
-        )
+        name, ns = submit_pod(mtls_client, pod_runner, pod)
         data = wait_for_pod_phase(
-            mtls_client_with_resolvers, pod_runner_with_resolvers, ns, name,
-            {"Succeeded"}, timeout=15,
+            mtls_client, pod_runner, ns, name, {"Succeeded"}, timeout=15,
         )
         assert data["phase"] == "Succeeded"
 
@@ -130,16 +125,11 @@ class TestSecrets:
 class TestConfigMaps:
     """Pod that resolves configmap values via env valueFrom and envFrom."""
 
-    def test_configmaps_resolve(
-        self, pod_runner_with_resolvers, mtls_client_with_resolvers,
-    ):
+    def test_configmaps_resolve(self, pod_runner, mtls_client):
         pod = load_pod_def("configmaps")
-        name, ns = submit_pod(
-            mtls_client_with_resolvers, pod_runner_with_resolvers, pod,
-        )
+        name, ns = submit_pod(mtls_client, pod_runner, pod)
         data = wait_for_pod_phase(
-            mtls_client_with_resolvers, pod_runner_with_resolvers, ns, name,
-            {"Succeeded"}, timeout=15,
+            mtls_client, pod_runner, ns, name, {"Succeeded"}, timeout=15,
         )
         assert data["phase"] == "Succeeded"
 
@@ -147,16 +137,11 @@ class TestConfigMaps:
 class TestConfigMapVolume:
     """Pod that mounts a configmap as a volume (one file per key)."""
 
-    def test_configmap_volume_files_present(
-        self, pod_runner_with_resolvers, mtls_client_with_resolvers,
-    ):
+    def test_configmap_volume_files_present(self, pod_runner, mtls_client):
         pod = load_pod_def("configmap-volume")
-        name, ns = submit_pod(
-            mtls_client_with_resolvers, pod_runner_with_resolvers, pod,
-        )
+        name, ns = submit_pod(mtls_client, pod_runner, pod)
         data = wait_for_pod_phase(
-            mtls_client_with_resolvers, pod_runner_with_resolvers, ns, name,
-            {"Succeeded"}, timeout=15,
+            mtls_client, pod_runner, ns, name, {"Succeeded"}, timeout=15,
         )
         # The pod's command `cat`s two files written from the configmap; if
         # they aren't created the container exits non-zero and Failed.

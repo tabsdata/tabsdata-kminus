@@ -2,6 +2,18 @@
 # Copyright 2026 Tabsdata Inc.
 #
 
+"""Fixtures for the pod-runner integration tests.
+
+These tests exercise the pod-runner HTTP API in isolation, with no
+control-plane or virtual-kubelet around it. The pod_runner fixture
+pre-writes a prsysconfig.yaml that points the SecretResolver and
+ConfigMapResolver at file-based directories under tests/resources/, so
+no Kubernetes API server is needed.
+
+Tests that need the full kminus stack (control-plane + pod-runner +
+virtual-kubelet) live under mods/kminus/tests/.
+"""
+
 import base64
 import http.client
 import json
@@ -15,7 +27,7 @@ import uuid
 import pytest
 import yaml
 
-from itest_common import ControlPlaneProcess, find_free_port, get_session_timestamp
+from itest_common import find_free_port, get_session_timestamp
 from pod_runner_testlib import TARGET_DIR, make_test_dir
 
 
@@ -50,45 +62,11 @@ def bin_dir():
 
 
 @pytest.fixture(scope="session")
-def control_plane_bin(bin_dir):
-    path = os.path.join(bin_dir, "control-plane")
-    if not os.path.isfile(path):
-        pytest.skip(f"control-plane binary not found at {path}")
-    return path
-
-
-@pytest.fixture(scope="session")
-def virtual_kubelet_bin(bin_dir):
-    path = os.path.join(bin_dir, "virtual-kubelet")
-    if not os.path.isfile(path):
-        pytest.skip(f"virtual-kubelet binary not found at {path}")
-    return path
-
-
-@pytest.fixture(scope="session")
 def pod_runner_bin(bin_dir):
     path = os.path.join(bin_dir, "pod-runner")
     if not os.path.isfile(path):
         pytest.skip(f"pod-runner binary not found at {path}")
     return path
-
-
-# ---------------------------------------------------------------------------
-# Control-plane fixture (session-scoped)
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="session")
-def control_plane(control_plane_bin):
-    ts = get_session_timestamp()
-    work_dir = os.path.join(TARGET_DIR, f"testrun.{ts}", "_control_plane")
-    os.makedirs(work_dir, exist_ok=True)
-    api_port = find_free_port()
-    kcm_port = find_free_port()
-    cp = ControlPlaneProcess(control_plane_bin, work_dir, api_port, kcm_port)
-    cp.start()
-    yield cp
-    cp.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -99,12 +77,10 @@ def control_plane(control_plane_bin):
 class PodRunnerProcess:
     """Manages a pod-runner process for testing."""
 
-    def __init__(self, binary, work_dir, port, kubeconfig,
-                 metrics_port=0, extra_args=None):
+    def __init__(self, binary, work_dir, port, metrics_port=0, extra_args=None):
         self.binary = binary
         self.work_dir = work_dir
         self.port = port
-        self.kubeconfig = kubeconfig
         self.metrics_port = metrics_port
         self.extra_args = extra_args or []
         self.process = None
@@ -122,7 +98,9 @@ class PodRunnerProcess:
             "--configdir", configdir,
             "--workdir", workdir,
             "--logdir", logdir,
-            "--kubeconfig", self.kubeconfig,
+            # File resolvers don't need a kubeconfig but pod-runner CLI
+            # still accepts the flag; pass an empty path.
+            "--kubeconfig", "",
         ] + self.extra_args
 
         # Note the log file's pre-existing size so we only scan lines
@@ -132,19 +110,13 @@ class PodRunnerProcess:
         log_path = os.path.join(logdir, "pod-runner.log")
         last_pos = os.path.getsize(log_path) if os.path.isfile(log_path) else 0
 
-        # pod-runner writes its own log to <logdir>/pod-runner.log via
-        # the rotating file appender (no longer to stdout).
-        debug_path = os.path.join(logdir, "pr-stderr.log")
-        self.debug_path = debug_path
-        debug_fd = open(debug_path, "wb")
         # Force info-level logs so the "Server listening" startup line
         # we poll for below is emitted. cargo-make sets RUST_LOG=error
         # in output.env, which would otherwise suppress it.
         env = {**os.environ, "RUST_LOG": "info"}
         self.process = subprocess.Popen(
-            args, stdout=debug_fd, stderr=subprocess.STDOUT, env=env,
+            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
         )
-        debug_fd.close()
 
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -171,17 +143,9 @@ class PodRunnerProcess:
                 except OSError:
                     pass
             time.sleep(0.1)
-        debug_tail = ""
-        if os.path.isfile(self.debug_path):
-            try:
-                with open(self.debug_path) as f:
-                    debug_tail = f.read()[-2000:]
-            except OSError:
-                pass
         raise TimeoutError(
             f"pod-runner did not become ready within {timeout}s\n"
-            f"log: {log_path}\n"
-            f"stderr:\n{debug_tail}"
+            f"log: {log_path}"
         )
 
     def stop(self, timeout=15):
@@ -271,51 +235,13 @@ class MtlsClient:
 # ---------------------------------------------------------------------------
 # Pod-runner fixture (session-scoped)
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="session")
-def pod_runner(pod_runner_bin, control_plane):
-    ts = get_session_timestamp()
-    work_dir = os.path.join(TARGET_DIR, f"testrun.{ts}", "_pod_runner")
-    os.makedirs(work_dir, exist_ok=True)
-
-    port = find_free_port()
-    pr = PodRunnerProcess(
-        pod_runner_bin, work_dir, port,
-        kubeconfig=control_plane.kubeconfig,
-        metrics_port=0,
-    )
-    pr.start()
-    yield pr
-    pr.stop()
-
-
-@pytest.fixture(scope="session")
-def mtls_client(pod_runner):
-    return MtlsClient(pod_runner.vk_prconfig_path, pod_runner.work_dir)
-
-
-# ---------------------------------------------------------------------------
-# Pod-runner fixture with file-based secret/configmap resolvers
-# ---------------------------------------------------------------------------
 #
-# A separate pod-runner instance (different work_dir, different port) that
-# starts with a pre-written prsysconfig.yaml pointing the file resolvers at
-# tests/resources/secrets/ and tests/resources/configmaps/. Used by tests
-# that submit pod-defs which reference secret/configmap data.
+# The fixture pre-writes a prsysconfig.yaml that points the secret and
+# configmap resolvers at file-based directories under tests/resources/.
+# This lets the pod-runner start without a Kubernetes control-plane.
 
 
-@pytest.fixture(scope="session")
-def pod_runner_with_resolvers(pod_runner_bin, control_plane):
-    ts = get_session_timestamp()
-    work_dir = os.path.join(
-        TARGET_DIR, f"testrun.{ts}", "_pod_runner_resolvers"
-    )
-    os.makedirs(work_dir, exist_ok=True)
-
-    # Pre-write prsysconfig.yaml with file resolvers before pod-runner starts.
-    # Once present, pod-runner will read it instead of generating defaults.
-    configdir = os.path.join(work_dir, "config")
+def _write_file_resolver_prsysconfig(configdir):
     os.makedirs(configdir, exist_ok=True)
     prsysconfig = {
         "secretResolver": {
@@ -335,125 +261,25 @@ def pod_runner_with_resolvers(pod_runner_bin, control_plane):
     with open(os.path.join(configdir, "prsysconfig.yaml"), "w") as f:
         yaml.safe_dump(prsysconfig, f)
 
+
+@pytest.fixture(scope="session")
+def pod_runner(pod_runner_bin):
+    ts = get_session_timestamp()
+    work_dir = os.path.join(TARGET_DIR, f"testrun.{ts}", "_pod_runner")
+    os.makedirs(work_dir, exist_ok=True)
+
+    _write_file_resolver_prsysconfig(os.path.join(work_dir, "config"))
+
     port = find_free_port()
-    pr = PodRunnerProcess(
-        pod_runner_bin, work_dir, port,
-        kubeconfig=control_plane.kubeconfig,
-        metrics_port=0,
-    )
+    pr = PodRunnerProcess(pod_runner_bin, work_dir, port, metrics_port=0)
     pr.start()
     yield pr
     pr.stop()
 
 
 @pytest.fixture(scope="session")
-def mtls_client_with_resolvers(pod_runner_with_resolvers):
-    return MtlsClient(
-        pod_runner_with_resolvers.vk_prconfig_path,
-        pod_runner_with_resolvers.work_dir,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Virtual-kubelet (session-scoped, for job/cronjob tests)
-# ---------------------------------------------------------------------------
-
-
-class VirtualKubeletProcess:
-    def __init__(self, binary, kubeconfig, prconfig_path, work_dir, kubelet_port):
-        self.binary = binary
-        self.kubeconfig = kubeconfig
-        self.prconfig_path = prconfig_path
-        self.work_dir = work_dir
-        self.kubelet_port = kubelet_port
-        self.process = None
-
-    def start(self, timeout=30):
-        self.process = subprocess.Popen(
-            [self.binary, "--kubeconfig", self.kubeconfig,
-             "--prconfig", self.prconfig_path,
-             "--workdir", self.work_dir,
-             "--kubelet-port", str(self.kubelet_port)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        )
-        deadline = time.time() + timeout
-        output_lines = []
-        while time.time() < deadline:
-            line = self.process.stdout.readline()
-            if not line:
-                if self.process.poll() is not None:
-                    raise RuntimeError(
-                        f"virtual-kubelet exited: {self.process.returncode}\n"
-                        f"output: {''.join(l.decode() for l in output_lines)}"
-                    )
-                time.sleep(0.1)
-                continue
-            output_lines.append(line)
-            if b"VK PR Config" in line:
-                break
-
-        log_path = os.path.join(self.work_dir, "log", "virtual-kubelet.log")
-        while time.time() < deadline:
-            if self.process.poll() is not None:
-                lc = ""
-                if os.path.isfile(log_path):
-                    with open(log_path) as f:
-                        lc = f.read()
-                raise RuntimeError(f"virtual-kubelet exited: {self.process.returncode}\nlog: {lc}")
-            if os.path.isfile(log_path):
-                with open(log_path) as f:
-                    if "Starting pod controller" in f.read():
-                        time.sleep(3)
-                        return
-            time.sleep(0.5)
-        raise TimeoutError("virtual-kubelet did not start")
-
-    def stop(self, timeout=10):
-        if self.process is None:
-            return
-        self.process.send_signal(signal.SIGTERM)
-        try:
-            self.process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait(timeout=5)
-
-
-@pytest.fixture(scope="session")
-def virtual_kubelet(virtual_kubelet_bin, control_plane, pod_runner):
-    ts = get_session_timestamp()
-    work_dir = os.path.join(TARGET_DIR, f"testrun.{ts}", "_virtual_kubelet")
-    os.makedirs(work_dir, exist_ok=True)
-
-    vk = VirtualKubeletProcess(
-        virtual_kubelet_bin,
-        control_plane.vk_kubeconfig,
-        pod_runner.vk_prconfig_path,
-        work_dir,
-        kubelet_port=find_free_port(),
-    )
-    vk.start()
-    yield vk
-    vk.stop()
-
-
-# ---------------------------------------------------------------------------
-# Kubernetes client fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="session")
-def k8s_client(control_plane):
-    from kubernetes import client, config as k8s_config
-    k8s_config.load_kube_config(config_file=control_plane.kubeconfig)
-    return client.CoreV1Api()
-
-
-@pytest.fixture(scope="session")
-def batch_client(control_plane):
-    from kubernetes import client, config as k8s_config
-    k8s_config.load_kube_config(config_file=control_plane.kubeconfig)
-    return client.BatchV1Api()
+def mtls_client(pod_runner):
+    return MtlsClient(pod_runner.vk_prconfig_path, pod_runner.work_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -476,15 +302,6 @@ def load_pod_def(name, **replacements):
     pod_name = unique_name(name)
     pod["metadata"]["name"] = pod_name
     pod["metadata"]["uid"] = unique_name("uid")
-    return pod
-
-
-def load_job_def(name):
-    """Load a job definition YAML with unique name."""
-    path = os.path.join(RESOURCES_DIR, "job-def", f"{name}.yaml")
-    with open(path) as f:
-        pod = yaml.safe_load(f)
-    pod["metadata"]["name"] = unique_name(name)
     return pod
 
 

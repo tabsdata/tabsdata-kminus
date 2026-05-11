@@ -2,29 +2,34 @@
 # Copyright 2026 Tabsdata Inc.
 #
 
-"""Integration tests for K8s Jobs and CronJobs through the full stack.
+"""Integration tests for K8s Jobs and CronJobs through the full kminus stack.
 
-These tests bring up control-plane + virtual-kubelet + pod-runner and
-submit Jobs/CronJobs via the K8s API. The virtual-kubelet schedules pods
-to the pod-runner, which executes them as local processes.
+These tests bring up the whole stack (control-plane + virtual-kubelet +
+pod-runner) via the km orchestrator and submit Jobs/CronJobs through
+the K8s API. The kube-controller-manager creates pods, the
+virtual-kubelet schedules them onto the pod-runner node, and pod-runner
+executes them as native processes.
 """
 
 import time
+import uuid
 
-from conftest import unique_name
+
+def _unique_name(prefix):
+    return f"{prefix}-{uuid.uuid4().hex[:8]}"
 
 
 class TestJob:
     """K8s batch/v1 Job executed through virtual-kubelet → pod-runner."""
 
-    def test_job_completes(self, virtual_kubelet, k8s_client, batch_client):
+    def test_job_completes(self, km, batch_client):
         """A simple Job should complete successfully."""
         from kubernetes.client import (
             V1Job, V1JobSpec, V1PodTemplateSpec, V1PodSpec,
             V1Container, V1ObjectMeta, V1Toleration,
         )
 
-        name = unique_name("job")
+        name = _unique_name("job")
         job = V1Job(
             metadata=V1ObjectMeta(name=name, namespace="default"),
             spec=V1JobSpec(
@@ -54,7 +59,6 @@ class TestJob:
 
         batch_client.create_namespaced_job(namespace="default", body=job)
 
-        # Wait for job to complete
         deadline = time.time() + 60
         while time.time() < deadline:
             j = batch_client.read_namespaced_job(name=name, namespace="default")
@@ -67,7 +71,6 @@ class TestJob:
         j = batch_client.read_namespaced_job(name=name, namespace="default")
         assert j.status.succeeded >= 1
 
-        # Cleanup
         batch_client.delete_namespaced_job(
             name=name, namespace="default",
             propagation_policy="Background",
@@ -77,7 +80,7 @@ class TestJob:
 class TestCronJob:
     """K8s batch/v1 CronJob creates pods via virtual-kubelet → pod-runner."""
 
-    def test_cronjob_creates_jobs(self, virtual_kubelet, k8s_client, batch_client):
+    def test_cronjob_creates_jobs(self, km, batch_client):
         """A CronJob should create at least one Job within its schedule."""
         from kubernetes.client import (
             V1CronJob, V1CronJobSpec, V1JobTemplateSpec, V1JobSpec,
@@ -85,7 +88,7 @@ class TestCronJob:
             V1Toleration,
         )
 
-        name = unique_name("cron")
+        name = _unique_name("cron")
         cron = V1CronJob(
             metadata=V1ObjectMeta(name=name, namespace="default"),
             spec=V1CronJobSpec(
@@ -120,13 +123,12 @@ class TestCronJob:
 
         batch_client.create_namespaced_cron_job(namespace="default", body=cron)
 
-        # Wait for at least one child Job to be created (up to 90s for cron)
         deadline = time.time() + 90
         found = False
         while time.time() < deadline:
             jobs = batch_client.list_namespaced_job(
                 namespace="default",
-                label_selector=f"batch.kubernetes.io/controller-uid",
+                label_selector="batch.kubernetes.io/controller-uid",
             )
             cron_jobs = [j for j in jobs.items if j.metadata.name.startswith(name)]
             if cron_jobs:
@@ -136,7 +138,6 @@ class TestCronJob:
 
         assert found, f"CronJob {name} did not create any Jobs within 90s"
 
-        # Cleanup
         batch_client.delete_namespaced_cron_job(
             name=name, namespace="default",
             propagation_policy="Background",

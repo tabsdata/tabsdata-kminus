@@ -135,3 +135,37 @@ class KminusProcess:
     @property
     def kubeconfig(self):
         return os.path.join(self.work_dir, "config", "kubeconfig.yaml")
+
+
+# ---------------------------------------------------------------------------
+# Session-scoped km fixture for tests that don't need their own restart cycle.
+# Tests that exercise restart behavior should still construct their own
+# KminusProcess via the `km_bin` and `test_dir` fixtures.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def _km_session_dir(tmp_path_factory):
+    return str(tmp_path_factory.mktemp("kminus-session"))
+
+
+@pytest.fixture(scope="session")
+def km(km_bin, _km_session_dir):
+    proc = KminusProcess(km_bin, _km_session_dir)
+    proc.start()
+    yield proc
+    proc.stop()
+
+
+@pytest.fixture(scope="session")
+def k8s_client(km):
+    from kubernetes import client, config as k8s_config
+    k8s_config.load_kube_config(config_file=km.kubeconfig)
+    return client.CoreV1Api()
+
+
+@pytest.fixture(scope="session")
+def batch_client(km):
+    from kubernetes import client, config as k8s_config
+    k8s_config.load_kube_config(config_file=km.kubeconfig)
+    return client.BatchV1Api()
