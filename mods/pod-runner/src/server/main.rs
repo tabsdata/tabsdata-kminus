@@ -145,7 +145,7 @@ async fn main() {
     let server_config = pod_runner::server::tls::build_server_config(&pr_config)
         .expect("Failed to build TLS config");
     let shutdown = Box::pin(async move {
-        tokio::signal::ctrl_c().await.ok();
+        wait_for_shutdown_signal().await;
         info!("Shutting down...");
         let _ = shutdown_tx.send(());
     });
@@ -159,4 +159,52 @@ async fn main() {
     let wait_timeout = std::time::Duration::from_secs(grace_secs * 2 + 10);
     state.logic.wait_for_pods(wait_timeout).await;
     info!("Server stopped");
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut sigquit = signal(SignalKind::quit()).expect("install SIGQUIT handler");
+    tokio::select! {
+        _ = sigint.recv() => {
+            info!("Received SIGINT (Ctrl+C). Initiating graceful stop...");
+        }
+        _ = sigterm.recv() => {
+            info!("Received SIGTERM. Initiating graceful stop...");
+        }
+        _ = sigquit.recv() => {
+            info!("Received SIGQUIT. Initiating forceful stop...");
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::windows::{
+        ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown,
+    };
+    let mut ctrlc = ctrl_c().expect("install Ctrl+C handler");
+    let mut ctrlbreak = ctrl_break().expect("install Ctrl+Break handler");
+    let mut ctrlclose = ctrl_close().expect("install Ctrl+Close handler");
+    let mut ctrllogoff = ctrl_logoff().expect("install Ctrl+Logoff handler");
+    let mut ctrlshutdown = ctrl_shutdown().expect("install Ctrl+Shutdown handler");
+    tokio::select! {
+        _ = ctrlc.recv() => {
+            info!("Received Ctrl+C. Initiating graceful stop...");
+        }
+        _ = ctrlbreak.recv() => {
+            info!("Received Ctrl+Break. Initiating graceful stop...");
+        }
+        _ = ctrlclose.recv() => {
+            info!("Received Ctrl+Close. Initiating graceful stop...");
+        }
+        _ = ctrllogoff.recv() => {
+            info!("Received Ctrl+Logoff. Initiating graceful stop...");
+        }
+        _ = ctrlshutdown.recv() => {
+            info!("Received Ctrl+Shutdown. Initiating graceful stop...");
+        }
+    }
 }

@@ -252,13 +252,18 @@ impl PodLogic {
 
     /// Wait for all running pod monitor tasks to complete.
     ///
-    /// Call after sending the shutdown signal. Polls until all runtimes
-    /// have drained (monitors finish cleanup, write sentinels, archive).
+    /// Call after sending the shutdown signal. Polls until every active
+    /// monitor has finished (cleanup, sentinels, archive). Naturally
+    /// completed pods keep their runtime entry so logs stay accessible
+    /// — those have `_monitor.is_finished()` and don't block shutdown.
     /// Times out after `timeout` to avoid hanging on stuck pods.
     pub async fn wait_for_pods(&self, timeout: Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let count = self.runtimes.read().unwrap().len();
+            let count = self.runtimes.read().unwrap()
+                .values()
+                .filter(|r| !r._monitor.is_finished())
+                .count();
             if count == 0 {
                 info!("All pod monitors completed");
                 return;
