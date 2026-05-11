@@ -8,13 +8,21 @@ category = "04 - Test"
 description = "Task 'itest' for virtual-kubelet project"
 dependencies = [
     "__km__build_go_virtual_kubelet",
+    # The virtual-kubelet integration tests spin up control-plane
+    # alongside virtual-kubelet; build it and stage both binaries in
+    # target/dist via __km__assembly_root.
+    "__km__build_go_control_plane",
+    "__km__assembly_root",
 ]
 cwd = "${KM_ROOT}/mods/virtual-kubelet/src/itest"
 script_runner = "@duckscript"
 script = '''
     km_root = get_env KM_ROOT
     test_folder = get_env KM_TEST_FOLDER
-    bin_folder = concat ${km_root} "/mods/virtual-kubelet/target"
+
+    # __km__assembly_root collects every binary the integration tests
+    # need (virtual-kubelet, control-plane) into target/dist.
+    bin_folder = concat ${km_root} "/target/dist"
 
     target_subfolder = pwd
     target_subfolder = concat ${target_subfolder} "/bin"

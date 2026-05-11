@@ -134,9 +134,17 @@ class PodRunnerProcess:
 
         # pod-runner writes its own log to <logdir>/pod-runner.log via
         # the rotating file appender (no longer to stdout).
+        debug_path = os.path.join(logdir, "pr-stderr.log")
+        self.debug_path = debug_path
+        debug_fd = open(debug_path, "wb")
+        # Force info-level logs so the "Server listening" startup line
+        # we poll for below is emitted. cargo-make sets RUST_LOG=error
+        # in output.env, which would otherwise suppress it.
+        env = {**os.environ, "RUST_LOG": "info"}
         self.process = subprocess.Popen(
-            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            args, stdout=debug_fd, stderr=subprocess.STDOUT, env=env,
         )
+        debug_fd.close()
 
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -163,9 +171,17 @@ class PodRunnerProcess:
                 except OSError:
                     pass
             time.sleep(0.1)
+        debug_tail = ""
+        if os.path.isfile(self.debug_path):
+            try:
+                with open(self.debug_path) as f:
+                    debug_tail = f.read()[-2000:]
+            except OSError:
+                pass
         raise TimeoutError(
             f"pod-runner did not become ready within {timeout}s\n"
-            f"log: {log_path}"
+            f"log: {log_path}\n"
+            f"stderr:\n{debug_tail}"
         )
 
     def stop(self, timeout=15):

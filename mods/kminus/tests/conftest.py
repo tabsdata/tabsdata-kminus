@@ -39,15 +39,36 @@ class KminusProcess:
 
     def __init__(self, binary, work_dir):
         self.binary = binary
-        self.work_dir = work_dir
+        # km create requires the workdir not to exist, but pytest's
+        # test_dir fixture has already created `work_dir`. Use a
+        # subdirectory as the actual kminus instance folder.
+        self.work_dir = os.path.join(work_dir, "km")
         self.process = None
 
+    def _ensure_created(self):
+        """Run `km create` if the instance has not been initialized yet."""
+        sysconfig = os.path.join(
+            self.work_dir, "config", "kmsysconfig.yaml"
+        )
+        if os.path.isfile(sysconfig):
+            return
+        # Use --portstart 0 so km picks random free ports at every start.
+        subprocess.run(
+            [
+                self.binary, "create",
+                "--workdir", self.work_dir,
+                "--portstart", "0",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
     def start(self, timeout=90):
-        # Use --portstart 0 so km picks random free ports.
+        self._ensure_created()
         args = [
-            self.binary,
+            self.binary, "start",
             "--workdir", self.work_dir,
-            "--portstart", "0",
         ]
 
         # Note the log file's pre-existing size so we only scan lines
@@ -60,10 +81,15 @@ class KminusProcess:
 
         # km writes its own log to <workdir>/log/km.log via the rotating
         # file appender (no longer to stdout).
+        # Force info-level logs so the "K- ready" startup line we poll
+        # for below is emitted. cargo-make sets RUST_LOG=error in
+        # output.env, which would otherwise suppress it.
+        env = {**os.environ, "RUST_LOG": "info"}
         self.process = subprocess.Popen(
             args,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=env,
         )
 
         deadline = time.time() + timeout

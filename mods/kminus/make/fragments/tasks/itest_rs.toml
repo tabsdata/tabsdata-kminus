@@ -8,19 +8,25 @@ category = "04 - Test"
 description = "Task 'itest' for kminus project"
 dependencies = [
     "__km__build_rs_kminus",
+    # The kminus integration tests spawn the full stack (control-plane,
+    # pod-runner, virtual-kubelet, plus K8s helpers) via the km
+    # orchestrator; build them and stage every binary in target/dist
+    # via __km__assembly_root so km can resolve siblings.
+    "__km__build_rs_pod_runner",
+    "__km__build_go_control_plane",
+    "__km__build_go_virtual_kubelet",
+    "__km__assembly_root",
 ]
 cwd = "${KM_ROOT}/mods/kminus/tests"
 script_runner = "@duckscript"
 script = '''
     km_root = get_env KM_ROOT
     test_folder = get_env KM_TEST_FOLDER
-    profile = get_env profile
 
-    build_folder = set ${profile}
-    if eq ${profile} "dev"
-        build_folder = set "debug"
-    end
-    bin_folder = concat ${km_root} "/mods/kminus/target/" ${build_folder}
+    # __km__assembly_root collects every binary the integration tests
+    # need (km, pod-runner, control-plane, virtual-kubelet, kmc, etcd,
+    # kube-apiserver, kube-controller-manager) into target/dist.
+    bin_folder = concat ${km_root} "/target/dist"
 
     itest_folder = concat ${km_root} "/mods/kminus/tests"
     if is_dir ${itest_folder}

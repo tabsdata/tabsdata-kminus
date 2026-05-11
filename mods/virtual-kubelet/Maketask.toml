@@ -17,6 +17,12 @@ extend = [
     { path = "./mods/virtual-kubelet/make/fragments/tasks/test_go.toml", relative = "git" },
     { path = "./mods/virtual-kubelet/make/fragments/tasks/itest_go.toml", relative = "git" },
 
+    # itest needs control-plane alongside virtual-kubelet; bring in its
+    # build task plus the assembly copy step so `cargo make itest` works
+    # without manual binary plumbing.
+    { path = "./mods/control-plane/make/fragments/tasks/build_go.toml", relative = "git" },
+    { path = "./make/fragments/tasks/assembly.toml", relative = "git" },
+
     { path = "./make/fragments/hooks/banner.toml", relative = "git" },
     { path = "./make/fragments/hooks/start.toml", relative = "git" },
     { path = "./make/fragments/hooks/stop.toml", relative = "git" },

@@ -9,7 +9,10 @@ description = "Task 'itest' for kcommon project"
 dependencies = [
     "__km__build_rs_kcommon",
 ]
-cwd = "${KM_ROOT}/mods/kcommon/tests"
+# Use the module root rather than `tests/` — kcommon has no `tests/`
+# directory yet and cargo-make would fail to chdir before the script
+# could run the existence check below.
+cwd = "${KM_ROOT}/mods/kcommon"
 script_runner = "@duckscript"
 script = '''
     km_root = get_env KM_ROOT
