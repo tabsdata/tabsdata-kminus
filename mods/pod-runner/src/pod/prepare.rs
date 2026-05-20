@@ -64,7 +64,7 @@ enum ImageKind {
 /// the root (the container `image` is used verbatim).
 pub async fn prepare_pod(
     spec: &PodSpec,
-    pod_dir: &str,
+    pod_dir: &Path,
     namespace: &str,
     resolvers: &ResolverSet,
     images_dir: &Path,
@@ -89,7 +89,7 @@ pub async fn prepare_pod(
 /// - `volumeMount.mountPath` values are prefixed with the container root.
 ///
 /// Adds the `pr.tabsdata.com/prepared` annotation.
-pub fn rewrite_pod_paths(pod: &PodSpec, pod_dir: &str) -> Result<PodSpec, String> {
+pub fn rewrite_pod_paths(pod: &PodSpec, pod_dir: &Path) -> Result<PodSpec, String> {
     if is_prepared(pod) {
         return Err(
             "Pod has already been prepared (pr.tabsdata.com/prepared annotation is set)"
@@ -100,7 +100,7 @@ pub fn rewrite_pod_paths(pod: &PodSpec, pod_dir: &str) -> Result<PodSpec, String
     let mut prepared = pod.clone();
 
     for c in prepared.spec.all_containers_mut() {
-        let container_root = Path::new(pod_dir).join("work").join(&c.name);
+        let container_root = pod_dir.join("work").join(&c.name);
         let container_root_str = container_root.to_string_lossy();
 
         if c.working_dir.is_empty() {
@@ -304,7 +304,7 @@ fn substitute_dollar(s: &str, env: &HashMap<String, String>) -> String {
 ///   that does not exist as a directory).
 pub fn create_container_dirs(
     spec: &PodSpec,
-    pod_dir: &str,
+    pod_dir: &Path,
     images_dir: &Path,
 ) -> Result<(), String> {
     for c in spec.spec.all_containers() {
@@ -321,7 +321,7 @@ pub fn create_container_dirs(
         // Populate from image (directory copy or archive extract)
         if !c.image.is_empty() && c.image != IMAGE_SKIP {
             let src = resolve_image_path(&c.image, images_dir);
-            let dest = Path::new(pod_dir).join("work").join(&c.name);
+            let dest = pod_dir.join("work").join(&c.name);
             let kind = image_kind(&src);
 
             match kind {
@@ -498,7 +498,7 @@ mod tests {
             vec![make_container("app", "/usr/src/app", vec![])],
             vec![],
         );
-        let prepared = rewrite_pod_paths(&pod, "/data/pods/mypod").unwrap();
+        let prepared = rewrite_pod_paths(&pod, Path::new("/data/pods/mypod")).unwrap();
         assert_eq!(
             prepared.spec.containers[0].working_dir,
             "/data/pods/mypod/work/app/usr/src/app"
@@ -508,7 +508,7 @@ mod tests {
     #[test]
     fn empty_working_dir_defaults_to_container_root() {
         let pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
-        let prepared = rewrite_pod_paths(&pod, "/data/pods/mypod").unwrap();
+        let prepared = rewrite_pod_paths(&pod, Path::new("/data/pods/mypod")).unwrap();
         assert_eq!(
             prepared.spec.containers[0].working_dir,
             "/data/pods/mypod/work/app"
@@ -525,7 +525,7 @@ mod tests {
             )],
             vec![],
         );
-        let prepared = rewrite_pod_paths(&pod, "/pods/p1").unwrap();
+        let prepared = rewrite_pod_paths(&pod, Path::new("/pods/p1")).unwrap();
         assert_eq!(
             prepared.spec.containers[0].volume_mounts[0].mount_path,
             "/pods/p1/work/app/mnt/data"
@@ -542,7 +542,7 @@ mod tests {
             vec![make_container("app", "/app", vec![])],
             vec![make_container("init", "/setup", vec![])],
         );
-        let prepared = rewrite_pod_paths(&pod, "/pods/p1").unwrap();
+        let prepared = rewrite_pod_paths(&pod, Path::new("/pods/p1")).unwrap();
         assert_eq!(
             prepared.spec.init_containers[0].working_dir,
             "/pods/p1/work/init/setup"
@@ -552,7 +552,7 @@ mod tests {
     #[test]
     fn adds_prepared_annotation() {
         let pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
-        let prepared = rewrite_pod_paths(&pod, "/pods/p1").unwrap();
+        let prepared = rewrite_pod_paths(&pod, Path::new("/pods/p1")).unwrap();
         assert!(is_prepared(&prepared));
         assert!(!is_prepared(&pod));
     }
@@ -560,15 +560,15 @@ mod tests {
     #[test]
     fn double_prepare_fails() {
         let pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
-        let prepared = rewrite_pod_paths(&pod, "/pods/p1").unwrap();
-        let result = rewrite_pod_paths(&prepared, "/pods/p1");
+        let prepared = rewrite_pod_paths(&pod, Path::new("/pods/p1")).unwrap();
+        let result = rewrite_pod_paths(&prepared, Path::new("/pods/p1"));
         assert!(result.is_err());
     }
 
     #[test]
     fn does_not_modify_original() {
         let pod = make_pod(vec![make_container("app", "/app", vec![])], vec![]);
-        let _ = rewrite_pod_paths(&pod, "/pods/p1").unwrap();
+        let _ = rewrite_pod_paths(&pod, Path::new("/pods/p1")).unwrap();
         assert_eq!(pod.spec.containers[0].working_dir, "/app");
         assert!(!is_prepared(&pod));
     }
@@ -582,7 +582,7 @@ mod tests {
             ],
             vec![],
         );
-        let prepared = rewrite_pod_paths(&pod, "/pods/p1").unwrap();
+        let prepared = rewrite_pod_paths(&pod, Path::new("/pods/p1")).unwrap();
         assert_eq!(
             prepared.spec.containers[0].working_dir,
             "/pods/p1/work/web/var/www"
@@ -599,9 +599,9 @@ mod tests {
     fn creates_working_dirs() {
         let dir = temp_dir("create-dirs");
         let pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
-        let prepared = rewrite_pod_paths(&pod, &dir.to_string_lossy()).unwrap();
+        let prepared = rewrite_pod_paths(&pod, &dir).unwrap();
 
-        create_container_dirs(&prepared, &dir.to_string_lossy(), Path::new("")).unwrap();
+        create_container_dirs(&prepared, &dir, Path::new("")).unwrap();
         assert!(dir.join("work/app").is_dir());
     }
 
@@ -617,8 +617,8 @@ mod tests {
         let mut pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
         pod.spec.containers[0].image = image_dir.to_string_lossy().to_string();
 
-        let prepared = rewrite_pod_paths(&pod, &dir.to_string_lossy()).unwrap();
-        create_container_dirs(&prepared, &dir.to_string_lossy(), Path::new("")).unwrap();
+        let prepared = rewrite_pod_paths(&pod, &dir).unwrap();
+        create_container_dirs(&prepared, &dir, Path::new("")).unwrap();
 
         let work = dir.join("work/app");
         assert!(work.join("app.conf").exists());
@@ -632,8 +632,8 @@ mod tests {
         let mut pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
         pod.spec.containers[0].image = "/dev/null".to_string();
 
-        let prepared = rewrite_pod_paths(&pod, &dir.to_string_lossy()).unwrap();
-        create_container_dirs(&prepared, &dir.to_string_lossy(), Path::new("")).unwrap();
+        let prepared = rewrite_pod_paths(&pod, &dir).unwrap();
+        create_container_dirs(&prepared, &dir, Path::new("")).unwrap();
         // Should not error, just create the working dir
         assert!(dir.join("work/app").is_dir());
     }
@@ -672,8 +672,8 @@ mod tests {
         let mut pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
         pod.spec.containers[0].image = archive_path.to_string_lossy().to_string();
 
-        let prepared = rewrite_pod_paths(&pod, &dir.to_string_lossy()).unwrap();
-        create_container_dirs(&prepared, &dir.to_string_lossy(), Path::new("")).unwrap();
+        let prepared = rewrite_pod_paths(&pod, &dir).unwrap();
+        create_container_dirs(&prepared, &dir, Path::new("")).unwrap();
 
         let work = dir.join("work/app");
         assert_eq!(
@@ -709,8 +709,8 @@ mod tests {
         let mut pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
         pod.spec.containers[0].image = archive_path.to_string_lossy().to_string();
 
-        let prepared = rewrite_pod_paths(&pod, &dir.to_string_lossy()).unwrap();
-        create_container_dirs(&prepared, &dir.to_string_lossy(), Path::new("")).unwrap();
+        let prepared = rewrite_pod_paths(&pod, &dir).unwrap();
+        create_container_dirs(&prepared, &dir, Path::new("")).unwrap();
 
         assert_eq!(
             fs::read_to_string(dir.join("work/app/greet.txt")).unwrap(),
@@ -729,8 +729,8 @@ mod tests {
         let mut pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
         pod.spec.containers[0].image = "my-app".to_string();
 
-        let prepared = rewrite_pod_paths(&pod, &dir.to_string_lossy()).unwrap();
-        create_container_dirs(&prepared, &dir.to_string_lossy(), &images_dir).unwrap();
+        let prepared = rewrite_pod_paths(&pod, &dir).unwrap();
+        create_container_dirs(&prepared, &dir, &images_dir).unwrap();
 
         assert_eq!(
             fs::read_to_string(dir.join("work/app/payload.txt")).unwrap(),
@@ -750,8 +750,8 @@ mod tests {
         let mut pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
         pod.spec.containers[0].image = abs_image.to_string_lossy().to_string();
 
-        let prepared = rewrite_pod_paths(&pod, &dir.to_string_lossy()).unwrap();
-        create_container_dirs(&prepared, &dir.to_string_lossy(), &images_dir).unwrap();
+        let prepared = rewrite_pod_paths(&pod, &dir).unwrap();
+        create_container_dirs(&prepared, &dir, &images_dir).unwrap();
 
         assert_eq!(
             fs::read_to_string(dir.join("work/app/abs.txt")).unwrap(),
@@ -765,8 +765,8 @@ mod tests {
         let mut pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
         pod.spec.containers[0].image = dir.join("does-not-exist").to_string_lossy().to_string();
 
-        let prepared = rewrite_pod_paths(&pod, &dir.to_string_lossy()).unwrap();
-        let result = create_container_dirs(&prepared, &dir.to_string_lossy(), Path::new(""));
+        let prepared = rewrite_pod_paths(&pod, &dir).unwrap();
+        let result = create_container_dirs(&prepared, &dir, Path::new(""));
         let err = result.unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
     }
@@ -777,8 +777,8 @@ mod tests {
         let mut pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
         pod.spec.containers[0].image = dir.join("missing.tgz").to_string_lossy().to_string();
 
-        let prepared = rewrite_pod_paths(&pod, &dir.to_string_lossy()).unwrap();
-        let result = create_container_dirs(&prepared, &dir.to_string_lossy(), Path::new(""));
+        let prepared = rewrite_pod_paths(&pod, &dir).unwrap();
+        let result = create_container_dirs(&prepared, &dir, Path::new(""));
         let err = result.unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
     }
@@ -883,7 +883,7 @@ mod tests {
 
         let prepared = prepare_pod(
             &pod,
-            &dir.to_string_lossy(),
+            &dir,
             "default",
             &ResolverSet::default(),
             Path::new(""),
@@ -931,7 +931,7 @@ mod tests {
 
         let prepared = prepare_pod(
             &pod,
-            &dir.to_string_lossy(),
+            &dir,
             "default",
             &resolvers,
             Path::new(""),
@@ -1313,7 +1313,7 @@ mod tests {
 
         let prepared = prepare_pod(
             &pod,
-            &dir.to_string_lossy(),
+            &dir,
             "default",
             &ResolverSet::default(),
             Path::new(""),

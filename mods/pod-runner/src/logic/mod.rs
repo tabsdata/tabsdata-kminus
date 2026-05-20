@@ -317,7 +317,7 @@ impl PodLogic {
         let pod_work_dir = self.executor_provider.work_dir(&id);
         let prepared = prepare_pod(
             &original_spec,
-            &pod_work_dir.to_string_lossy(),
+            &pod_work_dir,
             &id.namespace,
             &self.resolvers,
             &self.config.images_dir,

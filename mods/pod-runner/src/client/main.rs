@@ -3,7 +3,7 @@
 //! `kpr` — HTTP client CLI for a running Pod Runner server.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -212,7 +212,7 @@ fn build_client(config: &Option<VKPRConfig>) -> Result<reqwest::Client, String> 
         } else {
             // Add server CA certificate
             let ca_bytes = resolve_cert_bytes(
-                &config.server.tls.certificate_authority,
+                Path::new(&config.server.tls.certificate_authority),
                 &config.server.tls.certificate_authority_data,
             )
             .map_err(|e| format!("Server CA: {e}"))?;
@@ -227,13 +227,13 @@ fn build_client(config: &Option<VKPRConfig>) -> Result<reqwest::Client, String> 
         // Client certificate for mTLS
         if let Some(client_cfg) = config.client.as_ref() {
             let cert_bytes = resolve_cert_bytes(
-                &client_cfg.certificate,
+                Path::new(&client_cfg.certificate),
                 &client_cfg.certificate_data,
             )
             .map_err(|e| format!("Client cert: {e}"))?;
 
             let key_bytes = resolve_cert_bytes(
-                &client_cfg.certificate_key,
+                Path::new(&client_cfg.certificate_key),
                 &client_cfg.certificate_key_data,
             )
             .map_err(|e| format!("Client key: {e}"))?;

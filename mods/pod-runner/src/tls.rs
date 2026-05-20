@@ -10,6 +10,8 @@
 //! standalone [`resolve_cert_bytes`] function are provided for cases
 //! where a full [`CertSource`] is not available (e.g. client config).
 
+use std::path::Path;
+
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tracing::debug;
 
@@ -120,10 +122,10 @@ impl ServerTlsConfig {
 /// Priority: file path > inline base64 data. Returns `None` if neither is set.
 /// Used by the client config where fields are separate strings rather than
 /// a [`CertSource`].
-pub fn resolve_cert_bytes(file_path: &str, data_b64: &str) -> Result<Option<Vec<u8>>, String> {
-    if !file_path.is_empty() {
+pub fn resolve_cert_bytes(file_path: &Path, data_b64: &str) -> Result<Option<Vec<u8>>, String> {
+    if !file_path.as_os_str().is_empty() {
         let bytes = std::fs::read(file_path)
-            .map_err(|e| format!("Failed to read {file_path}: {e}"))?;
+            .map_err(|e| format!("Failed to read {}: {e}", file_path.display()))?;
         return Ok(Some(bytes));
     }
     if !data_b64.is_empty() {
@@ -274,7 +276,7 @@ mod tests {
         ));
         std::fs::write(&tmp, b"PEM DATA").unwrap();
 
-        let bytes = resolve_cert_bytes(tmp.to_str().unwrap(), "").unwrap();
+        let bytes = resolve_cert_bytes(&tmp, "").unwrap();
         assert_eq!(bytes.unwrap(), b"PEM DATA");
 
         let _ = std::fs::remove_file(&tmp);
@@ -284,13 +286,13 @@ mod tests {
     fn resolve_cert_bytes_from_base64() {
         use base64::Engine;
         let encoded = base64::engine::general_purpose::STANDARD.encode(b"PEM DATA");
-        let bytes = resolve_cert_bytes("", &encoded).unwrap();
+        let bytes = resolve_cert_bytes(Path::new(""), &encoded).unwrap();
         assert_eq!(bytes.unwrap(), b"PEM DATA");
     }
 
     #[test]
     fn resolve_cert_bytes_neither_returns_none() {
-        let bytes = resolve_cert_bytes("", "").unwrap();
+        let bytes = resolve_cert_bytes(Path::new(""), "").unwrap();
         assert!(bytes.is_none());
     }
 
@@ -301,7 +303,7 @@ mod tests {
         ));
         std::fs::write(&tmp, b"FROM FILE").unwrap();
 
-        let bytes = resolve_cert_bytes(tmp.to_str().unwrap(), "base64ignored").unwrap();
+        let bytes = resolve_cert_bytes(&tmp, "base64ignored").unwrap();
         assert_eq!(bytes.unwrap(), b"FROM FILE");
 
         let _ = std::fs::remove_file(&tmp);
@@ -309,13 +311,13 @@ mod tests {
 
     #[test]
     fn resolve_cert_bytes_bad_file_returns_error() {
-        let result = resolve_cert_bytes("/no/such/file.pem", "");
+        let result = resolve_cert_bytes(Path::new("/no/such/file.pem"), "");
         assert!(result.is_err());
     }
 
     #[test]
     fn resolve_cert_bytes_bad_base64_returns_error() {
-        let result = resolve_cert_bytes("", "not-valid-base64!!!");
+        let result = resolve_cert_bytes(Path::new(""), "not-valid-base64!!!");
         assert!(result.is_err());
     }
 

@@ -37,7 +37,7 @@
 //!
 //! All actions are wrapped in a timeout (`timeout_seconds`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -139,7 +139,7 @@ pub(crate) fn spawn_probe_tasks(
         }
 
         let container_name = container.name.clone();
-        let working_dir = container.working_dir.clone();
+        let working_dir = PathBuf::from(&container.working_dir);
         let action_tx = action_tx.clone();
         let event_tx = event_tx.clone();
         let state = Arc::clone(&state);
@@ -182,7 +182,7 @@ pub(crate) fn spawn_probe_tasks(
 /// processes are explicitly killed.
 async fn run_container_probes(
     container_name: &str,
-    working_dir: &str,
+    working_dir: &Path,
     probes: &[(String, Probe)],
     action_tx: &tokio::sync::mpsc::Sender<ProbeAction>,
     event_tx: &tokio::sync::mpsc::Sender<PodEvent>,
@@ -426,7 +426,7 @@ async fn run_container_probes(
 async fn execute_probe_interruptible(
     probe: &Probe,
     container_name: &str,
-    working_dir: &str,
+    working_dir: &Path,
     probe_type: &str,
     log_dir: Option<&std::path::Path>,
     timeout: Duration,
@@ -481,7 +481,7 @@ async fn execute_network_probe(probe: &Probe, timeout: Duration) -> bool {
 async fn execute_exec_probe_interruptible(
     command: &[String],
     container_name: &str,
-    working_dir: &str,
+    working_dir: &Path,
     probe_type: &str,
     log_dir: Option<&std::path::Path>,
     timeout: Duration,
@@ -497,7 +497,7 @@ async fn execute_exec_probe_interruptible(
     if command.len() > 1 {
         builder = builder.args(&command[1..]);
     }
-    if !working_dir.is_empty() {
+    if !working_dir.as_os_str().is_empty() {
         builder = builder.work_dir(working_dir);
     }
 
@@ -919,7 +919,7 @@ mod tests {
 
         let result = execute_exec_probe_interruptible(
             &["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
-            "c", "", PROBE_LIVENESS, None,
+            "c", Path::new(""), PROBE_LIVENESS, None,
             Duration::from_secs(5),
             &mut shutdown_rx, &mut stop_rx,
         ).await;
@@ -934,7 +934,7 @@ mod tests {
 
         let result = execute_exec_probe_interruptible(
             &["sh".to_string(), "-c".to_string(), "exit 1".to_string()],
-            "c", "", PROBE_LIVENESS, None,
+            "c", Path::new(""), PROBE_LIVENESS, None,
             Duration::from_secs(5),
             &mut shutdown_rx, &mut stop_rx,
         ).await;
@@ -948,7 +948,7 @@ mod tests {
         let (_st_tx, mut stop_rx) = stop_pair();
 
         let result = execute_exec_probe_interruptible(
-            &[], "c", "", PROBE_LIVENESS, None,
+            &[], "c", Path::new(""), PROBE_LIVENESS, None,
             Duration::from_secs(1),
             &mut shutdown_rx, &mut stop_rx,
         ).await;
@@ -964,7 +964,7 @@ mod tests {
         // A command that doesn't exist anywhere in PATH or at the given path.
         let result = execute_exec_probe_interruptible(
             &["/no/such/binary-xyz-12345".to_string()],
-            "c", "", PROBE_LIVENESS, None,
+            "c", Path::new(""), PROBE_LIVENESS, None,
             Duration::from_secs(1),
             &mut shutdown_rx, &mut stop_rx,
         ).await;
@@ -980,7 +980,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let result = execute_exec_probe_interruptible(
             &["sh".to_string(), "-c".to_string(), "sleep 10".to_string()],
-            "c", "", PROBE_LIVENESS, None,
+            "c", Path::new(""), PROBE_LIVENESS, None,
             Duration::from_millis(200),
             &mut shutdown_rx, &mut stop_rx,
         ).await;
@@ -1004,7 +1004,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let result = execute_exec_probe_interruptible(
             &["sh".to_string(), "-c".to_string(), "sleep 10".to_string()],
-            "c", "", PROBE_LIVENESS, None,
+            "c", Path::new(""), PROBE_LIVENESS, None,
             Duration::from_secs(30),
             &mut shutdown_rx, &mut stop_rx,
         ).await;
@@ -1028,7 +1028,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let result = execute_exec_probe_interruptible(
             &["sh".to_string(), "-c".to_string(), "sleep 10".to_string()],
-            "c", "", PROBE_LIVENESS, None,
+            "c", Path::new(""), PROBE_LIVENESS, None,
             Duration::from_secs(30),
             &mut shutdown_rx, &mut stop_rx,
         ).await;
@@ -1053,7 +1053,7 @@ mod tests {
             ..Default::default()
         };
         let result = execute_probe_interruptible(
-            &probe, "c", "", PROBE_READINESS, None,
+            &probe, "c", Path::new(""), PROBE_READINESS, None,
             Duration::from_secs(5),
             &mut shutdown_rx, &mut stop_rx,
         ).await;
@@ -1076,7 +1076,7 @@ mod tests {
             ..Default::default()
         };
         let result = execute_probe_interruptible(
-            &probe, "c", "", PROBE_READINESS, None,
+            &probe, "c", Path::new(""), PROBE_READINESS, None,
             Duration::from_secs(1),
             &mut shutdown_rx, &mut stop_rx,
         ).await;
@@ -1105,7 +1105,7 @@ mod tests {
         };
         let start = tokio::time::Instant::now();
         let result = execute_probe_interruptible(
-            &probe, "c", "", PROBE_READINESS, None,
+            &probe, "c", Path::new(""), PROBE_READINESS, None,
             Duration::from_secs(30),
             &mut shutdown_rx, &mut stop_rx,
         ).await;
@@ -1134,7 +1134,7 @@ mod tests {
         };
         let start = tokio::time::Instant::now();
         let result = execute_probe_interruptible(
-            &probe, "c", "", PROBE_READINESS, None,
+            &probe, "c", Path::new(""), PROBE_READINESS, None,
             Duration::from_secs(30),
             &mut shutdown_rx, &mut stop_rx,
         ).await;
@@ -1151,7 +1151,7 @@ mod tests {
 
         let probe = Probe::default(); // no exec, http, or tcp
         let result = execute_probe_interruptible(
-            &probe, "c", "", PROBE_READINESS, None,
+            &probe, "c", Path::new(""), PROBE_READINESS, None,
             Duration::from_secs(1),
             &mut shutdown_rx, &mut stop_rx,
         ).await;
