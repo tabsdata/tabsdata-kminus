@@ -577,13 +577,11 @@ impl OutputRedirector for MergedOutput {
         self: Box<Self>,
         stdout: Option<tokio::process::ChildStdout>,
         stderr: Option<tokio::process::ChildStderr>,
-        mut shutdown: watch::Receiver<()>,
+        shutdown: watch::Receiver<()>,
     ) -> JoinHandle<()> {
         let config = self.config;
 
         tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-
             let mut writer = match config.open() {
                 Ok(w) => w,
                 Err(e) => {
@@ -592,58 +590,92 @@ impl OutputRedirector for MergedOutput {
                 }
             };
 
-            let mut stdout_reader = stdout.map(BufReader::new);
-            let mut stderr_reader = stderr.map(BufReader::new);
-            let mut stdout_buf = String::new();
-            let mut stderr_buf = String::new();
-            let mut stdout_done = stdout_reader.is_none();
-            let mut stderr_done = stderr_reader.is_none();
+            // One pump task per child stream funnels tagged lines through
+            // an mpsc channel to a single writer loop. `read_line` is
+            // *not* cancel-safe, so it must never share a `select!` with
+            // another `read_line` — racing two reads would silently drop
+            // partial data on the losing branch.
+            let (tx, mut rx) =
+                tokio::sync::mpsc::channel::<(LogStream, String)>(256);
 
-            while !stdout_done || !stderr_done {
-                tokio::select! {
-                    result = async {
-                        match stdout_reader.as_mut() {
-                            Some(r) => r.read_line(&mut stdout_buf).await,
-                            None => std::future::pending().await,
-                        }
-                    }, if !stdout_done => {
-                        match result {
-                            Ok(0) | Err(_) => stdout_done = true,
-                            Ok(_) => {
-                                if let Err(e) = writer.write_line(stdout_buf.as_bytes(), LogStream::Stdout) {
-                                    warn!("Error writing stdout: {}", e);
-                                    break;
-                                }
-                                stdout_buf.clear();
-                            }
-                        }
-                    }
-                    result = async {
-                        match stderr_reader.as_mut() {
-                            Some(r) => r.read_line(&mut stderr_buf).await,
-                            None => std::future::pending().await,
-                        }
-                    }, if !stderr_done => {
-                        match result {
-                            Ok(0) | Err(_) => stderr_done = true,
-                            Ok(_) => {
-                                if let Err(e) = writer.write_line(stderr_buf.as_bytes(), LogStream::Stderr) {
-                                    warn!("Error writing stderr: {}", e);
-                                    break;
-                                }
-                                stderr_buf.clear();
-                            }
-                        }
-                    }
-                    _ = shutdown.changed() => {
-                        debug!("MergedOutput pump received shutdown signal");
-                        break;
-                    }
+            let stdout_pump = spawn_merged_pump(
+                "stdout",
+                LogStream::Stdout,
+                stdout,
+                tx.clone(),
+                shutdown.clone(),
+            );
+            let stderr_pump = spawn_merged_pump(
+                "stderr",
+                LogStream::Stderr,
+                stderr,
+                tx,
+                shutdown,
+            );
+
+            while let Some((stream, line)) = rx.recv().await {
+                if let Err(e) = writer.write_line(line.as_bytes(), stream) {
+                    warn!("Error writing {}: {}", stream.as_str(), e);
+                    break;
                 }
             }
+
+            // Dropping `rx` (loop exit) signals pumps to stop if they
+            // haven't already; await them to keep this task's lifetime
+            // covering the whole pipeline.
+            drop(rx);
+            let _ = stdout_pump.await;
+            let _ = stderr_pump.await;
+
             let _ = writer.flush();
         })
     }
+}
+
+/// Pump one child stream's lines onto a shared mpsc channel.
+///
+/// `read_line` is only ever raced against `shutdown.changed()` (which
+/// *is* cancel-safe), so partial reads can't be lost the way they would
+/// be if two `read_line`s raced each other in a `select!`.
+fn spawn_merged_pump(
+    label: &'static str,
+    log_stream: LogStream,
+    stream: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>,
+    tx: tokio::sync::mpsc::Sender<(LogStream, String)>,
+    mut shutdown: watch::Receiver<()>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let stream = match stream {
+            Some(s) => s,
+            None => return,
+        };
+
+        let mut reader = BufReader::new(stream);
+        let mut buf = String::new();
+
+        loop {
+            tokio::select! {
+                result = reader.read_line(&mut buf) => {
+                    match result {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            let line = std::mem::take(&mut buf);
+                            if tx.send((log_stream, line)).await.is_err() {
+                                // Writer task is gone; nothing left to do.
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ = shutdown.changed() => {
+                    debug!("{} pump received shutdown signal", label);
+                    break;
+                }
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1760,6 +1792,53 @@ mod tests {
         let content = fs::read_to_string(&out).unwrap();
         assert!(content.contains("out_line"), "missing stdout: {}", content);
         assert!(content.contains("err_line"), "missing stderr: {}", content);
+    }
+
+    // Regression: with both streams producing heavy interleaved output,
+    // earlier versions raced two `read_line` futures in a `tokio::select!`.
+    // `read_line` is not cancel-safe, so the losing branch silently lost
+    // bytes on every line.
+    //
+    // Each line is written as two halves with the *other* stream's write
+    // in between (`printf` is unbuffered for fd != tty). That forces
+    // multi-poll `read_line` calls and gives the select! a chance to
+    // cancel a partially-completed read.
+    #[tokio::test]
+    async fn test_merged_output_no_data_loss_under_interleaved_load() {
+        let dir = test_dir!();
+        let out = dir.join("merged.log");
+
+        const N: usize = 2000;
+        let script = format!(
+            "i=1; while [ $i -le {n} ]; do \
+                printf 'OUT_%d_' $i; \
+                printf 'ERR_%d_part1_' $i >&2; \
+                printf 'tail\\n'; \
+                printf 'tail\\n' >&2; \
+                i=$((i+1)); \
+             done",
+            n = N
+        );
+
+        let mut handle = ProcessExecutor::new("sh")
+            .args(["-c", &script])
+            .output(MergedOutput::new(FileStream::new(&out)))
+            .spawn(shutdown())
+            .await
+            .unwrap();
+
+        assert_eq!(handle.wait().await.unwrap(), 0);
+        let content = fs::read_to_string(&out).unwrap();
+        for i in 1..=N {
+            assert!(
+                content.contains(&format!("OUT_{}_tail\n", i)),
+                "missing OUT_{} (data loss?)", i
+            );
+            assert!(
+                content.contains(&format!("ERR_{}_part1_tail\n", i)),
+                "missing ERR_{} (data loss?)", i
+            );
+        }
     }
 
     // -- MergedOutput + RollingFileStream ------------------------------------
