@@ -10,7 +10,7 @@
 #
 # Note: the pod runner rewrites the absolute mount path to
 # <container_root>/<mountPath> during preparation, so the command uses
-# $PR_POD_ROOT to access the resolved location.
+# $KM_CONTAINER_ROOT to access the resolved location.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -24,7 +24,7 @@ spec:
     - name: app
       image: /dev/null
       command: ["sh", "-c"]
-      args: ["cat $PR_POD_ROOT/configmaps/db-config/host && cat $PR_POD_ROOT/configmaps/db-config/port"]
+      args: ["cat $KM_CONTAINER_ROOT/configmaps/db-config/host && cat $KM_CONTAINER_ROOT/configmaps/db-config/port"]
       volumeMounts:
         - name: config
           mountPath: /configmaps/db-config

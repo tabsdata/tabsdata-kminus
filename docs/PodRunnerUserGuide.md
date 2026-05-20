@@ -90,17 +90,31 @@ containers:
 Each container runs in its own working directory at `<pod_dir>/work/<container-name>/`. The image directory
 template is copied here. All file references in the container should be **relative** to this directory.
 
-If you need an absolute path at runtime, use the `PR_POD_ROOT` environment variable:
+If you need an absolute path at runtime, use the `KM_CONTAINER_ROOT` environment variable:
 
 ```yaml
 env:
   - name: CONFIG_PATH
-    value: "$(PR_POD_ROOT)/config/app.yaml"
+    value: "$(KM_CONTAINER_ROOT)/config/app.yaml"
 ```
 
-`PR_POD_ROOT` is set by the pod runner to the container's physical working directory. In a real K8s cluster (where
-`PR_POD_ROOT` is not set), it resolves to an empty string, making the path `/config/app.yaml` -- the standard
-container path.
+`KM_CONTAINER_ROOT` is set by the pod runner to the container's physical working directory
+(`<pod_dir>/work/<container-name>/`). Each container in the pod gets its own value.
+
+The pod runner performs K8s-style `$(VAR)` substitution on env values, `command`, and `args`
+during pod preparation, matching the kubelet's expansion semantics:
+
+- `$(VAR)` is replaced with the value of `VAR`; `$$` escapes a literal `$`.
+- `$(VAR)` referencing an undefined variable is left as a literal (e.g. `$(UNKNOWN)`).
+- **Declaration order matters** for individual `env` entries: a value can only reference
+  `envFrom` values, `KM_CONTAINER_ROOT`, or `env` entries declared *earlier* in the list.
+  Forward references (e.g. `B=$(A)` before `A=val`) are left as the literal `$(A)`.
+- `envFrom`-derived values (loaded from Secrets / ConfigMaps) are NOT substituted; they are
+  passed to the container verbatim.
+- `command` and `args` are substituted using the full container env after all entries are
+  processed.
+
+Substitution runs before (and in addition to) the container shell's own `$VAR` expansion.
 
 ### Init Containers
 

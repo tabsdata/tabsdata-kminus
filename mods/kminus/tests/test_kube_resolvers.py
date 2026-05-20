@@ -275,11 +275,11 @@ class TestConfigMapVolumeMount:
             job_name = _unique_name("cm-vol-job")
             # pod-runner rewrites absolute mountPath values under the
             # container root, so the container reads the files via the
-            # injected $PR_POD_ROOT env var rather than the K8s-style
+            # injected $KM_CONTAINER_ROOT env var rather than the K8s-style
             # absolute path.
             check = (
-                f"[ \"$(cat $PR_POD_ROOT{mount_path}/app.conf)\" = \"setting=value\" ] && "
-                f"[ \"$(cat $PR_POD_ROOT{mount_path}/log.yaml)\" = \"level: info\" ]"
+                f"[ \"$(cat $KM_CONTAINER_ROOT{mount_path}/app.conf)\" = \"setting=value\" ] && "
+                f"[ \"$(cat $KM_CONTAINER_ROOT{mount_path}/log.yaml)\" = \"level: info\" ]"
             )
             job = _job_body(
                 job_name,

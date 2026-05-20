@@ -27,7 +27,7 @@ spec:
     - name: main
       image: /dev/null
       command: ["sh", "-c"]
-      args: ["echo \"MSG=$MSG\" && echo 'main wrote' > $PR_POD_ROOT/mounts/scratch/main.txt && sleep 2 && echo 'main done'"]
+      args: ["echo \"MSG=$MSG\" && echo 'main wrote' > $KM_CONTAINER_ROOT/mounts/scratch/main.txt && sleep 2 && echo 'main done'"]
       env:
         - name: MSG
           value: kitchen-sink-test

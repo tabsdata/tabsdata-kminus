@@ -1,0 +1,39 @@
+# Pod that exercises KM_CONTAINER_ROOT auto-injection and chained K8s-style
+# $(VAR) substitution.
+#
+# pod-runner injects KM_CONTAINER_ROOT into every container with the
+# container's physical working directory. The pod-runner preparation
+# pipeline then performs K8s-style $(VAR) substitution on env values,
+# command, and args. This pod:
+#   - defines ROOT=$(KM_CONTAINER_ROOT) in the env block (substituted at
+#     prep time to the absolute container working directory);
+#   - uses $(ROOT) in another env value and in args (also substituted);
+#   - asserts that the substituted shell vars resolve to the expected paths
+#     and writes a marker file.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: container-root
+  namespace: default
+
+spec:
+  nodeName: virtual-node
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: /dev/null
+      env:
+        - name: ROOT
+          value: $(KM_CONTAINER_ROOT)
+        - name: MARKER
+          value: $(ROOT)/marker.txt
+      command: ["sh", "-c"]
+      args:
+        - |
+          set -e
+          [ -n "$ROOT" ] || { echo "ROOT unset"; exit 1; }
+          [ -d "$ROOT" ] || { echo "ROOT not a dir: $ROOT"; exit 2; }
+          [ "$MARKER" = "$ROOT/marker.txt" ] || { echo "MARKER mismatch: $MARKER"; exit 3; }
+          echo "container-root-marker" > "$(ROOT)/marker.txt"
+          [ -f "$MARKER" ] || { echo "marker not written: $MARKER"; exit 4; }
+          echo "OK"

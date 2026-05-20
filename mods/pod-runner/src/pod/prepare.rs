@@ -15,6 +15,7 @@
 //!
 //! [`prepare_pod`] runs all four steps in order and returns the running spec.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -27,8 +28,8 @@ use crate::spec::pod::{EnvVar, PodSpec};
 
 /// Environment variable injected into every container with the container's
 /// working directory. Allows shell scripts to reference paths relative to
-/// the pod root without hardcoding absolute paths.
-const ENV_PR_POD_ROOT: &str = "PR_POD_ROOT";
+/// the container working directory without hardcoding absolute paths.
+const ENV_KM_CONTAINER_ROOT: &str = "KM_CONTAINER_ROOT";
 
 /// Annotation key added to metadata to indicate the pod has been prepared.
 const PREPARED_ANNOTATION: &str = "pr.tabsdata.com/prepared";
@@ -52,8 +53,7 @@ pub async fn prepare_pod(
 ) -> Result<PodSpec, String> {
     let mut prepared = rewrite_pod_paths(spec, pod_dir)?;
     let resolved = resolve_k8s_values(&prepared, namespace, resolvers).await?;
-    apply_resolved_envs(&mut prepared, &resolved);
-    inject_pr_pod_root(&mut prepared);
+    apply_envs_and_substitute(&mut prepared, &resolved);
     create_container_dirs(&prepared, pod_dir)?;
     setup_volumes(&prepared, &resolved)?;
     Ok(prepared)
@@ -128,41 +128,139 @@ pub async fn resolve_pod_k8s_values(
     resolve_k8s_values(spec, namespace, resolvers).await
 }
 
-/// Apply resolved environment variables to the spec, replacing
-/// `valueFrom` references with literal values.
-pub fn apply_resolved_envs(spec: &mut PodSpec, resolved: &ResolvedK8sValues) {
+/// Apply resolved env values to the spec, inject `KM_CONTAINER_ROOT`, and
+/// perform K8s-style `$(VAR)` substitution.
+///
+/// Implements the kubelet's expansion semantics
+/// (`k8s.io/.../third_party/forked/golang/expansion`):
+///
+/// - `envFrom`-derived entries are loaded literally; their values are NOT
+///   subject to `$(VAR)` substitution.
+/// - Individual `env` entries are processed in declaration order. Each
+///   value is substituted using only variables defined *earlier*
+///   (`envFrom` entries + `KM_CONTAINER_ROOT` + previously-declared
+///   individual entries).
+/// - `command` and `args` are substituted using the full env map after
+///   all entries are processed.
+/// - Substitution rules: `$(VAR)` → value when defined; `$$` → `$`;
+///   `$(UNDEFINED)` and unclosed `$(VAR` are left literal.
+///
+/// `KM_CONTAINER_ROOT` is pod-runner specific (not a K8s feature) and is
+/// treated as if it were an `envFrom` entry: visible to all individual env
+/// substitutions. A user-defined `KM_CONTAINER_ROOT` entry is dropped.
+pub fn apply_envs_and_substitute(spec: &mut PodSpec, resolved: &ResolvedK8sValues) {
     for c in spec.spec.all_containers_mut() {
+        let individual_names: HashSet<String> =
+            c.env.iter().map(|e| e.name.clone()).collect();
+
+        let mut new_env: Vec<EnvVar> = Vec::new();
+        let mut available: HashMap<String, String> = HashMap::new();
+
+        // 1. KM_CONTAINER_ROOT (auto-injected, treated like an envFrom entry).
+        if !c.working_dir.is_empty() {
+            available.insert(ENV_KM_CONTAINER_ROOT.to_string(), c.working_dir.clone());
+            new_env.push(EnvVar {
+                name: ENV_KM_CONTAINER_ROOT.to_string(),
+                value: Some(c.working_dir.clone()),
+                value_from: None,
+            });
+        }
+
         if let Some(ce) = resolved.containers.get(&c.name) {
-            c.env = ce
-                .env
-                .iter()
-                .map(|(k, v)| EnvVar {
+            // 2. envFrom-derived entries (in ce.env but not in original individual env).
+            //    Loaded literally — NOT subject to $(VAR) substitution.
+            for (k, v) in &ce.env {
+                if individual_names.contains(k) || k == ENV_KM_CONTAINER_ROOT {
+                    continue;
+                }
+                available.insert(k.clone(), v.clone());
+                new_env.push(EnvVar {
                     name: k.clone(),
                     value: Some(v.clone()),
                     value_from: None,
-                })
-                .collect();
-            c.env_from.clear();
+                });
+            }
+
+            // 3. Individual env entries in declaration order. Substitute $(VAR)
+            //    using only vars defined earlier.
+            for ev in &c.env {
+                if ev.name == ENV_KM_CONTAINER_ROOT {
+                    continue;
+                }
+                let Some(raw_v) = ce.env.get(&ev.name) else {
+                    continue;
+                };
+                let substituted = substitute_dollar(raw_v, &available);
+                available.insert(ev.name.clone(), substituted.clone());
+                new_env.push(EnvVar {
+                    name: ev.name.clone(),
+                    value: Some(substituted),
+                    value_from: None,
+                });
+            }
+        }
+
+        c.env = new_env;
+        c.env_from.clear();
+
+        // 4. Substitute command/args using the full env map.
+        for s in &mut c.command {
+            *s = substitute_dollar(s, &available);
+        }
+        for s in &mut c.args {
+            *s = substitute_dollar(s, &available);
         }
     }
 }
 
-/// Inject `PR_POD_ROOT` env var into every container, set to that
-/// container's `working_dir`. This lets shell scripts reference pod-relative
-/// paths without hardcoding absolute paths.
-fn inject_pr_pod_root(spec: &mut PodSpec) {
-    for c in spec.spec.all_containers_mut() {
-        if c.working_dir.is_empty() {
+/// K8s-style single-pass `$(VAR)` substitution.
+///
+/// Rules: `$(VAR)` → `env[VAR]` when defined, else left literal; `$$` → `$`;
+/// unclosed `$(VAR` left literal; bare `$X` left as-is. The string between
+/// `(` and `)` is used verbatim as the lookup key (no identifier-format
+/// validation, matching kubelet behavior).
+fn substitute_dollar(s: &str, env: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            out.push(bytes[i] as char);
+            i += 1;
             continue;
         }
-        // Remove any existing PR_POD_ROOT (shouldn't happen, but be safe)
-        c.env.retain(|e| e.name != ENV_PR_POD_ROOT);
-        c.env.push(EnvVar {
-            name: ENV_PR_POD_ROOT.to_string(),
-            value: Some(c.working_dir.clone()),
-            value_from: None,
-        });
+        if i + 1 >= bytes.len() {
+            out.push('$');
+            i += 1;
+            continue;
+        }
+        match bytes[i + 1] {
+            b'$' => {
+                out.push('$');
+                i += 2;
+            }
+            b'(' => {
+                if let Some(rel_end) = bytes[i + 2..].iter().position(|&b| b == b')') {
+                    let end = i + 2 + rel_end;
+                    let name = &s[i + 2..end];
+                    if let Some(val) = env.get(name) {
+                        out.push_str(val);
+                    } else {
+                        out.push_str(&s[i..=end]);
+                    }
+                    i = end + 1;
+                } else {
+                    out.push('$');
+                    i += 1;
+                }
+            }
+            _ => {
+                out.push('$');
+                i += 1;
+            }
+        }
     }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -581,47 +679,55 @@ mod tests {
         );
     }
 
-    // -- inject_pr_pod_root --
+    // -- apply_envs_and_substitute --
 
-    #[test]
-    fn inject_pr_pod_root_sets_env() {
-        let mut spec = make_pod(
-            vec![
-                Container {
-                    name: "app".to_string(),
-                    working_dir: "/work/app".to_string(),
-                    ..Default::default()
+    use crate::pod::resolver::k8s_values::{ContainerEnv, ResolvedK8sValues};
+
+    fn resolved_for(name: &str, env: Vec<(&str, &str)>) -> ResolvedK8sValues {
+        ResolvedK8sValues {
+            config_map_volumes: HashMap::new(),
+            containers: [(
+                name.to_string(),
+                ContainerEnv {
+                    name: name.to_string(),
+                    env: env
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                    secret_keys: HashSet::new(),
                 },
-                Container {
-                    name: "sidecar".to_string(),
-                    working_dir: "/work/sidecar".to_string(),
-                    ..Default::default()
-                },
-            ],
-            vec![],
-        );
+            )]
+            .into_iter()
+            .collect(),
+        }
+    }
 
-        inject_pr_pod_root(&mut spec);
-
-        let app_env: Vec<_> = spec.spec.containers[0]
-            .env
-            .iter()
-            .filter(|e| e.name == ENV_PR_POD_ROOT)
-            .collect();
-        assert_eq!(app_env.len(), 1);
-        assert_eq!(app_env[0].value.as_deref(), Some("/work/app"));
-
-        let sidecar_env: Vec<_> = spec.spec.containers[1]
-            .env
-            .iter()
-            .filter(|e| e.name == ENV_PR_POD_ROOT)
-            .collect();
-        assert_eq!(sidecar_env.len(), 1);
-        assert_eq!(sidecar_env[0].value.as_deref(), Some("/work/sidecar"));
+    fn env_to_map(env: &[EnvVar]) -> HashMap<&str, &str> {
+        env.iter()
+            .map(|e| (e.name.as_str(), e.value.as_deref().unwrap()))
+            .collect()
     }
 
     #[test]
-    fn inject_pr_pod_root_skips_empty_working_dir() {
+    fn injects_km_container_root_from_working_dir() {
+        let mut spec = make_pod(
+            vec![Container {
+                name: "app".to_string(),
+                working_dir: "/work/app".to_string(),
+                ..Default::default()
+            }],
+            vec![],
+        );
+        let resolved = resolved_for("app", vec![]);
+
+        apply_envs_and_substitute(&mut spec, &resolved);
+
+        let map = env_to_map(&spec.spec.containers[0].env);
+        assert_eq!(map[ENV_KM_CONTAINER_ROOT], "/work/app");
+    }
+
+    #[test]
+    fn skips_km_container_root_when_working_dir_empty() {
         let mut spec = make_pod(
             vec![Container {
                 name: "app".to_string(),
@@ -630,51 +736,48 @@ mod tests {
             }],
             vec![],
         );
+        let resolved = resolved_for("app", vec![]);
 
-        inject_pr_pod_root(&mut spec);
+        apply_envs_and_substitute(&mut spec, &resolved);
 
         assert!(
             spec.spec.containers[0]
                 .env
                 .iter()
-                .all(|e| e.name != ENV_PR_POD_ROOT),
-            "PR_POD_ROOT should not be set when working_dir is empty"
+                .all(|e| e.name != ENV_KM_CONTAINER_ROOT),
         );
     }
-
-    #[tokio::test]
-    async fn full_pipeline_injects_pr_pod_root() {
-        let dir = temp_dir("pr-pod-root");
-        let pod = make_pod(vec![make_container("app", "/app", vec![])], vec![]);
-
-        let prepared = prepare_pod(
-            &pod,
-            &dir.to_string_lossy(),
-            "default",
-            &ResolverSet::default(),
-        )
-        .await
-        .unwrap();
-
-        let pr_root: Vec<_> = prepared.spec.containers[0]
-            .env
-            .iter()
-            .filter(|e| e.name == ENV_PR_POD_ROOT)
-            .collect();
-        assert_eq!(pr_root.len(), 1);
-        assert_eq!(
-            pr_root[0].value.as_deref().unwrap(),
-            prepared.spec.containers[0].working_dir,
-        );
-    }
-
-    // -- apply_resolved_envs --
 
     #[test]
-    fn apply_resolved_envs_replaces_refs() {
-        use crate::pod::resolver::k8s_values::{ContainerEnv, ResolvedK8sValues};
-        use std::collections::{HashMap, HashSet};
+    fn user_cannot_override_km_container_root() {
+        let mut spec = make_pod(
+            vec![Container {
+                name: "app".to_string(),
+                working_dir: "/work/app".to_string(),
+                env: vec![EnvVar {
+                    name: ENV_KM_CONTAINER_ROOT.to_string(),
+                    value: Some("/bogus".to_string()),
+                    value_from: None,
+                }],
+                ..Default::default()
+            }],
+            vec![],
+        );
+        let resolved = resolved_for("app", vec![(ENV_KM_CONTAINER_ROOT, "/bogus")]);
 
+        apply_envs_and_substitute(&mut spec, &resolved);
+
+        let entries: Vec<_> = spec.spec.containers[0]
+            .env
+            .iter()
+            .filter(|e| e.name == ENV_KM_CONTAINER_ROOT)
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].value.as_deref(), Some("/work/app"));
+    }
+
+    #[test]
+    fn resolves_value_from_refs_into_literal() {
         let mut spec = make_pod(
             vec![Container {
                 name: "app".to_string(),
@@ -699,39 +802,258 @@ mod tests {
             }],
             vec![],
         );
+        let resolved = resolved_for(
+            "app",
+            vec![("FROM_REF", "resolved-value"), ("BULK_KEY", "bulk-value")],
+        );
 
-        let resolved = ResolvedK8sValues {
-            config_map_volumes: HashMap::new(),
-            containers: [(
-                "app".to_string(),
-                ContainerEnv {
-                    name: "app".to_string(),
-                    env: [
-                        ("FROM_REF".to_string(), "resolved-value".to_string()),
-                        ("BULK_KEY".to_string(), "bulk-value".to_string()),
-                    ]
-                    .into_iter()
-                    .collect(),
-                    secret_keys: HashSet::new(),
-                },
-            )]
-            .into_iter()
-            .collect(),
-        };
+        apply_envs_and_substitute(&mut spec, &resolved);
 
-        apply_resolved_envs(&mut spec, &resolved);
-
-        // env_from should be cleared
+        let map = env_to_map(&spec.spec.containers[0].env);
         assert!(spec.spec.containers[0].env_from.is_empty());
-        // env should have literal values only (no value_from)
-        let env = &spec.spec.containers[0].env;
-        assert_eq!(env.len(), 2);
-        assert!(env.iter().all(|e| e.value.is_some() && e.value_from.is_none()));
-        let env_map: HashMap<&str, &str> = env
+        assert_eq!(map["FROM_REF"], "resolved-value");
+        assert_eq!(map["BULK_KEY"], "bulk-value");
+        assert!(
+            spec.spec.containers[0]
+                .env
+                .iter()
+                .all(|e| e.value.is_some() && e.value_from.is_none())
+        );
+    }
+
+    #[test]
+    fn k8s_order_resolves_only_earlier_env_entries() {
+        // Per K8s expansion semantics, B=$(A) declared BEFORE A=val
+        // must leave B as the literal "$(A)".
+        let mut spec = make_pod(
+            vec![Container {
+                name: "app".to_string(),
+                env: vec![
+                    EnvVar {
+                        name: "B".to_string(),
+                        value: Some("$(A)".to_string()),
+                        value_from: None,
+                    },
+                    EnvVar {
+                        name: "A".to_string(),
+                        value: Some("val".to_string()),
+                        value_from: None,
+                    },
+                ],
+                ..Default::default()
+            }],
+            vec![],
+        );
+        let resolved = resolved_for("app", vec![("A", "val"), ("B", "$(A)")]);
+
+        apply_envs_and_substitute(&mut spec, &resolved);
+
+        let map = env_to_map(&spec.spec.containers[0].env);
+        assert_eq!(map["A"], "val");
+        assert_eq!(map["B"], "$(A)");
+    }
+
+    #[test]
+    fn k8s_order_chains_resolve_when_declared_in_order() {
+        let mut spec = make_pod(
+            vec![Container {
+                name: "app".to_string(),
+                env: vec![
+                    EnvVar {
+                        name: "A".to_string(),
+                        value: Some("hello".to_string()),
+                        value_from: None,
+                    },
+                    EnvVar {
+                        name: "B".to_string(),
+                        value: Some("$(A)".to_string()),
+                        value_from: None,
+                    },
+                    EnvVar {
+                        name: "C".to_string(),
+                        value: Some("$(B)/world".to_string()),
+                        value_from: None,
+                    },
+                ],
+                command: vec!["sh".to_string(), "-c".to_string()],
+                args: vec!["echo $(C)".to_string()],
+                ..Default::default()
+            }],
+            vec![],
+        );
+        let resolved = resolved_for(
+            "app",
+            vec![("A", "hello"), ("B", "$(A)"), ("C", "$(B)/world")],
+        );
+
+        apply_envs_and_substitute(&mut spec, &resolved);
+
+        let map = env_to_map(&spec.spec.containers[0].env);
+        assert_eq!(map["A"], "hello");
+        assert_eq!(map["B"], "hello");
+        assert_eq!(map["C"], "hello/world");
+        assert_eq!(spec.spec.containers[0].args[0], "echo hello/world");
+    }
+
+    #[test]
+    fn env_from_values_are_not_substituted() {
+        // envFrom-derived values must be loaded literally, even if they
+        // contain $(VAR) that would otherwise resolve.
+        let mut spec = make_pod(
+            vec![Container {
+                name: "app".to_string(),
+                working_dir: "/work/app".to_string(),
+                env_from: vec![crate::spec::pod::EnvFromSource {
+                    config_map_ref: Some(crate::spec::pod::ObjectRef {
+                        name: "cm".to_string(),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            vec![],
+        );
+        // Simulate the configmap producing a value containing $(KM_CONTAINER_ROOT).
+        let resolved = resolved_for("app", vec![("CM_KEY", "$(KM_CONTAINER_ROOT)/x")]);
+
+        apply_envs_and_substitute(&mut spec, &resolved);
+
+        let map = env_to_map(&spec.spec.containers[0].env);
+        assert_eq!(map["CM_KEY"], "$(KM_CONTAINER_ROOT)/x");
+        assert_eq!(map[ENV_KM_CONTAINER_ROOT], "/work/app");
+    }
+
+    #[test]
+    fn individual_env_can_reference_env_from_and_km_container_root() {
+        let mut spec = make_pod(
+            vec![Container {
+                name: "app".to_string(),
+                working_dir: "/work/app".to_string(),
+                env: vec![EnvVar {
+                    name: "TARGET".to_string(),
+                    value: Some("$(KM_CONTAINER_ROOT)/$(SUBDIR)".to_string()),
+                    value_from: None,
+                }],
+                env_from: vec![crate::spec::pod::EnvFromSource {
+                    config_map_ref: Some(crate::spec::pod::ObjectRef {
+                        name: "cm".to_string(),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            vec![],
+        );
+        let resolved = resolved_for(
+            "app",
+            vec![("SUBDIR", "data"), ("TARGET", "$(KM_CONTAINER_ROOT)/$(SUBDIR)")],
+        );
+
+        apply_envs_and_substitute(&mut spec, &resolved);
+
+        let map = env_to_map(&spec.spec.containers[0].env);
+        assert_eq!(map["TARGET"], "/work/app/data");
+    }
+
+    #[test]
+    fn command_and_args_substituted_with_full_env() {
+        let mut spec = make_pod(
+            vec![Container {
+                name: "app".to_string(),
+                working_dir: "/work/app".to_string(),
+                env: vec![EnvVar {
+                    name: "FILE".to_string(),
+                    value: Some("$(KM_CONTAINER_ROOT)/data.txt".to_string()),
+                    value_from: None,
+                }],
+                command: vec!["cat".to_string(), "$(FILE)".to_string()],
+                args: vec!["$(KM_CONTAINER_ROOT)/x".to_string()],
+                ..Default::default()
+            }],
+            vec![],
+        );
+        let resolved =
+            resolved_for("app", vec![("FILE", "$(KM_CONTAINER_ROOT)/data.txt")]);
+
+        apply_envs_and_substitute(&mut spec, &resolved);
+
+        assert_eq!(spec.spec.containers[0].command[1], "/work/app/data.txt");
+        assert_eq!(spec.spec.containers[0].args[0], "/work/app/x");
+    }
+
+    // -- substitute_dollar (pure function) --
+
+    #[test]
+    fn substitute_dollar_resolves_known_vars() {
+        let env: HashMap<String, String> =
+            [("ROOT".to_string(), "/work/app".to_string())].into_iter().collect();
+        assert_eq!(substitute_dollar("$(ROOT)/foo", &env), "/work/app/foo");
+        assert_eq!(substitute_dollar("a$(ROOT)b", &env), "a/work/appb");
+    }
+
+    #[test]
+    fn substitute_dollar_leaves_unknown_vars_literal() {
+        let env: HashMap<String, String> = HashMap::new();
+        assert_eq!(substitute_dollar("$(UNDEF)/x", &env), "$(UNDEF)/x");
+    }
+
+    #[test]
+    fn substitute_dollar_escapes_double_dollar() {
+        let env: HashMap<String, String> =
+            [("V".to_string(), "value".to_string())].into_iter().collect();
+        // $$ -> $; then "(V)" is plain text, so $(V) literal stays
+        assert_eq!(substitute_dollar("$$(V)", &env), "$(V)");
+        // No false re-expansion: $$ -> $ only
+        assert_eq!(substitute_dollar("$$X", &env), "$X");
+    }
+
+    #[test]
+    fn substitute_dollar_keeps_bare_dollar() {
+        let env: HashMap<String, String> = HashMap::new();
+        assert_eq!(substitute_dollar("$VAR", &env), "$VAR");
+        assert_eq!(substitute_dollar("end$", &env), "end$");
+        // Unclosed $( is left literal
+        assert_eq!(substitute_dollar("$(unclosed", &env), "$(unclosed");
+    }
+
+    #[tokio::test]
+    async fn full_pipeline_substitutes_km_container_root() {
+        let dir = temp_dir("substitute-km");
+        let pod = make_pod(
+            vec![Container {
+                name: "app".to_string(),
+                working_dir: String::new(),
+                env: vec![EnvVar {
+                    name: "ROOT".to_string(),
+                    value: Some("$(KM_CONTAINER_ROOT)".to_string()),
+                    value_from: None,
+                }],
+                command: vec!["sh".to_string(), "-c".to_string()],
+                args: vec!["echo $(ROOT)/marker".to_string()],
+                ..Default::default()
+            }],
+            vec![],
+        );
+
+        let prepared = prepare_pod(
+            &pod,
+            &dir.to_string_lossy(),
+            "default",
+            &ResolverSet::default(),
+        )
+        .await
+        .unwrap();
+
+        let working_dir = prepared.spec.containers[0].working_dir.clone();
+        let env: HashMap<&str, &str> = prepared.spec.containers[0]
+            .env
             .iter()
             .map(|e| (e.name.as_str(), e.value.as_deref().unwrap()))
             .collect();
-        assert_eq!(env_map["FROM_REF"], "resolved-value");
-        assert_eq!(env_map["BULK_KEY"], "bulk-value");
+        assert_eq!(env["ROOT"], working_dir);
+        assert_eq!(
+            prepared.spec.containers[0].args[0],
+            format!("echo {}/marker", working_dir),
+        );
     }
 }

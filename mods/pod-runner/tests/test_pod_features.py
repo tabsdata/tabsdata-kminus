@@ -148,6 +148,23 @@ class TestConfigMapVolume:
         assert data["phase"] == "Succeeded"
 
 
+class TestContainerRoot:
+    """Pod that exercises the auto-injected KM_CONTAINER_ROOT env var,
+    including a chained env entry referencing it (resolved via shell eval)."""
+
+    def test_km_container_root_resolves(self, pod_runner, mtls_client):
+        pod = load_pod_def("container-root")
+        name, ns = submit_pod(mtls_client, pod_runner, pod)
+        data = wait_for_pod_phase(
+            mtls_client, pod_runner, ns, name, {"Succeeded"}, timeout=15,
+        )
+        # The pod's command asserts $KM_CONTAINER_ROOT is set, that the
+        # chained $ROOT (=$KM_CONTAINER_ROOT) resolves to the same path,
+        # and writes a marker file under it. Non-zero exit on any of
+        # those checks would surface as Failed rather than Succeeded.
+        assert data["phase"] == "Succeeded"
+
+
 class TestOnFailureRestart:
     """Pod with restartPolicy: OnFailure."""
 

@@ -2,7 +2,7 @@
 # The hostPath directory and emptyDir are set up at test time.
 # Mount paths must be under /mounts (PR constraint).
 #
-# Commands use $PR_POD_ROOT (injected during resolution) to access
+# Commands use $KM_CONTAINER_ROOT (injected during resolution) to access
 # the resolved mount paths — since absolute K8s paths like /mounts/input
 # get rewritten to <container_root>/mounts/input during preparation.
 apiVersion: v1
@@ -18,7 +18,7 @@ spec:
     - name: app
       image: /dev/null
       command: ["sh", "-c"]
-      args: ["cat $PR_POD_ROOT/mounts/input/data.txt && echo 'wrote' > $PR_POD_ROOT/mounts/scratch/output.txt"]
+      args: ["cat $KM_CONTAINER_ROOT/mounts/input/data.txt && echo 'wrote' > $KM_CONTAINER_ROOT/mounts/scratch/output.txt"]
       volumeMounts:
         - name: input-vol
           mountPath: /mounts/input
