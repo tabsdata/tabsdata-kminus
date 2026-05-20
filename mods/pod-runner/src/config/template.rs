@@ -50,6 +50,18 @@ dieWithParent: true
 writeSecretsToContainerShellScript: false
 
 # ---------------------------------------------------------------------------
+# Images
+# ---------------------------------------------------------------------------
+#
+# Root directory used to resolve relative container `image` paths from pod
+# specs. Absolute `image` paths are used as-is, regardless of this setting.
+# Supported `image` forms are: a directory tree, or a `.tgz` / `.tar.gz`
+# archive. Leave empty to require fully-qualified `image` paths in pod
+# specs.
+
+imagesDir: ""
+
+# ---------------------------------------------------------------------------
 # Cleanup and archival
 # ---------------------------------------------------------------------------
 

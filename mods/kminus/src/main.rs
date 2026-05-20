@@ -90,6 +90,13 @@ struct StartArgs {
     /// Log directory. Defaults to `<workdir>/log`.
     #[arg(long)]
     logdir: Option<String>,
+
+    /// Root directory for resolving relative container `image` paths
+    /// in pod specs. Forwarded to the pod-runner as `--imagesdir`.
+    /// When unset, the pod-runner falls back to `imagesDir` in
+    /// `prsysconfig.yaml`, then to `./images`.
+    #[arg(long)]
+    imagesdir: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +491,7 @@ fn command_start(args: StartArgs) {
         &port_pr_metrics,
         &kubeconfig,
         &vk_prconfig,
+        args.imagesdir.as_deref(),
         &mut cp,
     );
     control_plane::cleanup_stale_node_resources(&kubeconfig);

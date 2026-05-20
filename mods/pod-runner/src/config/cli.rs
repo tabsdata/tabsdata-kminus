@@ -11,6 +11,10 @@ pub const DEFAULT_CONFIGDIR: &str = "config";
 pub const DEFAULT_WORKDIR: &str = ".";
 /// Default log directory (under cwd when standalone).
 pub const DEFAULT_LOGDIR: &str = "log";
+/// Default root for resolving relative container `image` paths (under
+/// cwd when standalone). Used when neither `--imagesdir` nor an
+/// `imagesDir` entry in `prsysconfig.yaml` is set.
+pub const DEFAULT_IMAGESDIR: &str = "images";
 
 /// Pod Runner — executes pods as local processes.
 #[derive(Parser, Debug)]
@@ -46,6 +50,13 @@ pub struct CliArgs {
     #[arg(long)]
     pub logdir: Option<String>,
 
+    /// Root directory for resolving relative container `image` paths
+    /// in pod specs. Absolute `image` paths are used as-is.
+    /// Precedence: this flag > `imagesDir` in `prsysconfig.yaml` >
+    /// `./images` under the current directory.
+    #[arg(long)]
+    pub imagesdir: Option<String>,
+
     /// Max size of a single pod-runner log file (MB) before rotation.
     #[arg(long, default_value_t = 100)]
     pub logmaxsizemb: u32,
@@ -80,6 +91,7 @@ mod tests {
         assert!(args.configdir.is_none());
         assert!(args.workdir.is_none());
         assert!(args.logdir.is_none());
+        assert!(args.imagesdir.is_none());
         assert!(args.port.is_none());
         assert!(args.metrics_port.is_none());
     }
@@ -92,6 +104,7 @@ mod tests {
             "--configdir", "/etc/pr",
             "--workdir", "/var/pr",
             "--logdir", "/var/log/pr",
+            "--imagesdir", "/var/lib/kminus/images",
             "--port", "9000",
             "--metrics-port", "9001",
         ])
@@ -102,6 +115,7 @@ mod tests {
         assert_eq!(args.metrics_port, Some(9001));
         assert_eq!(args.workdir.as_deref(), Some("/var/pr"));
         assert_eq!(args.logdir.as_deref(), Some("/var/log/pr"));
+        assert_eq!(args.imagesdir.as_deref(), Some("/var/lib/kminus/images"));
     }
 
     #[test]

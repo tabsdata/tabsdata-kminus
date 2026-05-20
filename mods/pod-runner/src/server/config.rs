@@ -176,6 +176,13 @@ pub struct PRConfig {
     /// Set to `false` if it may contain resolved secrets.
     pub write_running_spec: bool,
 
+    // -- images --
+
+    /// Root directory for resolving relative container `image` paths.
+    /// Absolute `image` paths are used as-is. Empty means the container
+    /// `image` field is used verbatim.
+    pub images_dir: PathBuf,
+
     // -- resolvers --
 
     /// Secret resolver configuration.
@@ -239,6 +246,8 @@ impl Default for PRConfig {
 
             write_running_spec: false,
 
+            images_dir: PathBuf::new(),
+
             secret_resolver: ResolverConfig::default(),
             config_map_resolver: ResolverConfig::default(),
             node_env_resolver: ResolverConfig::default(),
@@ -286,6 +295,7 @@ impl From<&PRConfig> for LogicConfig {
                 pods: c.capacity_pods,
             },
             address: c.node_address.clone(),
+            images_dir: c.images_dir.clone(),
         }
     }
 }

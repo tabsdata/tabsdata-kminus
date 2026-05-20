@@ -8,7 +8,7 @@ use std::path::Path;
 use base64::Engine;
 use tracing::info;
 
-use super::cli::{CliArgs, DEFAULT_CONFIGDIR, DEFAULT_LOGDIR, DEFAULT_WORKDIR};
+use super::cli::{CliArgs, DEFAULT_CONFIGDIR, DEFAULT_IMAGESDIR, DEFAULT_LOGDIR, DEFAULT_WORKDIR};
 use super::pki;
 use super::template::{PRCONFIG_FILENAME, VK_PRCONFIG_FILENAME};
 use super::vk_config;
@@ -164,7 +164,32 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
     // 10. Regenerate vk-prconfig.yaml (every startup)
     regenerate_vk_prconfig(&configdir, url, &sys, &tls)?;
 
-    // 11. Build PRConfig
+    // 11. Resolve images_dir: CLI > prsysconfig.yaml > DEFAULT_IMAGESDIR.
+    //     Absolute path is used as-is; relative is joined against the cwd.
+    let images_dir_raw: String = cli
+        .imagesdir
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            if sys.images_dir.is_empty() {
+                None
+            } else {
+                Some(sys.images_dir.clone())
+            }
+        })
+        .unwrap_or_else(|| DEFAULT_IMAGESDIR.to_string());
+    let images_dir = {
+        let p = std::path::PathBuf::from(&images_dir_raw);
+        if p.is_absolute() {
+            p
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&p))
+                .unwrap_or(p)
+        }
+    };
+
+    // 12. Build PRConfig
     Ok(PRConfig {
         bind_address,
         node_address: parsed.host,
@@ -191,6 +216,8 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
         die_with_parent: sys.die_with_parent,
 
         write_running_spec: sys.write_secrets_to_container_shell_script,
+
+        images_dir,
 
         secret_resolver: map_resolver(&sys.secret_resolver),
         config_map_resolver: map_resolver(&sys.config_map_resolver),
@@ -372,6 +399,7 @@ mod tests {
             configdir: Some(configdir.to_string_lossy().into()),
             workdir: Some(workdir.to_string_lossy().into()),
             logdir: Some(logdir.to_string_lossy().into()),
+            imagesdir: None,
             port: None,
             metrics_port: None,
             logmaxsizemb: 100,
@@ -436,6 +464,7 @@ keepDeletedPodDir: true
             configdir: Some(configdir.to_string_lossy().into()),
             workdir: Some(workdir.to_string_lossy().into()),
             logdir: Some(logdir.to_string_lossy().into()),
+            imagesdir: None,
             port: None,
             metrics_port: None,
             logmaxsizemb: 100,
@@ -489,6 +518,7 @@ keepDeletedPodDir: true
             configdir: Some(configdir.to_string_lossy().into()),
             workdir: Some(workdir.to_string_lossy().into()),
             logdir: Some(logdir.to_string_lossy().into()),
+            imagesdir: None,
             port: None,
             metrics_port: None,
             logmaxsizemb: 100,
@@ -500,6 +530,130 @@ keepDeletedPodDir: true
 
         // SAFETY: test-only cleanup
         unsafe { std::env::remove_var(KUBECONFIG_ENV) };
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_config_images_dir_absolute() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let tmp = std::env::temp_dir().join(format!(
+            "pr-resolve-images-abs-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed),
+        ));
+        let configdir = tmp.join("config");
+        let workdir = tmp.join("work");
+        let logdir = tmp.join("log");
+        std::fs::create_dir_all(&configdir).unwrap();
+
+        std::fs::write(
+            configdir.join(PRCONFIG_FILENAME),
+            "url: \"https://127.0.0.1:3000\"\nserver:\n  tls:\n    certificate-data: \"Y2VydA==\"\n    certificate-key-data: \"a2V5\"\n    certificate-authority-data: \"Y2E=\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            configdir.join(crate::config::template::PRSYSCONFIG_FILENAME),
+            "imagesDir: \"/var/lib/kminus/images\"\n",
+        )
+        .unwrap();
+
+        let cli = CliArgs {
+            kubeconfig: None,
+            configdir: Some(configdir.to_string_lossy().into()),
+            workdir: Some(workdir.to_string_lossy().into()),
+            logdir: Some(logdir.to_string_lossy().into()),
+            imagesdir: None,
+            port: None,
+            metrics_port: None,
+            logmaxsizemb: 100,
+            logmaxfiles: 3,
+        };
+
+        let c = resolve_config(&cli).unwrap();
+        assert_eq!(c.images_dir, std::path::PathBuf::from("/var/lib/kminus/images"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_config_images_dir_default_when_unset() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let tmp = std::env::temp_dir().join(format!(
+            "pr-resolve-images-default-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed),
+        ));
+        let configdir = tmp.join("config");
+        let workdir = tmp.join("work");
+        let logdir = tmp.join("log");
+        std::fs::create_dir_all(&configdir).unwrap();
+        std::fs::write(
+            configdir.join(PRCONFIG_FILENAME),
+            "url: \"https://127.0.0.1:3000\"\nserver:\n  tls:\n    certificate-data: \"Y2VydA==\"\n    certificate-key-data: \"a2V5\"\n    certificate-authority-data: \"Y2E=\"\n",
+        )
+        .unwrap();
+        // No prsysconfig.yaml and no CLI flag — default applies.
+
+        let cli = CliArgs {
+            kubeconfig: None,
+            configdir: Some(configdir.to_string_lossy().into()),
+            workdir: Some(workdir.to_string_lossy().into()),
+            logdir: Some(logdir.to_string_lossy().into()),
+            imagesdir: None,
+            port: None,
+            metrics_port: None,
+            logmaxsizemb: 100,
+            logmaxfiles: 3,
+        };
+
+        let c = resolve_config(&cli).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(c.images_dir, cwd.join(DEFAULT_IMAGESDIR));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_config_images_dir_cli_overrides_yaml() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let tmp = std::env::temp_dir().join(format!(
+            "pr-resolve-images-cli-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed),
+        ));
+        let configdir = tmp.join("config");
+        let workdir = tmp.join("work");
+        let logdir = tmp.join("log");
+        std::fs::create_dir_all(&configdir).unwrap();
+        std::fs::write(
+            configdir.join(PRCONFIG_FILENAME),
+            "url: \"https://127.0.0.1:3000\"\nserver:\n  tls:\n    certificate-data: \"Y2VydA==\"\n    certificate-key-data: \"a2V5\"\n    certificate-authority-data: \"Y2E=\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            configdir.join(crate::config::template::PRSYSCONFIG_FILENAME),
+            "imagesDir: \"/from/yaml\"\n",
+        )
+        .unwrap();
+
+        let cli = CliArgs {
+            kubeconfig: None,
+            configdir: Some(configdir.to_string_lossy().into()),
+            workdir: Some(workdir.to_string_lossy().into()),
+            logdir: Some(logdir.to_string_lossy().into()),
+            imagesdir: Some("/from/cli".into()),
+            port: None,
+            metrics_port: None,
+            logmaxsizemb: 100,
+            logmaxfiles: 3,
+        };
+
+        let c = resolve_config(&cli).unwrap();
+        assert_eq!(c.images_dir, std::path::PathBuf::from("/from/cli"));
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -553,6 +707,7 @@ capacity:
             configdir: Some(configdir.to_string_lossy().into()),
             workdir: Some(workdir.to_string_lossy().into()),
             logdir: Some(logdir.to_string_lossy().into()),
+            imagesdir: None,
             port: None,
             metrics_port: None,
             logmaxsizemb: 100,

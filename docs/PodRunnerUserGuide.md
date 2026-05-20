@@ -64,18 +64,29 @@ tdk stop-force    # Force kill (if needed)
 
 ### Container Images
 
-Unlike standard Kubernetes, the `image` field points to a **local directory** on disk. The directory contents are
-copied into the container's working directory before the process starts.
+Unlike standard Kubernetes, the `image` field points to a **local directory** or a **local archive** on disk.
+The image contents are copied into the container's working directory before the process starts.
+
+Two `image` forms are supported:
+
+- A **directory** tree — copied recursively into the container working directory.
+- A **gzip-compressed tar archive** ending in `.tgz` or `.tar.gz` — extracted into the container working directory.
 
 ```yaml
 containers:
   - name: app
     image: /path/to/my/app        # Directory with binaries and configs
     command: ["./my-binary"]
-    args: ["--port=8080"]
+
+  - name: archived
+    image: /path/to/my/app.tgz    # tar.gz archive — extracted into the work dir
+    command: ["./my-binary"]
 ```
 
-Use `/dev/null` or `""` when no directory template is needed (e.g., running system commands):
+If the path resolves to a missing file or directory, pod preparation fails with an error. Format is detected by file-name suffix
+(`.tgz` or `.tar.gz` ⇒ archive; anything else ⇒ directory).
+
+Use `/dev/null` or `""` when no template is needed (e.g., running system commands):
 
 ```yaml
 containers:
@@ -84,6 +95,31 @@ containers:
     command: ["/usr/bin/python3"]
     args: ["script.py"]
 ```
+
+#### Resolving relative `image` paths (`imagesDir`)
+
+The `image` field may be either an **absolute** or a **relative** path:
+
+- **Absolute** paths (e.g. `/path/to/app` or `/path/to/app.tgz`) are used as-is.
+- **Relative** paths (e.g. `my-app` or `my-app.tgz`) are resolved against the pod runner's images root.
+
+The images root is determined with the following precedence (highest first):
+
+1. `--imagesdir <path>` on the pod-runner command line (forwarded by `km start --imagesdir <path>`).
+2. `imagesDir` in `prsysconfig.yaml`:
+
+   ```yaml
+   # prsysconfig.yaml
+   imagesDir: "/var/lib/kminus/images"
+   ```
+
+3. `./images` under the pod-runner's current working directory (default when neither of the above is set).
+
+A relative images-root value is itself resolved against the pod-runner's current working directory, so an
+absolute path is recommended when running pod-runner outside its install directory.
+
+With `imagesDir: "/var/lib/kminus/images"`, `image: my-app/v1` resolves to `/var/lib/kminus/images/my-app/v1`,
+and `image: my-app/v1.tgz` resolves to `/var/lib/kminus/images/my-app/v1.tgz`.
 
 ### Working Directory
 
@@ -540,7 +576,7 @@ To use custom certificates, create `prconfig.yaml` before first start with your 
 ## Limitations
 
 - **No container isolation** -- processes share the host filesystem and network
-- **Local directories only** -- no container image registry pulls
+- **Local images only** -- supports local directories and `.tgz` / `.tar.gz` archives; no container image registry pulls
 - **Single host** -- no multi-node scheduling
 - **No gRPC probes** -- exec, httpGet, and tcpSocket only
 - **No PVCs** -- hostPath, emptyDir, and configMap volumes only
@@ -563,7 +599,7 @@ kubectl describe pod <name>
 kpr status <name>
 ```
 
-Common causes: init container failed, image directory doesn't exist, secret/configmap not found.
+Common causes: init container failed, image directory or archive doesn't exist, secret/configmap not found.
 
 ### Pod Failed
 

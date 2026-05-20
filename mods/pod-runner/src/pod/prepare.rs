@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tracing::debug;
 
@@ -37,6 +37,19 @@ const PREPARED_ANNOTATION: &str = "pr.tabsdata.com/prepared";
 /// Image value that means "no template to copy".
 const IMAGE_SKIP: &str = "/dev/null";
 
+/// Suffixes that identify a gzip-compressed tar archive image.
+const IMAGE_SUFFIX_TGZ: &str = ".tgz";
+const IMAGE_SUFFIX_TAR_GZ: &str = ".tar.gz";
+
+/// Image source kinds supported by the pod runner.
+#[derive(Debug, PartialEq, Eq)]
+enum ImageKind {
+    /// Directory tree — copied recursively into the container work dir.
+    Directory,
+    /// `.tgz` / `.tar.gz` archive — extracted into the container work dir.
+    TarGz,
+}
+
 // ---------------------------------------------------------------------------
 // Full pipeline
 // ---------------------------------------------------------------------------
@@ -45,16 +58,21 @@ const IMAGE_SKIP: &str = "/dev/null";
 ///
 /// Runs the full pipeline: path rewriting, env resolution, directory
 /// creation (with image copying), and volume setup.
+///
+/// `images_dir` is the root used to resolve relative container `image`
+/// paths. Absolute `image` paths are used as-is. An empty path disables
+/// the root (the container `image` is used verbatim).
 pub async fn prepare_pod(
     spec: &PodSpec,
     pod_dir: &str,
     namespace: &str,
     resolvers: &ResolverSet,
+    images_dir: &Path,
 ) -> Result<PodSpec, String> {
     let mut prepared = rewrite_pod_paths(spec, pod_dir)?;
     let resolved = resolve_k8s_values(&prepared, namespace, resolvers).await?;
     apply_envs_and_substitute(&mut prepared, &resolved);
-    create_container_dirs(&prepared, pod_dir)?;
+    create_container_dirs(&prepared, pod_dir, images_dir)?;
     setup_volumes(&prepared, &resolved)?;
     Ok(prepared)
 }
@@ -267,14 +285,28 @@ fn substitute_dollar(s: &str, env: &HashMap<String, String>) -> String {
 // Step 3: create container dirs (+ image copy)
 // ---------------------------------------------------------------------------
 
-/// Create container working directories and copy image templates.
+/// Create container working directories and populate them from the
+/// container `image`.
 ///
 /// For each container:
 /// - Creates the working directory (`<pod_dir>/work/<name>`).
-/// - If the container's `image` field is a local directory path (not
-///   empty, not `/dev/null`), copies the directory tree into the
-///   container's work dir.
-pub fn create_container_dirs(spec: &PodSpec, pod_dir: &str) -> Result<(), String> {
+/// - When the container's `image` field is not empty and not `/dev/null`:
+///   - Resolves the image path: absolute paths are used as-is; relative
+///     paths are resolved against `images_dir`. A relative path with an
+///     empty `images_dir` is used verbatim.
+///   - Detects the image kind by file name suffix (`.tgz` / `.tar.gz`
+///     means a gzip tar archive; otherwise a directory tree).
+///   - Copies a directory recursively, or extracts a tar.gz archive,
+///     into the container's work dir.
+/// - Errors out if the resolved image path does not exist on disk, or
+///   if the resolved path does not match its expected kind (e.g. a
+///   `.tgz` path that is actually a directory, or a non-archive path
+///   that does not exist as a directory).
+pub fn create_container_dirs(
+    spec: &PodSpec,
+    pod_dir: &str,
+    images_dir: &Path,
+) -> Result<(), String> {
     for c in spec.spec.all_containers() {
         // Create working dir
         if !c.working_dir.is_empty() {
@@ -286,18 +318,80 @@ pub fn create_container_dirs(spec: &PodSpec, pod_dir: &str) -> Result<(), String
             })?;
         }
 
-        // Copy image template directory
+        // Populate from image (directory copy or archive extract)
         if !c.image.is_empty() && c.image != IMAGE_SKIP {
-            let src = Path::new(&c.image);
-            if src.is_dir() {
-                let dest = Path::new(pod_dir).join("work").join(&c.name);
-                debug!(container = c.name.as_str(), src = ?src, dest = ?dest, "Copying image template");
-                copy_dir_recursive(src, &dest)?;
+            let src = resolve_image_path(&c.image, images_dir);
+            let dest = Path::new(pod_dir).join("work").join(&c.name);
+            let kind = image_kind(&src);
+
+            match kind {
+                ImageKind::TarGz => {
+                    if !src.is_file() {
+                        return Err(format!(
+                            "Image archive for container '{}' not found at {}",
+                            c.name,
+                            src.display()
+                        ));
+                    }
+                    debug!(container = c.name.as_str(), src = ?src, dest = ?dest, "Extracting image archive");
+                    extract_tar_gz(&src, &dest)?;
+                }
+                ImageKind::Directory => {
+                    if !src.is_dir() {
+                        return Err(format!(
+                            "Image directory for container '{}' not found at {}",
+                            c.name,
+                            src.display()
+                        ));
+                    }
+                    debug!(container = c.name.as_str(), src = ?src, dest = ?dest, "Copying image template");
+                    copy_dir_recursive(&src, &dest)?;
+                }
             }
-            // If the image path doesn't exist as a directory, skip silently —
-            // it may be a container image reference handled elsewhere.
         }
     }
+    Ok(())
+}
+
+/// Resolve a container `image` field into a filesystem path.
+///
+/// Absolute paths are returned as-is. Relative paths are joined against
+/// `images_dir`; an empty `images_dir` leaves the path unchanged.
+fn resolve_image_path(image: &str, images_dir: &Path) -> PathBuf {
+    let p = Path::new(image);
+    if p.is_absolute() || images_dir.as_os_str().is_empty() {
+        p.to_path_buf()
+    } else {
+        images_dir.join(p)
+    }
+}
+
+/// Classify an image path by file-name suffix.
+fn image_kind(path: &Path) -> ImageKind {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if name.ends_with(IMAGE_SUFFIX_TAR_GZ) || name.ends_with(IMAGE_SUFFIX_TGZ) {
+        ImageKind::TarGz
+    } else {
+        ImageKind::Directory
+    }
+}
+
+/// Extract a `.tar.gz` archive into `dest`.
+fn extract_tar_gz(src: &Path, dest: &Path) -> Result<(), String> {
+    fs::create_dir_all(dest)
+        .map_err(|e| format!("Failed to create dir {}: {}", dest.display(), e))?;
+
+    let file = fs::File::open(src)
+        .map_err(|e| format!("Failed to open archive {}: {}", src.display(), e))?;
+    let dec = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(dec);
+    archive
+        .unpack(dest)
+        .map_err(|e| format!("Failed to extract {} -> {}: {}", src.display(), dest.display(), e))?;
     Ok(())
 }
 
@@ -507,7 +601,7 @@ mod tests {
         let pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
         let prepared = rewrite_pod_paths(&pod, &dir.to_string_lossy()).unwrap();
 
-        create_container_dirs(&prepared, &dir.to_string_lossy()).unwrap();
+        create_container_dirs(&prepared, &dir.to_string_lossy(), Path::new("")).unwrap();
         assert!(dir.join("work/app").is_dir());
     }
 
@@ -524,7 +618,7 @@ mod tests {
         pod.spec.containers[0].image = image_dir.to_string_lossy().to_string();
 
         let prepared = rewrite_pod_paths(&pod, &dir.to_string_lossy()).unwrap();
-        create_container_dirs(&prepared, &dir.to_string_lossy()).unwrap();
+        create_container_dirs(&prepared, &dir.to_string_lossy(), Path::new("")).unwrap();
 
         let work = dir.join("work/app");
         assert!(work.join("app.conf").exists());
@@ -539,9 +633,184 @@ mod tests {
         pod.spec.containers[0].image = "/dev/null".to_string();
 
         let prepared = rewrite_pod_paths(&pod, &dir.to_string_lossy()).unwrap();
-        create_container_dirs(&prepared, &dir.to_string_lossy()).unwrap();
+        create_container_dirs(&prepared, &dir.to_string_lossy(), Path::new("")).unwrap();
         // Should not error, just create the working dir
         assert!(dir.join("work/app").is_dir());
+    }
+
+    #[test]
+    fn extracts_tar_gz_image() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let dir = temp_dir("image-targz");
+        fs::create_dir_all(&dir).unwrap();
+        let archive_path = dir.join("app.tgz");
+
+        // Build a small tar.gz with two files
+        let file = fs::File::create(&archive_path).unwrap();
+        let enc = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(enc);
+        let mut hdr = tar::Header::new_gnu();
+        let payload = b"setting=value";
+        hdr.set_size(payload.len() as u64);
+        hdr.set_mode(0o644);
+        hdr.set_cksum();
+        builder.append_data(&mut hdr, "app.conf", &payload[..]).unwrap();
+        let nested = b"nested";
+        let mut hdr2 = tar::Header::new_gnu();
+        hdr2.set_size(nested.len() as u64);
+        hdr2.set_mode(0o644);
+        hdr2.set_cksum();
+        builder
+            .append_data(&mut hdr2, "subdir/nested.txt", &nested[..])
+            .unwrap();
+        let enc = builder.into_inner().unwrap();
+        enc.finish().unwrap().flush().unwrap();
+
+        let mut pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
+        pod.spec.containers[0].image = archive_path.to_string_lossy().to_string();
+
+        let prepared = rewrite_pod_paths(&pod, &dir.to_string_lossy()).unwrap();
+        create_container_dirs(&prepared, &dir.to_string_lossy(), Path::new("")).unwrap();
+
+        let work = dir.join("work/app");
+        assert_eq!(
+            fs::read_to_string(work.join("app.conf")).unwrap(),
+            "setting=value"
+        );
+        assert_eq!(
+            fs::read_to_string(work.join("subdir/nested.txt")).unwrap(),
+            "nested"
+        );
+    }
+
+    #[test]
+    fn extracts_tar_gz_with_tar_gz_suffix() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let dir = temp_dir("image-tar-gz-suffix");
+        fs::create_dir_all(&dir).unwrap();
+        let archive_path = dir.join("app.tar.gz");
+
+        let file = fs::File::create(&archive_path).unwrap();
+        let enc = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(enc);
+        let payload = b"hello";
+        let mut hdr = tar::Header::new_gnu();
+        hdr.set_size(payload.len() as u64);
+        hdr.set_mode(0o644);
+        hdr.set_cksum();
+        builder.append_data(&mut hdr, "greet.txt", &payload[..]).unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let mut pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
+        pod.spec.containers[0].image = archive_path.to_string_lossy().to_string();
+
+        let prepared = rewrite_pod_paths(&pod, &dir.to_string_lossy()).unwrap();
+        create_container_dirs(&prepared, &dir.to_string_lossy(), Path::new("")).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.join("work/app/greet.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn resolves_relative_image_against_images_dir() {
+        let dir = temp_dir("image-relative");
+        let images_dir = dir.join("images");
+        let image = images_dir.join("my-app");
+        fs::create_dir_all(&image).unwrap();
+        fs::write(image.join("payload.txt"), "rel").unwrap();
+
+        let mut pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
+        pod.spec.containers[0].image = "my-app".to_string();
+
+        let prepared = rewrite_pod_paths(&pod, &dir.to_string_lossy()).unwrap();
+        create_container_dirs(&prepared, &dir.to_string_lossy(), &images_dir).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.join("work/app/payload.txt")).unwrap(),
+            "rel"
+        );
+    }
+
+    #[test]
+    fn absolute_image_ignores_images_dir() {
+        let dir = temp_dir("image-abs-ignores-root");
+        let images_dir = dir.join("images-root");
+        fs::create_dir_all(&images_dir).unwrap();
+        let abs_image = dir.join("elsewhere");
+        fs::create_dir_all(&abs_image).unwrap();
+        fs::write(abs_image.join("abs.txt"), "abs").unwrap();
+
+        let mut pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
+        pod.spec.containers[0].image = abs_image.to_string_lossy().to_string();
+
+        let prepared = rewrite_pod_paths(&pod, &dir.to_string_lossy()).unwrap();
+        create_container_dirs(&prepared, &dir.to_string_lossy(), &images_dir).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.join("work/app/abs.txt")).unwrap(),
+            "abs"
+        );
+    }
+
+    #[test]
+    fn missing_image_directory_errors() {
+        let dir = temp_dir("image-missing-dir");
+        let mut pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
+        pod.spec.containers[0].image = dir.join("does-not-exist").to_string_lossy().to_string();
+
+        let prepared = rewrite_pod_paths(&pod, &dir.to_string_lossy()).unwrap();
+        let result = create_container_dirs(&prepared, &dir.to_string_lossy(), Path::new(""));
+        let err = result.unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn missing_image_archive_errors() {
+        let dir = temp_dir("image-missing-archive");
+        let mut pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
+        pod.spec.containers[0].image = dir.join("missing.tgz").to_string_lossy().to_string();
+
+        let prepared = rewrite_pod_paths(&pod, &dir.to_string_lossy()).unwrap();
+        let result = create_container_dirs(&prepared, &dir.to_string_lossy(), Path::new(""));
+        let err = result.unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    // -- resolve_image_path / image_kind --
+
+    #[test]
+    fn resolve_image_path_keeps_absolute() {
+        let resolved = resolve_image_path("/abs/img", Path::new("/root"));
+        assert_eq!(resolved, PathBuf::from("/abs/img"));
+    }
+
+    #[test]
+    fn resolve_image_path_joins_relative() {
+        let resolved = resolve_image_path("img", Path::new("/root"));
+        assert_eq!(resolved, PathBuf::from("/root/img"));
+    }
+
+    #[test]
+    fn resolve_image_path_empty_root_keeps_relative_verbatim() {
+        let resolved = resolve_image_path("img", Path::new(""));
+        assert_eq!(resolved, PathBuf::from("img"));
+    }
+
+    #[test]
+    fn image_kind_detects_archive_suffixes() {
+        assert_eq!(image_kind(Path::new("foo.tgz")), ImageKind::TarGz);
+        assert_eq!(image_kind(Path::new("foo.tar.gz")), ImageKind::TarGz);
+        assert_eq!(image_kind(Path::new("FOO.TGZ")), ImageKind::TarGz);
+        assert_eq!(image_kind(Path::new("/a/b/c.tar.gz")), ImageKind::TarGz);
+        assert_eq!(image_kind(Path::new("dir")), ImageKind::Directory);
+        assert_eq!(image_kind(Path::new("foo.zip")), ImageKind::Directory);
     }
 
     // -- setup_volumes --
@@ -617,6 +886,7 @@ mod tests {
             &dir.to_string_lossy(),
             "default",
             &ResolverSet::default(),
+            Path::new(""),
         )
         .await
         .unwrap();
@@ -659,9 +929,15 @@ mod tests {
             ..Default::default()
         };
 
-        let prepared = prepare_pod(&pod, &dir.to_string_lossy(), "default", &resolvers)
-            .await
-            .unwrap();
+        let prepared = prepare_pod(
+            &pod,
+            &dir.to_string_lossy(),
+            "default",
+            &resolvers,
+            Path::new(""),
+        )
+        .await
+        .unwrap();
 
         let mount = dir.join("work/app/etc/app");
         assert_eq!(
@@ -1040,6 +1316,7 @@ mod tests {
             &dir.to_string_lossy(),
             "default",
             &ResolverSet::default(),
+            Path::new(""),
         )
         .await
         .unwrap();

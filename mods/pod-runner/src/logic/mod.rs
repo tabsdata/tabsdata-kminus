@@ -150,6 +150,10 @@ pub struct LogicConfig {
     pub capacity: CapacityConfig,
     /// Node address reported as InternalIP.
     pub address: String,
+    /// Root directory for resolving relative container `image` paths.
+    /// Absolute paths bypass this. Empty means no root (the container
+    /// `image` field is used verbatim).
+    pub images_dir: PathBuf,
 }
 
 impl Default for LogicConfig {
@@ -159,6 +163,7 @@ impl Default for LogicConfig {
             default_grace_period: Duration::from_secs(30),
             capacity: CapacityConfig::default(),
             address: "127.0.0.1".to_string(),
+            images_dir: PathBuf::new(),
         }
     }
 }
@@ -315,6 +320,7 @@ impl PodLogic {
             &pod_work_dir.to_string_lossy(),
             &id.namespace,
             &self.resolvers,
+            &self.config.images_dir,
         )
         .await
         .map_err(LogicError::Internal)?;

@@ -42,6 +42,11 @@ const CAPACITY_PODS_KEY: &str = "pods:";
 /// Spawn the pod-runner and wait until its `vk-prconfig.yaml`
 /// appears (signalling readiness). On failure, kills the
 /// already-running control-plane and exits.
+///
+/// When `imagesdir` is `Some`, it is forwarded to the pod-runner as
+/// `--imagesdir <value>`. Otherwise the pod-runner resolves its own
+/// default (`imagesDir` from `prsysconfig.yaml`, then `./images`).
+#[allow(clippy::too_many_arguments)]
 pub fn start(
     workdir: &Path,
     configdir: &Path,
@@ -52,6 +57,7 @@ pub fn start(
     port_pr_metrics: &str,
     kubeconfig: &Path,
     vk_prconfig: &Path,
+    imagesdir: Option<&str>,
     cp: &mut Child,
 ) -> Child {
     info!("Starting {}...", BIN);
@@ -80,6 +86,9 @@ pub fn start(
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(dir) = imagesdir {
+        command.args(["--imagesdir", dir]);
+    }
     apply_subprocess_flags(&mut command);
     let mut pr = command
         .spawn()

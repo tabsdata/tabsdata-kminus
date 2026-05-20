@@ -134,6 +134,14 @@ pub struct YamlSysConfig {
     #[serde(alias = "writeSecretsToContainerShellScript")]
     pub write_secrets_to_container_shell_script: bool,
 
+    // -- images --
+
+    /// Root directory used to resolve relative `image` paths in pod specs.
+    /// Absolute `image` paths are used as-is. Empty (default) means the
+    /// container `image` field is used verbatim.
+    #[serde(alias = "imagesDir")]
+    pub images_dir: String,
+
     // -- cleanup --
 
     #[serde(alias = "keepDeletedPodDir")]
@@ -179,6 +187,7 @@ impl Default for YamlSysConfig {
             propagate_env: true,
             die_with_parent: true,
             write_secrets_to_container_shell_script: false,
+            images_dir: String::new(),
             keep_deleted_pod_dir: false,
             keep_failed_pod_dir: true,
             deleted_pod_dir_ttl_hours: 24,
@@ -372,5 +381,18 @@ secretResolver:
         let yaml = "metricsUrl: \"http://10.0.0.1:9090\"\n";
         let c = YamlSysConfig::from_str(yaml).unwrap();
         assert_eq!(c.metrics_url, "http://10.0.0.1:9090");
+    }
+
+    #[test]
+    fn syscfg_default_images_dir_is_empty() {
+        let c = YamlSysConfig::default();
+        assert_eq!(c.images_dir, "");
+    }
+
+    #[test]
+    fn syscfg_parse_images_dir() {
+        let yaml = "imagesDir: \"/var/lib/kminus/images\"\n";
+        let c = YamlSysConfig::from_str(yaml).unwrap();
+        assert_eq!(c.images_dir, "/var/lib/kminus/images");
     }
 }
