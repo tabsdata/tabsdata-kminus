@@ -535,3 +535,68 @@ class TestResolverWait:
         raise AssertionError(
             "pod was still present after delete during preparation"
         )
+
+
+class TestUnsupportedSpec:
+    """The admission module rejects pod specs that use features pod-runner
+    cannot honor, before the pod is stored — so they fail fast with a clear
+    error instead of running with surprising behavior."""
+
+    def _base_pod(self, name):
+        return {
+            "metadata": {"name": name, "namespace": "default",
+                         "uid": unique_name("uid")},
+            "spec": {
+                "nodeName": "tdknode",
+                "restartPolicy": "Never",
+                "containers": [{
+                    "name": "app", "image": "/dev/null",
+                    "command": ["sh", "-c"], "args": ["true"],
+                }],
+            },
+        }
+
+    def _assert_rejected(self, pod_runner, mtls_client, spec, needle):
+        status, data = mtls_client.post(f"{pod_runner.url}/createPod", spec)
+        assert status >= 400, f"expected rejection, got {status}: {data}"
+        body = json.dumps(data) if data is not None else ""
+        assert needle in body.lower(), f"expected '{needle}' in error, got: {body}"
+
+    def test_unsupported_volume_source_rejected(self, pod_runner, mtls_client):
+        pod = self._base_pod(unique_name("badvol"))
+        pod["spec"]["volumes"] = [{"name": "sec", "secret": {"secretName": "s"}}]
+        pod["spec"]["containers"][0]["volumeMounts"] = [
+            {"name": "sec", "mountPath": "/sec"}
+        ]
+        self._assert_rejected(pod_runner, mtls_client, pod, "volume")
+
+    def test_grpc_probe_rejected(self, pod_runner, mtls_client):
+        pod = self._base_pod(unique_name("grpc"))
+        pod["spec"]["containers"][0]["livenessProbe"] = {
+            "grpc": {"port": 9000}, "periodSeconds": 1,
+        }
+        self._assert_rejected(pod_runner, mtls_client, pod, "probe")
+
+    def test_subpath_mount_rejected(self, pod_runner, mtls_client):
+        pod = self._base_pod(unique_name("subpath"))
+        pod["spec"]["volumes"] = [{"name": "data", "emptyDir": {}}]
+        pod["spec"]["containers"][0]["volumeMounts"] = [
+            {"name": "data", "mountPath": "/data", "subPath": "nested"}
+        ]
+        self._assert_rejected(pod_runner, mtls_client, pod, "subpath")
+
+    def test_supported_spec_accepted(self, pod_runner, mtls_client):
+        # Sanity: a pod using only supported volume + probe features is
+        # accepted and runs to completion.
+        pod = self._base_pod(unique_name("ok"))
+        pod["spec"]["volumes"] = [{"name": "data", "emptyDir": {}}]
+        pod["spec"]["containers"][0]["volumeMounts"] = [
+            {"name": "data", "mountPath": "/mounts/data"}
+        ]
+        pod["spec"]["containers"][0]["livenessProbe"] = {
+            "exec": {"command": ["true"]}, "periodSeconds": 1,
+        }
+        name, ns = submit_pod(mtls_client, pod_runner, pod)
+        data = wait_for_pod_phase(mtls_client, pod_runner, ns, name,
+                                  {"Succeeded"}, timeout=15)
+        assert data["phase"] == "Succeeded"

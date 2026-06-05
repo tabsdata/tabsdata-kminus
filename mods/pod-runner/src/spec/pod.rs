@@ -129,6 +129,10 @@ pub struct VolumeMount {
     pub mount_path: String,
     #[serde(default)]
     pub read_only: bool,
+    /// Unknown/unsupported mount fields (e.g. `subPath`, `subPathExpr`)
+    /// land here so admission can reject the ones pod-runner can't honor.
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

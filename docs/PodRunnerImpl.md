@@ -551,3 +551,9 @@ Both stores are updated on every state change.
 | Restart policies         | Never, OnFailure. No Always (except for sidecar init containers). |
 | Networking               | Host network only. No pod networking or service mesh.             |
 | Security contexts        | Not enforced.                                                     |
+
+Some unsupported features are **rejected at admission** (before the pod is
+stored) rather than silently ignored, so they fail fast with a clear error:
+an unsupported volume source (anything other than hostPath / emptyDir /
+configMap / projected), a `gRPC` probe, `volumeMount.subPath` /
+`subPathExpr`, and `optional: true` on a configmap/secret reference.

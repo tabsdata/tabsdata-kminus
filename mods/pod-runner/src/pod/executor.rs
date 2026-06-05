@@ -2155,11 +2155,13 @@ mod tests {
                 name: "ro-vol".to_string(),
                 mount_path: "/mounts/input".to_string(),
                 read_only: true,
+                ..Default::default()
             },
             VolumeMount {
                 name: "rw-vol".to_string(),
                 mount_path: "/mounts/scratch".to_string(),
                 read_only: false,
+                ..Default::default()
             },
         ];
         let (_tx, rx) = shutdown();
@@ -2200,6 +2202,7 @@ mod tests {
             name: "ro-vol".to_string(),
             mount_path: "/mounts/input".to_string(),
             read_only: true,
+            ..Default::default()
         }];
 
         let config = ContainerConfig {

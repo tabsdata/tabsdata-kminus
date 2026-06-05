@@ -565,6 +565,7 @@ mod tests {
                     name: "vol".to_string(),
                     mount_path: mount_path.to_string_lossy().to_string(),
                     read_only: true,
+                    ..Default::default()
                 }],
                 ..Default::default()
             }],
@@ -752,6 +753,7 @@ mod tests {
                     name: "config".to_string(),
                     mount_path: mount_path.to_string_lossy().to_string(),
                     read_only: true,
+                    ..Default::default()
                 }],
                 ..Default::default()
             }],
@@ -937,6 +939,7 @@ mod tests {
                     name: "cfg".to_string(),
                     mount_path: mount_path.to_string_lossy().to_string(),
                     read_only: true,
+                    ..Default::default()
                 }],
                 ..Default::default()
             }],
@@ -1027,6 +1030,7 @@ mod tests {
                     name: "cfg".to_string(),
                     mount_path: mount_path.to_string_lossy().to_string(),
                     read_only: true,
+                    ..Default::default()
                 }],
                 ..Default::default()
             }],
