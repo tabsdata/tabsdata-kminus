@@ -74,6 +74,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, debug_span, info, info_span, warn, Instrument};
@@ -113,6 +114,53 @@ impl std::fmt::Display for ContainerRole {
             Self::Main => write!(f, "main"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// PodTask — user-registered task that runs for a pod's full lifetime
+// ---------------------------------------------------------------------------
+
+/// Context handed to a registered [`PodTask`] when the pod starts.
+///
+/// The task observes both signals; they are independent. `pod_kill` fires
+/// when this specific pod is killed (or reaches a terminal state); the
+/// orchestrator sets it to `true` on its way out. `runner_shutdown` fires
+/// when the whole pod runner is shutting down.
+#[derive(Clone)]
+pub struct PodTaskContext {
+    /// The pod's spec. Tasks should treat this as read-only.
+    pub pod: Arc<PodSpec>,
+    /// The pod's root working directory (matches what the executor was
+    /// configured with via [`PodExecutor::work_dir`]). May be empty when
+    /// no work dir was configured.
+    pub work_dir: PathBuf,
+    /// Fires (`true`) when this pod is being terminated. Tasks should
+    /// exit promptly once observed.
+    pub pod_kill: watch::Receiver<bool>,
+    /// Fires when the pod runner itself is shutting down. Tasks should
+    /// exit promptly once observed.
+    pub runner_shutdown: watch::Receiver<()>,
+}
+
+/// A user-registered task that runs alongside a pod for its full lifetime.
+///
+/// Registered tasks are spawned when [`PodExecutor::spawn`] returns and
+/// are expected to exit when either [`PodTaskContext::pod_kill`] or
+/// [`PodTaskContext::runner_shutdown`] fires. The executor allows
+/// `shutdown_grace_period` for each task to exit voluntarily after
+/// signalling, then aborts any that overrun.
+///
+/// If [`PodHandle`] is dropped before the orchestrator finishes (e.g.
+/// the pod is force-deleted), tasks are aborted immediately via
+/// [`JoinSet`]'s drop semantics — no grace period in that path.
+///
+/// Tasks are typically registered on [`crate::logic::PodLogic`], which
+/// adds them to every executor it creates.
+#[async_trait]
+pub trait PodTask: Send + Sync {
+    /// Run the task. The task should exit when either of the watch
+    /// signals in `ctx` fires.
+    async fn run(&self, ctx: PodTaskContext);
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +525,7 @@ pub struct PodExecutor {
     max_restarts: u32,
     restart_backoff_base: Duration,
     shutdown_grace_period: Duration,
+    tasks: Vec<Arc<dyn PodTask>>,
 }
 
 impl PodExecutor {
@@ -493,6 +542,7 @@ impl PodExecutor {
             max_restarts: 0,
             restart_backoff_base: Duration::from_secs(2),
             shutdown_grace_period: Duration::from_secs(30),
+            tasks: Vec::new(),
         }
     }
 
@@ -596,6 +646,22 @@ impl PodExecutor {
         self
     }
 
+    /// Register a [`PodTask`] to run alongside the pod for its full
+    /// lifetime.
+    ///
+    /// Each registered task is spawned when the pod starts and is expected
+    /// to exit when [`PodTaskContext::pod_kill`] or
+    /// [`PodTaskContext::runner_shutdown`] fires. The executor allows up
+    /// to `shutdown_grace_period` for each task to exit voluntarily,
+    /// then aborts any that overrun.
+    ///
+    /// Call multiple times to register more than one task. Tasks see the
+    /// same context (modulo separate clones of the watch receivers).
+    pub fn register_task(mut self, task: Arc<dyn PodTask>) -> Self {
+        self.tasks.push(task);
+        self
+    }
+
     /// Spawn the pod and return a [`PodHandle`].
     ///
     /// Returns immediately after creating the orchestrator task. The
@@ -604,6 +670,10 @@ impl PodExecutor {
     /// Events are emitted on the handle for every state change.
     pub async fn spawn(self, shutdown: watch::Receiver<()>) -> io::Result<PodHandle> {
         let pod = self.pod;
+        let tasks = self.tasks;
+        let task_work_dir = self.work_dir.clone().unwrap_or_default();
+        let task_grace = self.shutdown_grace_period;
+
         let initial_lifecycle = build_initial_lifecycle(&pod);
         let initial_status = initial_lifecycle.to_pod_status();
 
@@ -635,16 +705,59 @@ impl PodExecutor {
             pod = format!("{}/{}", pod.metadata.namespace, pod.metadata.name).as_str(),
         );
 
+        // Clones for the task-lifecycle wrapper. The original
+        // `kill_watch_tx` is moved into PodHandle so `kill()` can still
+        // fire the same channel.
+        let kill_watch_tx_tasks = kill_watch_tx.clone();
+        let task_pod = Arc::clone(&pod);
+        let orch_pod = Arc::clone(&pod);
+        let orch_state = Arc::clone(&state);
+
         let orchestrator = tokio::spawn(
-            run_orchestrator(
-                Arc::clone(&pod),
-                Arc::clone(&state),
-                config,
-                event_tx,
-                kill_rx,
-                kill_watch_rx,
-                shutdown,
-            )
+            async move {
+                // Spawn registered tasks into a JoinSet. JoinSet owns
+                // the handles — its Drop aborts every task if this
+                // outer future is itself aborted (e.g. PodHandle is
+                // dropped before the orchestrator finishes), which is
+                // the force-stop path.
+                let mut task_set: JoinSet<()> = JoinSet::new();
+                for task in &tasks {
+                    let task = Arc::clone(task);
+                    let ctx = PodTaskContext {
+                        pod: Arc::clone(&task_pod),
+                        work_dir: task_work_dir.clone(),
+                        pod_kill: kill_watch_tx_tasks.subscribe(),
+                        runner_shutdown: shutdown.clone(),
+                    };
+                    task_set.spawn(async move { task.run(ctx).await });
+                }
+
+                run_orchestrator(
+                    orch_pod,
+                    orch_state,
+                    config,
+                    event_tx,
+                    kill_rx,
+                    kill_watch_rx,
+                    shutdown,
+                )
+                .await;
+
+                // Orchestrator finished naturally. Fire kill_watch so
+                // tasks observe pod termination, then reap with grace.
+                // `kill_watch_tx.send(true)` is idempotent if the
+                // orchestrator was already in kill/shutdown mode.
+                let _ = kill_watch_tx_tasks.send(true);
+                if !task_set.is_empty() {
+                    // If the timeout future is dropped (grace exceeded),
+                    // task_set is dropped with it, aborting any
+                    // tasks that have not exited.
+                    let _ = tokio::time::timeout(task_grace, async {
+                        while task_set.join_next().await.is_some() {}
+                    })
+                    .await;
+                }
+            }
             .instrument(pod_span),
         );
 
@@ -3210,5 +3323,232 @@ mod tests {
         let r = st.lifecycle.condition(PodConditionKey::Ready)
             .expect("Ready condition should be set");
         assert!(r.status, "Ready should be True after all exited");
+    }
+
+    // -- registered tasks ---------------------------------------------------
+
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    /// Observable task: records that it started, observes both signals,
+    /// and reports which one ended its run.
+    struct ObserverTask {
+        started: Arc<AtomicBool>,
+        finished_via_pod_kill: Arc<AtomicBool>,
+        finished_via_runner_shutdown: Arc<AtomicBool>,
+        recorded_work_dir: Arc<Mutex<Option<PathBuf>>>,
+        recorded_pod_name: Arc<Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl PodTask for ObserverTask {
+        async fn run(&self, mut ctx: PodTaskContext) {
+            self.started.store(true, Ordering::SeqCst);
+            *self.recorded_work_dir.lock().await = Some(ctx.work_dir.clone());
+            *self.recorded_pod_name.lock().await = Some(ctx.pod.metadata.name.clone());
+
+            tokio::select! {
+                _ = ctx.pod_kill.changed() => {
+                    self.finished_via_pod_kill.store(true, Ordering::SeqCst);
+                }
+                _ = ctx.runner_shutdown.changed() => {
+                    self.finished_via_runner_shutdown.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    /// Counts how many task instances are spawned across a pod's lifetime.
+    struct CountingTask {
+        spawn_count: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl PodTask for CountingTask {
+        async fn run(&self, mut ctx: PodTaskContext) {
+            self.spawn_count.fetch_add(1, Ordering::SeqCst);
+            let _ = ctx.pod_kill.changed().await;
+        }
+    }
+
+    /// Task that ignores the signals and runs forever — used to exercise
+    /// the grace-period abort path.
+    struct HangingTask {
+        aborted: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl PodTask for HangingTask {
+        async fn run(&self, _ctx: PodTaskContext) {
+            // Use a drop guard to detect abort.
+            struct Guard(Arc<AtomicBool>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let _g = Guard(Arc::clone(&self.aborted));
+            // Hang until aborted.
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn task_observes_pod_kill_on_natural_completion() {
+        let (_tx, rx) = shutdown();
+        let started = Arc::new(AtomicBool::new(false));
+        let via_kill = Arc::new(AtomicBool::new(false));
+        let via_shutdown = Arc::new(AtomicBool::new(false));
+        let work_dir = Arc::new(Mutex::new(None));
+        let pod_name = Arc::new(Mutex::new(None));
+
+        let task = Arc::new(ObserverTask {
+            started: Arc::clone(&started),
+            finished_via_pod_kill: Arc::clone(&via_kill),
+            finished_via_runner_shutdown: Arc::clone(&via_shutdown),
+            recorded_work_dir: Arc::clone(&work_dir),
+            recorded_pod_name: Arc::clone(&pod_name),
+        });
+
+        let dir = test_dir!();
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
+            .work_dir(&dir)
+            .register_task(task)
+            .spawn(rx)
+            .await
+            .unwrap();
+
+        assert_eq!(h.wait_for_completion().await.unwrap(), PodPhase::Succeeded);
+        // The orchestrator awaits the task with grace_period on its way
+        // out. Give the orchestrator a moment to finish that await so
+        // the task's flags are reliably set.
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut h.orchestrator).await;
+
+        assert!(started.load(Ordering::SeqCst), "task did not start");
+        assert!(via_kill.load(Ordering::SeqCst), "task should have exited via pod_kill");
+        assert!(!via_shutdown.load(Ordering::SeqCst), "runner_shutdown should not have fired");
+        assert_eq!(work_dir.lock().await.as_ref().unwrap(), &dir);
+        assert_eq!(pod_name.lock().await.as_deref(), Some("test-pod"));
+    }
+
+    #[tokio::test]
+    async fn task_observes_runner_shutdown() {
+        let (tx, rx) = shutdown();
+        let started = Arc::new(AtomicBool::new(false));
+        let via_kill = Arc::new(AtomicBool::new(false));
+        let via_shutdown = Arc::new(AtomicBool::new(false));
+
+        let task = Arc::new(ObserverTask {
+            started: Arc::clone(&started),
+            finished_via_pod_kill: Arc::clone(&via_kill),
+            finished_via_runner_shutdown: Arc::clone(&via_shutdown),
+            recorded_work_dir: Arc::new(Mutex::new(None)),
+            recorded_pod_name: Arc::new(Mutex::new(None)),
+        });
+
+        // Long-running container so the pod doesn't complete on its own.
+        let mut h = PodExecutor::new(pod_spec(
+            vec![],
+            vec![container("main", "sleep 30")],
+        ))
+        .register_task(task)
+        .spawn(rx)
+        .await
+        .unwrap();
+
+        // Wait briefly so the task is definitely spawned.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(started.load(Ordering::SeqCst), "task did not start before shutdown");
+
+        // Fire runner shutdown — orchestrator should kill containers and
+        // exit, and tasks should observe runner_shutdown.
+        let _ = tx.send(());
+
+        assert_eq!(h.wait_for_completion().await.unwrap(), PodPhase::Failed);
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut h.orchestrator).await;
+
+        // The orchestrator also fires kill_watch on its way out for task
+        // cleanup. Whichever signal the task observed first wins the
+        // select!, but at least one of the two must have fired.
+        assert!(
+            via_shutdown.load(Ordering::SeqCst) || via_kill.load(Ordering::SeqCst),
+            "task observed neither runner_shutdown nor pod_kill",
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_tasks_all_spawn() {
+        let (_tx, rx) = shutdown();
+        let count = Arc::new(AtomicU32::new(0));
+        let a = Arc::new(CountingTask { spawn_count: Arc::clone(&count) });
+        let b = Arc::new(CountingTask { spawn_count: Arc::clone(&count) });
+        let c = Arc::new(CountingTask { spawn_count: Arc::clone(&count) });
+
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
+            .register_task(a)
+            .register_task(b)
+            .register_task(c)
+            .spawn(rx)
+            .await
+            .unwrap();
+
+        assert_eq!(h.wait_for_completion().await.unwrap(), PodPhase::Succeeded);
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut h.orchestrator).await;
+
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn hanging_task_is_aborted_after_grace_period() {
+        let (_tx, rx) = shutdown();
+        let aborted = Arc::new(AtomicBool::new(false));
+        let task = Arc::new(HangingTask { aborted: Arc::clone(&aborted) });
+
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
+            .shutdown_grace_period(Duration::from_millis(200))
+            .register_task(task)
+            .spawn(rx)
+            .await
+            .unwrap();
+
+        assert_eq!(h.wait_for_completion().await.unwrap(), PodPhase::Succeeded);
+        // Orchestrator's task-grace timeout (200ms) plus a margin.
+        let _ = tokio::time::timeout(Duration::from_secs(3), &mut h.orchestrator).await;
+
+        assert!(aborted.load(Ordering::SeqCst), "hanging task was not aborted");
+    }
+
+    #[tokio::test]
+    async fn pod_with_no_registered_tasks_works_unchanged() {
+        // Sanity: the task pathway must not affect pods without tasks.
+        let (_tx, rx) = shutdown();
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
+            .spawn(rx)
+            .await
+            .unwrap();
+        assert_eq!(h.wait_for_completion().await.unwrap(), PodPhase::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn dropping_pod_handle_aborts_tasks() {
+        let (_tx, rx) = shutdown();
+        let aborted = Arc::new(AtomicBool::new(false));
+        let task = Arc::new(HangingTask { aborted: Arc::clone(&aborted) });
+
+        let h = PodExecutor::new(pod_spec(
+            vec![],
+            vec![container("main", "sleep 30")],
+        ))
+        .register_task(task)
+        .spawn(rx)
+        .await
+        .unwrap();
+
+        // Let the task start.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(h);
+        // Drop aborts the orchestrator JoinHandle. JoinSet inside the
+        // orchestrator drops with it, aborting registered tasks.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(aborted.load(Ordering::SeqCst), "task should be aborted when handle is dropped");
     }
 }

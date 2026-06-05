@@ -36,7 +36,9 @@ use tracing::{debug, debug_span, info, info_span, warn, Instrument};
 
 pub use crate::pod::container_log::ContainerLogOptions;
 use crate::metrics::Metrics;
-use crate::pod::executor::{PodEventKind, PodExecutor, PodHandle, PodKillHandle, PodLogHandle};
+use crate::pod::executor::{
+    PodEventKind, PodExecutor, PodHandle, PodKillHandle, PodLogHandle, PodTask,
+};
 use crate::pod::prepare::prepare_pod;
 pub use crate::pod::resolver::ResolverSet;
 use crate::spec::constants::*;
@@ -253,6 +255,9 @@ pub struct PodLogic {
     runtimes: Arc<RwLock<HashMap<PodId, PodRuntime>>>,
     metrics: Option<Arc<Metrics>>,
     shutdown_tx: watch::Sender<()>,
+    /// Tasks registered via [`PodLogic::register_task`]. A snapshot of
+    /// this Vec is passed to every pod executor at spawn time.
+    tasks: Arc<Vec<Arc<dyn PodTask>>>,
 }
 
 impl PodLogic {
@@ -273,6 +278,7 @@ impl PodLogic {
             runtimes: Arc::new(RwLock::new(HashMap::new())),
             metrics: None,
             shutdown_tx,
+            tasks: Arc::new(Vec::new()),
         }
     }
 
@@ -306,6 +312,23 @@ impl PodLogic {
     /// Set the metrics instance for instrumentation.
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Register a [`PodTask`] that runs alongside every pod for the
+    /// duration of its execution.
+    ///
+    /// Each registered task gets its own tokio task per pod, started when
+    /// the executor spawns the pod and signalled to stop (via the
+    /// per-pod kill watch) when the orchestrator finishes. The
+    /// pod-runner shutdown signal is also exposed; tasks should exit
+    /// promptly when either fires. See [`PodTask`] and
+    /// [`crate::pod::executor::PodTaskContext`] for the contract.
+    ///
+    /// Call this on the builder before `create_pod` is invoked; pods
+    /// created before registration won't receive the task.
+    pub fn register_task(mut self, task: Arc<dyn PodTask>) -> Self {
+        Arc::make_mut(&mut self.tasks).push(task);
         self
     }
 
@@ -375,6 +398,7 @@ impl PodLogic {
                 Arc::clone(&deleted),
                 self.shutdown_tx.clone(),
                 cancel_rx,
+                Arc::clone(&self.tasks),
             )
             .instrument(prep_span),
         );
@@ -898,6 +922,7 @@ async fn prepare_and_run(
     deleted: Arc<AtomicBool>,
     shutdown_tx: watch::Sender<()>,
     mut cancel_rx: watch::Receiver<()>,
+    tasks: Arc<Vec<Arc<dyn PodTask>>>,
 ) {
     let pod_work_dir = executor_provider.work_dir(&id);
     let timeout = original_spec
@@ -962,7 +987,10 @@ async fn prepare_and_run(
         .await;
 
     // Spawn the executor for the prepared spec.
-    let executor = executor_provider.create(Arc::clone(&running_spec), &id);
+    let mut executor = executor_provider.create(Arc::clone(&running_spec), &id);
+    for task in tasks.iter() {
+        executor = executor.register_task(Arc::clone(task));
+    }
     let exec_shutdown = shutdown_tx.subscribe();
     let handle = match executor.spawn(exec_shutdown).await {
         Ok(h) => h,
@@ -1957,6 +1985,52 @@ mod tests {
             logic.delete_pod("default", "waiter", Some(Duration::from_secs(1))).await.unwrap();
             wait_for_removal(&store, "waiter").await;
             assert_eq!(store.len().await, 0);
+        }
+
+        #[tokio::test]
+        async fn pod_logic_register_task_propagates_to_created_pods() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+
+            use crate::pod::executor::{PodTask, PodTaskContext};
+
+            struct Counter {
+                started: Arc<AtomicU32>,
+            }
+
+            #[async_trait::async_trait]
+            impl PodTask for Counter {
+                async fn run(&self, mut ctx: PodTaskContext) {
+                    self.started.fetch_add(1, Ordering::SeqCst);
+                    // Exit promptly once the orchestrator fires kill_watch.
+                    let _ = ctx.pod_kill.changed().await;
+                }
+            }
+
+            let started = Arc::new(AtomicU32::new(0));
+            let store = Arc::new(MemoryStore::new());
+            let (shutdown_tx, _) = watch::channel(());
+            let logic = PodLogic::new(
+                LogicConfig::default(),
+                test_cleanup_config(),
+                Arc::clone(&store) as Arc<dyn PodStore>,
+                make_provider(),
+                ResolverSet::default(),
+                shutdown_tx.clone(),
+            )
+            .register_task(Arc::new(Counter { started: Arc::clone(&started) }));
+
+            // Two pods on the same PodLogic — both should pick up the
+            // registered task.
+            logic.create_pod(make_pod_spec("a", "exit 0")).await.unwrap();
+            logic.create_pod(make_pod_spec("b", "exit 0")).await.unwrap();
+            wait_for_terminal(&logic, "a").await;
+            wait_for_terminal(&logic, "b").await;
+
+            assert_eq!(
+                started.load(Ordering::SeqCst),
+                2,
+                "Counter task should have run once per pod",
+            );
         }
 
         #[tokio::test]
