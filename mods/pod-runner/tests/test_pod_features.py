@@ -494,7 +494,7 @@ class TestResolverWait:
         pod["spec"]["containers"][0]["env"][0]["valueFrom"]["secretKeyRef"]["optional"] = True
         spec = {"metadata": pod["metadata"], "spec": pod["spec"]}
         status, data = mtls_client.post(f"{pod_runner.url}/createPod", spec)
-        assert status >= 400, f"expected rejection, got {status}: {data}"
+        assert status == 400, f"expected 400 rejection, got {status}: {data}"
         body = json.dumps(data) if data is not None else ""
         assert "optional" in body.lower(), (
             f"expected admission error mentioning 'optional', got: {body}"
@@ -558,7 +558,7 @@ class TestUnsupportedSpec:
 
     def _assert_rejected(self, pod_runner, mtls_client, spec, needle):
         status, data = mtls_client.post(f"{pod_runner.url}/createPod", spec)
-        assert status >= 400, f"expected rejection, got {status}: {data}"
+        assert status == 400, f"expected 400 rejection, got {status}: {data}"
         body = json.dumps(data) if data is not None else ""
         assert needle in body.lower(), f"expected '{needle}' in error, got: {body}"
 

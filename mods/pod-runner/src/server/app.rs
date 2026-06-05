@@ -110,7 +110,9 @@ fn error_response(err: LogicError) -> Response {
         LogicError::NotFound { .. } => StatusCode::NOT_FOUND,
         LogicError::Conflict { .. } => StatusCode::CONFLICT,
         LogicError::CapacityExceeded { .. } => StatusCode::FORBIDDEN,
-        LogicError::Admission(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        // Admission failures are client errors — the submitted pod spec uses
+        // a feature pod-runner doesn't support, so the request is malformed.
+        LogicError::Admission(_) => StatusCode::BAD_REQUEST,
         LogicError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (code, Json(ErrorResponse { error: err.to_string() })).into_response()
@@ -634,7 +636,13 @@ mod tests {
                 LogicError::Admission(AdmissionError::OptionalNotSupported {
                     location: "container 'app', env 'PORT', secretKeyRef 'creds/pass'".into(),
                 }),
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                LogicError::Admission(AdmissionError::UnsupportedVolume {
+                    location: "volume 'sec', unsupported source: secret".into(),
+                }),
+                StatusCode::BAD_REQUEST,
             ),
             (LogicError::Internal("boom".into()), StatusCode::INTERNAL_SERVER_ERROR),
         ];
