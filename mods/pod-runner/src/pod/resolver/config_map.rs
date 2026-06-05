@@ -28,7 +28,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::watch;
 
-use super::backoff::{poll_with_backoff, PollError};
+use super::backoff::poll_with_backoff;
+// Re-exports preserved so existing call sites
+// (`ConfigMapResolverError::not_found`,
+// `ConfigMapResolverErrorKind::Timeout`) continue to resolve through
+// this module.
+pub use super::error::{ConfigMapResolverError, ConfigMapResolverErrorKind};
 
 /// Op-name passed to the backoff logger.
 const OP_NAME: &str = "configmap_resolver.fetch";
@@ -48,77 +53,6 @@ pub trait ConfigMapResolver: Send + Sync {
         timeout: Option<Duration>,
         cancel: &mut watch::Receiver<()>,
     ) -> Result<HashMap<String, HashMap<String, String>>, ConfigMapResolverError>;
-}
-
-/// Error returned by a config map resolver.
-#[derive(Debug, thiserror::Error)]
-#[error("configmap '{name}': {message}")]
-pub struct ConfigMapResolverError {
-    pub name: String,
-    pub message: String,
-    pub kind: ConfigMapResolverErrorKind,
-}
-
-/// Classification of a [`ConfigMapResolverError`]. Drives the retry loop
-/// in [`ConfigMapResolver::config_maps`] and lets callers distinguish
-/// "missing" from "permanently broken".
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum ConfigMapResolverErrorKind {
-    /// The named configmap is not (yet) defined. Retryable.
-    NotFound,
-    /// The wait exceeded the timeout. Pod should transition to Failed.
-    Timeout,
-    /// The cancel signal fired during the wait.
-    Cancelled,
-    /// Non-retryable failure (parse error, unreachable kube API, etc.).
-    Other,
-}
-
-impl ConfigMapResolverError {
-    pub fn not_found(name: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            message: message.into(),
-            kind: ConfigMapResolverErrorKind::NotFound,
-        }
-    }
-
-    pub fn other(name: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            message: message.into(),
-            kind: ConfigMapResolverErrorKind::Other,
-        }
-    }
-
-    pub fn is_not_found(&self) -> bool {
-        self.kind == ConfigMapResolverErrorKind::NotFound
-    }
-}
-
-impl From<PollError<ConfigMapResolverError>> for ConfigMapResolverError {
-    fn from(err: PollError<ConfigMapResolverError>) -> Self {
-        match err {
-            PollError::Timeout { last_err, elapsed } => Self {
-                name: last_err.name,
-                message: format!(
-                    "timed out after {:.1}s waiting for configmap to become available: {}",
-                    elapsed.as_secs_f64(),
-                    last_err.message,
-                ),
-                kind: ConfigMapResolverErrorKind::Timeout,
-            },
-            PollError::Cancelled { elapsed } => Self {
-                name: String::new(),
-                message: format!(
-                    "configmap resolution cancelled after {:.1}s",
-                    elapsed.as_secs_f64(),
-                ),
-                kind: ConfigMapResolverErrorKind::Cancelled,
-            },
-            PollError::Fatal(e) => e,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

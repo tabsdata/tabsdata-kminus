@@ -26,6 +26,7 @@
 
 pub mod backoff;
 pub mod config_map;
+pub mod error;
 pub mod k8s_values;
 pub mod secret;
 pub mod volume;

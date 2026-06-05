@@ -28,7 +28,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::watch;
 
-use super::backoff::{poll_with_backoff, PollError};
+use super::backoff::poll_with_backoff;
+// Re-exports preserved so existing call sites
+// (`SecretResolverError::not_found`, `SecretResolverErrorKind::Timeout`)
+// continue to resolve through this module.
+pub use super::error::{SecretResolverError, SecretResolverErrorKind};
 
 /// Op-name passed to the backoff logger.
 const OP_NAME: &str = "secret_resolver.fetch";
@@ -48,77 +52,6 @@ pub trait SecretResolver: Send + Sync {
         timeout: Option<Duration>,
         cancel: &mut watch::Receiver<()>,
     ) -> Result<HashMap<String, HashMap<String, String>>, SecretResolverError>;
-}
-
-/// Error returned by a secret resolver.
-#[derive(Debug, thiserror::Error)]
-#[error("secret '{name}': {message}")]
-pub struct SecretResolverError {
-    pub name: String,
-    pub message: String,
-    pub kind: SecretResolverErrorKind,
-}
-
-/// Classification of a [`SecretResolverError`]. Drives the retry loop in
-/// [`SecretResolver::secrets`] and lets callers distinguish "missing"
-/// from "permanently broken".
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum SecretResolverErrorKind {
-    /// The named secret is not (yet) defined. Retryable.
-    NotFound,
-    /// The wait exceeded the timeout. Pod should transition to Failed.
-    Timeout,
-    /// The cancel signal fired during the wait.
-    Cancelled,
-    /// Non-retryable failure (parse error, unreachable kube API, etc.).
-    Other,
-}
-
-impl SecretResolverError {
-    pub fn not_found(name: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            message: message.into(),
-            kind: SecretResolverErrorKind::NotFound,
-        }
-    }
-
-    pub fn other(name: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            message: message.into(),
-            kind: SecretResolverErrorKind::Other,
-        }
-    }
-
-    pub fn is_not_found(&self) -> bool {
-        self.kind == SecretResolverErrorKind::NotFound
-    }
-}
-
-impl From<PollError<SecretResolverError>> for SecretResolverError {
-    fn from(err: PollError<SecretResolverError>) -> Self {
-        match err {
-            PollError::Timeout { last_err, elapsed } => Self {
-                name: last_err.name,
-                message: format!(
-                    "timed out after {:.1}s waiting for secret to become available: {}",
-                    elapsed.as_secs_f64(),
-                    last_err.message,
-                ),
-                kind: SecretResolverErrorKind::Timeout,
-            },
-            PollError::Cancelled { elapsed } => Self {
-                name: String::new(),
-                message: format!(
-                    "secret resolution cancelled after {:.1}s",
-                    elapsed.as_secs_f64(),
-                ),
-                kind: SecretResolverErrorKind::Cancelled,
-            },
-            PollError::Fatal(e) => e,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
