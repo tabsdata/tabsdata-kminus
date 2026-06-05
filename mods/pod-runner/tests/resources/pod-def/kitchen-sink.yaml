@@ -11,7 +11,7 @@ metadata:
   namespace: default
 
 spec:
-  nodeName: virtual-node
+  nodeName: tdknode
   restartPolicy: Never
   initContainers:
     - name: setup

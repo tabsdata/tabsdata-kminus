@@ -6,7 +6,7 @@ metadata:
   namespace: default
 
 spec:
-  nodeName: virtual-node
+  nodeName: tdknode
   restartPolicy: OnFailure
   containers:
     - name: app

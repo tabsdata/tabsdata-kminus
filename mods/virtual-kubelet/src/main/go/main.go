@@ -33,6 +33,7 @@ import (
 	"gopkg.in/yaml.v2"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -402,16 +403,32 @@ func main() {
 		v1.EventSource{Component: "virtual-kubelet", Host: vkNodeName},
 	)
 
-	// Create pod informer
+	// Create pod informer, filtered to pods assigned to this node — like
+	// a real kubelet, pods pinned to another (or nonexistent) node are
+	// never run here; they stay Pending. This also keeps apiserver log
+	// routing consistent: `kubectl logs` resolves the kubelet through the
+	// pod's spec.nodeName, so a pod this node ran but isn't assigned to
+	// would have unreachable logs.
 	podInformerFactory := informers.NewSharedInformerFactoryWithOptions(
 		clientset,
 		1*time.Minute,
 		informers.WithNamespace(vkNamespace),
+		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.FieldSelector = fields.OneTermEqualSelector("spec.nodeName", vkNodeName).String()
+		}),
 	)
 	podInformer := podInformerFactory.Core().V1().Pods()
-	configMapInformer := podInformerFactory.Core().V1().ConfigMaps()
-	secretInformer := podInformerFactory.Core().V1().Secrets()
-	serviceInformer := podInformerFactory.Core().V1().Services()
+
+	// ConfigMaps/secrets/services need an unfiltered factory:
+	// spec.nodeName is not a valid field selector for those resources.
+	scmInformerFactory := informers.NewSharedInformerFactoryWithOptions(
+		clientset,
+		1*time.Minute,
+		informers.WithNamespace(vkNamespace),
+	)
+	configMapInformer := scmInformerFactory.Core().V1().ConfigMaps()
+	secretInformer := scmInformerFactory.Core().V1().Secrets()
+	serviceInformer := scmInformerFactory.Core().V1().Services()
 
 	// Create pod controller
 	podController, err := node.NewPodController(node.PodControllerConfig{
@@ -429,13 +446,15 @@ func main() {
 
 	// Start informers
 	podInformerFactory.Start(ctx.Done())
+	scmInformerFactory.Start(ctx.Done())
 
 	// Wait for informer caches to sync
 	logger.Info("Waiting for informer caches to sync...")
-	synced := podInformerFactory.WaitForCacheSync(ctx.Done())
-	for informerType, ok := range synced {
-		if !ok {
-			logger.Fatalf("Failed to sync cache for %v", informerType)
+	for _, factory := range []informers.SharedInformerFactory{podInformerFactory, scmInformerFactory} {
+		for informerType, ok := range factory.WaitForCacheSync(ctx.Done()) {
+			if !ok {
+				logger.Fatalf("Failed to sync cache for %v", informerType)
+			}
 		}
 	}
 	logger.Info("Informer caches synced successfully")

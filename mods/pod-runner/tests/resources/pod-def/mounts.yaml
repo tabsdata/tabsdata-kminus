@@ -12,7 +12,7 @@ metadata:
   namespace: default
 
 spec:
-  nodeName: virtual-node
+  nodeName: tdknode
   restartPolicy: Never
   containers:
     - name: app

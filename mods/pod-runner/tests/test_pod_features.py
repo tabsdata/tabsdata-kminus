@@ -377,7 +377,7 @@ class TestResolverWait:
                 "uid": unique_name("uid"),
             },
             "spec": {
-                "nodeName": "virtual-node",
+                "nodeName": "tdknode",
                 "restartPolicy": "Never",
                 "containers": [{
                     "name": "app",
@@ -454,7 +454,7 @@ class TestResolverWait:
                 "uid": unique_name("uid"),
             },
             "spec": {
-                "nodeName": "virtual-node",
+                "nodeName": "tdknode",
                 "restartPolicy": "Never",
                 "activeDeadlineSeconds": 30,
                 "containers": [{
