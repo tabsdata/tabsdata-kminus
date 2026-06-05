@@ -26,12 +26,13 @@ pub mod purge;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, debug_span, info, info_span, warn, Instrument};
 
 pub use crate::pod::container_log::ContainerLogOptions;
@@ -242,6 +243,42 @@ impl PodRuntime {
 }
 
 // ---------------------------------------------------------------------------
+// RunnerTask — pod-runner-level background task
+// ---------------------------------------------------------------------------
+
+/// Context handed to a registered [`RunnerTask`] when it's spawned.
+///
+/// Unlike [`crate::pod::executor::PodTaskContext`], this is per-runner
+/// (not per-pod): there is no pod spec or pod-level kill signal. The
+/// task runs once for the lifetime of the [`PodLogic`] instance.
+#[derive(Clone)]
+pub struct RunnerTaskContext {
+    /// The pod-runner's working directory (set via
+    /// [`PodLogic::runner_work_dir`]). Empty when not configured.
+    pub work_dir: PathBuf,
+    /// Fires when the pod runner is shutting down. Tasks should exit
+    /// promptly once observed.
+    pub runner_shutdown: watch::Receiver<()>,
+}
+
+/// A user-registered task that runs for the entire pod-runner lifetime.
+///
+/// Tasks are registered on [`PodLogic`] via
+/// [`PodLogic::register_runner_task`] and are spawned eagerly (at
+/// registration time). They are expected to exit when
+/// [`RunnerTaskContext::runner_shutdown`] fires.
+///
+/// On clean shutdown, call [`PodLogic::wait_for_runner_tasks`] to await
+/// graceful exit with a timeout. If [`PodLogic`] is dropped before
+/// tasks exit, the underlying [`JoinSet`] aborts them.
+#[async_trait]
+pub trait RunnerTask: Send + Sync {
+    /// Run the task. The task should exit when
+    /// [`RunnerTaskContext::runner_shutdown`] fires.
+    async fn run(&self, ctx: RunnerTaskContext);
+}
+
+// ---------------------------------------------------------------------------
 // PodLogic
 // ---------------------------------------------------------------------------
 
@@ -258,6 +295,14 @@ pub struct PodLogic {
     /// Tasks registered via [`PodLogic::register_task`]. A snapshot of
     /// this Vec is passed to every pod executor at spawn time.
     tasks: Arc<Vec<Arc<dyn PodTask>>>,
+    /// Pod-runner working directory passed to every [`RunnerTask`] via
+    /// [`RunnerTaskContext::work_dir`].
+    runner_work_dir: PathBuf,
+    /// JoinSet of spawned [`RunnerTask`] handles. Wrapped in `StdMutex`
+    /// so the builder methods (which take `&mut self`) can still spawn
+    /// into it without giving up `Self` ownership. Dropping the
+    /// `JoinSet` aborts all surviving tasks.
+    runner_task_set: StdMutex<JoinSet<()>>,
 }
 
 impl PodLogic {
@@ -279,6 +324,8 @@ impl PodLogic {
             metrics: None,
             shutdown_tx,
             tasks: Arc::new(Vec::new()),
+            runner_work_dir: PathBuf::new(),
+            runner_task_set: StdMutex::new(JoinSet::new()),
         }
     }
 
@@ -330,6 +377,78 @@ impl PodLogic {
     pub fn register_task(mut self, task: Arc<dyn PodTask>) -> Self {
         Arc::make_mut(&mut self.tasks).push(task);
         self
+    }
+
+    /// Set the working directory passed to every [`RunnerTask`] via
+    /// [`RunnerTaskContext::work_dir`].
+    ///
+    /// Call before [`register_runner_task`](Self::register_runner_task);
+    /// tasks already registered get the value that was set at the time
+    /// of their registration (empty `PathBuf` if never set).
+    pub fn runner_work_dir(mut self, dir: PathBuf) -> Self {
+        self.runner_work_dir = dir;
+        self
+    }
+
+    /// Register a [`RunnerTask`] that runs for the lifetime of this
+    /// pod-runner.
+    ///
+    /// The task is spawned immediately with a context containing the
+    /// runner working directory (see
+    /// [`runner_work_dir`](Self::runner_work_dir)) and a fresh subscriber
+    /// of the runner shutdown signal. Call
+    /// [`wait_for_runner_tasks`](Self::wait_for_runner_tasks) after
+    /// firing shutdown to await graceful exit; dropping `PodLogic`
+    /// aborts any still-running tasks.
+    pub fn register_runner_task(self, task: Arc<dyn RunnerTask>) -> Self {
+        let ctx = RunnerTaskContext {
+            work_dir: self.runner_work_dir.clone(),
+            runner_shutdown: self.shutdown_tx.subscribe(),
+        };
+        self.runner_task_set
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .spawn(async move { task.run(ctx).await });
+        self
+    }
+
+    /// Wait for all registered runner tasks to finish, up to `timeout`.
+    ///
+    /// Call after sending the shutdown signal. Returns when every task
+    /// has exited or when `timeout` elapses. Tasks still running after
+    /// the timeout are NOT aborted here — they remain owned by the
+    /// inner [`JoinSet`] and are aborted only when `PodLogic` is
+    /// dropped.
+    pub async fn wait_for_runner_tasks(&self, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // Try to reap any already-finished tasks. Use try_join_next
+            // so we don't block while holding the StdMutex.
+            let finished = {
+                let mut guard = self.runner_task_set
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if guard.is_empty() {
+                    return;
+                }
+                guard.try_join_next().is_some()
+            };
+            if finished {
+                continue;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let remaining = self.runner_task_set
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .len();
+                warn!(
+                    remaining,
+                    "Timeout waiting for runner tasks, proceeding with shutdown",
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Create a pod.
@@ -2090,6 +2209,204 @@ mod tests {
             // Clean up so the test runtime doesn't hang on the spawned
             // preparer task.
             logic.delete_pod("default", "prep", Some(Duration::from_secs(1))).await.unwrap();
+        }
+
+        // -- runner tasks ---------------------------------------------------
+
+        use std::sync::atomic::{AtomicBool, AtomicU32};
+
+        /// Records work_dir, signals when spawned, exits on shutdown.
+        struct RunnerObserver {
+            spawned: Arc<AtomicBool>,
+            shutdown_observed: Arc<AtomicBool>,
+            recorded_work_dir: Arc<tokio::sync::Mutex<Option<PathBuf>>>,
+        }
+
+        #[async_trait]
+        impl RunnerTask for RunnerObserver {
+            async fn run(&self, mut ctx: RunnerTaskContext) {
+                self.spawned.store(true, Ordering::SeqCst);
+                *self.recorded_work_dir.lock().await = Some(ctx.work_dir.clone());
+                let _ = ctx.runner_shutdown.changed().await;
+                self.shutdown_observed.store(true, Ordering::SeqCst);
+            }
+        }
+
+        struct RunnerCounter {
+            spawn_count: Arc<AtomicU32>,
+        }
+
+        #[async_trait]
+        impl RunnerTask for RunnerCounter {
+            async fn run(&self, mut ctx: RunnerTaskContext) {
+                self.spawn_count.fetch_add(1, Ordering::SeqCst);
+                let _ = ctx.runner_shutdown.changed().await;
+            }
+        }
+
+        /// Hangs forever — used to exercise the wait_for_runner_tasks
+        /// timeout path and the Drop-aborts-tasks path.
+        struct RunnerHang {
+            aborted: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl RunnerTask for RunnerHang {
+            async fn run(&self, _ctx: RunnerTaskContext) {
+                struct Guard(Arc<AtomicBool>);
+                impl Drop for Guard {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::SeqCst);
+                    }
+                }
+                let _g = Guard(Arc::clone(&self.aborted));
+                std::future::pending::<()>().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn runner_task_receives_work_dir_and_observes_shutdown() {
+            let store = Arc::new(MemoryStore::new());
+            let (shutdown_tx, _) = watch::channel(());
+            let spawned = Arc::new(AtomicBool::new(false));
+            let shutdown_observed = Arc::new(AtomicBool::new(false));
+            let recorded = Arc::new(tokio::sync::Mutex::new(None));
+
+            let task = Arc::new(RunnerObserver {
+                spawned: Arc::clone(&spawned),
+                shutdown_observed: Arc::clone(&shutdown_observed),
+                recorded_work_dir: Arc::clone(&recorded),
+            });
+
+            let work_dir = PathBuf::from("/tmp/runner-test");
+            let logic = PodLogic::new(
+                LogicConfig::default(),
+                test_cleanup_config(),
+                store,
+                make_provider(),
+                ResolverSet::default(),
+                shutdown_tx.clone(),
+            )
+            .runner_work_dir(work_dir.clone())
+            .register_runner_task(task);
+
+            // The task is spawned eagerly. Give it a tick to start.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(spawned.load(Ordering::SeqCst));
+            assert_eq!(recorded.lock().await.as_ref().unwrap(), &work_dir);
+            assert!(!shutdown_observed.load(Ordering::SeqCst));
+
+            // Fire shutdown — task should observe it and exit.
+            let _ = shutdown_tx.send(());
+            logic.wait_for_runner_tasks(Duration::from_secs(2)).await;
+
+            assert!(shutdown_observed.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        async fn multiple_runner_tasks_all_spawn() {
+            let store = Arc::new(MemoryStore::new());
+            let (shutdown_tx, _) = watch::channel(());
+            let count = Arc::new(AtomicU32::new(0));
+
+            let logic = PodLogic::new(
+                LogicConfig::default(),
+                test_cleanup_config(),
+                store,
+                make_provider(),
+                ResolverSet::default(),
+                shutdown_tx.clone(),
+            )
+            .register_runner_task(Arc::new(RunnerCounter { spawn_count: Arc::clone(&count) }))
+            .register_runner_task(Arc::new(RunnerCounter { spawn_count: Arc::clone(&count) }))
+            .register_runner_task(Arc::new(RunnerCounter { spawn_count: Arc::clone(&count) }));
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(count.load(Ordering::SeqCst), 3);
+
+            let _ = shutdown_tx.send(());
+            logic.wait_for_runner_tasks(Duration::from_secs(2)).await;
+        }
+
+        #[tokio::test]
+        async fn wait_for_runner_tasks_times_out_on_hang() {
+            let store = Arc::new(MemoryStore::new());
+            let (shutdown_tx, _) = watch::channel(());
+            let aborted = Arc::new(AtomicBool::new(false));
+
+            let logic = PodLogic::new(
+                LogicConfig::default(),
+                test_cleanup_config(),
+                store,
+                make_provider(),
+                ResolverSet::default(),
+                shutdown_tx.clone(),
+            )
+            .register_runner_task(Arc::new(RunnerHang { aborted: Arc::clone(&aborted) }));
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = shutdown_tx.send(());
+
+            // wait_for_runner_tasks does NOT abort on its own — it just
+            // gives up after the timeout. The task should still be
+            // running afterwards.
+            let start = std::time::Instant::now();
+            logic.wait_for_runner_tasks(Duration::from_millis(200)).await;
+            assert!(
+                start.elapsed() >= Duration::from_millis(150),
+                "wait should have honored the timeout",
+            );
+            assert!(!aborted.load(Ordering::SeqCst), "task should still be running after timeout");
+
+            // Drop logic — JoinSet drop aborts the task.
+            drop(logic);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(aborted.load(Ordering::SeqCst), "task should be aborted on PodLogic drop");
+        }
+
+        #[tokio::test]
+        async fn dropping_pod_logic_aborts_runner_tasks() {
+            let store = Arc::new(MemoryStore::new());
+            let (shutdown_tx, _) = watch::channel(());
+            let aborted = Arc::new(AtomicBool::new(false));
+
+            let logic = PodLogic::new(
+                LogicConfig::default(),
+                test_cleanup_config(),
+                store,
+                make_provider(),
+                ResolverSet::default(),
+                shutdown_tx,
+            )
+            .register_runner_task(Arc::new(RunnerHang { aborted: Arc::clone(&aborted) }));
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!aborted.load(Ordering::SeqCst));
+
+            drop(logic);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(aborted.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        async fn no_runner_tasks_wait_returns_immediately() {
+            let store = Arc::new(MemoryStore::new());
+            let (shutdown_tx, _) = watch::channel(());
+            let logic = PodLogic::new(
+                LogicConfig::default(),
+                test_cleanup_config(),
+                store,
+                make_provider(),
+                ResolverSet::default(),
+                shutdown_tx,
+            );
+
+            let start = std::time::Instant::now();
+            logic.wait_for_runner_tasks(Duration::from_secs(5)).await;
+            assert!(
+                start.elapsed() < Duration::from_millis(200),
+                "wait should have returned immediately when no tasks registered",
+            );
         }
     }
 }
