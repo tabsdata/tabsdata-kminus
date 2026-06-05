@@ -540,9 +540,11 @@ func main() {
 		defer ticker.Stop()
 
 		// Phase cache: tracks the last phase we successfully synced to
-		// the K8s API for each pod. Keyed by "namespace/name".
-		// Entries accumulate over the VK's lifetime — terminal phases
-		// are harmless (bounded by total pods ever created).
+		// the K8s API for each pod incarnation. Keyed by the kube pod
+		// UID — keying by "namespace/name" alone would leak stale
+		// entries across pod replacement (delete + recreate with the
+		// same name), causing the new pod's status to be skipped if it
+		// happens to match the old pod's last cached phase.
 		phaseCache := make(map[string]string)
 
 		for {
@@ -559,19 +561,16 @@ func main() {
 					continue
 				}
 
-				// Step 2: Collect pods whose phase changed since our
-				// last successful K8s API update.
+				// Step 2: Collect pods that may need a status push. The
+				// phase-only check can't run yet because we don't have
+				// the kube UID until step 3 fetches the live pod —
+				// dedup happens after the Get returns the UID.
 				type syncItem struct {
 					entry PodStatusEntry
-					key   string
 				}
-				var toSync []syncItem
+				toSync := make([]syncItem, 0, len(entries))
 				for _, entry := range entries {
-					key := entry.Namespace + "/" + entry.Name
-					if cached, ok := phaseCache[key]; ok && cached == entry.Phase {
-						continue
-					}
-					toSync = append(toSync, syncItem{entry: entry, key: key})
+					toSync = append(toSync, syncItem{entry: entry})
 				}
 
 				if len(toSync) == 0 {
@@ -583,17 +582,18 @@ func main() {
 				// Get+UpdateStatus calls remain (2 per pod, not 3).
 				maxWorkers := vkSys.SyncMaxWorkers
 				type syncResult struct {
-					key   string
-					phase string
+					uidKey string
+					phase  string
 				}
 				results := make(chan syncResult, len(toSync))
 				sem := make(chan struct{}, maxWorkers)
+				cacheMu := sync.Mutex{}
 				var wg sync.WaitGroup
 
 				for _, item := range toSync {
 					wg.Add(1)
 					sem <- struct{}{}
-					go func(e PodStatusEntry, key string) {
+					go func(e PodStatusEntry) {
 						defer wg.Done()
 						defer func() { <-sem }()
 
@@ -602,19 +602,59 @@ func main() {
 							if err != nil {
 								break
 							}
+							uidKey := string(latestPod.UID)
+
+							// Stale-incarnation eviction. The pod-runner keys
+							// pods by uid, but the kube control plane reuses
+							// (namespace, name) across incarnations, each with a
+							// fresh uid. If the live kube pod for this name has a
+							// different uid than the pod-runner entry, the runner
+							// is still holding a *previous* incarnation: its delete
+							// was never delivered — the upstream PodController skips
+							// the provider delete for terminal pods (it deletes them
+							// from the API server only), and dangling-pod GC can't
+							// spot a uid mismatch under a reused name. Such a stale
+							// entry shadows the current pod in the runner's
+							// name-keyed lookups: getPod (which drives the lib's
+							// createOrUpdatePod, blocking the new pod's create) and
+							// getAllPodStatuses (this loop, which would otherwise
+							// push the old pod's status onto the new one).
+							//
+							// So evict it by name and skip the entry; the next sync
+							// finds the current pod and the lib creates it cleanly.
+							// e.UID == "" means an older pod-runner that doesn't
+							// report uids — skip the check rather than evict blindly.
+							// (create_pod keeps at most one incarnation per name in
+							// the runner, so the name-based delete can't hit the
+							// current pod.)
+							if e.UID != "" && uidKey != e.UID {
+								logger.Warnf("pod-runner holds stale incarnation of %s/%s (runner uid %s, live kube uid %s); evicting", e.Namespace, e.Name, e.UID, uidKey)
+								stale := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: e.Namespace, Name: e.Name}}
+								if delErr := provider.DeletePod(ctx, stale); delErr != nil {
+									logger.WithError(delErr).Warnf("failed to evict stale incarnation of %s/%s", e.Namespace, e.Name)
+								}
+								return
+							}
+
+							cacheMu.Lock()
+							cached, ok := phaseCache[uidKey]
+							cacheMu.Unlock()
+							if ok && cached == e.Phase {
+								return
+							}
 							latestPod.Status = e.Status
 							_, err = clientset.CoreV1().Pods(e.Namespace).UpdateStatus(ctx, latestPod, metav1.UpdateOptions{})
 							if err == nil {
-								results <- syncResult{key: key, phase: e.Phase}
+								results <- syncResult{uidKey: uidKey, phase: e.Phase}
 								return
 							}
 							if attempt < 2 {
 								time.Sleep(time.Duration(100*(attempt+1)) * time.Millisecond)
 							} else {
-								logger.WithError(err).Warnf("Failed to update status for %s after retries", key)
+								logger.WithError(err).Warnf("Failed to update status for %s/%s after retries", e.Namespace, e.Name)
 							}
 						}
-					}(item.entry, item.key)
+					}(item.entry)
 				}
 
 				wg.Wait()
@@ -623,11 +663,13 @@ func main() {
 				// Update cache from successful results.
 				synced := 0
 				for r := range results {
-					phaseCache[r.key] = r.phase
+					cacheMu.Lock()
+					phaseCache[r.uidKey] = r.phase
+					cacheMu.Unlock()
 					synced++
 				}
 				if synced > 0 {
-					logger.Infof("Synced %d/%d pod status updates", synced, len(toSync))
+					logger.Infof("Synced %d pod status updates", synced)
 				}
 			}
 		}

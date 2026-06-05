@@ -197,12 +197,21 @@ func (p *PodRunnerProvider) GetPods(ctx context.Context) ([]*v1.Pod, error) {
 }
 
 // PodStatusEntry is the response from GET /getAllPodStatuses.
-// Contains namespace, name, phase, and the full pod status.
+// Contains namespace, name, uid, phase, and the full pod status.
 // Used by the sync loop — one bulk call replaces N individual
 // getPodStatus calls.
+//
+// UID is the pod-runner's identity for the pod (the kube pod UID it was
+// created with). The sync loop compares it against the live kube pod's
+// UID: a pod's (namespace, name) is reused across incarnations, so a
+// mismatch means the pod-runner is still holding a *previous*
+// incarnation under this name. Older pod-runners that don't send it
+// leave UID == "", which the loop treats as "can't tell" and skips the
+// staleness check (graceful degradation across the version skew).
 type PodStatusEntry struct {
 	Namespace string       `json:"namespace"`
 	Name      string       `json:"name"`
+	UID       string       `json:"uid"`
 	Phase     string       `json:"phase"`
 	Status    v1.PodStatus `json:"status"`
 }
