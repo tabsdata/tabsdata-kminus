@@ -6,7 +6,9 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
+	"crypto/rand"
+	"encoding/csv"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -68,6 +70,104 @@ func loadOrCreateCPSysConfig(configDir string) (cpSysConfig, error) {
 		return cpSysConfig{}, fmt.Errorf("write %s: %w", path, err)
 	}
 	return cfg, nil
+}
+
+// tokensFile is the kube-apiserver static token file (--token-auth-file),
+// created with random tokens on first startup and reused thereafter so
+// the kubeconfigs (and their credentials) stay stable across restarts.
+// Pure CSV — the apiserver's parser does not support comment lines.
+const tokensFile = "tokens.csv"
+
+// Authenticated identities provisioned in tokens.csv.
+const (
+	adminUserName = "admin"
+	vkUserName    = "virtual-kubelet"
+	kcmUserName   = "system:kube-controller-manager"
+)
+
+// tokenUsers defines the users provisioned in tokens.csv and the groups
+// embedded in each token's identity.
+var tokenUsers = []struct {
+	name   string
+	groups string
+}{
+	{adminUserName, "system:masters"},
+	{vkUserName, "system:masters,system:nodes"},
+	{kcmUserName, "system:masters"},
+}
+
+// loadOrCreateTokens reads tokens.csv or creates it with fresh random
+// tokens. Returns a map of user name -> token. File format (one record
+// per user): token,user,uid,"group1,group2".
+func loadOrCreateTokens(configDir string) (map[string]string, error) {
+	path := filepath.Join(configDir, tokensFile)
+	if _, err := os.Stat(path); err == nil {
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", path, err)
+		}
+		defer file.Close()
+		reader := csv.NewReader(file)
+		reader.FieldsPerRecord = -1
+		records, err := reader.ReadAll()
+		if err != nil {
+			return nil, fmt.Errorf("parse %s: %w", path, err)
+		}
+		tokens := make(map[string]string)
+		for _, record := range records {
+			if len(record) >= 2 {
+				tokens[record[1]] = record[0]
+			}
+		}
+		for _, u := range tokenUsers {
+			if tokens[u.name] == "" {
+				return nil, fmt.Errorf("%s: no token for user %q (delete the file to regenerate it)", path, u.name)
+			}
+		}
+		return tokens, nil
+	}
+
+	tokens := make(map[string]string)
+	var lines []string
+	for _, u := range tokenUsers {
+		raw := make([]byte, 32)
+		if _, err := rand.Read(raw); err != nil {
+			return nil, fmt.Errorf("generate token: %w", err)
+		}
+		token := hex.EncodeToString(raw)
+		tokens[u.name] = token
+		lines = append(lines, fmt.Sprintf("%s,%s,%s,%q", token, u.name, u.name, u.groups))
+	}
+	content := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		return nil, fmt.Errorf("write %s: %w", path, err)
+	}
+	return tokens, nil
+}
+
+// writeKubeconfig writes a token-based kubeconfig. Token auth keeps the
+// file contents stable across restarts, unlike client certificates,
+// which envtest signs with a fresh in-memory CA on every start.
+func writeKubeconfig(path, host, userLabel, token string) error {
+	content := fmt.Sprintf(`apiVersion: v1
+clusters:
+- cluster:
+    server: %s
+    insecure-skip-tls-verify: true
+  name: local
+contexts:
+- context:
+    cluster: local
+    user: %s
+  name: default
+current-context: default
+kind: Config
+users:
+- name: %s
+  user:
+    token: %s
+`, host, userLabel, userLabel, token)
+	return os.WriteFile(path, []byte(content), 0600)
 }
 
 func writePid(path string, pid int) {
@@ -248,6 +348,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Load or create tokens.csv — static auth tokens, generated once and
+	// reused so the kubeconfigs stay valid across restarts.
+	tokens, err := loadOrCreateTokens(outDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
+
 	// Log dir (default: <workdir>/log)
 	ld := *logDir
 	if ld == "" {
@@ -330,9 +438,11 @@ func main() {
 	// Point envtest to the directory containing the binaries
 	os.Setenv("KUBEBUILDER_ASSETS", baseDir)
 
-	// Certs and configs are regenerated on every start — envtest generates
-	// a fresh CA each time so previous client certificates are not valid.
-	info("[+] Generating certificates and kubeconfigs...")
+	// envtest regenerates serving certs on every start (clients use
+	// insecure-skip-tls-verify, so it does not matter), while client auth
+	// uses the static tokens from tokens.csv — the kubeconfigs written
+	// below are stable across restarts.
+	info("[+] Generating kubeconfigs...")
 
 	testEnv := &envtest.Environment{
 		ControlPlane: envtest.ControlPlane{
@@ -353,7 +463,8 @@ func main() {
 	testEnv.ControlPlane.GetAPIServer().Configure().
 		Set("runtime-config", "api/all=true,coordination.k8s.io/v1=true").
 		Set("api-audiences", "https://kubernetes.default.svc").
-		Set("service-account-issuer", "https://kubernetes.default.svc")
+		Set("service-account-issuer", "https://kubernetes.default.svc").
+		Set("token-auth-file", filepath.Join(outDir, tokensFile))
 
 	// Start the Server
 	cfg, err := testEnv.Start()
@@ -414,39 +525,11 @@ func main() {
 	}
 
 	// Generate KCM kubeconfig
-	kcmUser, err := testEnv.AddUser(envtest.User{
-		Name:   "system:kube-controller-manager",
-		Groups: []string{"system:masters"},
-	}, nil)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create KCM user: %v\n", err)
+	kcmConfigPath := filepath.Join(outDir, "kubeconfig-kcm.yaml")
+	if err := writeKubeconfig(kcmConfigPath, cfg.Host, "kcm", tokens[kcmUserName]); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to write KCM kubeconfig: %v\n", err)
 		os.Exit(1)
 	}
-
-	kcmKubeconfig := fmt.Sprintf(`apiVersion: v1
-clusters:
-- cluster:
-    server: %s
-    insecure-skip-tls-verify: true
-  name: local
-contexts:
-- context:
-    cluster: local
-    user: kcm
-  name: default
-current-context: default
-kind: Config
-users:
-- name: kcm
-  user:
-    client-certificate-data: %s
-    client-key-data: %s
-`, cfg.Host,
-		base64.StdEncoding.EncodeToString(kcmUser.Config().CertData),
-		base64.StdEncoding.EncodeToString(kcmUser.Config().KeyData))
-
-	kcmConfigPath := filepath.Join(outDir, "kubeconfig-kcm.yaml")
-	os.WriteFile(kcmConfigPath, []byte(kcmKubeconfig), 0644)
 
 	// Start kube-controller-manager with rotating log
 	kcmLog := newRotatingLog(ld, "kube-controller-manager", *logMaxSizeMB, *logMaxFiles)
@@ -472,74 +555,19 @@ users:
 	info("[+] kube-controller-manager started (pid: %d)", kcmCmd.Process.Pid)
 
 	// Generate VK kubeconfig
-	user, err := testEnv.AddUser(envtest.User{
-		Name:   "virtual-kubelet",
-		Groups: []string{"system:masters", "system:nodes"},
-	}, nil)
-	if err != nil {
-		panic(err)
-	}
-
-	vkKubeconfig := fmt.Sprintf(`apiVersion: v1
-clusters:
-- cluster:
-    server: %s
-    insecure-skip-tls-verify: true
-  name: local
-contexts:
-- context:
-    cluster: local
-    user: vk-user
-  name: default
-current-context: default
-kind: Config
-users:
-- name: vk-user
-  user:
-    client-certificate-data: %s
-    client-key-data: %s
-`, cfg.Host,
-		base64.StdEncoding.EncodeToString(user.Config().CertData),
-		base64.StdEncoding.EncodeToString(user.Config().KeyData))
-
 	vkConfigPath := filepath.Join(outDir, "vk-kubeconfig.yaml")
-	os.WriteFile(vkConfigPath, []byte(vkKubeconfig), 0644)
+	if err := writeKubeconfig(vkConfigPath, cfg.Host, "vk-user", tokens[vkUserName]); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to write VK kubeconfig: %v\n", err)
+		os.Exit(1)
+	}
 	info("[+] VK Kubeconfig written to: %s", vkConfigPath)
 
 	// Generate admin kubeconfig
-	adminUser, err := testEnv.AddUser(envtest.User{
-		Name:   "admin",
-		Groups: []string{"system:masters"},
-	}, nil)
-	if err != nil {
-		panic(err)
-	}
-
-	kubeconfigContent := fmt.Sprintf(`apiVersion: v1
-clusters:
-- cluster:
-    server: %s
-    insecure-skip-tls-verify: true
-  name: local
-contexts:
-- context:
-    cluster: local
-    user: admin
-  name: default
-current-context: default
-kind: Config
-preferences: {}
-users:
-- name: admin
-  user:
-    client-certificate-data: %s
-    client-key-data: %s
-`, cfg.Host,
-		base64.StdEncoding.EncodeToString(adminUser.Config().CertData),
-		base64.StdEncoding.EncodeToString(adminUser.Config().KeyData))
-
 	configPath := filepath.Join(outDir, "kubeconfig.yaml")
-	os.WriteFile(configPath, []byte(kubeconfigContent), 0644)
+	if err := writeKubeconfig(configPath, cfg.Host, "admin", tokens[adminUserName]); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to write admin kubeconfig: %v\n", err)
+		os.Exit(1)
+	}
 	info("[+] Admin Kubeconfig written to: %s", configPath)
 
 	info("\nTo connect, run:")
