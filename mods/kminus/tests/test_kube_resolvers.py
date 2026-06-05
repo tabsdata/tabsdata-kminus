@@ -306,3 +306,140 @@ class TestConfigMapVolumeMount:
             k8s_client.delete_namespaced_config_map(
                 name=cm_name, namespace="default",
             )
+
+
+class TestProjectedConfigMapVolume:
+    """Pod mounts a `projected` volume merging multiple ConfigMap sources
+    flat into one directory, with per-item paths and last-source-wins on
+    collision."""
+
+    def test_projected_configmaps_merge_flat(self, km, k8s_client, batch_client):
+        from kubernetes.client import (
+            V1ConfigMap, V1ObjectMeta, V1Volume, V1VolumeMount,
+            V1ProjectedVolumeSource, V1VolumeProjection, V1ConfigMapProjection,
+            V1KeyToPath,
+        )
+
+        cm_a = _unique_name("proj-a")
+        cm_b = _unique_name("proj-b")
+        k8s_client.create_namespaced_config_map(
+            namespace="default",
+            body=V1ConfigMap(metadata=V1ObjectMeta(name=cm_a),
+                             data={"apiserver.yaml": "AAA"}),
+        )
+        k8s_client.create_namespaced_config_map(
+            namespace="default",
+            body=V1ConfigMap(metadata=V1ObjectMeta(name=cm_b),
+                             data={"apiserver.log.yaml": "BBB"}),
+        )
+
+        try:
+            mount_path = "/configs"
+            job_name = _unique_name("proj-job")
+            # Each source projects its key to a nested path; both land flat
+            # under the single mount directory.
+            check = (
+                f"[ \"$(cat $KM_CONTAINER_ROOT{mount_path}/apiserver/apiserver.yaml)\" = \"AAA\" ] && "
+                f"[ \"$(cat $KM_CONTAINER_ROOT{mount_path}/apiserver/apiserver.log.yaml)\" = \"BBB\" ]"
+            )
+            job = _job_body(
+                job_name,
+                check,
+                volumes=[V1Volume(
+                    name="cfg",
+                    projected=V1ProjectedVolumeSource(sources=[
+                        V1VolumeProjection(config_map=V1ConfigMapProjection(
+                            name=cm_a,
+                            items=[V1KeyToPath(
+                                key="apiserver.yaml",
+                                path="apiserver/apiserver.yaml",
+                            )],
+                        )),
+                        V1VolumeProjection(config_map=V1ConfigMapProjection(
+                            name=cm_b,
+                            items=[V1KeyToPath(
+                                key="apiserver.log.yaml",
+                                path="apiserver/apiserver.log.yaml",
+                            )],
+                        )),
+                    ]),
+                )],
+                volume_mounts=[V1VolumeMount(
+                    name="cfg", mount_path=mount_path, read_only=True,
+                )],
+            )
+            batch_client.create_namespaced_job(namespace="default", body=job)
+            try:
+                _wait_for_job(batch_client, job_name)
+            finally:
+                batch_client.delete_namespaced_job(
+                    name=job_name, namespace="default",
+                    propagation_policy="Background",
+                )
+        finally:
+            k8s_client.delete_namespaced_config_map(name=cm_a, namespace="default")
+            k8s_client.delete_namespaced_config_map(name=cm_b, namespace="default")
+
+    def test_projected_collision_last_source_wins(self, km, k8s_client, batch_client):
+        from kubernetes.client import (
+            V1ConfigMap, V1ObjectMeta, V1Volume, V1VolumeMount,
+            V1ProjectedVolumeSource, V1VolumeProjection, V1ConfigMapProjection,
+            V1KeyToPath,
+        )
+
+        # NOTE: the collision must come from two sources sharing a *key
+        # name* with NO `items` set. If both sources declared the same
+        # explicit `items[].path`, the kube-apiserver rejects the pod at
+        # admission ("conflicting duplicate paths") — the silent last-wins
+        # behavior only applies to implicit (key-name) paths it can't
+        # pre-validate. Both configMaps share the key "shared.yaml".
+        cm_first = _unique_name("col-first")
+        cm_second = _unique_name("col-second")
+        k8s_client.create_namespaced_config_map(
+            namespace="default",
+            body=V1ConfigMap(metadata=V1ObjectMeta(name=cm_first),
+                             data={"shared.yaml": "FIRST"}),
+        )
+        k8s_client.create_namespaced_config_map(
+            namespace="default",
+            body=V1ConfigMap(metadata=V1ObjectMeta(name=cm_second),
+                             data={"shared.yaml": "SECOND"}),
+        )
+
+        try:
+            mount_path = "/configs"
+            job_name = _unique_name("col-job")
+            # Both sources project a "shared.yaml" key into the same dir; the
+            # later source (cm_second) wins. pod-runner logs a warning too.
+            check = (
+                f"[ \"$(cat $KM_CONTAINER_ROOT{mount_path}/shared.yaml)\" = \"SECOND\" ]"
+            )
+            job = _job_body(
+                job_name,
+                check,
+                volumes=[V1Volume(
+                    name="cfg",
+                    projected=V1ProjectedVolumeSource(sources=[
+                        V1VolumeProjection(config_map=V1ConfigMapProjection(
+                            name=cm_first,
+                        )),
+                        V1VolumeProjection(config_map=V1ConfigMapProjection(
+                            name=cm_second,
+                        )),
+                    ]),
+                )],
+                volume_mounts=[V1VolumeMount(
+                    name="cfg", mount_path=mount_path, read_only=True,
+                )],
+            )
+            batch_client.create_namespaced_job(namespace="default", body=job)
+            try:
+                _wait_for_job(batch_client, job_name)
+            finally:
+                batch_client.delete_namespaced_job(
+                    name=job_name, namespace="default",
+                    propagation_policy="Background",
+                )
+        finally:
+            k8s_client.delete_namespaced_config_map(name=cm_first, namespace="default")
+            k8s_client.delete_namespaced_config_map(name=cm_second, namespace="default")

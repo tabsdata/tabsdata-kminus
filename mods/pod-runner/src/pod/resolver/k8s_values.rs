@@ -95,6 +95,17 @@ pub async fn resolve_k8s_values(
             configmap_names.push(cm.name.clone());
             configmap_volume_names.push(cm.name.clone());
         }
+        // `projected` volumes: fetch the data of every configMap source so
+        // the volume resolver can materialize them. Other source types are
+        // ignored here (and warned about at materialization time).
+        if let Some(ref proj) = v.projected {
+            for src in &proj.sources {
+                if let Some(ref cm) = src.config_map {
+                    configmap_names.push(cm.name.clone());
+                    configmap_volume_names.push(cm.name.clone());
+                }
+            }
+        }
     }
 
     // Dedup
@@ -455,6 +466,7 @@ mod tests {
             name: "config".to_string(),
             config_map: Some(ConfigMapVolume {
                 name: "app-config".to_string(),
+                ..Default::default()
             }),
             ..Default::default()
         });
@@ -480,6 +492,7 @@ mod tests {
             name: "config".to_string(),
             config_map: Some(ConfigMapVolume {
                 name: "missing".to_string(),
+                ..Default::default()
             }),
             ..Default::default()
         });
@@ -502,5 +515,55 @@ mod tests {
 
         let result = resolve_no_wait(&pod, "default", &ResolverSet::default()).await.unwrap();
         assert_eq!(result.containers["app"].env["PLAIN"], "val");
+    }
+
+    #[tokio::test]
+    async fn projected_configmap_sources_resolved() {
+        let dir = setup_dir("proj-cm");
+        fs::write(dir.join("cm-a.yaml"), "data:\n  apiserver.yaml: \"A\"\n").unwrap();
+        fs::write(dir.join("cm-b.yaml"), "data:\n  apiserver.log.yaml: \"B\"\n").unwrap();
+
+        let mut pod = make_pod_with_envs(vec![Container {
+            name: "app".to_string(),
+            volume_mounts: vec![VolumeMount {
+                name: "cfg".to_string(),
+                mount_path: "/etc/app".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }]);
+        pod.spec.volumes.push(Volume {
+            name: "cfg".to_string(),
+            projected: Some(ProjectedVolume {
+                sources: vec![
+                    VolumeProjection {
+                        config_map: Some(ConfigMapVolume {
+                            name: "cm-a".to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    VolumeProjection {
+                        config_map: Some(ConfigMapVolume {
+                            name: "cm-b".to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ],
+            }),
+            ..Default::default()
+        });
+
+        let resolvers = ResolverSet {
+            config_map_resolver: Some(Box::new(FileConfigMapResolver::new(dir).unwrap())),
+            ..Default::default()
+        };
+
+        // Both projected configMap sources are fetched and stashed for the
+        // volume resolver to materialize.
+        let result = resolve_no_wait(&pod, "default", &resolvers).await.unwrap();
+        assert_eq!(result.config_map_volumes["cm-a"]["apiserver.yaml"], "A");
+        assert_eq!(result.config_map_volumes["cm-b"]["apiserver.log.yaml"], "B");
     }
 }

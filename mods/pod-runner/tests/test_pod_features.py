@@ -148,6 +148,17 @@ class TestConfigMapVolume:
         # they aren't created the container exits non-zero and Failed.
         assert data["phase"] == "Succeeded"
 
+    def test_projected_volume_files_present(self, pod_runner, mtls_client):
+        pod = load_pod_def("projected-configmap-volume")
+        name, ns = submit_pod(mtls_client, pod_runner, pod)
+        data = wait_for_pod_phase(
+            mtls_client, pod_runner, ns, name, {"Succeeded"}, timeout=15,
+        )
+        # The pod `cat`s both files projected from two configMap sources into
+        # nested paths under one mount; a missing file would exit non-zero
+        # and surface as Failed.
+        assert data["phase"] == "Succeeded"
+
 
 class TestContainerRoot:
     """Pod that exercises the auto-injected KM_CONTAINER_ROOT env var,
@@ -307,6 +318,55 @@ class TestResolverWait:
         finally:
             if os.path.exists(secret_path):
                 os.remove(secret_path)
+
+    def test_missing_projected_configmap_appearing_succeeds(self, pod_runner, mtls_client):
+        """A configMap referenced by a `projected` volume source goes through
+        the same wait/backoff path as any configMap: a source that is missing
+        at create time blocks preparation until it materializes (or the
+        deadline elapses). Here it appears mid-wait and the pod Succeeds."""
+        cm_name = f"late-proj-{unique_name('cm')}"
+        cm_path = os.path.join(RESOURCES_DIR, "configmaps", f"{cm_name}.yaml")
+        if os.path.exists(cm_path):
+            os.remove(cm_path)
+        spec = {
+            "metadata": {
+                "name": unique_name("wait-proj"),
+                "namespace": "default",
+                "uid": unique_name("uid"),
+            },
+            "spec": {
+                "nodeName": "virtual-node",
+                "restartPolicy": "Never",
+                "activeDeadlineSeconds": 30,
+                "containers": [{
+                    "name": "app",
+                    "image": "/dev/null",
+                    "command": ["sh", "-c"],
+                    "args": ["cat $KM_CONTAINER_ROOT/configs/app.yaml"],
+                    "volumeMounts": [{
+                        "name": "cfg", "mountPath": "/configs", "readOnly": True,
+                    }],
+                }],
+                "volumes": [{
+                    "name": "cfg",
+                    "projected": {"sources": [{"configMap": {"name": cm_name}}]},
+                }],
+            },
+        }
+        try:
+            name, ns = submit_pod(mtls_client, pod_runner, spec)
+            # Let the preparer fail at least once and enter backoff before the
+            # configMap materializes.
+            time.sleep(1.0)
+            with open(cm_path, "w") as f:
+                f.write("data:\n  app.yaml: \"ready\"\n")
+            data = wait_for_pod_phase(
+                mtls_client, pod_runner, ns, name, {"Succeeded"}, timeout=20,
+            )
+            assert data["phase"] == "Succeeded"
+        finally:
+            if os.path.exists(cm_path):
+                os.remove(cm_path)
 
     def test_optional_true_rejected_at_admission(self, pod_runner, mtls_client):
         """`optional: true` on a secret reference is rejected by the

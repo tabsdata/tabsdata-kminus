@@ -1,0 +1,50 @@
+# Pod that mounts a `projected` volume merging two configMap sources into a
+# single directory. Each source uses `items` to project one key to a nested
+# path; both land flat under the one mount point:
+#
+#   /configs/apiserver/apiserver.yaml      (from configMap apiserver-config)
+#   /configs/apiserver/apiserver.log.yaml  (from configMap apiserver-log-config)
+#
+# Only `configMap` projection sources are supported. All keys from all sources
+# are merged flat; on a path collision the LAST source in `sources` wins and
+# pod-runner logs a warning (k8s does the same, silently).
+#
+# Requires a ConfigMapResolver configured at create time. As with `configMap`
+# volumes, the data is resolved once during preparation and not refreshed.
+#
+# Note: the pod runner rewrites the absolute mount path to
+# <container_root>/<mountPath> during preparation, so the command uses
+# $KM_CONTAINER_ROOT to access the resolved location.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: projected-configmap-volume
+  namespace: default
+
+spec:
+  nodeName: virtual-node
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: /dev/null
+      command: ["sh", "-c"]
+      args:
+        - "cat $KM_CONTAINER_ROOT/configs/apiserver/apiserver.yaml && cat $KM_CONTAINER_ROOT/configs/apiserver/apiserver.log.yaml"
+      volumeMounts:
+        - name: configmap-configs
+          mountPath: /configs
+          readOnly: true
+  volumes:
+    - name: configmap-configs
+      projected:
+        sources:
+          - configMap:
+              name: apiserver-config
+              items:
+                - key: apiserver.yaml
+                  path: apiserver/apiserver.yaml
+          - configMap:
+              name: apiserver-log-config
+              items:
+                - key: apiserver.log.yaml
+                  path: apiserver/apiserver.log.yaml

@@ -313,12 +313,15 @@ relative to this directory.
 |-------------|---------------------------------------------------------------------------|
 | `emptyDir`  | Creates an empty directory at the mount path                              |
 | `hostPath`  | Creates a symlink from the mount path to the host directory               |
-| `configMap` | Creates a directory at the mount path; one file per key (key=name, value=contents). ConfigMap data is fetched once during pod preparation via the configured `ConfigMapResolver`. |
+| `configMap` | Creates a directory at the mount path; one file per key (key=name, value=contents), or only the keys selected by `configMap.items` at their `path`. ConfigMap data is fetched once during pod preparation via the configured `ConfigMapResolver`. |
+| `projected` | Merges one or more `configMap` sources flat into the mount directory (each source honoring `items`). On a path collision the later source wins and a warning is logged. Only `configMap` sources are supported; others are skipped with a warning. |
 
-**ConfigMap volumes — whole-configmap mounts only.** kminus only supports
-mounting a configmap as a full directory: every key in the configmap becomes a
-file in the mounted directory. `configMap.items` (per-key selection) and
-`volumeMount.subPath` (per-file mounting) are **not** supported.
+**`configMap.items` is supported; `volumeMount.subPath` is not.** A configMap
+volume writes either every key (file named after the key) or, when `items` is
+set, only the listed keys at their relative `path`. A `projected` volume flat-
+merges multiple configMap sources into one directory with last-source-wins on
+collision (logged as a warning, since k8s does this silently). `mode` bits are
+parsed but ignored; item paths that are absolute or contain `..` are skipped.
 
 **ConfigMaps are not refreshed at runtime.** Unlike Kubernetes — where the
 kubelet re-syncs mounted configmap volumes when the underlying configmap
@@ -510,9 +513,9 @@ Both stores are updated on every state change.
 | Container images         | Local directory templates only. No registry pulls.                |
 | Resource requests/limits | Stored and echoed; not enforced.                                  |
 | Namespaces               | Accepted for lookup; no isolation.                                |
-| Volumes                  | hostPath (Directory), emptyDir, and configMap. No PVCs.           |
+| Volumes                  | hostPath (Directory), emptyDir, configMap, and projected (configMap sources). No PVCs. |
 | Secrets                  | Environment variables only. No file-mount support.                |
-| ConfigMaps               | Environment variables, plus whole-configmap volume mounts (one file per key). No `items` or `subPath`. |
+| ConfigMaps               | Environment variables, plus configMap / projected volume mounts (`items` supported, `subPath` not). |
 | Probes                   | exec, httpGet, tcpSocket. No gRPC.                                |
 | Restart policies         | Never, OnFailure. No Always (except for sidecar init containers). |
 | Networking               | Host network only. No pod networking or service mesh.             |

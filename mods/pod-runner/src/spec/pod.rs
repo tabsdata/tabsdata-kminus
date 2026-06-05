@@ -143,10 +143,48 @@ pub struct HostPathVolume {
 #[serde(rename_all = "camelCase", default)]
 pub struct EmptyDirVolume {}
 
+/// Maps a single ConfigMap key to a relative path under the mount point.
+///
+/// The `path` is relative to the volume's `mountPath` and may contain
+/// subdirectories (e.g. `apiserver/apiserver.yaml`). `mode` (file
+/// permission bits) is accepted but ignored.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct KeyToPath {
+    pub key: String,
+    pub path: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ConfigMapVolume {
     pub name: String,
+    /// Optional key selection. When empty, every key in the configmap is
+    /// projected at a file named after the key. When set, only the listed
+    /// keys are projected, each at its `path` (relative to the mount).
+    pub items: Vec<KeyToPath>,
+}
+
+/// One source within a `projected` volume. Only `configMap` sources are
+/// supported; any other source type (secret, downwardAPI,
+/// serviceAccountToken) lands in `extra` and is skipped with a warning
+/// during volume materialization.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct VolumeProjection {
+    pub config_map: Option<ConfigMapVolume>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// A `projected` volume. All sources are merged flat into the single mount
+/// directory (respecting each item's `path`). On a path collision the last
+/// source in `sources` wins — pod-runner logs a warning, matching k8s'
+/// silent last-wins behavior but making it visible.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProjectedVolume {
+    pub sources: Vec<VolumeProjection>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -156,6 +194,7 @@ pub struct Volume {
     pub host_path: Option<HostPathVolume>,
     pub empty_dir: Option<EmptyDirVolume>,
     pub config_map: Option<ConfigMapVolume>,
+    pub projected: Option<ProjectedVolume>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -327,5 +366,46 @@ spec:
         assert_eq!(vm.name, "config");
         assert_eq!(vm.mount_path, "/etc/app");
         assert!(vm.read_only);
+    }
+
+    #[test]
+    fn projected_configmap_volume_deserializes_from_yaml() {
+        let yaml = r#"
+spec:
+  volumes:
+    - name: configmap-configs
+      projected:
+        sources:
+          - configMap:
+              name: tabsdata-configs-apiserver.yaml
+              items:
+                - key: apiserver.yaml
+                  path: apiserver/apiserver.yaml
+          - configMap:
+              name: tabsdata-configs-apiserver-log
+              items:
+                - key: apiserver.log.yaml
+                  path: apiserver/apiserver.log.yaml
+  containers:
+    - name: app
+      image: /dev/null
+"#;
+
+        let pod: PodSpec = serde_yaml_ng::from_str(yaml).unwrap();
+        let vol = &pod.spec.volumes[0];
+        assert_eq!(vol.name, "configmap-configs");
+        assert!(vol.config_map.is_none());
+        let proj = vol.projected.as_ref().expect("projected should be set");
+        assert_eq!(proj.sources.len(), 2);
+
+        let s0 = proj.sources[0].config_map.as_ref().unwrap();
+        assert_eq!(s0.name, "tabsdata-configs-apiserver.yaml");
+        assert_eq!(s0.items.len(), 1);
+        assert_eq!(s0.items[0].key, "apiserver.yaml");
+        assert_eq!(s0.items[0].path, "apiserver/apiserver.yaml");
+
+        let s1 = proj.sources[1].config_map.as_ref().unwrap();
+        assert_eq!(s1.name, "tabsdata-configs-apiserver-log");
+        assert_eq!(s1.items[0].path, "apiserver/apiserver.log.yaml");
     }
 }

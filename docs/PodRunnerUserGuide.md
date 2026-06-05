@@ -258,10 +258,11 @@ Creates a directory at the mount path and writes one file per configmap key
 (filename = key, contents = value). Requires a `ConfigMapResolver` to be
 configured.
 
-**kminus only supports mounting an entire configmap as a directory.** Per-key
-selection (`configMap.items`) and per-file mounts (`volumeMount.subPath`) are
-not supported — every key in the configmap becomes a file in the mounted
-directory.
+**`configMap.items` is supported.** When `items` is set, only the listed keys
+are projected, each written at its `items[].path` (relative to the mount,
+subdirectories allowed). When `items` is omitted, every key is written at a
+file named after the key. `mode` (file permission bits) is parsed but ignored,
+and `volumeMount.subPath` is **not** supported.
 
 **Convention:** mount configmap volumes at `/configmaps/<configmap-name>`.
 This makes the location predictable for both producers (writing pod specs)
@@ -293,6 +294,56 @@ spec:
 Given a configmap with `data: { app.conf: "...", logging.yaml: "..." }`, the
 container sees `/configmaps/app-config/app.conf` and
 `/configmaps/app-config/logging.yaml` populated with the corresponding values.
+
+### projected
+
+Merges one or more sources into a single mount directory. **Only `configMap`
+sources are supported** — other projection source types (`secret`,
+`downwardAPI`, `serviceAccountToken`) are skipped with a warning logged by
+pod-runner. Each `configMap` source behaves like a standalone configMap volume
+(honoring `items`), but all sources are flattened into the **same** target
+directory.
+
+**Flat merge with last-source-wins on collision.** All keys from all sources
+land in the mount directory at their `items[].path` (or key name when `items`
+is omitted). If two sources write the same target path, the source listed
+**later** in `sources` overwrites the earlier one. This matches Kubernetes'
+silent last-wins behavior — but pod-runner **logs a warning** identifying the
+colliding path and the winning/overwritten `configmap/key` so the collision is
+not invisible.
+
+Keys named by `items` but absent from their configMap, and item paths that are
+absolute or contain `..`, are skipped (each with a warning).
+
+```yaml
+spec:
+  volumes:
+    - name: configmap-configs
+      projected:
+        sources:
+          - configMap:
+              name: tabsdata-configs-apiserver.yaml
+              items:
+                - key: apiserver.yaml
+                  path: apiserver/apiserver.yaml
+          - configMap:
+              name: tabsdata-configs-apiserver-log
+              items:
+                - key: apiserver.log.yaml
+                  path: apiserver/apiserver.log.yaml
+  containers:
+    - name: app
+      image: /dev/null
+      command: ["./server"]
+      volumeMounts:
+        - name: configmap-configs
+          mountPath: /configs
+          readOnly: true
+```
+
+The container sees `/configs/apiserver/apiserver.yaml` and
+`/configs/apiserver/apiserver.log.yaml`. The same once-at-preparation
+resolution caveat as `configMap` volumes applies (not refreshed at runtime).
 
 ---
 

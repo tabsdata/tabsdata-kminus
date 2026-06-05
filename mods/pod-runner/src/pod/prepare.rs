@@ -1035,6 +1035,7 @@ mod tests {
             name: "config".to_string(),
             config_map: Some(ConfigMapVolume {
                 name: "app-config".to_string(),
+                ..Default::default()
             }),
             ..Default::default()
         });
