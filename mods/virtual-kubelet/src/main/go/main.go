@@ -29,6 +29,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/virtual-kubelet/virtual-kubelet/node"
 	nodeapi "github.com/virtual-kubelet/virtual-kubelet/node/api"
+	"golang.org/x/time/rate"
 	"gopkg.in/natefinch/lumberjack.v2"
 	"gopkg.in/yaml.v2"
 	v1 "k8s.io/api/core/v1"
@@ -41,6 +42,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/workqueue"
 )
 
 var (
@@ -61,6 +63,8 @@ var (
 type vkSysConfig struct {
 	SyncSec              int `yaml:"syncSec"`
 	PodControllerWorkers int `yaml:"podControllerWorkers"`
+	PodControllerQPS     int `yaml:"podControllerQps"`
+	PodControllerBurst   int `yaml:"podControllerBurst"`
 	SyncMaxWorkers       int `yaml:"syncMaxWorkers"`
 	ClientQPS            int `yaml:"clientQps"`
 	ClientBurst          int `yaml:"clientBurst"`
@@ -70,6 +74,8 @@ func defaultVKSysConfig() vkSysConfig {
 	return vkSysConfig{
 		SyncSec:              1,
 		PodControllerWorkers: 100,
+		PodControllerQPS:     500,
+		PodControllerBurst:   1000,
 		SyncMaxWorkers:       50,
 		ClientQPS:            500,
 		ClientBurst:          1000,
@@ -431,14 +437,32 @@ func main() {
 	serviceInformer := scmInformerFactory.Core().V1().Services()
 
 	// Create pod controller
+	// The PodController work queues default to client-go's
+	// DefaultControllerRateLimiter, whose token bucket caps the global
+	// drain at 10 qps / 100 burst — so all PodControllerWorkers share a
+	// 10/s ceiling and pod create/delete/status-sync back up at scale.
+	// Override with a configurable bucket (podControllerQps/Burst) so
+	// throughput tracks the worker count instead.
+	podRateLimiter := func() workqueue.RateLimiter {
+		return workqueue.NewMaxOfRateLimiter(
+			workqueue.NewItemExponentialFailureRateLimiter(5*time.Millisecond, 1000*time.Second),
+			&workqueue.BucketRateLimiter{
+				Limiter: rate.NewLimiter(rate.Limit(vkSys.PodControllerQPS), vkSys.PodControllerBurst),
+			},
+		)
+	}
+
 	podController, err := node.NewPodController(node.PodControllerConfig{
-		PodClient:         clientset.CoreV1(),
-		PodInformer:       podInformer,
-		ConfigMapInformer: configMapInformer,
-		SecretInformer:    secretInformer,
-		ServiceInformer:   serviceInformer,
-		EventRecorder:     recorder,
-		Provider:          provider,
+		PodClient:                            clientset.CoreV1(),
+		PodInformer:                          podInformer,
+		ConfigMapInformer:                    configMapInformer,
+		SecretInformer:                       secretInformer,
+		ServiceInformer:                      serviceInformer,
+		EventRecorder:                        recorder,
+		Provider:                             provider,
+		SyncPodsFromKubernetesRateLimiter:    podRateLimiter(),
+		DeletePodsFromKubernetesRateLimiter:  podRateLimiter(),
+		SyncPodStatusFromProviderRateLimiter: podRateLimiter(),
 	})
 	if err != nil {
 		logger.WithError(err).Fatal("failed to create pod controller")
