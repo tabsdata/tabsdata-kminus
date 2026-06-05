@@ -482,7 +482,8 @@ impl PodLogHandle {
 
             if let Err(e) =
                 container_log::stream_log_file(
-                    &tx, &log_path, options.tail_lines, options.follow, &state, &mut kill_watch,
+                    &tx, &log_path, options.tail_lines, options.follow, options.timestamps,
+                    &state, &mut kill_watch,
                 ).await
             {
                 let _ = tx.send(Err(e)).await;
@@ -2207,6 +2208,96 @@ mod tests {
                 "restart {restart_count}: first line should be the warning: {first_line}"
             );
         }
+    }
+
+    // -- log streaming ---------------------------------------------------------
+
+    use crate::pod::container_log::ContainerLogOptions;
+
+    /// Collect a log stream to a string until it closes (bounded by a timeout).
+    async fn collect_stream(
+        mut rx: mpsc::Receiver<Result<bytes::Bytes, io::Error>>,
+        secs: u64,
+    ) -> String {
+        let mut out = String::new();
+        let _ = tokio::time::timeout(Duration::from_secs(secs), async {
+            while let Some(item) = rx.recv().await {
+                match item {
+                    Ok(b) => out.push_str(std::str::from_utf8(&b).unwrap()),
+                    Err(_) => break,
+                }
+            }
+        })
+        .await;
+        out
+    }
+
+    #[tokio::test]
+    async fn test_log_stream_strips_cri_prefix() {
+        let dir = test_dir!("logs-stream-strip");
+        let (_tx, rx) = shutdown();
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![
+            container("main", "echo first && echo second"),
+        ]))
+        .log_dir(&dir)
+        .spawn(rx)
+        .await
+        .unwrap();
+        let log_handle = h.log_handle();
+        let _ = h.wait_for_completion().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let stream = log_handle.stream(None, ContainerLogOptions::default()).unwrap();
+        let out = collect_stream(stream, 10).await;
+        assert_eq!(out, "first\nsecond\n");
+
+        // With timestamps, each line is "<RFC3339Nano ts> <message>".
+        let stream = log_handle
+            .stream(None, ContainerLogOptions { timestamps: true, ..Default::default() })
+            .unwrap();
+        let out = collect_stream(stream, 10).await;
+        let first = out.lines().next().unwrap();
+        let (ts, msg) = first.split_once(' ').unwrap();
+        assert!(ts.ends_with('Z') && ts.contains('T'), "not a timestamp: {ts}");
+        assert_eq!(msg, "first");
+    }
+
+    #[tokio::test]
+    async fn test_log_stream_follow_survives_rotation() {
+        let dir = test_dir!("logs-rotation-follow");
+        // Each CRI line is ~50 bytes; rotate every ~200 bytes so the log
+        // rotates several times while the stream is following.
+        let c = container(
+            "main",
+            "i=0; while [ $i -lt 30 ]; do echo line-$i; i=$((i+1)); sleep 0.05; done; echo done-marker",
+        );
+        let (_tx, rx) = shutdown();
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
+            .log_dir_rolling(&dir, 200, 5)
+            .spawn(rx)
+            .await
+            .unwrap();
+
+        let log_handle = h.log_handle();
+        let stream = log_handle
+            .stream(None, ContainerLogOptions { follow: true, ..Default::default() })
+            .unwrap();
+        let collector = tokio::spawn(collect_stream(stream, 20));
+
+        let _ = h.wait_for_completion().await;
+        let out = collector.await.unwrap();
+
+        // Rotation actually happened…
+        assert!(
+            dir.join("main").join("0.log.1").exists(),
+            "expected rotation to have occurred"
+        );
+        // …and the follow stream kept delivering lines written after it,
+        // all the way to the final marker in the freshest file.
+        assert!(
+            out.contains("done-marker"),
+            "follow stream lost data after rotation; got: {out}"
+        );
     }
 
     // -- drop ----------------------------------------------------------------

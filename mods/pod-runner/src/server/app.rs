@@ -97,6 +97,8 @@ struct LogQuery {
     tail_lines: Option<u64>,
     #[serde(default)]
     previous: bool,
+    #[serde(default)]
+    timestamps: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +255,7 @@ async fn handle_get_container_logs(
         follow: params.follow,
         tail_lines: params.tail_lines,
         previous: params.previous,
+        timestamps: params.timestamps,
     };
 
     let rx = match state

@@ -140,10 +140,11 @@ class TestMounts:
         lines = text.splitlines()
         assert lines, "container log is empty"
         # The read-only warning for input-vol is the very first log line,
-        # before any container output (CRI format: "<ts> stderr F <msg>").
-        assert "volume 'input-vol' has been mounted as read-only" in lines[0], \
+        # before any container output. Output is kubectl-style: the CRI
+        # prefix ("<ts> stderr F ") is stripped.
+        assert lines[0].startswith(
+            "WARNING: volume 'input-vol' has been mounted as read-only"), \
             f"first log line is not the read-only warning: {lines[0]}"
-        assert " stderr F " in lines[0]
         # No warning for the read-write mounts.
         assert "'scratch-vol'" not in text
         assert "'output-vol'" not in text
@@ -157,6 +158,76 @@ class TestMounts:
         data = wait_for_pod_phase(mtls_client, pod_runner, ns, name,
                                   {"Succeeded"}, timeout=20)
         assert data["phase"] == "Succeeded"
+
+
+class TestContainerLogs:
+    """Container log streaming: kubectl-style output, tailLines,
+    timestamps, and follow."""
+
+    def _logs_url(self, pod_runner, name, ns, extra=""):
+        return (f"{pod_runner.url}/getContainerLogs"
+                f"?podName={name}&namespace={ns}&containerName=app{extra}")
+
+    def _run_log_lines_pod(self, pod_runner, mtls_client):
+        pod = load_pod_def("log-lines")
+        name, ns = submit_pod(mtls_client, pod_runner, pod)
+        data = wait_for_pod_phase(mtls_client, pod_runner, ns, name,
+                                  {"Succeeded"}, timeout=15)
+        assert data["phase"] == "Succeeded"
+        return name, ns
+
+    def test_logs_are_plain_messages(self, pod_runner, mtls_client):
+        name, ns = self._run_log_lines_pod(pod_runner, mtls_client)
+        st, text = mtls_client.get_text(self._logs_url(pod_runner, name, ns))
+        assert st == 200
+        # kubectl-style output: messages only, CRI prefix stripped.
+        assert text.splitlines() == [f"line-{i}" for i in range(10)]
+
+    def test_tail_lines(self, pod_runner, mtls_client):
+        name, ns = self._run_log_lines_pod(pod_runner, mtls_client)
+        st, text = mtls_client.get_text(
+            self._logs_url(pod_runner, name, ns, "&tailLines=3"))
+        assert st == 200
+        assert text.splitlines() == ["line-7", "line-8", "line-9"]
+
+    def test_timestamps(self, pod_runner, mtls_client):
+        import re
+        name, ns = self._run_log_lines_pod(pod_runner, mtls_client)
+        st, text = mtls_client.get_text(
+            self._logs_url(pod_runner, name, ns, "&timestamps=true"))
+        assert st == 200
+        lines = text.splitlines()
+        assert len(lines) == 10
+        # Each line: "<RFC3339Nano ts> <message>"
+        pat = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z line-\d$")
+        for line in lines:
+            assert pat.match(line), f"bad timestamped line: {line}"
+
+    def test_follow_streams_until_pod_terminates(self, pod_runner,
+                                                 mtls_client):
+        # Ticker prints one line per second for 5s then exits. follow=true
+        # must keep the stream open while the pod runs and deliver every
+        # line, closing only once the pod is terminal.
+        pod = load_pod_def("log-lines")
+        pod["spec"]["containers"][0]["args"] = [
+            "i=0; while [ $i -lt 5 ]; do echo tick-$i; i=$((i+1)); sleep 1; done"
+        ]
+        name, ns = submit_pod(mtls_client, pod_runner, pod)
+        wait_for_pod_phase(mtls_client, pod_runner, ns, name,
+                           {"Running"}, timeout=10)
+
+        import time
+        start = time.time()
+        st, text = mtls_client.get_text(
+            self._logs_url(pod_runner, name, ns, "&follow=true"))
+        elapsed = time.time() - start
+        assert st == 200
+        lines = text.splitlines()
+        assert [l for l in lines if l.startswith("tick-")] == \
+            [f"tick-{i}" for i in range(5)], f"missing ticks: {lines}"
+        # The stream stayed open until the pod finished (~5s), rather
+        # than returning the current snapshot immediately.
+        assert elapsed > 2, f"follow returned too quickly ({elapsed:.1f}s)"
 
 
 class TestSecrets:

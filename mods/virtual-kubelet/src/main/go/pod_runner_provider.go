@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
+	"strconv"
 	"time"
 
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
@@ -24,18 +26,24 @@ type PodRunnerProvider struct {
 	nodeName         string
 	providerEndpoint string
 	httpClient       *http.Client
-	kubeletPort      int32
+	// streamClient shares httpClient's transport (TLS config) but has no
+	// whole-request timeout — used for endpoints that stream indefinitely
+	// (container logs with follow).
+	streamClient *http.Client
+	kubeletPort  int32
 }
 
 func NewPodRunnerProvider(nodeName, providerEndpoint string, httpClient *http.Client, kubeletPort int32) *PodRunnerProvider {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
+	streamClient := &http.Client{Transport: httpClient.Transport}
 	return &PodRunnerProvider{
 		nodeName:         nodeName,
 		providerEndpoint: providerEndpoint,
 		kubeletPort:      kubeletPort,
 		httpClient:       httpClient,
+		streamClient:     streamClient,
 	}
 }
 
@@ -354,11 +362,41 @@ func defaultNodeAddresses() []v1.NodeAddress {
 	}
 }
 
-func (p *PodRunnerProvider) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts api.ContainerLogOpts) (io.ReadCloser, error) {
-	url := fmt.Sprintf("%s/getContainerLogs?podName=%s&namespace=%s&containerName=%s",
-		p.providerEndpoint, podName, namespace, containerName)
+// containerLogsURL builds the pod-runner /getContainerLogs URL for the
+// given pod/container, forwarding the kubectl log options (follow,
+// tailLines, previous, timestamps) as query parameters.
+func (p *PodRunnerProvider) containerLogsURL(namespace, podName, containerName string, opts api.ContainerLogOpts) string {
+	q := neturl.Values{}
+	q.Set("podName", podName)
+	q.Set("namespace", namespace)
+	q.Set("containerName", containerName)
+	if opts.Follow {
+		q.Set("follow", "true")
+	}
+	if opts.Tail > 0 {
+		q.Set("tailLines", strconv.Itoa(opts.Tail))
+	}
+	if opts.Previous {
+		q.Set("previous", "true")
+	}
+	if opts.Timestamps {
+		q.Set("timestamps", "true")
+	}
+	return fmt.Sprintf("%s/getContainerLogs?%s", p.providerEndpoint, q.Encode())
+}
 
-	resp, err := p.httpClient.Get(url)
+func (p *PodRunnerProvider) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts api.ContainerLogOpts) (io.ReadCloser, error) {
+	url := p.containerLogsURL(namespace, podName, containerName, opts)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build container logs request: %w", err)
+	}
+
+	// Use the stream client: with follow=true the response body streams
+	// until the pod terminates or kubectl disconnects (ctx cancel), so
+	// the regular client's whole-request timeout must not apply.
+	resp, err := p.streamClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get container logs: %w", err)
 	}

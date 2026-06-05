@@ -92,6 +92,8 @@ pub struct ContainerLogOptions {
     pub tail_lines: Option<u64>,
     /// Return logs from the previous container restart.
     pub previous: bool,
+    /// Prefix each line with its CRI timestamp (kubectl --timestamps).
+    pub timestamps: bool,
 }
 
 
@@ -104,16 +106,22 @@ const LOG_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Maximum time to wait for a log file to appear before giving up.
 const LOG_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Stream a log file in chunks through the sender.
+/// Stream a log file through the sender, reformatting CRI lines into
+/// kubectl-style output (message only, or `<ts> <message>` with
+/// `timestamps`).
 ///
 /// Handles `tail_lines` (seek to last N lines before reading) and
 /// `follow` (poll for new data until the pod reaches a terminal phase
-/// or the receiver is dropped).
+/// or the receiver is dropped). In follow mode the file is reopened
+/// when the writer rotates it (current → `.1`, fresh current file), so
+/// the stream keeps following across rotations; bytes appended to the
+/// old file between the last read and the rotation are drained first.
 pub(crate) async fn stream_log_file(
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
     path: &Path,
     tail_lines: Option<u64>,
     follow: bool,
+    timestamps: bool,
     state: &Arc<Mutex<PodState>>,
     kill_watch: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), io::Error> {
@@ -170,34 +178,212 @@ pub(crate) async fn stream_log_file(
         }
     }
 
+    // Bytes consumed from the current file — compared against the
+    // on-disk size to detect rotation (fresh file is smaller).
+    let mut offset = file.stream_position().await?;
+    let mut formatter = CriFormatter::new(timestamps);
+
+    // Send the reformatted lines completed by one chunk. Returns false
+    // when the receiver is gone.
+    async fn send_chunk(
+        tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+        formatter: &mut CriFormatter,
+        chunk: &[u8],
+    ) -> bool {
+        let out = formatter.push(chunk);
+        out.is_empty() || tx.send(Ok(Bytes::from(out))).await.is_ok()
+    }
+
+    // Send any trailing line that never got its newline (stream end).
+    async fn send_rest(tx: &mpsc::Sender<Result<Bytes, io::Error>>, formatter: &mut CriFormatter) {
+        let out = formatter.finish();
+        if !out.is_empty() {
+            let _ = tx.send(Ok(Bytes::from(out))).await;
+        }
+    }
+
     // Stream the file in chunks
     let mut buf = vec![0u8; LOG_CHUNK_SIZE];
     loop {
         let n = file.read(&mut buf).await?;
         if n > 0 {
-            if tx.send(Ok(Bytes::copy_from_slice(&buf[..n]))).await.is_err() {
+            offset += n as u64;
+            if !send_chunk(tx, &mut formatter, &buf[..n]).await {
                 return Ok(());
             }
         } else if follow {
-            // EOF — check if pod is terminal or killed
+            // EOF — check if killed, rotated, or pod is terminal
             if *kill_watch.borrow() {
+                drain_to_end(&mut file, &mut offset, path, &mut buf, tx, &mut formatter).await;
+                send_rest(tx, &mut formatter).await;
                 return Ok(());
             }
+
+            // Rotation: the writer moved the current file aside and
+            // started a fresh one when the on-disk size is smaller than
+            // what we've already consumed. Drain anything appended to
+            // the old file after our last read, then switch to the
+            // fresh file. A missing path / failed open is transient
+            // (mid-rotation) — retry on the next poll.
+            if let Ok(meta) = tokio::fs::metadata(path).await
+                && meta.len() < offset
+                && let Ok(fresh) = tokio::fs::File::open(path).await
+            {
+                loop {
+                    let n = file.read(&mut buf).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    if !send_chunk(tx, &mut formatter, &buf[..n]).await {
+                        return Ok(());
+                    }
+                }
+                file = fresh;
+                offset = 0;
+                continue;
+            }
+
             let is_terminal = {
                 let st = state.lock().await;
                 st.lifecycle.is_terminal()
             };
             if is_terminal {
-                let n = file.read(&mut buf).await?;
-                if n > 0 {
-                    let _ = tx.send(Ok(Bytes::copy_from_slice(&buf[..n]))).await;
-                }
+                drain_to_end(&mut file, &mut offset, path, &mut buf, tx, &mut formatter).await;
+                send_rest(tx, &mut formatter).await;
                 return Ok(());
             }
             tokio::time::sleep(LOG_POLL_INTERVAL).await;
         } else {
+            send_rest(tx, &mut formatter).await;
             return Ok(());
         }
+    }
+}
+
+/// Final catch-up when a followed stream ends (pod killed or terminal):
+/// drain the current fd, then follow any rotation that raced with the
+/// shutdown so the freshest lines (e.g. the container's last output)
+/// aren't lost. Best-effort — an I/O error or a dropped receiver just
+/// stops the drain. The rotation hops are bounded as a safety valve.
+async fn drain_to_end(
+    file: &mut tokio::fs::File,
+    offset: &mut u64,
+    path: &Path,
+    buf: &mut [u8],
+    tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    formatter: &mut CriFormatter,
+) {
+    use tokio::io::AsyncReadExt;
+
+    const MAX_ROTATION_HOPS: usize = 8;
+    for _ in 0..MAX_ROTATION_HOPS {
+        loop {
+            match file.read(buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    *offset += n as u64;
+                    let out = formatter.push(&buf[..n]);
+                    if !out.is_empty() && tx.send(Ok(Bytes::from(out))).await.is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+        match tokio::fs::metadata(path).await {
+            Ok(meta) if meta.len() < *offset => match tokio::fs::File::open(path).await {
+                Ok(fresh) => {
+                    *file = fresh;
+                    *offset = 0;
+                }
+                Err(_) => return,
+            },
+            _ => return,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CRI line reformatting — kubectl-style output
+// ---------------------------------------------------------------------------
+
+/// Reformat CRI log lines (`<ts> <stdout|stderr> <P|F> <message>`) into
+/// kubectl-style output: the message alone, or `<ts> <message>` when
+/// `timestamps` is set — matching what a real kubelet serves.
+///
+/// Input arrives in arbitrary chunks; a line straddling a chunk boundary
+/// is buffered until its newline arrives. Lines that don't parse as CRI
+/// pass through unchanged.
+struct CriFormatter {
+    timestamps: bool,
+    partial: Vec<u8>,
+}
+
+impl CriFormatter {
+    fn new(timestamps: bool) -> Self {
+        Self {
+            timestamps,
+            partial: Vec::new(),
+        }
+    }
+
+    /// Feed a chunk, returning the reformatted bytes of every line the
+    /// chunk completes.
+    fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.partial.extend_from_slice(chunk);
+        let mut out = Vec::with_capacity(self.partial.len());
+        let mut start = 0;
+        while let Some(rel) = self.partial[start..].iter().position(|&b| b == b'\n') {
+            let end = start + rel;
+            reformat_cri_line(&self.partial[start..end], self.timestamps, &mut out);
+            out.push(b'\n');
+            start = end + 1;
+        }
+        self.partial.drain(..start);
+        out
+    }
+
+    /// Flush a trailing line that never got its newline (stream end).
+    fn finish(&mut self) -> Vec<u8> {
+        if self.partial.is_empty() {
+            return Vec::new();
+        }
+        let line = std::mem::take(&mut self.partial);
+        let mut out = Vec::with_capacity(line.len());
+        reformat_cri_line(&line, self.timestamps, &mut out);
+        out
+    }
+}
+
+/// Rewrite one CRI line (without its trailing newline) into `out`.
+fn reformat_cri_line(line: &[u8], timestamps: bool, out: &mut Vec<u8>) {
+    // CRI: "<ts> <stdout|stderr> <P|F> <message>"
+    let parsed = (|| {
+        let sp1 = line.iter().position(|&b| b == b' ')?;
+        let rest = &line[sp1 + 1..];
+        let sp2 = rest.iter().position(|&b| b == b' ')?;
+        let stream = &rest[..sp2];
+        if stream != b"stdout" && stream != b"stderr" {
+            return None;
+        }
+        let rest = &rest[sp2 + 1..];
+        let sp3 = rest.iter().position(|&b| b == b' ')?;
+        let tag = &rest[..sp3];
+        if tag != b"F" && tag != b"P" {
+            return None;
+        }
+        Some((&line[..sp1], &rest[sp3 + 1..]))
+    })();
+
+    match parsed {
+        Some((ts, msg)) => {
+            if timestamps {
+                out.extend_from_slice(ts);
+                out.push(b' ');
+            }
+            out.extend_from_slice(msg);
+        }
+        None => out.extend_from_slice(line),
     }
 }
 
@@ -691,6 +877,63 @@ mod tests {
             let content = std::fs::read_to_string(&path).unwrap();
             assert!(content.contains(&format!("{}-check", probe_type)));
         }
+    }
+
+    // -- CriFormatter ----------------------------------------------------------
+
+    fn fmt_all(timestamps: bool, chunks: &[&str]) -> String {
+        let mut f = CriFormatter::new(timestamps);
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend(f.push(c.as_bytes()));
+        }
+        out.extend(f.finish());
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn test_cri_formatter_strips_prefix() {
+        let s = fmt_all(false, &[
+            "2026-04-14T15:30:00.000000000Z stdout F hello world\n\
+             2026-04-14T15:30:01.000000000Z stderr F warn line\n",
+        ]);
+        assert_eq!(s, "hello world\nwarn line\n");
+    }
+
+    #[test]
+    fn test_cri_formatter_timestamps() {
+        let s = fmt_all(true, &["2026-04-14T15:30:00.000000000Z stdout F hello\n"]);
+        assert_eq!(s, "2026-04-14T15:30:00.000000000Z hello\n");
+    }
+
+    #[test]
+    fn test_cri_formatter_line_across_chunks() {
+        let s = fmt_all(false, &[
+            "2026-04-14T15:30:00.000000000Z std",
+            "out F spl",
+            "it line\n2026-04-14T15:30:01.000000000Z stdout F next\n",
+        ]);
+        assert_eq!(s, "split line\nnext\n");
+    }
+
+    #[test]
+    fn test_cri_formatter_non_cri_passthrough() {
+        let s = fmt_all(false, &["plain line no prefix\nanother\n"]);
+        assert_eq!(s, "plain line no prefix\nanother\n");
+        // Wrong stream token is not CRI either.
+        let s = fmt_all(false, &["2026-04-14T15:30:00Z bogus F x\n"]);
+        assert_eq!(s, "2026-04-14T15:30:00Z bogus F x\n");
+    }
+
+    #[test]
+    fn test_cri_formatter_empty_message_and_trailing_partial() {
+        // Empty message keeps its line; trailing partial (no newline)
+        // is flushed by finish() without adding a newline.
+        let s = fmt_all(false, &[
+            "2026-04-14T15:30:00.000000000Z stdout F \n\
+             2026-04-14T15:30:01.000000000Z stdout F no newline",
+        ]);
+        assert_eq!(s, "\nno newline");
     }
 
     // -- shift_files (unit tests) --------------------------------------------

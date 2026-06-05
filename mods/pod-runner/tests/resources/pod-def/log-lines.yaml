@@ -1,0 +1,16 @@
+# Pod that prints 10 numbered lines and exits — used by container-log
+# streaming tests (tailLines, timestamps, follow).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: log-lines
+  namespace: default
+
+spec:
+  nodeName: virtual-node
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["i=0; while [ $i -lt 10 ]; do echo line-$i; i=$((i+1)); done"]
