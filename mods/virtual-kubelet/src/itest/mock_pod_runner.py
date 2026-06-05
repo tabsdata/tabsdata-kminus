@@ -63,6 +63,24 @@ class MockPodRunnerHandler(BaseHTTPRequestHandler):
             pods = list(self.server.pods.values())
             self._send_json(pods)
 
+        elif path == "/getAllPodStatuses":
+            # Bulk status feed consumed by the VK status-sync loop. Only
+            # pods the mock still holds are reported; a deleted pod drops
+            # out (see do_DELETE), which is what lets the VK finalize the
+            # Terminating kube object instead of waiting the grace period.
+            entries = []
+            for pod in self.server.pods.values():
+                meta = pod.get("metadata", {})
+                status = pod.get("status", {"phase": "Running"})
+                entries.append({
+                    "namespace": meta.get("namespace", "default"),
+                    "name": meta.get("name", "unknown"),
+                    "uid": meta.get("uid", ""),
+                    "phase": status.get("phase", "Running"),
+                    "status": status,
+                })
+            self._send_json(entries)
+
         elif path == "/getPod":
             ns = query.get("namespace", [""])[0]
             name = query.get("name", [""])[0]

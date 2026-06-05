@@ -33,12 +33,15 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 	"gopkg.in/yaml.v2"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
@@ -204,6 +207,71 @@ func (f *klogFormatter) Format(entry *logrus.Entry) ([]byte, error) {
 func writePidFile(path string, pid int) {
 	os.MkdirAll(filepath.Dir(path), 0755)
 	os.WriteFile(path, []byte(strconv.Itoa(pid)), 0644)
+}
+
+// podsToFinalize selects Terminating pods (a deletionTimestamp is set) whose
+// containers the provider is no longer running — i.e. whose UID is not in
+// `activeUIDs`, the set of pods the pod-runner currently reports with a
+// non-terminal phase (Pending/Running/…). A pod the provider reports as
+// terminal, or no longer reports at all (already cleaned up), is done and
+// safe to remove immediately.
+//
+// Why this exists: when a *running* pod is deleted, the upstream
+// PodController calls the provider's DeletePod and then enqueues the
+// API-server removal with a delay equal to the pod's
+// DeletionGracePeriodSeconds (podcontroller.go:575). The pod-runner kills
+// the container and drops the pod from its status feed within milliseconds,
+// but the object then sits in Terminating for the full grace period (30s by
+// default) before the library removes it. A real kubelet instead finalizes
+// as soon as the containers stop. We restore that behavior by force-deleting
+// (grace 0) these pods ourselves; whichever delete lands first wins and the
+// other is a harmless NotFound.
+func podsToFinalize(pods []*v1.Pod, activeUIDs map[string]bool) []*v1.Pod {
+	var out []*v1.Pod
+	for _, pod := range pods {
+		if pod.DeletionTimestamp == nil {
+			continue
+		}
+		if activeUIDs[string(pod.UID)] {
+			// Provider is still running this incarnation — let it
+			// terminate within its grace period rather than yanking it.
+			continue
+		}
+		out = append(out, pod)
+	}
+	return out
+}
+
+// finalizeTerminatingPods force-deletes (grace 0, UID precondition) the
+// Terminating pods whose work the provider has finished, so they don't
+// linger in Terminating for the full grace period. See [podsToFinalize].
+func finalizeTerminatingPods(
+	ctx context.Context,
+	pods corev1.PodsGetter,
+	lister listersv1.PodLister,
+	activeUIDs map[string]bool,
+	logger *logrus.Logger,
+) {
+	all, err := lister.List(labels.Everything())
+	if err != nil {
+		logger.WithError(err).Debug("finalize: failed to list pods from informer")
+		return
+	}
+	for _, pod := range podsToFinalize(all, activeUIDs) {
+		opts := *metav1.NewDeleteOptions(0)
+		opts.Preconditions = metav1.NewUIDPreconditions(string(pod.UID))
+		err := pods.Pods(pod.Namespace).Delete(ctx, pod.Name, opts)
+		switch {
+		case err == nil:
+			logger.Infof("finalize: force-deleted terminating pod %s/%s (provider done)",
+				pod.Namespace, pod.Name)
+		case apierrors.IsNotFound(err) || apierrors.IsConflict(err):
+			// Already removed (library queue or a newer incarnation) — fine.
+		default:
+			logger.WithError(err).Warnf("finalize: failed to force-delete %s/%s",
+				pod.Namespace, pod.Name)
+		}
+	}
 }
 
 func main() {
@@ -578,6 +646,7 @@ func main() {
 	//   After:  1 pod-runner call + 0 K8s calls       → ~10 ms/tick
 	// -----------------------------------------------------------------------
 	logger.Infof("Pod status sync interval: %s", syncInterval)
+	podLister := podInformer.Lister()
 	go func() {
 		ticker := time.NewTicker(syncInterval)
 		defer ticker.Stop()
@@ -603,6 +672,19 @@ func main() {
 					logger.WithError(err).Debug("Failed to get pod statuses for sync")
 					continue
 				}
+
+				// Finalize Terminating pods whose containers the provider has
+				// already finished, so they don't sit in Terminating for the
+				// full grace period (see finalizeTerminatingPods). A pod is
+				// "active" only while the pod-runner reports it with a
+				// non-terminal phase.
+				activeUIDs := make(map[string]bool, len(entries))
+				for _, e := range entries {
+					if e.Phase != "Succeeded" && e.Phase != "Failed" {
+						activeUIDs[e.UID] = true
+					}
+				}
+				finalizeTerminatingPods(ctx, clientset.CoreV1(), podLister, activeUIDs, logger)
 
 				// Step 2: Collect pods that may need a status push. The
 				// phase-only check can't run yet because we don't have

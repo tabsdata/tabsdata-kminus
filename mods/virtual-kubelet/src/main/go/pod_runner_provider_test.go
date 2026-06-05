@@ -10,6 +10,9 @@ import (
 	"testing"
 
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 func parseLogsQuery(t *testing.T, rawURL string) neturl.Values {
@@ -78,5 +81,63 @@ func TestStreamClientHasNoTimeout(t *testing.T) {
 	p := NewPodRunnerProvider("node", "https://127.0.0.1:1", nil, 10250)
 	if p.streamClient.Timeout != 0 {
 		t.Fatalf("stream client must not have a whole-request timeout, got %v", p.streamClient.Timeout)
+	}
+}
+
+func termPod(name, uid string, deleting bool) *v1.Pod {
+	p := &v1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "default", Name: name, UID: types.UID(uid),
+	}}
+	if deleting {
+		now := metav1.Now()
+		p.DeletionTimestamp = &now
+	}
+	return p
+}
+
+func names(pods []*v1.Pod) []string {
+	out := make([]string, 0, len(pods))
+	for _, p := range pods {
+		out = append(out, p.Name)
+	}
+	return out
+}
+
+func TestPodsToFinalizeSelectsDoneTerminatingPods(t *testing.T) {
+	pods := []*v1.Pod{
+		termPod("running-deleting", "uid-run", true),   // active → keep
+		termPod("terminal-deleting", "uid-term", true), // not active → finalize
+		termPod("gone-deleting", "uid-gone", true),     // absent from provider → finalize
+		termPod("running-alive", "uid-alive", false),   // not deleting → skip
+	}
+	// Provider reports the running pod (non-terminal) and the terminal one.
+	active := map[string]bool{"uid-run": true}
+
+	got := names(podsToFinalize(pods, active))
+	want := map[string]bool{"terminal-deleting": true, "gone-deleting": true}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 pods to finalize, got %v", got)
+	}
+	for _, n := range got {
+		if !want[n] {
+			t.Fatalf("unexpected pod selected for finalize: %s (got %v)", n, got)
+		}
+	}
+}
+
+func TestPodsToFinalizeSkipsNonTerminating(t *testing.T) {
+	pods := []*v1.Pod{termPod("alive", "uid-1", false)}
+	if got := podsToFinalize(pods, map[string]bool{}); len(got) != 0 {
+		t.Fatalf("non-terminating pod must never be finalized, got %v", names(got))
+	}
+}
+
+func TestPodsToFinalizeKeepsActiveTerminating(t *testing.T) {
+	// A pod still running in the provider must NOT be finalized even though
+	// it is Terminating — it should terminate within its grace period.
+	pods := []*v1.Pod{termPod("running-deleting", "uid-run", true)}
+	active := map[string]bool{"uid-run": true}
+	if got := podsToFinalize(pods, active); len(got) != 0 {
+		t.Fatalf("active terminating pod must not be finalized, got %v", names(got))
 	}
 }
