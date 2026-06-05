@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use sysinfo::{Pid, System};
+use sysinfo::{Pid, ProcessesToUpdate, System};
 use tracing::{info, warn};
 
 pub const DATA_DIR: &str = "data";
@@ -76,25 +76,47 @@ pub fn apply_subprocess_flags(command: &mut Command) {
 /// Check whether a process with the given PID is currently running.
 pub fn is_alive(pid: u32) -> bool {
     let mut system = System::new();
-    system.refresh_processes(
-        sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
-        true,
-    );
+    system.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
     system.process(Pid::from_u32(pid)).is_some()
 }
 
+/// Walk the process table by PPID and return every descendant of `root`.
+/// Needed because some children (notably kube-apiserver and etcd) call
+/// `setpgid` and escape the leader's process group, so a group-wide
+/// SIGKILL alone leaves them dangling.
+fn collect_descendants(root: u32) -> Vec<u32> {
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    let root_pid = Pid::from_u32(root);
+    let mut descendants: Vec<u32> = Vec::new();
+    let mut frontier: Vec<Pid> = vec![root_pid];
+    while let Some(current) = frontier.pop() {
+        for (pid, process) in system.processes() {
+            if process.parent() == Some(current) {
+                descendants.push(pid.as_u32());
+                frontier.push(*pid);
+            }
+        }
+    }
+    descendants
+}
+
 /// Send a graceful shutdown request to the process with `pid`, wait up
-/// to `grace`, then force-kill the whole tree if it has not exited.
+/// to `grace` for the whole descendant tree, then force-kill anything
+/// still alive.
 ///
-/// Unix: `SIGTERM` then (after `grace`) `SIGKILL`.
+/// Unix: `SIGTERM` to the leader, then (after `grace`) `SIGKILL` to the
+/// process group and to each descendant by PID. The per-PID pass catches
+/// kube-apiserver and etcd, which escape the leader's process group.
 /// Windows: `CTRL_BREAK_EVENT` to the process group then (after
 /// `grace`) `taskkill /F /T` to terminate the whole tree.
 pub fn terminate_process(pid: u32, grace: Duration) {
+    let descendants = collect_descendants(pid);
     request_graceful_shutdown(pid);
-    if wait_for_exit(pid, grace) {
+    if wait_for_tree_exit(pid, &descendants, grace) {
         return;
     }
-    force_kill_tree(pid);
+    force_kill_tree(pid, &descendants);
 }
 
 fn request_graceful_shutdown(pid: u32) {
@@ -113,31 +135,38 @@ fn request_graceful_shutdown(pid: u32) {
     }
 }
 
-fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
+fn wait_for_tree_exit(root: u32, descendants: &[u32], timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if !is_alive(pid) {
+    loop {
+        let any_alive = is_alive(root) || descendants.iter().any(|pid| is_alive(*pid));
+        if !any_alive {
             return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    !is_alive(pid)
 }
 
-fn force_kill_tree(pid: u32) {
+fn force_kill_tree(root: u32, descendants: &[u32]) {
     #[cfg(unix)]
     {
         use nix::sys::signal::{self, Signal};
         use nix::unistd::Pid as NixPid;
-        let _ = signal::kill(NixPid::from_raw(pid as i32), Signal::SIGKILL);
+        let _ = signal::kill(NixPid::from_raw(-(root as i32)), Signal::SIGKILL);
+        for pid in descendants {
+            let _ = signal::kill(NixPid::from_raw(*pid as i32), Signal::SIGKILL);
+        }
     }
     #[cfg(target_os = "windows")]
     {
+        let _ = descendants;
         let mut command = Command::new("taskkill.exe");
         apply_detached_flags(&mut command);
         let _ = command
             .arg("/PID")
-            .arg(pid.to_string())
+            .arg(root.to_string())
             .arg("/T")
             .arg("/F")
             .status();

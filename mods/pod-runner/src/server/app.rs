@@ -394,6 +394,12 @@ mod tests {
         })
     }
 
+    fn pod_spec_json_uid(name: &str, uid: &str, cmd: &str) -> serde_json::Value {
+        let mut v = pod_spec_json(name, cmd);
+        v["metadata"]["uid"] = serde_json::json!(uid);
+        v
+    }
+
     // -- createPod --
 
     #[tokio::test]
@@ -419,8 +425,10 @@ mod tests {
     async fn create_pod_duplicate() {
         let (addr, _) = start_server().await;
 
+        // Same name, new uid, old pod still live → conflict (retryable);
+        // the old pod is terminated so a later retry can proceed.
         request(&addr, "POST", "/createPod", Some(pod_spec_json("app", "sleep 60"))).await;
-        let (status, body) = request(&addr, "POST", "/createPod", Some(pod_spec_json("app", "sleep 60"))).await;
+        let (status, body) = request(&addr, "POST", "/createPod", Some(pod_spec_json_uid("app", "uid-app-2", "sleep 60"))).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(body["error"].as_str().unwrap().contains("already exists"));
     }

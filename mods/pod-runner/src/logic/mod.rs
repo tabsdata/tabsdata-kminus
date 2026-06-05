@@ -468,13 +468,53 @@ impl PodLogic {
         // full list of rules.
         crate::pod::admission::admit(&spec)?;
 
-        // Uniqueness
-        if self.store.get_by_name(&id.namespace, &id.name, SpecView::Running).await.is_some() {
-            warn!(pod = %id, "Pod already exists");
-            return Err(LogicError::Conflict {
-                namespace: id.namespace,
-                name: id.name,
-            });
+        // Identity reconciliation. A pod's (namespace, name) is its
+        // identity in kube; the UID only distinguishes successive
+        // incarnations. The control plane reuses a name only after the
+        // prior pod has been deleted, so an existing entry under the same
+        // name means one of:
+        //   - same UID  → a redelivery of this same pod (resync).
+        //     Idempotent: return the current snapshot, don't start a
+        //     second run.
+        //   - diff UID + terminal → a stale incarnation whose delete went
+        //     missing upstream. Evict it and run the new pod.
+        //   - diff UID + live → a live pod with the same name still
+        //     exists. Never run two pods with the same name at once:
+        //     terminate the old one and reject the new pod with a
+        //     (retryable) conflict — the next attempt proceeds once the
+        //     old pod has been reaped.
+        // A different-UID collision always means a delete went missing
+        // upstream, so warn to keep it visible.
+        if let Some(existing) = self
+            .store
+            .get_by_name(&id.namespace, &id.name, SpecView::Running)
+            .await
+        {
+            if existing.id.uid == id.uid {
+                debug!(pod = %id, "Create for already-known pod (same UID); returning current snapshot");
+                return Ok(existing);
+            }
+            if existing.status.phase.is_terminal() {
+                warn!(
+                    pod = %id,
+                    stale_uid = %existing.id.uid,
+                    stale_phase = ?existing.status.phase,
+                    "Evicting stale terminal pod to make room for the new incarnation"
+                );
+                self.delete_pod_inner(existing, None, std::time::Instant::now()).await?;
+            } else {
+                warn!(
+                    pod = %id,
+                    live_uid = %existing.id.uid,
+                    live_phase = ?existing.status.phase,
+                    "Live pod with same name still exists; terminating it and rejecting the new pod (retry once reaped)"
+                );
+                self.delete_pod_inner(existing, None, std::time::Instant::now()).await?;
+                return Err(LogicError::Conflict {
+                    namespace: id.namespace,
+                    name: id.name,
+                });
+            }
         }
 
         // Capacity
@@ -735,6 +775,10 @@ impl PodLogic {
                 .map(|snap| crate::spec::api::PodStatusEntry {
                     namespace: snap.id.namespace,
                     name: snap.id.name,
+                    // Carry the uid so the VK can distinguish a stale
+                    // incarnation lingering under a reused name from the
+                    // current one. See PodStatusEntry docs.
+                    uid: snap.id.uid,
                     phase: snap.status.phase.to_string(),
                     status: snap.status,
                 })
@@ -1475,6 +1519,12 @@ mod tests {
             spec
         }
 
+        fn make_pod_spec_uid(name: &str, uid: &str, cmd: &str) -> PodSpec {
+            let mut spec = make_pod_spec(name, cmd);
+            spec.metadata.uid = uid.to_string();
+            spec
+        }
+
         fn make_logic_with_store() -> (PodLogic, Arc<MemoryStore>, watch::Sender<()>) {
             let store = Arc::new(MemoryStore::new());
             let provider = make_provider();
@@ -1579,12 +1629,53 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn create_pod_duplicate_rejected() {
+        async fn create_pod_same_uid_is_idempotent() {
+            let (logic, store, _) = make_logic_with_store();
+            // Same (namespace, name, uid) redelivered — a resync, not a
+            // second incarnation. The second create returns the current
+            // snapshot without starting another run.
+            let first = logic.create_pod(make_pod_spec("app", "sleep 60")).await.unwrap();
+            let second = logic.create_pod(make_pod_spec("app", "sleep 60")).await.unwrap();
+            assert_eq!(first.id, second.id);
+            assert_eq!(store.len().await, 1);
+        }
+
+        #[tokio::test]
+        async fn create_pod_same_name_new_uid_rejected_when_live() {
             let (logic, _, _) = make_logic_with_store();
             logic.create_pod(make_pod_spec("app", "sleep 60")).await.unwrap();
 
-            let err = logic.create_pod(make_pod_spec("app", "sleep 60")).await.unwrap_err();
+            // Same name, different uid, old pod still live → reject
+            // (retryable). The old pod is terminated so a later retry can
+            // proceed once it has been reaped.
+            let err = logic
+                .create_pod(make_pod_spec_uid("app", "uid-app-2", "sleep 60"))
+                .await
+                .unwrap_err();
             assert!(matches!(err, LogicError::Conflict { .. }));
+        }
+
+        #[tokio::test]
+        async fn create_pod_evicts_stale_terminal_same_name() {
+            let (logic, store, _) = make_logic_with_store();
+            // First incarnation runs to completion but is never deleted.
+            logic.create_pod(make_pod_spec("app", "exit 0")).await.unwrap();
+            wait_for_terminal(&logic, "app").await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // New incarnation, same name, different uid: the stale
+            // terminal entry is evicted and the new pod starts.
+            let snap = logic
+                .create_pod(make_pod_spec_uid("app", "uid-app-2", "sleep 60"))
+                .await
+                .unwrap();
+            assert_eq!(snap.id.uid, "uid-app-2");
+            assert_eq!(snap.status.phase, PodPhase::Pending);
+
+            // Only the new incarnation remains under this name.
+            let got = logic.get_pod("default", "app", SpecView::Running).await.unwrap();
+            assert_eq!(got.id.uid, "uid-app-2");
+            assert_eq!(store.len().await, 1);
         }
 
         #[tokio::test]
@@ -1601,6 +1692,20 @@ mod tests {
             logic.create_pod(make_pod_spec("first", "sleep 60")).await.unwrap();
             let err = logic.create_pod(make_pod_spec("second", "sleep 60")).await.unwrap_err();
             assert!(matches!(err, LogicError::CapacityExceeded { max: 1 }));
+        }
+
+        #[tokio::test]
+        async fn list_pod_statuses_carries_uid() {
+            let (logic, _, _) = make_logic_with_store();
+            logic.create_pod(make_pod_spec("app", "sleep 60")).await.unwrap();
+
+            // The uid must be present in the bulk status feed: the VK sync
+            // loop relies on it to distinguish a stale incarnation from the
+            // current one under a reused name.
+            let entries = logic.list_pod_statuses().await;
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].name, "app");
+            assert_eq!(entries[0].uid, "uid-app");
         }
 
         // -- monitor: status transitions --

@@ -669,6 +669,28 @@ spec:
         path.to_string_lossy().to_string()
     }
 
+    /// Like `write_pod_yaml` but with an explicit uid (and a uid-derived
+    /// filename so two specs for the same name don't clobber each other).
+    /// Used to exercise same-name/different-uid incarnations.
+    fn write_pod_yaml_uid(dir: &std::path::Path, name: &str, uid: &str, cmd: &str) -> String {
+        let cmd_json = serde_json::to_string(&shell_cmd(cmd)).unwrap();
+        let yaml = format!(
+            r#"metadata:
+  namespace: default
+  name: {name}
+  uid: {uid}
+spec:
+  containers:
+    - name: main
+      command: {cmd_json}
+"#
+        );
+        let path = dir.join(format!("{uid}.yaml"));
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(&path, &yaml).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
     // -- create --
 
     #[tokio::test]
@@ -689,13 +711,36 @@ spec:
         let (url, _tx) = start_test_server().await;
         let client = test_client();
         let dir = std::env::temp_dir().join(format!("td-prc-dup-{}", std::process::id()));
-        let file = write_pod_yaml(&dir, "dup", "sleep 60");
 
+        // First incarnation, live.
+        let file = write_pod_yaml_uid(&dir, "dup", "uid-dup-1", "sleep 60");
         let code = cmd_create(&client, &url, &file).await;
         assert_eq!(code, EXIT_OK);
 
-        let code = cmd_create(&client, &url, &file).await;
+        // Same name, different uid, old pod still live → the server
+        // rejects with a Conflict (it terminates the old pod so a later
+        // retry can proceed once it is reaped).
+        let file2 = write_pod_yaml_uid(&dir, "dup", "uid-dup-2", "sleep 60");
+        let code = cmd_create(&client, &url, &file2).await;
         assert_eq!(code, EXIT_SERVER_ERROR);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_create_pod_same_uid_idempotent() {
+        let (url, _tx) = start_test_server().await;
+        let client = test_client();
+        let dir = std::env::temp_dir().join(format!("td-prc-idem-{}", std::process::id()));
+        let file = write_pod_yaml(&dir, "idem", "sleep 60");
+
+        // Re-submitting the very same pod (same namespace/name/uid) is a
+        // redelivery, not a second incarnation — the server returns the
+        // current pod, so the client succeeds both times.
+        let code = cmd_create(&client, &url, &file).await;
+        assert_eq!(code, EXIT_OK);
+        let code = cmd_create(&client, &url, &file).await;
+        assert_eq!(code, EXIT_OK);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

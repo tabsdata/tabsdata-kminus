@@ -43,13 +43,22 @@ pub struct DeletePodResponse {
 
 /// Entry in the GET /getAllPodStatuses response.
 ///
-/// Contains namespace, name, phase, and the full pod status — designed
-/// for the virtual-kubelet's sync loop. One bulk call replaces N
-/// individual getPodStatus calls.
+/// Contains namespace, name, uid, phase, and the full pod status —
+/// designed for the virtual-kubelet's sync loop. One bulk call replaces
+/// N individual getPodStatus calls.
+///
+/// `uid` is the pod's identity within this runner (the kube pod UID as
+/// submitted on create). The VK sync loop needs it to tell incarnations
+/// apart: a pod's `(namespace, name)` is reused across successive
+/// incarnations, so when the runner still holds a previous incarnation
+/// the VK compares this `uid` against the live kube pod's UID to detect
+/// (and evict) the stale one. Without it the loop would push a stale
+/// pod's status onto the current pod under the same name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodStatusEntry {
     pub namespace: String,
     pub name: String,
+    pub uid: String,
     pub phase: String,
     pub status: PodStatus,
 }
