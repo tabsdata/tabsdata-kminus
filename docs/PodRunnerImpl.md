@@ -219,8 +219,8 @@ All endpoints use query parameters for GET/DELETE and JSON body for POST.
 | **GET**    | `/getPod`             | Get full pod object     | `name` (req), `namespace`                                                         |
 | **GET**    | `/getPodStatus`       | Get status only         | `podName` (req), `namespace`                                                      |
 | **GET**    | `/getPods`            | List all pods           | `namespace` (optional)                                                            |
-| **GET**    | `/getAllPodStatuses`  | Bulk status dump for sync loop — returns `[{namespace, name, phase, status}]`   |                                                                                   |
-| **GET**    | `/getContainerLogs`   | Stream container logs   | `podName` (req), `namespace`, `containerName`, `follow`, `tailLines`, `previous`  |
+| **GET**    | `/getAllPodStatuses`  | Bulk status dump for sync loop — returns `[{namespace, name, uid, phase, status}]` |                                                                                   |
+| **GET**    | `/getContainerLogs`   | Stream container logs   | `podName` (req), `namespace`, `containerName`, `follow`, `tailLines`, `previous`, `timestamps` |
 
 ### Node Information
 
@@ -295,9 +295,12 @@ Each container status reports one of three states:
 
 ### Container Image Resolution
 
-The `image` field in a container spec is treated as a **local directory path**. If the path exists and is a
-directory, its contents are recursively copied into the container's working directory. Use `/dev/null` or an empty
-string to skip the copy.
+The `image` field in a container spec is treated as a **local path**: a
+directory is recursively copied into the container's working directory; a
+`.tgz` / `.tar.gz` archive is extracted into it. Relative paths are resolved
+against the images root (`--imagesdir`, falling back to `imagesDir` in
+`prsysconfig.yaml`, then `./images`); absolute paths are used as-is. Use
+`/dev/null` or an empty string to skip the copy.
 
 ### Working Directory
 
@@ -309,12 +312,26 @@ relative to this directory.
 
 ### Volume Mounts
 
-| Type        | Behavior                                                                  |
+Volumes are pod-level: each volume referenced by a `volumeMount` is
+materialized exactly once under `<pod_dir>/volumes/<volume_name>`, and
+every container mount path becomes a symlink to that volume directory.
+Volumes are therefore shared across containers (an `emptyDir` written by
+one container is visible to the others). A stale symlink or empty
+directory already at a mount path (e.g. from an image template) is
+replaced; any other existing content fails preparation with
+`MountPathConflict`.
+
+| Type        | Materialization under `volumes/<name>`                                    |
 |-------------|---------------------------------------------------------------------------|
-| `emptyDir`  | Creates an empty directory at the mount path                              |
-| `hostPath`  | Creates a symlink from the mount path to the host directory               |
-| `configMap` | Creates a directory at the mount path; one file per key (key=name, value=contents), or only the keys selected by `configMap.items` at their `path`. ConfigMap data is fetched once during pod preparation via the configured `ConfigMapResolver`. |
-| `projected` | Merges one or more `configMap` sources flat into the mount directory (each source honoring `items`). On a path collision the later source wins and a warning is logged. Only `configMap` sources are supported; others are skipped with a warning. |
+| `emptyDir`  | An empty directory                                                        |
+| `hostPath`  | A symlink to the host directory                                           |
+| `configMap` | A directory with one file per key (key=name, value=contents), or only the keys selected by `configMap.items` at their `path`. ConfigMap data is fetched once during pod preparation via the configured `ConfigMapResolver`. |
+| `projected` | A directory merging one or more `configMap` sources flat (each source honoring `items`). On a path collision the later source wins and a warning is logged. Only `configMap` sources are supported; others are skipped with a warning. |
+
+**Read-only mounts are not enforced** (mounts are plain symlinks).
+Instead, a warning line is written at the very beginning of the
+container's log for each `readOnly` mount, stating that not writing
+into the volume is the container's responsibility.
 
 **`configMap.items` is supported; `volumeMount.subPath` is not.** A configMap
 volume writes either every key (file named after the key) or, when `items` is
@@ -443,13 +460,23 @@ Follows K8s log naming conventions:
 
 Log rotation: 100MB per file, 5 files max. Rotation happens after a newline boundary.
 
+On-disk log files use the CRI format
+(`<ts> <stdout|stderr> F <message>`); log collectors can consume them
+directly.
+
 ### Log Retrieval
 
-The `/getContainerLogs` endpoint supports:
+The `/getContainerLogs` endpoint serves kubectl-style output — like a
+real kubelet, it parses the CRI lines and returns the messages only. It
+supports:
 
 - `tailLines` -- return only the last N lines
-- `follow` -- stream logs until the pod reaches a terminal phase
+- `follow` -- stream logs until the pod reaches a terminal phase;
+  followed streams survive log rotation (the reader drains the rotated
+  file and reopens the fresh one)
 - `previous` -- return logs from the previous restart
+- `timestamps` -- prefix each line with its CRI timestamp (matches
+  `kubectl logs --timestamps`)
 
 ---
 
@@ -487,7 +514,8 @@ Both stores are updated on every state change.
     pod-runner.log                               # pod-runner's own log (rotated)
   run/                                           # Current run (rotated on restart)
     pods/<namespace>_<name>_<uid>/               # Per-pod, co-located
-      work/<container>/                          # Container working directory
+      volumes/<volume_name>/                     # Pod-level volumes (emptyDir dir, hostPath symlink, configMap files)
+      work/<container>/                          # Container working directory (mount paths symlink into volumes/)
       log/<container>/
         0.log                                    # Container stdout/stderr
         0.log.1                                  # Rolled log
@@ -510,7 +538,7 @@ Both stores are updated on every state change.
 | Area                     | Status                                                            |
 |--------------------------|-------------------------------------------------------------------|
 | Workload types           | Jobs, CronJobs, Pods. No Deployments/StatefulSets/DaemonSets.     |
-| Container images         | Local directory templates only. No registry pulls.                |
+| Container images         | Local directory templates or `.tgz`/`.tar.gz` archives. No registry pulls. |
 | Resource requests/limits | Stored and echoed; not enforced.                                  |
 | Namespaces               | Accepted for lookup; no isolation.                                |
 | Volumes                  | hostPath (Directory), emptyDir, configMap, and projected (configMap sources). No PVCs. |

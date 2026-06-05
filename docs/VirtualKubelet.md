@@ -15,18 +15,27 @@ and the pod-runner:
 
 1. Registers a virtual node in the cluster with configurable name,
    labels, and a `virtual-kubelet.io/provider=minimal:NoSchedule` taint.
-2. Watches for pods scheduled to the virtual node via informers.
+2. Watches for pods assigned to this node via informers. The pod
+   informer is filtered with a `spec.nodeName == <nodeName>` field
+   selector — like a real kubelet, pods pinned to another (or
+   nonexistent) node are never run and stay `Pending`. ConfigMaps,
+   secrets, and services use a separate unfiltered informer factory
+   (that field selector is pods-only).
 3. Forwards pod lifecycle operations (create, update, delete) to the
    pod-runner HTTPS endpoint (mTLS).
 4. Syncs pod status from the pod-runner back to the Kubernetes API.
    The sync loop uses a single bulk `/getAllPodStatuses` call per tick
    plus a local phase cache, so K8s `UpdateStatus` calls only fire on
-   actual phase transitions.
+   actual phase transitions (see [Status Sync Loop](#status-sync-loop)).
 5. Reports node capacity, conditions, and addresses fetched from the
    pod-runner.
 6. Serves the kubelet API (TLS with a self-signed cert) for
    `kubectl logs` support. The port is configurable via `--kubelet-port`
-   (default `10250`).
+   (default `10250`). The kubectl log options (`-f`/follow,
+   `--tail`/tailLines, `--previous`, `--timestamps`) are forwarded to
+   the pod-runner as query parameters; log streams use a dedicated HTTP
+   client with no whole-request timeout so `kubectl logs -f` can stream
+   indefinitely.
 
 ## Configuration
 
@@ -90,11 +99,11 @@ The virtual kubelet communicates with the pod-runner via these endpoints:
 | GET    | `/getPod?namespace=X&name=Y`          | Get a single pod                                 |
 | GET    | `/getPodStatus?namespace=X&name=Y`    | Get pod status                                   |
 | GET    | `/getPods`                            | List all pods                                    |
-| GET    | `/getAllPodStatuses`                  | Bulk status dump used by the sync loop           |
+| GET    | `/getAllPodStatuses`                  | Bulk `{namespace, name, uid, phase, status}` dump used by the sync loop |
 | GET    | `/capacity`                           | Node resource capacity                           |
 | GET    | `/nodeConditions`                     | Node health conditions                           |
 | GET    | `/nodeAddresses`                      | Node network addresses                           |
-| GET    | `/getContainerLogs?...`               | Container log stream                             |
+| GET    | `/getContainerLogs?...`               | Container log stream (`follow`, `tailLines`, `previous`, `timestamps` query params) |
 
 ## Command-Line Options
 
@@ -131,10 +140,17 @@ The virtual node is registered with:
 To keep costs flat at high pod counts, the sync loop uses two techniques:
 
 1. **Bulk fetch** — one call per tick to `/getAllPodStatuses` returns
-   `{namespace, name, phase, status}` for every pod.
-2. **Phase cache** — a local `map[key]phase` tracks the last phase
+   `{namespace, name, uid, phase, status}` for every pod.
+2. **Phase cache** — a local map (keyed by the kube pod **UID**, not
+   namespace/name, so entries can't go stale across pod recreation;
+   mutex-guarded for the concurrent workers) tracks the last phase
    successfully pushed to the K8s API. When the reported phase matches
-   the cache, the K8s `Get` + `UpdateStatus` calls are skipped.
+   the cache, the K8s `UpdateStatus` call is skipped.
+
+A pod-runner entry whose UID doesn't match the live kube pod of the
+same namespace/name is a **stale incarnation** (e.g. the pod was
+deleted and recreated); the sync loop evicts it from the pod-runner
+instead of pushing its status.
 
 At steady state this reduces the sync cost to a single pod-runner call
 per tick plus zero K8s API calls.

@@ -1,3 +1,13 @@
+<!--
+  Copyright 2026 Tabsdata Inc.
+-->
+
+> **Historical design notes.** This file explores the full load-test
+> measurement space considered at design time. The implemented harness
+> is simpler — three metrics (`nominal_time_secs`, `actual_time_secs`,
+> `start_latency_secs`) — and lives in `ltest/`; see `ltest/LoadTest.md`
+> for current usage.
+
 Good problem. Here's how I'd think about the full measurement space:
 
 ## Time Dimensions

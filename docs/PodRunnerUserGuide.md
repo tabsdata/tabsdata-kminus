@@ -207,6 +207,14 @@ spec:
 
 ## Volumes
 
+Volumes are pod-level: each volume is materialized once under the pod
+directory (`<pod_dir>/volumes/<volume_name>`) and every container mount
+path is a symlink to it, so a volume mounted by several containers is
+genuinely shared. `readOnly` mounts cannot be enforced (mounts are
+plain symlinks); instead, a warning is written at the very beginning of
+the container's log stating that not writing into the volume is the
+container's responsibility.
+
 ### emptyDir
 
 Creates an empty directory shared between containers in the same pod:
@@ -475,7 +483,7 @@ kpr logs <pod-name> --container <name> --follow --tail 50
 Container logs are stored under the pod's log directory:
 
 ```
-<log_dir>/<namespace>_<name>_<uid>/<container-name>/
+<workdir>/run/pods/<namespace>_<name>_<uid>/log/<container-name>/
   0.log               # Current log (restart 0)
   0.log.1             # Most recent rotation
   0.log.2             # Older rotation
@@ -630,8 +638,8 @@ To use custom certificates, create `prconfig.yaml` before first start with your 
 - **Local images only** -- supports local directories and `.tgz` / `.tar.gz` archives; no container image registry pulls
 - **Single host** -- no multi-node scheduling
 - **No gRPC probes** -- exec, httpGet, and tcpSocket only
-- **No PVCs** -- hostPath, emptyDir, and configMap volumes only
-- **Whole-configmap mounts only** -- `configMap.items` and `volumeMount.subPath` are not supported; every key becomes a file in the mounted directory
+- **No PVCs** -- hostPath, emptyDir, configMap, and projected (configMap sources) volumes only
+- **No `volumeMount.subPath`** -- `configMap.items` is supported, but a mount always exposes the whole volume directory
 - **No network policies** -- all containers share the host network
 - **No resource enforcement** -- CPU/memory limits are stored but not enforced
 - **No security contexts** -- all processes run as the pod runner's user
