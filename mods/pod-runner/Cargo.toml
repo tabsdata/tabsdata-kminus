@@ -89,6 +89,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149" }
 serde_yaml_ng = { version = "0.10" }
 tar = { version = "0.4" }
+thiserror = { version = "2" }
 time = { version = "0.3" }
 tokio = { version = "1.50.0", features = ["full"] }
 tokio-rustls = { version = "0.26" }

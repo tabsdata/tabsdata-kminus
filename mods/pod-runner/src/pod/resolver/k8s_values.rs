@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
+use crate::pod::prepare::PrepareError;
 use crate::spec::pod::PodSpec;
 
 use super::ResolverSet;
@@ -64,7 +65,7 @@ pub async fn resolve_k8s_values(
     resolvers: &ResolverSet,
     timeout: Option<Duration>,
     cancel: &mut watch::Receiver<()>,
-) -> Result<ResolvedK8sValues, String> {
+) -> Result<ResolvedK8sValues, PrepareError> {
     // Collect all referenced secret and configmap names
     let mut secret_names: Vec<String> = Vec::new();
     let mut configmap_names: Vec<String> = Vec::new();
@@ -106,11 +107,10 @@ pub async fn resolve_k8s_values(
         let resolver = resolvers
             .secret_resolver
             .as_ref()
-            .ok_or("Pod references secrets but no SecretResolver configured")?;
+            .ok_or(PrepareError::NoSecretResolver)?;
         resolver
             .secrets(namespace, &secret_names, timeout, cancel)
-            .await
-            .map_err(|e| e.to_string())?
+            .await?
     } else {
         HashMap::new()
     };
@@ -120,11 +120,10 @@ pub async fn resolve_k8s_values(
         let resolver = resolvers
             .config_map_resolver
             .as_ref()
-            .ok_or("Pod references configmaps but no ConfigMapResolver configured")?;
+            .ok_or(PrepareError::NoConfigMapResolver)?;
         resolver
             .config_maps(namespace, &configmap_names, timeout, cancel)
-            .await
-            .map_err(|e| e.to_string())?
+            .await?
     } else {
         HashMap::new()
     };
@@ -137,9 +136,10 @@ pub async fn resolve_k8s_values(
 
     // Stash configmap data referenced by volumes for the volume resolver.
     for name in &configmap_volume_names {
-        let data = resolved_configmaps.get(name).cloned().ok_or_else(|| {
-            format!("ConfigMap '{}' referenced by a volume was not resolved", name)
-        })?;
+        let data = resolved_configmaps
+            .get(name)
+            .cloned()
+            .ok_or_else(|| PrepareError::ConfigMapVolumeNotResolved(name.clone()))?;
         result.config_map_volumes.insert(name.clone(), data);
     }
 
@@ -241,7 +241,7 @@ mod tests {
         pod: &PodSpec,
         namespace: &str,
         resolvers: &ResolverSet,
-    ) -> Result<ResolvedK8sValues, String> {
+    ) -> Result<ResolvedK8sValues, PrepareError> {
         let (_tx, mut rx) = watch::channel(());
         resolve_k8s_values(pod, namespace, resolvers, None, &mut rx).await
     }
@@ -430,7 +430,7 @@ mod tests {
         }]);
 
         let err = resolve_no_wait(&pod, "default", &ResolverSet::default()).await.unwrap_err();
-        assert!(err.contains("no SecretResolver"));
+        assert!(matches!(err, PrepareError::NoSecretResolver));
     }
 
     #[tokio::test]
@@ -485,7 +485,7 @@ mod tests {
         });
 
         let err = resolve_no_wait(&pod, "default", &ResolverSet::default()).await.unwrap_err();
-        assert!(err.contains("no ConfigMapResolver"));
+        assert!(matches!(err, PrepareError::NoConfigMapResolver));
     }
 
     #[tokio::test]

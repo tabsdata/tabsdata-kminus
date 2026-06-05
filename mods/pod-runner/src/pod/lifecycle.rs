@@ -74,25 +74,14 @@ const MACHINE_POD: &str = "PodLifecycle";
 // ---------------------------------------------------------------------------
 
 /// Error returned when a state transition is rejected by a guard.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{machine}: invalid transition {from} -> {to} ({reason})")]
 pub struct TransitionError {
     pub machine: &'static str,
     pub from: String,
     pub to: String,
     pub reason: String,
 }
-
-impl std::fmt::Display for TransitionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}: invalid transition {} -> {} ({})",
-            self.machine, self.from, self.to, self.reason,
-        )
-    }
-}
-
-impl std::error::Error for TransitionError {}
 
 // ---------------------------------------------------------------------------
 // WaitingReason / TerminatedReason

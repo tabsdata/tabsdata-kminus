@@ -16,6 +16,60 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
+// TlsError
+// ---------------------------------------------------------------------------
+
+/// Errors raised by TLS configuration loading and PEM parsing.
+#[derive(Debug, thiserror::Error)]
+pub enum TlsError {
+    /// A [`CertSource`] has both `path` and `data` set.
+    #[error("{name}: cannot set both path and inline data")]
+    BothPathAndData { name: String },
+    /// A [`CertSource`] is required but has neither `path` nor `data`.
+    #[error("{name}: not configured")]
+    NotConfigured { name: String },
+    /// Failed to read a cert/key file from disk.
+    #[error("{name}: failed to read {path}: {source}")]
+    ReadFile {
+        name: String,
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Failed to decode inline base64-encoded PEM data.
+    #[error("{name}: invalid base64: {source}")]
+    InvalidBase64 {
+        name: String,
+        #[source]
+        source: base64::DecodeError,
+    },
+    /// Failed to parse PEM-encoded certificates.
+    #[error("Failed to parse certificates: {0}")]
+    ParseCerts(std::io::Error),
+    /// Failed to parse a PEM-encoded private key.
+    #[error("Failed to parse private key: {0}")]
+    ParseKey(std::io::Error),
+    /// PEM data contained no certificates.
+    #[error("No certificates found in PEM data")]
+    EmptyCerts,
+    /// PEM data contained no private key.
+    #[error("No private key found in PEM data")]
+    EmptyKey,
+    /// Failed to add a client CA cert to the trust store.
+    #[error("Failed to add client CA cert: {0}")]
+    AddCaCert(rustls::Error),
+    /// Failed to build the client certificate verifier.
+    #[error("Failed to build client verifier: {0}")]
+    BuildVerifier(String),
+    /// Failed to negotiate TLS protocol versions.
+    #[error("TLS protocol error: {0}")]
+    Protocol(rustls::Error),
+    /// Failed to build the mTLS server config.
+    #[error("mTLS config error: {0}")]
+    MtlsConfig(rustls::Error),
+}
+
+// ---------------------------------------------------------------------------
 // CertSource
 // ---------------------------------------------------------------------------
 
@@ -38,11 +92,9 @@ impl CertSource {
     }
 
     /// Validate that path and data are not both set.
-    pub fn validate(&self, name: &str) -> Result<(), String> {
+    pub fn validate(&self, name: &str) -> Result<(), TlsError> {
         if self.path.is_some() && self.data.is_some() {
-            return Err(format!(
-                "{name}: cannot set both path and inline data",
-            ));
+            return Err(TlsError::BothPathAndData { name: name.to_string() });
         }
         Ok(())
     }
@@ -51,18 +103,24 @@ impl CertSource {
     ///
     /// Returns `Err` if not configured, both are set, the file can't be
     /// read, or the base64 is invalid.
-    pub fn resolve(&self, name: &str) -> Result<Vec<u8>, String> {
+    pub fn resolve(&self, name: &str) -> Result<Vec<u8>, TlsError> {
         self.validate(name)?;
         if let Some(ref path) = self.path {
-            std::fs::read(path)
-                .map_err(|e| format!("{name}: failed to read {path}: {e}"))
+            std::fs::read(path).map_err(|source| TlsError::ReadFile {
+                name: name.to_string(),
+                path: path.clone(),
+                source,
+            })
         } else if let Some(ref b64) = self.data {
             use base64::Engine;
             base64::engine::general_purpose::STANDARD
                 .decode(b64)
-                .map_err(|e| format!("{name}: invalid base64: {e}"))
+                .map_err(|source| TlsError::InvalidBase64 {
+                    name: name.to_string(),
+                    source,
+                })
         } else {
-            Err(format!("{name}: not configured"))
+            Err(TlsError::NotConfigured { name: name.to_string() })
         }
     }
 }
@@ -105,7 +163,7 @@ impl ServerTlsConfig {
     }
 
     /// Validate all sources (no path+data conflicts).
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), TlsError> {
         self.certificate.validate("tls.certificate")?;
         self.certificate_key.validate("tls.certificate_key")?;
         self.client_ca.validate("tls.client_ca")?;
@@ -122,17 +180,23 @@ impl ServerTlsConfig {
 /// Priority: file path > inline base64 data. Returns `None` if neither is set.
 /// Used by the client config where fields are separate strings rather than
 /// a [`CertSource`].
-pub fn resolve_cert_bytes(file_path: &Path, data_b64: &str) -> Result<Option<Vec<u8>>, String> {
+pub fn resolve_cert_bytes(file_path: &Path, data_b64: &str) -> Result<Option<Vec<u8>>, TlsError> {
     if !file_path.as_os_str().is_empty() {
-        let bytes = std::fs::read(file_path)
-            .map_err(|e| format!("Failed to read {}: {e}", file_path.display()))?;
+        let bytes = std::fs::read(file_path).map_err(|source| TlsError::ReadFile {
+            name: "cert".to_string(),
+            path: file_path.display().to_string(),
+            source,
+        })?;
         return Ok(Some(bytes));
     }
     if !data_b64.is_empty() {
         use base64::Engine;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(data_b64)
-            .map_err(|e| format!("Invalid base64: {e}"))?;
+            .map_err(|source| TlsError::InvalidBase64 {
+                name: "cert".to_string(),
+                source,
+            })?;
         return Ok(Some(bytes));
     }
     Ok(None)
@@ -143,22 +207,22 @@ pub fn resolve_cert_bytes(file_path: &Path, data_b64: &str) -> Result<Option<Vec
 // ---------------------------------------------------------------------------
 
 /// Parse PEM-encoded certificates, returning DER representations.
-pub fn load_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, String> {
+pub fn load_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, TlsError> {
     let certs: Vec<_> = rustls_pemfile::certs(&mut &*pem)
         .collect::<Result<_, _>>()
-        .map_err(|e| format!("Failed to parse certificates: {e}"))?;
+        .map_err(TlsError::ParseCerts)?;
     if certs.is_empty() {
-        return Err("No certificates found in PEM data".into());
+        return Err(TlsError::EmptyCerts);
     }
     debug!(count = certs.len(), "Loaded certificates");
     Ok(certs)
 }
 
 /// Parse a PEM-encoded private key, returning the DER representation.
-pub fn load_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, String> {
+pub fn load_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, TlsError> {
     rustls_pemfile::private_key(&mut &*pem)
-        .map_err(|e| format!("Failed to parse private key: {e}"))?
-        .ok_or_else(|| "No private key found in PEM data".into())
+        .map_err(TlsError::ParseKey)?
+        .ok_or(TlsError::EmptyKey)
 }
 
 // ---------------------------------------------------------------------------

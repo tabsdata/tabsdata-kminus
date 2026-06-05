@@ -40,13 +40,21 @@ use crate::spec::pod::{Container, PodSpec};
 pub const ERR_OPTIONAL_NOT_SUPPORTED: &str =
     "pod-runner does not support 'optional: true' on configmap/secret references";
 
+/// Errors raised when admitting a pod spec.
+#[derive(Debug, thiserror::Error)]
+pub enum AdmissionError {
+    /// The pod sets `optional: true` on a configmap/secret reference.
+    #[error("{ERR_OPTIONAL_NOT_SUPPORTED} ({location})")]
+    OptionalNotSupported { location: String },
+}
+
 /// Validate a pod spec. Returns `Ok(())` if the spec is accepted, or an
-/// error string describing the first rule violation.
+/// [`AdmissionError`] describing the first rule violation.
 ///
 /// Called from the logic layer before the pod is stored. A rejected pod
 /// never enters the store, so the caller is responsible for surfacing the
 /// error to the API client.
-pub fn admit(spec: &PodSpec) -> Result<(), String> {
+pub fn admit(spec: &PodSpec) -> Result<(), AdmissionError> {
     for c in spec.spec.init_containers.iter().chain(spec.spec.containers.iter()) {
         check_no_optional_refs(c)?;
     }
@@ -54,42 +62,50 @@ pub fn admit(spec: &PodSpec) -> Result<(), String> {
 }
 
 /// Reject any configmap/secret reference on `c` that sets `optional: true`.
-fn check_no_optional_refs(c: &Container) -> Result<(), String> {
+fn check_no_optional_refs(c: &Container) -> Result<(), AdmissionError> {
     for ev in &c.env {
         let Some(ref vf) = ev.value_from else { continue };
         if let Some(ref r) = vf.secret_key_ref
             && r.optional == Some(true)
         {
-            return Err(format!(
-                "{} (container '{}', env '{}', secretKeyRef '{}/{}')",
-                ERR_OPTIONAL_NOT_SUPPORTED, c.name, ev.name, r.name, r.key
-            ));
+            return Err(AdmissionError::OptionalNotSupported {
+                location: format!(
+                    "container '{}', env '{}', secretKeyRef '{}/{}'",
+                    c.name, ev.name, r.name, r.key
+                ),
+            });
         }
         if let Some(ref r) = vf.config_map_key_ref
             && r.optional == Some(true)
         {
-            return Err(format!(
-                "{} (container '{}', env '{}', configMapKeyRef '{}/{}')",
-                ERR_OPTIONAL_NOT_SUPPORTED, c.name, ev.name, r.name, r.key
-            ));
+            return Err(AdmissionError::OptionalNotSupported {
+                location: format!(
+                    "container '{}', env '{}', configMapKeyRef '{}/{}'",
+                    c.name, ev.name, r.name, r.key
+                ),
+            });
         }
     }
     for ef in &c.env_from {
         if let Some(ref r) = ef.secret_ref
             && r.optional == Some(true)
         {
-            return Err(format!(
-                "{} (container '{}', envFrom secretRef '{}')",
-                ERR_OPTIONAL_NOT_SUPPORTED, c.name, r.name
-            ));
+            return Err(AdmissionError::OptionalNotSupported {
+                location: format!(
+                    "container '{}', envFrom secretRef '{}'",
+                    c.name, r.name
+                ),
+            });
         }
         if let Some(ref r) = ef.config_map_ref
             && r.optional == Some(true)
         {
-            return Err(format!(
-                "{} (container '{}', envFrom configMapRef '{}')",
-                ERR_OPTIONAL_NOT_SUPPORTED, c.name, r.name
-            ));
+            return Err(AdmissionError::OptionalNotSupported {
+                location: format!(
+                    "container '{}', envFrom configMapRef '{}'",
+                    c.name, r.name
+                ),
+            });
         }
     }
     Ok(())
@@ -200,7 +216,7 @@ mod tests {
             }],
             ..Default::default()
         });
-        let err = admit(&pod).unwrap_err();
+        let err = admit(&pod).unwrap_err().to_string();
         assert!(err.contains(ERR_OPTIONAL_NOT_SUPPORTED));
         assert!(err.contains("creds"));
         assert!(err.contains("pass"));
@@ -224,7 +240,7 @@ mod tests {
             }],
             ..Default::default()
         });
-        let err = admit(&pod).unwrap_err();
+        let err = admit(&pod).unwrap_err().to_string();
         assert!(err.contains(ERR_OPTIONAL_NOT_SUPPORTED));
         assert!(err.contains("cfg"));
     }
@@ -242,7 +258,7 @@ mod tests {
             }],
             ..Default::default()
         });
-        let err = admit(&pod).unwrap_err();
+        let err = admit(&pod).unwrap_err().to_string();
         assert!(err.contains(ERR_OPTIONAL_NOT_SUPPORTED));
         assert!(err.contains("bulk"));
     }
@@ -260,7 +276,7 @@ mod tests {
             }],
             ..Default::default()
         });
-        let err = admit(&pod).unwrap_err();
+        let err = admit(&pod).unwrap_err().to_string();
         assert!(err.contains(ERR_OPTIONAL_NOT_SUPPORTED));
         assert!(err.contains("settings"));
     }
@@ -278,7 +294,7 @@ mod tests {
             }],
             ..Default::default()
         });
-        let err = admit(&pod).unwrap_err();
+        let err = admit(&pod).unwrap_err().to_string();
         assert!(err.contains("init-creds"));
         assert!(err.contains("setup"));
     }

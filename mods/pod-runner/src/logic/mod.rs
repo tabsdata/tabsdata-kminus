@@ -174,36 +174,24 @@ impl Default for LogicConfig {
 // ---------------------------------------------------------------------------
 
 /// Errors returned by logic layer operations.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum LogicError {
     /// Pod not found by namespace + name.
+    #[error("pod {namespace}/{name} not found")]
     NotFound { namespace: String, name: String },
     /// A pod with this namespace + name already exists.
+    #[error("pod {namespace}/{name} already exists")]
     Conflict { namespace: String, name: String },
     /// Store is at capacity.
+    #[error("pod capacity exceeded (max {max})")]
     CapacityExceeded { max: usize },
+    /// Pod admission rejected the spec.
+    #[error("admission rejected: {0}")]
+    Admission(#[from] crate::pod::admission::AdmissionError),
     /// Internal error (executor failure, etc.).
+    #[error("internal error: {0}")]
     Internal(String),
 }
-
-impl std::fmt::Display for LogicError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotFound { namespace, name } => {
-                write!(f, "pod {}/{} not found", namespace, name)
-            }
-            Self::Conflict { namespace, name } => {
-                write!(f, "pod {}/{} already exists", namespace, name)
-            }
-            Self::CapacityExceeded { max } => {
-                write!(f, "pod capacity exceeded (max {})", max)
-            }
-            Self::Internal(msg) => write!(f, "internal error: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for LogicError {}
 
 // ---------------------------------------------------------------------------
 // PodRuntime — per-pod runtime state owned by the logic layer
@@ -335,7 +323,7 @@ impl PodLogic {
         // Admission — reject unsupported features (e.g. `optional: true`
         // on configmap/secret references). See pod::admission for the
         // full list of rules.
-        crate::pod::admission::admit(&spec).map_err(LogicError::Internal)?;
+        crate::pod::admission::admit(&spec)?;
 
         // Uniqueness
         if self.store.get_by_name(&id.namespace, &id.name, SpecView::Running).await.is_some() {
@@ -943,16 +931,16 @@ async fn prepare_and_run(
 
     let prepared = match prepare_result {
         Ok(p) => p,
-        Err(msg) => {
+        Err(err) => {
             // Classify and surface as Failed in the store.
-            let reason = if msg.contains("timed out") {
-                warn!(pod = %id, error = %msg, "Pod preparation timed out");
+            let reason = if err.is_timeout() {
+                warn!(pod = %id, error = %err, "Pod preparation timed out");
                 REASON_DEADLINE_EXCEEDED
             } else {
-                warn!(pod = %id, error = %msg, "Pod preparation failed");
+                warn!(pod = %id, error = %err, "Pod preparation failed");
                 REASON_POD_PREPARATION_FAILED
             };
-            let status = build_failed_prep_status(reason, &msg);
+            let status = build_failed_prep_status(reason, &err.to_string());
             store.update_status(&id, status).await;
             if let Some(ref m) = metrics {
                 m.pods_failed_total.inc();
@@ -1989,12 +1977,12 @@ mod tests {
             });
             let err = logic.create_pod(pod).await.unwrap_err();
             match err {
-                LogicError::Internal(msg) => assert!(
-                    msg.contains("optional"),
+                LogicError::Admission(ref ae) => assert!(
+                    ae.to_string().contains("optional"),
                     "expected admission error mentioning 'optional', got: {}",
-                    msg,
+                    ae,
                 ),
-                other => panic!("expected Internal admission error, got {:?}", other),
+                other => panic!("expected Admission error, got {:?}", other),
             }
         }
 

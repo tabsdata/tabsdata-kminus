@@ -108,6 +108,7 @@ fn error_response(err: LogicError) -> Response {
         LogicError::NotFound { .. } => StatusCode::NOT_FOUND,
         LogicError::Conflict { .. } => StatusCode::CONFLICT,
         LogicError::CapacityExceeded { .. } => StatusCode::FORBIDDEN,
+        LogicError::Admission(_) => StatusCode::INTERNAL_SERVER_ERROR,
         LogicError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (code, Json(ErrorResponse { error: err.to_string() })).into_response()
@@ -593,6 +594,44 @@ mod tests {
         assert_eq!(conditions[1]["status"], "False");
         assert_eq!(conditions[2]["type"], "DiskPressure");
         assert_eq!(conditions[2]["status"], "False");
+    }
+
+    // -- error_response --
+
+    #[test]
+    fn error_response_status_codes() {
+        use crate::logic::LogicError;
+        use crate::pod::admission::AdmissionError;
+
+        let cases = [
+            (
+                LogicError::NotFound {
+                    namespace: "default".into(),
+                    name: "p".into(),
+                },
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                LogicError::Conflict {
+                    namespace: "default".into(),
+                    name: "p".into(),
+                },
+                StatusCode::CONFLICT,
+            ),
+            (LogicError::CapacityExceeded { max: 10 }, StatusCode::FORBIDDEN),
+            (
+                LogicError::Admission(AdmissionError::OptionalNotSupported {
+                    location: "container 'app', env 'PORT', secretKeyRef 'creds/pass'".into(),
+                }),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (LogicError::Internal("boom".into()), StatusCode::INTERNAL_SERVER_ERROR),
+        ];
+
+        for (err, expected) in cases {
+            let resp = error_response(err);
+            assert_eq!(resp.status(), expected);
+        }
     }
 
     // -- nodeAddresses --

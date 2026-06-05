@@ -52,15 +52,18 @@ pub fn backoff_for_attempt(attempt: usize) -> Duration {
 // ---------------------------------------------------------------------------
 
 /// Outcome when [`poll_with_backoff`] does not produce a value.
-#[derive(Debug)]
-pub enum PollError<E> {
+#[derive(Debug, thiserror::Error)]
+pub enum PollError<E: std::fmt::Display + std::fmt::Debug> {
     /// The total elapsed time exceeded the caller-supplied timeout. The
     /// last retryable error is returned for diagnostics.
+    #[error("timed out after {elapsed:?}: {last_err}")]
     Timeout { last_err: E, elapsed: Duration },
     /// The cancel signal fired before a value was produced.
+    #[error("cancelled after {elapsed:?}")]
     Cancelled { elapsed: Duration },
     /// The operation produced a non-retryable error. Returned without
     /// further retries.
+    #[error("{0}")]
     Fatal(E),
 }
 
@@ -89,7 +92,7 @@ pub async fn poll_with_backoff<T, E, F, Fut>(
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,
-    E: std::fmt::Display,
+    E: std::fmt::Display + std::fmt::Debug,
 {
     let start = Instant::now();
     let mut attempt: usize = 0;

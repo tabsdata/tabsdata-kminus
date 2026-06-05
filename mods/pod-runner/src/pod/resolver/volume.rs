@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+use crate::pod::prepare::PrepareError;
 use crate::pod::resolver::k8s_values::ResolvedK8sValues;
 use crate::spec::pod::PodSpec;
 
@@ -44,7 +45,7 @@ pub struct ResolvedVolumes {
 pub fn resolve_volumes(
     pod: &PodSpec,
     resolved: &ResolvedK8sValues,
-) -> Result<ResolvedVolumes, String> {
+) -> Result<ResolvedVolumes, PrepareError> {
     let volume_map = pod.spec.volume_map();
     let mut result = ResolvedVolumes {
         containers: HashMap::new(),
@@ -55,18 +56,19 @@ pub fn resolve_volumes(
 
         for vm in &c.volume_mounts {
             let vol = volume_map.get(vm.name.as_str()).ok_or_else(|| {
-                format!(
-                    "Container '{}' references unknown volume '{}'",
-                    c.name, vm.name
-                )
+                PrepareError::UnknownVolume {
+                    container: c.name.clone(),
+                    volume: vm.name.clone(),
+                }
             })?;
 
             if vol.empty_dir.is_some() {
-                fs::create_dir_all(&vm.mount_path).map_err(|e| {
-                    format!(
-                        "Failed to create emptyDir '{}' at {}: {}",
-                        vm.name, vm.mount_path, e
-                    )
+                fs::create_dir_all(&vm.mount_path).map_err(|source| PrepareError::Io {
+                    context: format!(
+                        "Failed to create emptyDir '{}' at {}",
+                        vm.name, vm.mount_path
+                    ),
+                    source,
                 })?;
                 mounts.push(MountInfo {
                     volume_name: vm.name.clone(),
@@ -76,27 +78,28 @@ pub fn resolve_volumes(
                 });
             } else if let Some(ref cm) = vol.config_map {
                 let data = resolved.config_map_volumes.get(&cm.name).ok_or_else(|| {
-                    format!(
-                        "Volume '{}' references unresolved configMap '{}'",
-                        vm.name, cm.name
-                    )
+                    PrepareError::VolumeConfigMapMissing {
+                        volume: vm.name.clone(),
+                        name: cm.name.clone(),
+                    }
                 })?;
 
-                fs::create_dir_all(&vm.mount_path).map_err(|e| {
-                    format!(
-                        "Failed to create configMap dir '{}' at {}: {}",
-                        vm.name, vm.mount_path, e
-                    )
+                fs::create_dir_all(&vm.mount_path).map_err(|source| PrepareError::Io {
+                    context: format!(
+                        "Failed to create configMap dir '{}' at {}",
+                        vm.name, vm.mount_path
+                    ),
+                    source,
                 })?;
 
                 for (key, value) in data {
                     let file_path = Path::new(&vm.mount_path).join(key);
-                    fs::write(&file_path, value).map_err(|e| {
-                        format!(
-                            "Failed to write configMap file '{}': {}",
-                            file_path.display(),
-                            e
-                        )
+                    fs::write(&file_path, value).map_err(|source| PrepareError::Io {
+                        context: format!(
+                            "Failed to write configMap file '{}'",
+                            file_path.display()
+                        ),
+                        source,
                     })?;
                 }
 
@@ -109,16 +112,17 @@ pub fn resolve_volumes(
             } else if let Some(ref hp) = vol.host_path {
                 let host = &hp.path;
                 if !Path::new(host).is_dir() {
-                    return Err(format!(
-                        "Volume '{}' hostPath does not exist: {}",
-                        vm.name, host
-                    ));
+                    return Err(PrepareError::HostPathMissing {
+                        volume: vm.name.clone(),
+                        path: host.clone(),
+                    });
                 }
 
                 // Create parent dir for the symlink
                 if let Some(parent) = Path::new(&vm.mount_path).parent() {
-                    fs::create_dir_all(parent).map_err(|e| {
-                        format!("Failed to create parent for mount '{}': {}", vm.name, e)
+                    fs::create_dir_all(parent).map_err(|source| PrepareError::Io {
+                        context: format!("Failed to create parent for mount '{}'", vm.name),
+                        source,
                     })?;
                 }
 
@@ -129,19 +133,19 @@ pub fn resolve_volumes(
                 }
 
                 #[cfg(unix)]
-                std::os::unix::fs::symlink(host, &vm.mount_path).map_err(|e| {
-                    format!(
-                        "Failed to symlink '{}' -> '{}': {}",
-                        vm.mount_path, host, e
-                    )
+                std::os::unix::fs::symlink(host, &vm.mount_path).map_err(|source| {
+                    PrepareError::Io {
+                        context: format!("Failed to symlink '{}' -> '{}'", vm.mount_path, host),
+                        source,
+                    }
                 })?;
 
                 #[cfg(windows)]
-                std::os::windows::fs::symlink_dir(host, &vm.mount_path).map_err(|e| {
-                    format!(
-                        "Failed to symlink '{}' -> '{}': {}",
-                        vm.mount_path, host, e
-                    )
+                std::os::windows::fs::symlink_dir(host, &vm.mount_path).map_err(|source| {
+                    PrepareError::Io {
+                        context: format!("Failed to symlink '{}' -> '{}'", vm.mount_path, host),
+                        source,
+                    }
                 })?;
 
                 mounts.push(MountInfo {
@@ -291,7 +295,7 @@ mod tests {
         );
 
         let err = resolve_volumes(&pod, &ResolvedK8sValues::default()).unwrap_err();
-        assert!(err.contains("hostPath does not exist"));
+        assert!(matches!(err, PrepareError::HostPathMissing { .. }));
     }
 
     #[test]
@@ -310,7 +314,7 @@ mod tests {
         );
 
         let err = resolve_volumes(&pod, &ResolvedK8sValues::default()).unwrap_err();
-        assert!(err.contains("unknown volume 'missing'"));
+        assert!(matches!(err, PrepareError::UnknownVolume { ref volume, .. } if volume == "missing"));
     }
 
     #[test]
@@ -385,7 +389,7 @@ mod tests {
         );
 
         let err = resolve_volumes(&pod, &ResolvedK8sValues::default()).unwrap_err();
-        assert!(err.contains("unresolved configMap"));
+        assert!(matches!(err, PrepareError::VolumeConfigMapMissing { .. }));
     }
 
     #[test]

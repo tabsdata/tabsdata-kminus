@@ -51,7 +51,8 @@ pub trait ConfigMapResolver: Send + Sync {
 }
 
 /// Error returned by a config map resolver.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("configmap '{name}': {message}")]
 pub struct ConfigMapResolverError {
     pub name: String,
     pub message: String,
@@ -95,37 +96,28 @@ impl ConfigMapResolverError {
     }
 }
 
-impl std::fmt::Display for ConfigMapResolverError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "configmap '{}': {}", self.name, self.message)
-    }
-}
-
-impl std::error::Error for ConfigMapResolverError {}
-
-/// Translate a [`PollError`] returned by the backoff helper into a
-/// [`ConfigMapResolverError`] suitable for callers of
-/// [`ConfigMapResolver`].
-fn poll_err_to_cm_err(err: PollError<ConfigMapResolverError>) -> ConfigMapResolverError {
-    match err {
-        PollError::Timeout { last_err, elapsed } => ConfigMapResolverError {
-            name: last_err.name,
-            message: format!(
-                "timed out after {:.1}s waiting for configmap to become available: {}",
-                elapsed.as_secs_f64(),
-                last_err.message,
-            ),
-            kind: ConfigMapResolverErrorKind::Timeout,
-        },
-        PollError::Cancelled { elapsed } => ConfigMapResolverError {
-            name: String::new(),
-            message: format!(
-                "configmap resolution cancelled after {:.1}s",
-                elapsed.as_secs_f64(),
-            ),
-            kind: ConfigMapResolverErrorKind::Cancelled,
-        },
-        PollError::Fatal(e) => e,
+impl From<PollError<ConfigMapResolverError>> for ConfigMapResolverError {
+    fn from(err: PollError<ConfigMapResolverError>) -> Self {
+        match err {
+            PollError::Timeout { last_err, elapsed } => Self {
+                name: last_err.name,
+                message: format!(
+                    "timed out after {:.1}s waiting for configmap to become available: {}",
+                    elapsed.as_secs_f64(),
+                    last_err.message,
+                ),
+                kind: ConfigMapResolverErrorKind::Timeout,
+            },
+            PollError::Cancelled { elapsed } => Self {
+                name: String::new(),
+                message: format!(
+                    "configmap resolution cancelled after {:.1}s",
+                    elapsed.as_secs_f64(),
+                ),
+                kind: ConfigMapResolverErrorKind::Cancelled,
+            },
+            PollError::Fatal(e) => e,
+        }
     }
 }
 
@@ -214,7 +206,7 @@ impl ConfigMapResolver for FileConfigMapResolver {
             || async { self.try_fetch(names) },
         )
         .await
-        .map_err(poll_err_to_cm_err)
+        .map_err(Into::into)
     }
 }
 
@@ -293,7 +285,7 @@ impl ConfigMapResolver for KubeConfigMapResolver {
             || self.try_fetch(namespace, names),
         )
         .await
-        .map_err(poll_err_to_cm_err)
+        .map_err(Into::into)
     }
 }
 

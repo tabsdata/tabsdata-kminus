@@ -18,7 +18,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use super::config::PRConfig;
-use crate::tls::{load_certs, load_private_key};
+use crate::tls::{load_certs, load_private_key, TlsError};
 
 /// Return the process-default CryptoProvider, falling back to `aws-lc-rs`.
 fn crypto_provider() -> Arc<CryptoProvider> {
@@ -36,7 +36,7 @@ fn crypto_provider() -> Arc<CryptoProvider> {
 /// Always mTLS: server cert + key, client certs verified against CA.
 ///
 /// Returns `Err` if the config is invalid or certs can't be loaded.
-pub fn build_server_config(pr_config: &PRConfig) -> Result<ServerConfig, String> {
+pub fn build_server_config(pr_config: &PRConfig) -> Result<ServerConfig, TlsError> {
     pr_config.tls.validate()?;
 
     let cert_pem = pr_config.tls.certificate.resolve("tls.certificate")?;
@@ -56,26 +56,24 @@ fn build_mtls_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     ca_certs: Vec<CertificateDer<'static>>,
-) -> Result<ServerConfig, String> {
+) -> Result<ServerConfig, TlsError> {
     let mut root_store = rustls::RootCertStore::empty();
     for cert in ca_certs {
-        root_store
-            .add(cert)
-            .map_err(|e| format!("Failed to add client CA cert: {e}"))?;
+        root_store.add(cert).map_err(TlsError::AddCaCert)?;
     }
     let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
             Arc::new(root_store),
             crypto_provider(),
         )
         .build()
-        .map_err(|e| format!("Failed to build client verifier: {e}"))?;
+        .map_err(|e| TlsError::BuildVerifier(e.to_string()))?;
 
     ServerConfig::builder_with_provider(crypto_provider())
         .with_safe_default_protocol_versions()
-        .map_err(|e| format!("TLS protocol error: {e}"))?
+        .map_err(TlsError::Protocol)?
         .with_client_cert_verifier(verifier)
         .with_single_cert(certs, key)
-        .map_err(|e| format!("mTLS config error: {e}"))
+        .map_err(TlsError::MtlsConfig)
 }
 
 // ---------------------------------------------------------------------------
@@ -316,7 +314,6 @@ mod tests {
         };
 
         let result = build_server_config(&config);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("cannot set both"));
+        assert!(matches!(result, Err(TlsError::BothPathAndData { .. })));
     }
 }

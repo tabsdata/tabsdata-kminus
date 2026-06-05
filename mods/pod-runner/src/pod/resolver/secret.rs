@@ -51,7 +51,8 @@ pub trait SecretResolver: Send + Sync {
 }
 
 /// Error returned by a secret resolver.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("secret '{name}': {message}")]
 pub struct SecretResolverError {
     pub name: String,
     pub message: String,
@@ -95,33 +96,28 @@ impl SecretResolverError {
     }
 }
 
-impl std::fmt::Display for SecretResolverError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "secret '{}': {}", self.name, self.message)
-    }
-}
-
-impl std::error::Error for SecretResolverError {}
-
-/// Translate a [`PollError`] returned by the backoff helper into a
-/// [`SecretResolverError`] suitable for callers of [`SecretResolver`].
-fn poll_err_to_secret_err(err: PollError<SecretResolverError>) -> SecretResolverError {
-    match err {
-        PollError::Timeout { last_err, elapsed } => SecretResolverError {
-            name: last_err.name,
-            message: format!(
-                "timed out after {:.1}s waiting for secret to become available: {}",
-                elapsed.as_secs_f64(),
-                last_err.message,
-            ),
-            kind: SecretResolverErrorKind::Timeout,
-        },
-        PollError::Cancelled { elapsed } => SecretResolverError {
-            name: String::new(),
-            message: format!("secret resolution cancelled after {:.1}s", elapsed.as_secs_f64()),
-            kind: SecretResolverErrorKind::Cancelled,
-        },
-        PollError::Fatal(e) => e,
+impl From<PollError<SecretResolverError>> for SecretResolverError {
+    fn from(err: PollError<SecretResolverError>) -> Self {
+        match err {
+            PollError::Timeout { last_err, elapsed } => Self {
+                name: last_err.name,
+                message: format!(
+                    "timed out after {:.1}s waiting for secret to become available: {}",
+                    elapsed.as_secs_f64(),
+                    last_err.message,
+                ),
+                kind: SecretResolverErrorKind::Timeout,
+            },
+            PollError::Cancelled { elapsed } => Self {
+                name: String::new(),
+                message: format!(
+                    "secret resolution cancelled after {:.1}s",
+                    elapsed.as_secs_f64(),
+                ),
+                kind: SecretResolverErrorKind::Cancelled,
+            },
+            PollError::Fatal(e) => e,
+        }
     }
 }
 
@@ -200,7 +196,7 @@ impl SecretResolver for FileSecretResolver {
             || async { self.try_fetch(names) },
         )
         .await
-        .map_err(poll_err_to_secret_err)
+        .map_err(Into::into)
     }
 }
 
@@ -334,7 +330,7 @@ impl SecretResolver for KubeSecretResolver {
             || self.try_fetch(namespace, names),
         )
         .await
-        .map_err(poll_err_to_secret_err)
+        .map_err(Into::into)
     }
 }
 

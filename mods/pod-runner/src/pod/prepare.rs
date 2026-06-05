@@ -52,10 +52,82 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::debug;
 
+use crate::pod::resolver::config_map::ConfigMapResolverError;
 use crate::pod::resolver::k8s_values::{resolve_k8s_values, ResolvedK8sValues};
+use crate::pod::resolver::secret::SecretResolverError;
 use crate::pod::resolver::volume::resolve_volumes;
 use crate::pod::resolver::ResolverSet;
 use crate::spec::pod::{EnvVar, PodSpec};
+
+// ---------------------------------------------------------------------------
+// PrepareError
+// ---------------------------------------------------------------------------
+
+/// Errors raised by the pod preparation pipeline.
+#[derive(Debug, thiserror::Error)]
+pub enum PrepareError {
+    /// The pod was already prepared (annotation is set).
+    #[error("Pod has already been prepared (pr.tabsdata.com/prepared annotation is set)")]
+    AlreadyPrepared,
+    /// Pod references secrets but the resolver set has no secret resolver.
+    #[error("Pod references secrets but no SecretResolver configured")]
+    NoSecretResolver,
+    /// Pod references configmaps but the resolver set has no configmap resolver.
+    #[error("Pod references configmaps but no ConfigMapResolver configured")]
+    NoConfigMapResolver,
+    /// Secret resolution failed.
+    #[error("{0}")]
+    SecretResolution(#[from] SecretResolverError),
+    /// ConfigMap resolution failed.
+    #[error("{0}")]
+    ConfigMapResolution(#[from] ConfigMapResolverError),
+    /// A configmap referenced by a `configMap` volume was not resolved.
+    #[error("ConfigMap '{0}' referenced by a volume was not resolved")]
+    ConfigMapVolumeNotResolved(String),
+    /// A `volumeMount` references a volume not declared on the pod.
+    #[error("Container '{container}' references unknown volume '{volume}'")]
+    UnknownVolume { container: String, volume: String },
+    /// A `configMap` volume references a configmap that wasn't resolved.
+    #[error("Volume '{volume}' references unresolved configMap '{name}'")]
+    VolumeConfigMapMissing { volume: String, name: String },
+    /// A `hostPath` volume points at a non-existent directory.
+    #[error("Volume '{volume}' hostPath does not exist: {path}")]
+    HostPathMissing { volume: String, path: String },
+    /// Image archive file is missing for a container.
+    #[error("Image archive for container '{container}' not found at {path}")]
+    ImageArchiveMissing { container: String, path: String },
+    /// Image template directory is missing for a container.
+    #[error("Image directory for container '{container}' not found at {path}")]
+    ImageDirMissing { container: String, path: String },
+    /// Filesystem I/O error with caller-supplied context.
+    #[error("{context}: {source}")]
+    Io {
+        context: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl PrepareError {
+    /// Build an [`Io`](Self::Io) error with the given context.
+    pub fn io(context: impl Into<String>, source: std::io::Error) -> Self {
+        Self::Io {
+            context: context.into(),
+            source,
+        }
+    }
+
+    /// True when the error originates from a resolver timeout.
+    pub fn is_timeout(&self) -> bool {
+        use crate::pod::resolver::config_map::ConfigMapResolverErrorKind;
+        use crate::pod::resolver::secret::SecretResolverErrorKind;
+        match self {
+            Self::SecretResolution(e) => e.kind == SecretResolverErrorKind::Timeout,
+            Self::ConfigMapResolution(e) => e.kind == ConfigMapResolverErrorKind::Timeout,
+            _ => false,
+        }
+    }
+}
 
 /// Environment variable injected into every container with the container's
 /// working directory. Allows shell scripts to reference paths relative to
@@ -101,7 +173,7 @@ pub async fn prepare_pod(
     images_dir: &Path,
     timeout: Option<Duration>,
     cancel: &mut watch::Receiver<()>,
-) -> Result<PodSpec, String> {
+) -> Result<PodSpec, PrepareError> {
     let mut prepared = rewrite_pod_paths(spec, pod_dir)?;
     let resolved =
         resolve_k8s_values(&prepared, namespace, resolvers, timeout, cancel).await?;
@@ -123,12 +195,9 @@ pub async fn prepare_pod(
 /// - `volumeMount.mountPath` values are prefixed with the container root.
 ///
 /// Adds the `pr.tabsdata.com/prepared` annotation.
-pub fn rewrite_pod_paths(pod: &PodSpec, pod_dir: &Path) -> Result<PodSpec, String> {
+pub fn rewrite_pod_paths(pod: &PodSpec, pod_dir: &Path) -> Result<PodSpec, PrepareError> {
     if is_prepared(pod) {
-        return Err(
-            "Pod has already been prepared (pr.tabsdata.com/prepared annotation is set)"
-                .to_string(),
-        );
+        return Err(PrepareError::AlreadyPrepared);
     }
 
     let mut prepared = pod.clone();
@@ -178,7 +247,7 @@ pub async fn resolve_pod_k8s_values(
     resolvers: &ResolverSet,
     timeout: Option<Duration>,
     cancel: &mut watch::Receiver<()>,
-) -> Result<ResolvedK8sValues, String> {
+) -> Result<ResolvedK8sValues, PrepareError> {
     resolve_k8s_values(spec, namespace, resolvers, timeout, cancel).await
 }
 
@@ -342,15 +411,13 @@ pub fn create_container_dirs(
     spec: &PodSpec,
     pod_dir: &Path,
     images_dir: &Path,
-) -> Result<(), String> {
+) -> Result<(), PrepareError> {
     for c in spec.spec.all_containers() {
         // Create working dir
         if !c.working_dir.is_empty() {
-            fs::create_dir_all(&c.working_dir).map_err(|e| {
-                format!(
-                    "Failed to create working dir for '{}': {}",
-                    c.name, e
-                )
+            fs::create_dir_all(&c.working_dir).map_err(|source| PrepareError::Io {
+                context: format!("Failed to create working dir for '{}'", c.name),
+                source,
             })?;
         }
 
@@ -363,22 +430,20 @@ pub fn create_container_dirs(
             match kind {
                 ImageKind::TarGz => {
                     if !src.is_file() {
-                        return Err(format!(
-                            "Image archive for container '{}' not found at {}",
-                            c.name,
-                            src.display()
-                        ));
+                        return Err(PrepareError::ImageArchiveMissing {
+                            container: c.name.clone(),
+                            path: src.display().to_string(),
+                        });
                     }
                     debug!(container = c.name.as_str(), src = ?src, dest = ?dest, "Extracting image archive");
                     extract_tar_gz(&src, &dest)?;
                 }
                 ImageKind::Directory => {
                     if !src.is_dir() {
-                        return Err(format!(
-                            "Image directory for container '{}' not found at {}",
-                            c.name,
-                            src.display()
-                        ));
+                        return Err(PrepareError::ImageDirMissing {
+                            container: c.name.clone(),
+                            path: src.display().to_string(),
+                        });
                     }
                     debug!(container = c.name.as_str(), src = ?src, dest = ?dest, "Copying image template");
                     copy_dir_recursive(&src, &dest)?;
@@ -417,44 +482,55 @@ fn image_kind(path: &Path) -> ImageKind {
 }
 
 /// Extract a `.tar.gz` archive into `dest`.
-fn extract_tar_gz(src: &Path, dest: &Path) -> Result<(), String> {
-    fs::create_dir_all(dest)
-        .map_err(|e| format!("Failed to create dir {}: {}", dest.display(), e))?;
+fn extract_tar_gz(src: &Path, dest: &Path) -> Result<(), PrepareError> {
+    fs::create_dir_all(dest).map_err(|source| PrepareError::Io {
+        context: format!("Failed to create dir {}", dest.display()),
+        source,
+    })?;
 
-    let file = fs::File::open(src)
-        .map_err(|e| format!("Failed to open archive {}: {}", src.display(), e))?;
+    let file = fs::File::open(src).map_err(|source| PrepareError::Io {
+        context: format!("Failed to open archive {}", src.display()),
+        source,
+    })?;
     let dec = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(dec);
-    archive
-        .unpack(dest)
-        .map_err(|e| format!("Failed to extract {} -> {}: {}", src.display(), dest.display(), e))?;
+    archive.unpack(dest).map_err(|source| PrepareError::Io {
+        context: format!("Failed to extract {} -> {}", src.display(), dest.display()),
+        source,
+    })?;
     Ok(())
 }
 
 /// Recursively copy a directory tree, creating dest dirs as needed.
-fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
-    fs::create_dir_all(dest)
-        .map_err(|e| format!("Failed to create dir {}: {}", dest.display(), e))?;
+fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), PrepareError> {
+    fs::create_dir_all(dest).map_err(|source| PrepareError::Io {
+        context: format!("Failed to create dir {}", dest.display()),
+        source,
+    })?;
 
-    let entries = fs::read_dir(src)
-        .map_err(|e| format!("Failed to read dir {}: {}", src.display(), e))?;
+    let entries = fs::read_dir(src).map_err(|source| PrepareError::Io {
+        context: format!("Failed to read dir {}", src.display()),
+        source,
+    })?;
 
     for entry in entries {
-        let entry =
-            entry.map_err(|e| format!("Failed to read entry in {}: {}", src.display(), e))?;
+        let entry = entry.map_err(|source| PrepareError::Io {
+            context: format!("Failed to read entry in {}", src.display()),
+            source,
+        })?;
         let src_path = entry.path();
         let dest_path = dest.join(entry.file_name());
 
         if src_path.is_dir() {
             copy_dir_recursive(&src_path, &dest_path)?;
         } else {
-            fs::copy(&src_path, &dest_path).map_err(|e| {
-                format!(
-                    "Failed to copy {} -> {}: {}",
+            fs::copy(&src_path, &dest_path).map_err(|source| PrepareError::Io {
+                context: format!(
+                    "Failed to copy {} -> {}",
                     src_path.display(),
                     dest_path.display(),
-                    e
-                )
+                ),
+                source,
             })?;
         }
     }
@@ -467,7 +543,7 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
 
 /// Create emptyDir directories, hostPath symlinks, and configMap volume
 /// directories (one file per key).
-pub fn setup_volumes(spec: &PodSpec, resolved: &ResolvedK8sValues) -> Result<(), String> {
+pub fn setup_volumes(spec: &PodSpec, resolved: &ResolvedK8sValues) -> Result<(), PrepareError> {
     resolve_volumes(spec, resolved).map(|_| ())
 }
 
@@ -804,7 +880,7 @@ mod tests {
         let prepared = rewrite_pod_paths(&pod, &dir).unwrap();
         let result = create_container_dirs(&prepared, &dir, Path::new(""));
         let err = result.unwrap_err();
-        assert!(err.contains("not found"), "got: {err}");
+        assert!(matches!(err, PrepareError::ImageDirMissing { .. }), "got: {err}");
     }
 
     #[test]
@@ -816,7 +892,7 @@ mod tests {
         let prepared = rewrite_pod_paths(&pod, &dir).unwrap();
         let result = create_container_dirs(&prepared, &dir, Path::new(""));
         let err = result.unwrap_err();
-        assert!(err.contains("not found"), "got: {err}");
+        assert!(matches!(err, PrepareError::ImageArchiveMissing { .. }), "got: {err}");
     }
 
     // -- resolve_image_path / image_kind --
