@@ -1,20 +1,52 @@
 // Copyright 2026 Tabsdata Inc.
 
 //! Secret resolver — fetch secret key/value data by name.
+//!
+//! The trait's [`SecretResolver::secrets`] method accepts an optional
+//! timeout (sourced from the pod's `activeDeadlineSeconds`) and a cancel
+//! signal. If any requested secret does not (yet) exist the resolver
+//! retries with an exponential backoff (see
+//! [`crate::pod::resolver::backoff`]) until one of the following happens:
+//!
+//! - the secret becomes available — `Ok(...)` is returned;
+//! - the timeout expires — [`SecretResolverErrorKind::Timeout`] is
+//!   returned;
+//! - the cancel signal fires — [`SecretResolverErrorKind::Cancelled`] is
+//!   returned;
+//! - a non-retryable error occurs (e.g. YAML parse, unreachable kube API)
+//!   — [`SecretResolverErrorKind::Other`] is returned without retrying.
+//!
+//! Existence is checked at the **entry** (secret object) level. The
+//! resolver does not inspect individual keys — a missing key inside an
+//! existing secret is silently skipped by the env-resolution code, not
+//! waited for here.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::sync::watch;
+
+use super::backoff::{poll_with_backoff, PollError};
+
+/// Op-name passed to the backoff logger.
+const OP_NAME: &str = "secret_resolver.fetch";
 
 /// Fetch secrets by name. Returns `{name: {key: value}}` for each
 /// requested name.
+///
+/// `timeout` bounds the total wait when any requested secret is missing.
+/// `None` means no bound (the wait is indefinite). `cancel` is observed
+/// throughout the wait and aborts it when it fires.
 #[async_trait]
 pub trait SecretResolver: Send + Sync {
     async fn secrets(
         &self,
         namespace: &str,
         names: &[String],
+        timeout: Option<Duration>,
+        cancel: &mut watch::Receiver<()>,
     ) -> Result<HashMap<String, HashMap<String, String>>, SecretResolverError>;
 }
 
@@ -23,6 +55,44 @@ pub trait SecretResolver: Send + Sync {
 pub struct SecretResolverError {
     pub name: String,
     pub message: String,
+    pub kind: SecretResolverErrorKind,
+}
+
+/// Classification of a [`SecretResolverError`]. Drives the retry loop in
+/// [`SecretResolver::secrets`] and lets callers distinguish "missing"
+/// from "permanently broken".
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum SecretResolverErrorKind {
+    /// The named secret is not (yet) defined. Retryable.
+    NotFound,
+    /// The wait exceeded the timeout. Pod should transition to Failed.
+    Timeout,
+    /// The cancel signal fired during the wait.
+    Cancelled,
+    /// Non-retryable failure (parse error, unreachable kube API, etc.).
+    Other,
+}
+
+impl SecretResolverError {
+    pub fn not_found(name: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            message: message.into(),
+            kind: SecretResolverErrorKind::NotFound,
+        }
+    }
+
+    pub fn other(name: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            message: message.into(),
+            kind: SecretResolverErrorKind::Other,
+        }
+    }
+
+    pub fn is_not_found(&self) -> bool {
+        self.kind == SecretResolverErrorKind::NotFound
+    }
 }
 
 impl std::fmt::Display for SecretResolverError {
@@ -32,6 +102,28 @@ impl std::fmt::Display for SecretResolverError {
 }
 
 impl std::error::Error for SecretResolverError {}
+
+/// Translate a [`PollError`] returned by the backoff helper into a
+/// [`SecretResolverError`] suitable for callers of [`SecretResolver`].
+fn poll_err_to_secret_err(err: PollError<SecretResolverError>) -> SecretResolverError {
+    match err {
+        PollError::Timeout { last_err, elapsed } => SecretResolverError {
+            name: last_err.name,
+            message: format!(
+                "timed out after {:.1}s waiting for secret to become available: {}",
+                elapsed.as_secs_f64(),
+                last_err.message,
+            ),
+            kind: SecretResolverErrorKind::Timeout,
+        },
+        PollError::Cancelled { elapsed } => SecretResolverError {
+            name: String::new(),
+            message: format!("secret resolution cancelled after {:.1}s", elapsed.as_secs_f64()),
+            kind: SecretResolverErrorKind::Cancelled,
+        },
+        PollError::Fatal(e) => e,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // File-based implementation
@@ -52,6 +144,43 @@ impl FileSecretResolver {
         }
         Ok(Self { dir })
     }
+
+    /// Single-pass fetch. Returns [`SecretResolverErrorKind::NotFound`]
+    /// when any requested `<name>.yaml` is absent; other I/O or parse
+    /// errors are classified as [`SecretResolverErrorKind::Other`].
+    fn try_fetch(
+        &self,
+        names: &[String],
+    ) -> Result<HashMap<String, HashMap<String, String>>, SecretResolverError> {
+        let mut result = HashMap::new();
+        for name in names {
+            let path = self.dir.join(format!("{}.yaml", name));
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(SecretResolverError::not_found(
+                        name,
+                        format!("file not found: {}", path.display()),
+                    ));
+                }
+                Err(e) => {
+                    return Err(SecretResolverError::other(
+                        name,
+                        format!("failed to read {}: {}", path.display(), e),
+                    ));
+                }
+            };
+            let doc: serde_json::Value =
+                serde_yaml_ng::from_str(&content).map_err(|e| {
+                    SecretResolverError::other(
+                        name,
+                        format!("invalid YAML in {}: {}", path.display(), e),
+                    )
+                })?;
+            result.insert(name.clone(), extract_secret_data(&doc, name)?);
+        }
+        Ok(result)
+    }
 }
 
 #[async_trait]
@@ -60,22 +189,18 @@ impl SecretResolver for FileSecretResolver {
         &self,
         _namespace: &str,
         names: &[String],
+        timeout: Option<Duration>,
+        cancel: &mut watch::Receiver<()>,
     ) -> Result<HashMap<String, HashMap<String, String>>, SecretResolverError> {
-        let mut result = HashMap::new();
-        for name in names {
-            let path = self.dir.join(format!("{}.yaml", name));
-            let content = std::fs::read_to_string(&path).map_err(|e| SecretResolverError {
-                name: name.clone(),
-                message: format!("failed to read {}: {}", path.display(), e),
-            })?;
-            let doc: serde_json::Value =
-                serde_yaml_ng::from_str(&content).map_err(|e| SecretResolverError {
-                    name: name.clone(),
-                    message: format!("invalid YAML in {}: {}", path.display(), e),
-                })?;
-            result.insert(name.clone(), extract_secret_data(&doc, name)?);
-        }
-        Ok(result)
+        poll_with_backoff(
+            OP_NAME,
+            timeout,
+            cancel,
+            SecretResolverError::is_not_found,
+            || async { self.try_fetch(names) },
+        )
+        .await
+        .map_err(poll_err_to_secret_err)
     }
 }
 
@@ -92,13 +217,17 @@ fn extract_secret_data(
                 use base64::Engine;
                 let decoded = base64::engine::general_purpose::STANDARD
                     .decode(b64)
-                    .map_err(|e| SecretResolverError {
-                        name: name.to_string(),
-                        message: format!("base64 decode failed for key '{}': {}", key, e),
+                    .map_err(|e| {
+                        SecretResolverError::other(
+                            name,
+                            format!("base64 decode failed for key '{}': {}", key, e),
+                        )
                     })?;
-                let s = String::from_utf8(decoded).map_err(|e| SecretResolverError {
-                    name: name.to_string(),
-                    message: format!("UTF-8 decode failed for key '{}': {}", key, e),
+                let s = String::from_utf8(decoded).map_err(|e| {
+                    SecretResolverError::other(
+                        name,
+                        format!("UTF-8 decode failed for key '{}': {}", key, e),
+                    )
                 })?;
                 values.insert(key.clone(), s);
             }
@@ -141,11 +270,11 @@ impl KubeSecretResolver {
 
         Ok(Self { client })
     }
-}
 
-#[async_trait]
-impl SecretResolver for KubeSecretResolver {
-    async fn secrets(
+    /// Single-pass fetch. A kube API 404 produces
+    /// [`SecretResolverErrorKind::NotFound`]; everything else is
+    /// classified as [`SecretResolverErrorKind::Other`] (no retry).
+    async fn try_fetch(
         &self,
         namespace: &str,
         names: &[String],
@@ -157,17 +286,24 @@ impl SecretResolver for KubeSecretResolver {
         let mut result = HashMap::new();
 
         for name in names {
-            let secret = api.get(name).await.map_err(|e| SecretResolverError {
-                name: name.clone(),
-                message: format!("{}", e),
-            })?;
+            let secret = match api.get(name).await {
+                Ok(s) => s,
+                Err(kube::Error::Api(e)) if e.code == 404 => {
+                    return Err(SecretResolverError::not_found(name, e.message));
+                }
+                Err(e) => {
+                    return Err(SecretResolverError::other(name, format!("{}", e)));
+                }
+            };
 
             let mut values = HashMap::new();
             if let Some(data) = secret.data {
                 for (key, val) in data {
-                    let s = String::from_utf8(val.0).map_err(|e| SecretResolverError {
-                        name: name.clone(),
-                        message: format!("UTF-8 decode for '{}': {}", key, e),
+                    let s = String::from_utf8(val.0).map_err(|e| {
+                        SecretResolverError::other(
+                            name,
+                            format!("UTF-8 decode for '{}': {}", key, e),
+                        )
                     })?;
                     values.insert(key, s);
                 }
@@ -178,6 +314,27 @@ impl SecretResolver for KubeSecretResolver {
             result.insert(name.clone(), values);
         }
         Ok(result)
+    }
+}
+
+#[async_trait]
+impl SecretResolver for KubeSecretResolver {
+    async fn secrets(
+        &self,
+        namespace: &str,
+        names: &[String],
+        timeout: Option<Duration>,
+        cancel: &mut watch::Receiver<()>,
+    ) -> Result<HashMap<String, HashMap<String, String>>, SecretResolverError> {
+        poll_with_backoff(
+            OP_NAME,
+            timeout,
+            cancel,
+            SecretResolverError::is_not_found,
+            || self.try_fetch(namespace, names),
+        )
+        .await
+        .map_err(poll_err_to_secret_err)
     }
 }
 
@@ -201,6 +358,10 @@ mod tests {
         dir
     }
 
+    fn cancel_channel() -> (watch::Sender<()>, watch::Receiver<()>) {
+        watch::channel(())
+    }
+
     #[tokio::test]
     async fn file_resolver_reads_base64_data() {
         let dir = setup_secret_dir("b64");
@@ -211,8 +372,9 @@ mod tests {
         .unwrap();
 
         let resolver = FileSecretResolver::new(dir).unwrap();
+        let (_tx, mut rx) = cancel_channel();
         let result = resolver
-            .secrets("default", &["my-secret".to_string()])
+            .secrets("default", &["my-secret".to_string()], None, &mut rx)
             .await
             .unwrap();
         assert_eq!(result["my-secret"]["username"], "admin");
@@ -225,8 +387,9 @@ mod tests {
         fs::write(dir.join("plain.yaml"), "stringData:\n  api_key: \"sk-12345\"\n").unwrap();
 
         let resolver = FileSecretResolver::new(dir).unwrap();
+        let (_tx, mut rx) = cancel_channel();
         let result = resolver
-            .secrets("default", &["plain".to_string()])
+            .secrets("default", &["plain".to_string()], None, &mut rx)
             .await
             .unwrap();
         assert_eq!(result["plain"]["api_key"], "sk-12345");
@@ -242,23 +405,104 @@ mod tests {
         .unwrap();
 
         let resolver = FileSecretResolver::new(dir).unwrap();
+        let (_tx, mut rx) = cancel_channel();
         let result = resolver
-            .secrets("default", &["mixed".to_string()])
+            .secrets("default", &["mixed".to_string()], None, &mut rx)
             .await
             .unwrap();
         assert_eq!(result["mixed"]["encoded"], "hello");
         assert_eq!(result["mixed"]["plain"], "world");
     }
 
-    #[tokio::test]
-    async fn file_resolver_missing_file() {
-        let dir = setup_secret_dir("missing");
+    #[tokio::test(start_paused = true)]
+    async fn file_resolver_missing_file_times_out() {
+        let dir = setup_secret_dir("missing-timeout");
         let resolver = FileSecretResolver::new(dir).unwrap();
+        let (_tx, mut rx) = cancel_channel();
+
         let err = resolver
-            .secrets("default", &["nonexistent".to_string()])
+            .secrets(
+                "default",
+                &["nonexistent".to_string()],
+                Some(Duration::from_secs(1)),
+                &mut rx,
+            )
             .await
             .unwrap_err();
-        assert!(err.message.contains("failed to read"));
+        assert_eq!(err.kind, SecretResolverErrorKind::Timeout);
+        assert!(err.message.contains("timed out"), "got: {}", err.message);
+        assert!(err.message.contains("file not found"), "got: {}", err.message);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn file_resolver_missing_then_appears_succeeds() {
+        let dir = setup_secret_dir("missing-then-appears");
+        let resolver = FileSecretResolver::new(dir.clone()).unwrap();
+        let (_tx, mut rx) = cancel_channel();
+        let secret_path = dir.join("late.yaml");
+
+        let writer = tokio::spawn(async move {
+            // Wait long enough for the resolver to fail at least once and
+            // begin its first backoff (500ms), then materialize the file.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            fs::write(&secret_path, "stringData:\n  key: appeared\n").unwrap();
+        });
+
+        let result = resolver
+            .secrets(
+                "default",
+                &["late".to_string()],
+                Some(Duration::from_secs(60)),
+                &mut rx,
+            )
+            .await
+            .unwrap();
+        writer.await.unwrap();
+        assert_eq!(result["late"]["key"], "appeared");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn file_resolver_cancelled_returns_cancelled_kind() {
+        let dir = setup_secret_dir("cancelled");
+        let resolver = FileSecretResolver::new(dir).unwrap();
+        let (tx, mut rx) = cancel_channel();
+
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = tx.send(());
+        });
+
+        let err = resolver
+            .secrets(
+                "default",
+                &["never-comes".to_string()],
+                None, // indefinite wait, only cancel can stop it
+                &mut rx,
+            )
+            .await
+            .unwrap_err();
+        canceller.await.unwrap();
+        assert_eq!(err.kind, SecretResolverErrorKind::Cancelled);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn file_resolver_invalid_yaml_returns_other_no_retry() {
+        let dir = setup_secret_dir("bad-yaml");
+        fs::write(dir.join("bad.yaml"), "not: valid: yaml: at: all: [\n").unwrap();
+        let resolver = FileSecretResolver::new(dir).unwrap();
+        let (_tx, mut rx) = cancel_channel();
+
+        let err = resolver
+            .secrets(
+                "default",
+                &["bad".to_string()],
+                Some(Duration::from_secs(60)),
+                &mut rx,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, SecretResolverErrorKind::Other);
+        assert!(err.message.contains("invalid YAML"), "got: {}", err.message);
     }
 
     #[test]
@@ -274,11 +518,28 @@ mod tests {
         fs::write(dir.join("b.yaml"), "stringData:\n  key: val-b\n").unwrap();
 
         let resolver = FileSecretResolver::new(dir).unwrap();
+        let (_tx, mut rx) = cancel_channel();
         let result = resolver
-            .secrets("default", &["a".to_string(), "b".to_string()])
+            .secrets(
+                "default",
+                &["a".to_string(), "b".to_string()],
+                None,
+                &mut rx,
+            )
             .await
             .unwrap();
         assert_eq!(result["a"]["key"], "val-a");
         assert_eq!(result["b"]["key"], "val-b");
+    }
+
+    #[test]
+    fn error_kind_classification() {
+        let nf = SecretResolverError::not_found("s", "missing");
+        assert!(nf.is_not_found());
+        assert_eq!(nf.kind, SecretResolverErrorKind::NotFound);
+
+        let other = SecretResolverError::other("s", "boom");
+        assert!(!other.is_not_found());
+        assert_eq!(other.kind, SecretResolverErrorKind::Other);
     }
 }

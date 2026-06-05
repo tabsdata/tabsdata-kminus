@@ -14,6 +14,9 @@ use super::constants::RestartPolicy;
 pub struct KeyRef {
     pub name: String,
     pub key: String,
+    /// K8s `optional` flag. Pod-runner does not support `true` — see
+    /// [`crate::pod::admission`] for the admission-time rejection.
+    pub optional: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -36,6 +39,9 @@ pub struct EnvVar {
 #[serde(rename_all = "camelCase", default)]
 pub struct ObjectRef {
     pub name: String,
+    /// K8s `optional` flag. Pod-runner does not support `true` — see
+    /// [`crate::pod::admission`] for the admission-time rejection.
+    pub optional: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -215,6 +221,11 @@ pub struct PodSpecBody {
     pub containers: Vec<Container>,
     pub volumes: Vec<Volume>,
     pub restart_policy: RestartPolicy,
+    /// K8s `activeDeadlineSeconds`. In pod-runner this bounds the total time
+    /// the preparer waits for referenced configmaps and secrets to become
+    /// available before the pod is transitioned to Failed. `None` means the
+    /// wait is indefinite.
+    pub active_deadline_seconds: Option<u64>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }

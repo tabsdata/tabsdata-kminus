@@ -1,5 +1,6 @@
 // Copyright 2026 Tabsdata Inc.
 
+pub mod admission;
 pub mod container_log;
 pub mod executor;
 pub mod lifecycle;

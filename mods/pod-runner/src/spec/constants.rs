@@ -74,6 +74,20 @@ pub const REASON_CONTAINER_NOT_FOUND: &str = "ContainerNotFound";
 pub const REASON_POD_INITIALIZING: &str = "PodInitializing";
 
 // ---------------------------------------------------------------------------
+// Pod-preparation failure reasons (set when prepare_pod fails before the
+// executor is spawned — e.g. missing configmap/secret times out).
+// ---------------------------------------------------------------------------
+
+/// `activeDeadlineSeconds` elapsed while the preparer was waiting for a
+/// referenced configmap or secret to appear. Matches the k8s convention.
+pub const REASON_DEADLINE_EXCEEDED: &str = "DeadlineExceeded";
+
+/// Pod preparation failed for a non-timeout reason — e.g. an unrecoverable
+/// resolver error, executor spawn failure, or filesystem error setting up
+/// the pod work directory.
+pub const REASON_POD_PREPARATION_FAILED: &str = "PodPreparationFailed";
+
+// ---------------------------------------------------------------------------
 // Container state serialization keys
 // ---------------------------------------------------------------------------
 //

@@ -5,19 +5,20 @@
 //! [`PodLogic`] provides the operations that an API server (or CLI)
 //! calls: create, delete, get, list. It owns the pod lifecycles:
 //!
-//! - **Create**: validates, prepares the running spec, stores both spec
-//!   variants, spawns the executor, and starts a background monitor task
-//!   that feeds events back into the store.
-//! - **Delete**: kills running containers (via [`PodKillHandle`]) and
-//!   marks the pod as a disruption target. Terminal pods are removed
+//! - **Create**: admits the pod (rejects unsupported features), checks
+//!   uniqueness/capacity, stores the pod in **Pending**, and spawns a
+//!   background preparer task. The preparer runs
+//!   [`crate::pod::prepare::prepare_pod`] which may wait (with
+//!   exponential backoff) for any referenced configmap/secret to appear.
+//!   On success the preparer spawns the executor and a monitor task,
+//!   replacing the preparer entry in the runtime map; on failure (incl.
+//!   `activeDeadlineSeconds` timeout) it transitions the pod to
+//!   **Failed** in the store.
+//! - **Delete**: cancels the preparer if the pod is still being
+//!   prepared, otherwise kills running containers (via [`PodKillHandle`])
+//!   and marks the pod as a disruption target. Terminal pods are removed
 //!   immediately.
 //! - **Get / List**: thin wrappers over the store.
-//!
-//! # Spec preparation
-//!
-//! Uses [`pod_prepare`](crate::pod::prepare::pod_prepare) to rewrite
-//! paths, then resolves environment variables (secrets, config maps,
-//! node envs) and sets up volumes (emptyDir, hostPath).
 
 pub mod cleanup;
 pub mod purge;
@@ -208,14 +209,46 @@ impl std::error::Error for LogicError {}
 // PodRuntime — per-pod runtime state owned by the logic layer
 // ---------------------------------------------------------------------------
 
-struct PodRuntime {
-    kill_handle: PodKillHandle,
-    log_handle: PodLogHandle,
-    /// True once `delete_pod` has been called for this pod.
-    deleted: Arc<AtomicBool>,
-    /// Monitor task that processes executor events and updates the store.
-    /// Kept alive — aborted if the runtime is dropped.
-    _monitor: JoinHandle<()>,
+/// Per-pod runtime state. A pod begins life as [`PodRuntime::Preparing`]
+/// while the preparer task waits for missing configmaps/secrets and
+/// builds the running spec. Once preparation succeeds the entry is
+/// replaced (atomically, under the runtimes write lock) with
+/// [`PodRuntime::Running`] which carries the executor's kill/log
+/// handles. If preparation fails or times out the entry stays as
+/// `Preparing` with a finished task until `delete_pod` removes it.
+enum PodRuntime {
+    Preparing {
+        /// Fires when the preparer should abort (delete or shutdown).
+        cancel_tx: watch::Sender<()>,
+        /// True once `delete_pod` has been called for this pod.
+        deleted: Arc<AtomicBool>,
+        /// Preparer task. Kept so `wait_for_pods` can poll completion.
+        task: JoinHandle<()>,
+    },
+    Running {
+        kill_handle: PodKillHandle,
+        log_handle: PodLogHandle,
+        /// True once `delete_pod` has been called for this pod.
+        deleted: Arc<AtomicBool>,
+        /// Monitor task that processes executor events and updates the
+        /// store. Kept alive — aborted if the runtime is dropped.
+        _monitor: JoinHandle<()>,
+    },
+}
+
+impl PodRuntime {
+    fn deleted(&self) -> &Arc<AtomicBool> {
+        match self {
+            Self::Preparing { deleted, .. } | Self::Running { deleted, .. } => deleted,
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        match self {
+            Self::Preparing { task, .. } => task.is_finished(),
+            Self::Running { _monitor, .. } => _monitor.is_finished(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -224,11 +257,11 @@ struct PodRuntime {
 
 /// Pod logic layer — owns pod lifecycles, wires store and executor.
 pub struct PodLogic {
-    config: LogicConfig,
+    config: Arc<LogicConfig>,
     cleanup_config: Arc<CleanupConfig>,
     store: Arc<dyn PodStore>,
     executor_provider: Arc<dyn ExecutorProvider>,
-    resolvers: ResolverSet,
+    resolvers: Arc<ResolverSet>,
     runtimes: Arc<RwLock<HashMap<PodId, PodRuntime>>>,
     metrics: Option<Arc<Metrics>>,
     shutdown_tx: watch::Sender<()>,
@@ -244,11 +277,11 @@ impl PodLogic {
         shutdown_tx: watch::Sender<()>,
     ) -> Self {
         Self {
-            config: config.into(),
+            config: Arc::new(config.into()),
             cleanup_config: Arc::new(cleanup_config),
             store,
             executor_provider,
-            resolvers,
+            resolvers: Arc::new(resolvers),
             runtimes: Arc::new(RwLock::new(HashMap::new())),
             metrics: None,
             shutdown_tx,
@@ -267,7 +300,7 @@ impl PodLogic {
         loop {
             let count = self.runtimes.read().unwrap()
                 .values()
-                .filter(|r| !r._monitor.is_finished())
+                .filter(|r| !r.is_finished())
                 .count();
             if count == 0 {
                 info!("All pod monitors completed");
@@ -288,14 +321,21 @@ impl PodLogic {
         self
     }
 
-    /// Create and start a pod.
+    /// Create a pod.
     ///
-    /// Validates uniqueness and capacity, prepares the running spec,
-    /// stores both variants, spawns the executor, and starts the
-    /// background monitor task.
+    /// Admits the spec (rejects unsupported features), checks
+    /// uniqueness/capacity, stores the pod in **Pending**, and spawns a
+    /// background preparer task. Returns the initial Pending snapshot.
+    /// The executor is spawned only after the preparer finishes — see
+    /// [`prepare_and_run`] for the full flow.
     pub async fn create_pod(&self, spec: PodSpec) -> Result<PodSnapshot, LogicError> {
         let create_start = std::time::Instant::now();
         let id = PodId::from_spec(&spec);
+
+        // Admission — reject unsupported features (e.g. `optional: true`
+        // on configmap/secret references). See pod::admission for the
+        // full list of rules.
+        crate::pod::admission::admit(&spec).map_err(LogicError::Internal)?;
 
         // Uniqueness
         if self.store.get_by_name(&id.namespace, &id.name, SpecView::Running).await.is_some() {
@@ -312,75 +352,49 @@ impl PodLogic {
             return Err(LogicError::CapacityExceeded { max: self.config.max_pods });
         }
 
-        // Prepare running spec: rewrite paths, resolve envs, create dirs, setup volumes
+        // Store the pod in Pending. The running_spec starts equal to the
+        // original; the preparer overwrites it with the rewritten spec
+        // once preparation succeeds.
         let original_spec = Arc::new(spec);
-        let pod_work_dir = self.executor_provider.work_dir(&id);
-        let prepared = prepare_pod(
-            &original_spec,
-            &pod_work_dir,
-            &id.namespace,
-            &self.resolvers,
-            &self.config.images_dir,
-        )
-        .await
-        .map_err(LogicError::Internal)?;
-
-        let running_spec = Arc::new(prepared);
-
-        // Build initial status
-        let status = build_initial_status(&running_spec);
-
-        // Store
+        let initial_status = build_initial_status(&original_spec);
         self.store.put(
             id.clone(),
             Arc::clone(&original_spec),
-            Arc::clone(&running_spec),
-            status,
+            Arc::clone(&original_spec),
+            initial_status,
         ).await;
-        info!(pod = %id, "Pod stored");
+        info!(pod = %id, "Pod stored in Pending; spawning preparer");
 
-        // Spawn executor — remove from store on failure
-        let shutdown_rx = self.shutdown_tx.subscribe();
-        let executor = self.executor_provider.create(Arc::clone(&running_spec), &id);
-        let handle = match executor
-            .spawn(shutdown_rx)
-            .await
-        {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(pod = %id, error = %e, "Executor spawn failed, removing pod from store");
-                self.store.remove(&id).await;
-                return Err(LogicError::Internal(e.to_string()));
-            }
-        };
-
-        // Extract handles before moving PodHandle to monitor task
-        let kill_handle = handle.kill_handle();
-        let log_handle = handle.log_handle();
+        // Per-pod cancel channel — fires on delete_pod or shutdown.
+        let (cancel_tx, cancel_rx) = watch::channel(());
         let deleted = Arc::new(AtomicBool::new(false));
 
-        // Spawn monitor task
-        let monitor_span = info_span!("monitor", pod = %id);
-        let monitor_shutdown = self.shutdown_tx.subscribe();
-        let monitor = tokio::spawn(
-            monitor_pod(
-                handle,
+        // Spawn preparer task. It owns the only path that mutates
+        // self.runtimes for this pod (swap Preparing → Running on
+        // success), keeping the lock-held regions short.
+        let prep_span = info_span!("prepare", pod = %id);
+        let task = tokio::spawn(
+            prepare_and_run(
+                id.clone(),
+                Arc::clone(&original_spec),
                 Arc::clone(&self.store),
                 Arc::clone(&self.executor_provider),
                 Arc::clone(&self.cleanup_config),
+                Arc::clone(&self.resolvers),
+                Arc::clone(&self.config),
                 Arc::clone(&self.runtimes),
                 self.metrics.clone(),
-                id.clone(),
                 Arc::clone(&deleted),
-                monitor_shutdown,
+                self.shutdown_tx.clone(),
+                cancel_rx,
             )
-            .instrument(monitor_span),
+            .instrument(prep_span),
         );
 
-        // Register runtime
+        // Register Preparing runtime entry so delete_pod can find it.
         self.runtimes.write().unwrap().insert(
             id.clone(),
-            PodRuntime { kill_handle, log_handle, deleted, _monitor: monitor },
+            PodRuntime::Preparing { cancel_tx, deleted, task },
         );
 
         // Metrics
@@ -390,7 +404,6 @@ impl PodLogic {
             m.pod_creation_seconds.observe(create_start.elapsed().as_secs_f64());
         }
 
-        info!(pod = %id, "Pod created and executor spawned");
         match self.store.get(&id, SpecView::Running).await {
             Some(snap) => Ok(snap),
             None => {
@@ -453,39 +466,65 @@ impl PodLogic {
             // Mark deleted so if the monitor is still finishing, it skips
             // its own cleanup (store entry already removed above).
             if let Some(runtime) = self.runtimes.read().unwrap().get(&snap.id) {
-                runtime.deleted.store(true, Ordering::Relaxed);
+                runtime.deleted().store(true, Ordering::Relaxed);
             }
             self.runtimes.write().unwrap().remove(&snap.id);
             return Ok(());
         }
 
-        // Kill via runtime and mark deleted.  Clone the kill handle out
-        // of the read-locked runtimes map so we can drop the lock before
-        // the async mark_disruption_target() call below.
-        let kill_handle = {
+        // Cancel the preparer (if still preparing) or kill via runtime
+        // (if already running). The map read lock is dropped before any
+        // .await — we extract the bits we need then act on them.
+        enum Action {
+            CancelPreparer(watch::Sender<()>),
+            KillRunning(PodKillHandle),
+            None,
+        }
+
+        let action = {
             let runtimes = self.runtimes.read().unwrap();
             match runtimes.get(&snap.id) {
                 Some(runtime) => {
-                    if runtime.deleted.load(Ordering::Relaxed) {
+                    if runtime.deleted().load(Ordering::Relaxed) {
                         debug!("Pod already marked for deletion");
                         return Ok(());
                     }
-                    runtime.deleted.store(true, Ordering::Relaxed);
-                    Some(runtime.kill_handle.clone())
+                    runtime.deleted().store(true, Ordering::Relaxed);
+                    match runtime {
+                        PodRuntime::Preparing { cancel_tx, .. } => {
+                            Action::CancelPreparer(cancel_tx.clone())
+                        }
+                        PodRuntime::Running { kill_handle, .. } => {
+                            Action::KillRunning(kill_handle.clone())
+                        }
+                    }
                 }
                 None => {
                     warn!("No runtime found for non-terminal pod");
-                    None
+                    Action::None
                 }
             }
         };
 
-        if let Some(kh) = kill_handle {
-            info!(grace_period = ?grace, "Killing pod");
-            kh.kill(grace);
-            // Mark disruption target on the LIVE lifecycle + status so
-            // the next emitted event carries it forward.
-            kh.mark_disruption_target().await;
+        match action {
+            Action::CancelPreparer(tx) => {
+                info!("Cancelling pod preparer");
+                let _ = tx.send(());
+                // The preparer task observes `deleted` after its
+                // prepare_pod call returns and exits without spawning the
+                // executor. The store entry is removed below.
+                self.store.remove(&snap.id).await;
+                self.runtimes.write().unwrap().remove(&snap.id);
+                return Ok(());
+            }
+            Action::KillRunning(kh) => {
+                info!(grace_period = ?grace, "Killing pod");
+                kh.kill(grace);
+                // Mark disruption target on the LIVE lifecycle + status
+                // so the next emitted event carries it forward.
+                kh.mark_disruption_target().await;
+            }
+            Action::None => {}
         }
 
         // Also write to the store immediately so clients that poll
@@ -610,9 +649,15 @@ impl PodLogic {
             LogicError::Internal("no runtime for pod".to_string())
         })?;
 
-        runtime.log_handle.stream(container, options).map_err(|e| {
-            LogicError::Internal(e.to_string())
-        })
+        match runtime {
+            PodRuntime::Preparing { .. } => Err(LogicError::Internal(
+                "pod is still being prepared (waiting for configmap/secret); no container logs available yet"
+                    .to_string(),
+            )),
+            PodRuntime::Running { log_handle, .. } => log_handle
+                .stream(container, options)
+                .map_err(|e| LogicError::Internal(e.to_string())),
+        }
     }
 
     /// Node capacity from configuration.
@@ -815,6 +860,173 @@ async fn monitor_pod(
     }
 
     debug!("Monitor task finished");
+}
+
+// ---------------------------------------------------------------------------
+// Preparer task
+// ---------------------------------------------------------------------------
+
+/// Build a Failed status for a pod that never made it past preparation.
+/// Sets `phase = Failed`, attaches the reason/message, and leaves container
+/// statuses empty (no container ever started).
+fn build_failed_prep_status(reason: &str, message: &str) -> PodStatus {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut status = PodStatus {
+        phase: PodPhase::Failed,
+        message: message.to_string(),
+        start_time: now.clone(),
+        last_transition_time: now,
+        ..Default::default()
+    };
+    status.mark_scheduled();
+    status.mark_not_initialized(reason);
+    status.mark_containers_not_ready(reason);
+    status
+}
+
+/// Background task that prepares the pod and, on success, spawns the
+/// executor + monitor (replacing this pod's `PodRuntime::Preparing` entry
+/// with `PodRuntime::Running`).
+///
+/// Failure modes:
+/// - **Timeout** (`activeDeadlineSeconds` exceeded while waiting for a
+///   referenced configmap/secret) — pod transitions to
+///   `Failed`/`DeadlineExceeded`.
+/// - **Cancelled** by `delete_pod` — the task exits silently; the caller
+///   has already removed the store and runtime entries.
+/// - **Other** preparation error (parse error, executor spawn failure,
+///   etc.) — pod transitions to `Failed`/`PodPreparationFailed`.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_and_run(
+    id: PodId,
+    original_spec: Arc<PodSpec>,
+    store: Arc<dyn PodStore>,
+    executor_provider: Arc<dyn ExecutorProvider>,
+    cleanup_config: Arc<CleanupConfig>,
+    resolvers: Arc<ResolverSet>,
+    config: Arc<LogicConfig>,
+    runtimes: Arc<RwLock<HashMap<PodId, PodRuntime>>>,
+    metrics: Option<Arc<Metrics>>,
+    deleted: Arc<AtomicBool>,
+    shutdown_tx: watch::Sender<()>,
+    mut cancel_rx: watch::Receiver<()>,
+) {
+    let pod_work_dir = executor_provider.work_dir(&id);
+    let timeout = original_spec
+        .spec
+        .active_deadline_seconds
+        .map(Duration::from_secs);
+
+    debug!(
+        pod = %id,
+        timeout_secs = ?timeout.map(|d| d.as_secs()),
+        "Starting pod preparation",
+    );
+
+    let prepare_result = prepare_pod(
+        &original_spec,
+        &pod_work_dir,
+        &id.namespace,
+        &resolvers,
+        &config.images_dir,
+        timeout,
+        &mut cancel_rx,
+    )
+    .await;
+
+    // If delete_pod fired the cancel while we were preparing, exit
+    // silently — the delete path has already cleaned store + runtimes.
+    if deleted.load(Ordering::Relaxed) {
+        info!(pod = %id, "Preparation aborted by deletion");
+        return;
+    }
+
+    let prepared = match prepare_result {
+        Ok(p) => p,
+        Err(msg) => {
+            // Classify and surface as Failed in the store.
+            let reason = if msg.contains("timed out") {
+                warn!(pod = %id, error = %msg, "Pod preparation timed out");
+                REASON_DEADLINE_EXCEEDED
+            } else {
+                warn!(pod = %id, error = %msg, "Pod preparation failed");
+                REASON_POD_PREPARATION_FAILED
+            };
+            let status = build_failed_prep_status(reason, &msg);
+            store.update_status(&id, status).await;
+            if let Some(ref m) = metrics {
+                m.pods_failed_total.inc();
+            }
+            return;
+        }
+    };
+
+    // Re-store with the prepared running spec and a fresh initial status.
+    let running_spec = Arc::new(prepared);
+    let initial_status = build_initial_status(&running_spec);
+    store
+        .put(
+            id.clone(),
+            Arc::clone(&original_spec),
+            Arc::clone(&running_spec),
+            initial_status,
+        )
+        .await;
+
+    // Spawn the executor for the prepared spec.
+    let executor = executor_provider.create(Arc::clone(&running_spec), &id);
+    let exec_shutdown = shutdown_tx.subscribe();
+    let handle = match executor.spawn(exec_shutdown).await {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(pod = %id, error = %e, "Executor spawn failed");
+            let status = build_failed_prep_status(
+                REASON_POD_PREPARATION_FAILED,
+                &format!("executor spawn failed: {}", e),
+            );
+            store.update_status(&id, status).await;
+            if let Some(ref m) = metrics {
+                m.pods_failed_total.inc();
+            }
+            return;
+        }
+    };
+
+    let kill_handle = handle.kill_handle();
+    let log_handle = handle.log_handle();
+
+    let monitor_span = info_span!("monitor", pod = %id);
+    let monitor_shutdown = shutdown_tx.subscribe();
+    let monitor = tokio::spawn(
+        monitor_pod(
+            handle,
+            Arc::clone(&store),
+            Arc::clone(&executor_provider),
+            Arc::clone(&cleanup_config),
+            Arc::clone(&runtimes),
+            metrics,
+            id.clone(),
+            Arc::clone(&deleted),
+            monitor_shutdown,
+        )
+        .instrument(monitor_span),
+    );
+
+    // Swap Preparing → Running. The preparer's own JoinHandle (held by
+    // the Preparing variant we're replacing) is dropped here — tokio
+    // detaches the task rather than aborting, so this fn keeps running
+    // to completion just fine.
+    runtimes.write().unwrap().insert(
+        id.clone(),
+        PodRuntime::Running {
+            kill_handle,
+            log_handle,
+            deleted,
+            _monitor: monitor,
+        },
+    );
+
+    info!(pod = %id, "Pod prepared and executor spawned");
 }
 
 // ---------------------------------------------------------------------------
@@ -1562,7 +1774,12 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Start following immediately
+            // create_pod returns while the pod is still Pending (the
+            // preparer task hasn't promoted it to Running yet). Wait for
+            // Running so the log handle is available before streaming.
+            wait_for_phase(&logic, "follower", PodPhase::Running).await;
+
+            // Start following from the Running state.
             let mut rx = logic
                 .stream_container_logs(
                     "default",
@@ -1594,6 +1811,223 @@ mod tests {
             let err = logic
                 .stream_container_logs("default", "nope", None, ContainerLogOptions::default()).await.unwrap_err();
             assert!(matches!(err, LogicError::NotFound { .. }));
+        }
+
+        // -- Phase 4: preparer with secret/configmap waits --
+
+        use crate::pod::resolver::secret::FileSecretResolver;
+        use crate::spec::pod::{EnvVar, EnvVarSource, KeyRef};
+
+        fn temp_dir(name: &str) -> std::path::PathBuf {
+            let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let d = std::env::temp_dir().join(format!(
+                "pod-runner-rs2-test-prep-{}-{}-{}",
+                std::process::id(),
+                name,
+                n,
+            ));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        /// Build a logic with a file-backed SecretResolver rooted at
+        /// `secret_dir`. Used by the preparer tests that need a real
+        /// resolver wait path.
+        fn make_logic_with_secret_dir(
+            secret_dir: std::path::PathBuf,
+        ) -> (PodLogic, Arc<MemoryStore>, watch::Sender<()>) {
+            let store = Arc::new(MemoryStore::new());
+            let provider = make_provider();
+            let (shutdown_tx, _) = watch::channel(());
+            let resolvers = ResolverSet {
+                secret_resolver: Some(Box::new(FileSecretResolver::new(secret_dir).unwrap())),
+                ..Default::default()
+            };
+            let logic = PodLogic::new(
+                LogicConfig::default(),
+                test_cleanup_config(),
+                Arc::clone(&store) as Arc<dyn PodStore>,
+                provider,
+                resolvers,
+                shutdown_tx.clone(),
+            );
+            (logic, store, shutdown_tx)
+        }
+
+        /// Pod spec that references a secret via valueFrom + a short
+        /// activeDeadlineSeconds. Used by the timeout-transitions test.
+        fn pod_with_secret_ref(
+            name: &str,
+            secret_name: &str,
+            active_deadline_seconds: Option<u64>,
+        ) -> PodSpec {
+            PodSpec {
+                metadata: PodMetadata {
+                    namespace: "default".to_string(),
+                    name: name.to_string(),
+                    uid: format!("uid-{}", name),
+                    ..Default::default()
+                },
+                spec: PodSpecBody {
+                    containers: vec![Container {
+                        name: "main".to_string(),
+                        command: shell_cmd("echo ok"),
+                        env: vec![EnvVar {
+                            name: "PASS".to_string(),
+                            value: None,
+                            value_from: Some(EnvVarSource {
+                                secret_key_ref: Some(KeyRef {
+                                    name: secret_name.to_string(),
+                                    key: "pass".to_string(),
+                                    optional: None,
+                                }),
+                                ..Default::default()
+                            }),
+                        }],
+                        ..Default::default()
+                    }],
+                    active_deadline_seconds,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+
+        #[tokio::test]
+        async fn missing_secret_with_deadline_transitions_to_failed() {
+            let secret_dir = temp_dir("missing-secret-deadline");
+            let (logic, _, _) = make_logic_with_secret_dir(secret_dir);
+
+            // Reference a secret that doesn't exist. activeDeadlineSeconds=1
+            // bounds the preparer wait so the test completes quickly.
+            let pod = pod_with_secret_ref("never", "missing-secret", Some(1));
+            let snap = logic.create_pod(pod).await.unwrap();
+            // create_pod returns Pending while the preparer runs in
+            // the background.
+            assert_eq!(snap.status.phase, PodPhase::Pending);
+
+            let phase = wait_for_terminal(&logic, "never").await;
+            assert_eq!(phase, PodPhase::Failed);
+
+            let status = logic.get_pod_status("default", "never").await.unwrap();
+            assert!(
+                status.message.contains("timed out"),
+                "status message should mention timeout, got: {}",
+                status.message,
+            );
+            let init_cond = status
+                .conditions
+                .iter()
+                .find(|c| c.condition_type == CONDITION_INITIALIZED)
+                .expect("Initialized condition should be set");
+            assert_eq!(
+                init_cond.message, REASON_DEADLINE_EXCEEDED,
+                "Initialized condition should carry the DeadlineExceeded reason",
+            );
+        }
+
+        #[tokio::test]
+        async fn secret_appearing_during_wait_lets_pod_run() {
+            let secret_dir = temp_dir("late-secret");
+            let (logic, _, _) = make_logic_with_secret_dir(secret_dir.clone());
+
+            // Generous deadline (30s) so the secret has time to appear.
+            let pod = pod_with_secret_ref("late", "late-secret", Some(30));
+            logic.create_pod(pod).await.unwrap();
+
+            // Materialize the secret after a short delay — long enough
+            // that the preparer has already failed at least once and is
+            // in its first backoff (500ms).
+            let writer = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                std::fs::write(
+                    secret_dir.join("late-secret.yaml"),
+                    "stringData:\n  pass: top-secret\n",
+                )
+                .unwrap();
+            });
+
+            let phase = wait_for_terminal(&logic, "late").await;
+            writer.await.unwrap();
+            assert_eq!(phase, PodPhase::Succeeded);
+        }
+
+        #[tokio::test]
+        async fn delete_during_preparation_removes_pod() {
+            let secret_dir = temp_dir("delete-during-prep");
+            let (logic, store, _) = make_logic_with_secret_dir(secret_dir);
+
+            // No deadline — the preparer waits indefinitely for the
+            // missing secret. delete_pod must cancel it.
+            let pod = pod_with_secret_ref("waiter", "absent", None);
+            logic.create_pod(pod).await.unwrap();
+
+            // Give the preparer a moment to enter its first wait.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            logic.delete_pod("default", "waiter", Some(Duration::from_secs(1))).await.unwrap();
+            wait_for_removal(&store, "waiter").await;
+            assert_eq!(store.len().await, 0);
+        }
+
+        #[tokio::test]
+        async fn create_pod_rejects_optional_true() {
+            let (logic, _, _) = make_logic_with_store();
+            let mut pod = make_pod_spec("rejected", "exit 0");
+            pod.spec.containers[0].env.push(EnvVar {
+                name: "X".to_string(),
+                value: None,
+                value_from: Some(EnvVarSource {
+                    secret_key_ref: Some(KeyRef {
+                        name: "s".to_string(),
+                        key: "k".to_string(),
+                        optional: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+            });
+            let err = logic.create_pod(pod).await.unwrap_err();
+            match err {
+                LogicError::Internal(msg) => assert!(
+                    msg.contains("optional"),
+                    "expected admission error mentioning 'optional', got: {}",
+                    msg,
+                ),
+                other => panic!("expected Internal admission error, got {:?}", other),
+            }
+        }
+
+        #[tokio::test]
+        async fn stream_logs_while_preparing_errors() {
+            let secret_dir = temp_dir("stream-while-prep");
+            let (logic, _, _) = make_logic_with_secret_dir(secret_dir);
+
+            let pod = pod_with_secret_ref("prep", "never-appears", None);
+            logic.create_pod(pod).await.unwrap();
+
+            // Pod stays in Preparing — stream should error out cleanly
+            // rather than panic.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let err = logic
+                .stream_container_logs(
+                    "default",
+                    "prep",
+                    None,
+                    ContainerLogOptions::default(),
+                )
+                .await
+                .unwrap_err();
+            match err {
+                LogicError::Internal(msg) => {
+                    assert!(msg.contains("being prepared"), "got: {}", msg);
+                }
+                other => panic!("expected Internal error, got {:?}", other),
+            }
+
+            // Clean up so the test runtime doesn't hang on the spawned
+            // preparer task.
+            logic.delete_pod("default", "prep", Some(Duration::from_secs(1))).await.unwrap();
         }
     }
 }

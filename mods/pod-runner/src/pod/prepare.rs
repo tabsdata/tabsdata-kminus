@@ -14,11 +14,42 @@
 //!    and configMap volume directories (one file per key).
 //!
 //! [`prepare_pod`] runs all four steps in order and returns the running spec.
+//!
+//! # Waiting for missing configmaps / secrets
+//!
+//! Step 2 calls into [`crate::pod::resolver`], which polls the configured
+//! [`crate::pod::resolver::secret::SecretResolver`] /
+//! [`crate::pod::resolver::config_map::ConfigMapResolver`] with an
+//! exponential backoff (see [`crate::pod::resolver::backoff`]) until every
+//! referenced entry exists, the `timeout` expires, or `cancel` fires.
+//! `timeout` is derived from the pod's `activeDeadlineSeconds`; when it is
+//! `None` the wait is indefinite (only `cancel` can stop it).
+//!
+//! # Known limitations
+//!
+//! 1. **Existence is checked at the entry (configmap/secret) level, not the
+//!    key level.** The preparer waits for the named configmap/secret to
+//!    appear, but if the named key is absent inside an existing
+//!    configmap/secret the env entry is silently skipped (see the env
+//!    resolution logic in [`crate::pod::resolver::k8s_values`]).
+//! 2. **`optional: true` on configmap/secret references is not supported.**
+//!    Pods using it are rejected at admission time — see
+//!    [`crate::pod::admission`].
+//! 3. **Pod-level wait barrier (stricter than k8s).** The preparer
+//!    collects the *union* of every configmap/secret referenced by every
+//!    init/main container and every `configMap` volume, and blocks the
+//!    whole pod in `Pending` until they all resolve. K8s instead waits
+//!    per container: an init or main container whose own references
+//!    resolve can proceed while siblings keep waiting. Observable only
+//!    when references straddle multiple containers and resources land
+//!    out of order.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use tokio::sync::watch;
 use tracing::debug;
 
 use crate::pod::resolver::k8s_values::{resolve_k8s_values, ResolvedK8sValues};
@@ -68,9 +99,12 @@ pub async fn prepare_pod(
     namespace: &str,
     resolvers: &ResolverSet,
     images_dir: &Path,
+    timeout: Option<Duration>,
+    cancel: &mut watch::Receiver<()>,
 ) -> Result<PodSpec, String> {
     let mut prepared = rewrite_pod_paths(spec, pod_dir)?;
-    let resolved = resolve_k8s_values(&prepared, namespace, resolvers).await?;
+    let resolved =
+        resolve_k8s_values(&prepared, namespace, resolvers, timeout, cancel).await?;
     apply_envs_and_substitute(&mut prepared, &resolved);
     create_container_dirs(&prepared, pod_dir, images_dir)?;
     setup_volumes(&prepared, &resolved)?;
@@ -142,8 +176,10 @@ pub async fn resolve_pod_k8s_values(
     spec: &PodSpec,
     namespace: &str,
     resolvers: &ResolverSet,
+    timeout: Option<Duration>,
+    cancel: &mut watch::Receiver<()>,
 ) -> Result<ResolvedK8sValues, String> {
-    resolve_k8s_values(spec, namespace, resolvers).await
+    resolve_k8s_values(spec, namespace, resolvers, timeout, cancel).await
 }
 
 /// Apply resolved env values to the spec, inject `KM_CONTAINER_ROOT`, and
@@ -880,6 +916,7 @@ mod tests {
     async fn full_pipeline() {
         let dir = temp_dir("full-pipeline");
         let pod = make_pod(vec![make_container("app", "/app", vec![])], vec![]);
+        let (_tx, mut cancel) = watch::channel(());
 
         let prepared = prepare_pod(
             &pod,
@@ -887,6 +924,8 @@ mod tests {
             "default",
             &ResolverSet::default(),
             Path::new(""),
+            None,
+            &mut cancel,
         )
         .await
         .unwrap();
@@ -929,12 +968,15 @@ mod tests {
             ..Default::default()
         };
 
+        let (_tx, mut cancel) = watch::channel(());
         let prepared = prepare_pod(
             &pod,
             &dir,
             "default",
             &resolvers,
             Path::new(""),
+            None,
+            &mut cancel,
         )
         .await
         .unwrap();
@@ -1064,6 +1106,7 @@ mod tests {
                         secret_key_ref: Some(crate::spec::pod::KeyRef {
                             name: "sec".to_string(),
                             key: "k".to_string(),
+                            ..Default::default()
                         }),
                         ..Default::default()
                     }),
@@ -1071,6 +1114,7 @@ mod tests {
                 env_from: vec![crate::spec::pod::EnvFromSource {
                     secret_ref: Some(crate::spec::pod::ObjectRef {
                         name: "bulk".to_string(),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 }],
@@ -1182,6 +1226,7 @@ mod tests {
                 env_from: vec![crate::spec::pod::EnvFromSource {
                     config_map_ref: Some(crate::spec::pod::ObjectRef {
                         name: "cm".to_string(),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 }],
@@ -1213,6 +1258,7 @@ mod tests {
                 env_from: vec![crate::spec::pod::EnvFromSource {
                     config_map_ref: Some(crate::spec::pod::ObjectRef {
                         name: "cm".to_string(),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 }],
@@ -1311,12 +1357,15 @@ mod tests {
             vec![],
         );
 
+        let (_tx, mut cancel) = watch::channel(());
         let prepared = prepare_pod(
             &pod,
             &dir,
             "default",
             &ResolverSet::default(),
             Path::new(""),
+            None,
+            &mut cancel,
         )
         .await
         .unwrap();

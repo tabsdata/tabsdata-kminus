@@ -18,6 +18,9 @@
 //! 3. Individual `env` entries
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
+use tokio::sync::watch;
 
 use crate::spec::pod::PodSpec;
 
@@ -51,10 +54,16 @@ pub struct ResolvedK8sValues {
 // ---------------------------------------------------------------------------
 
 /// Resolve env references and configmap-volume data for every container.
+///
+/// `timeout` bounds how long the resolvers will wait for any missing
+/// secret or configmap to appear. `None` means the wait is indefinite.
+/// `cancel` is a watch receiver that, when fired, aborts the wait.
 pub async fn resolve_k8s_values(
     pod: &PodSpec,
     namespace: &str,
     resolvers: &ResolverSet,
+    timeout: Option<Duration>,
+    cancel: &mut watch::Receiver<()>,
 ) -> Result<ResolvedK8sValues, String> {
     // Collect all referenced secret and configmap names
     let mut secret_names: Vec<String> = Vec::new();
@@ -99,7 +108,7 @@ pub async fn resolve_k8s_values(
             .as_ref()
             .ok_or("Pod references secrets but no SecretResolver configured")?;
         resolver
-            .secrets(namespace, &secret_names)
+            .secrets(namespace, &secret_names, timeout, cancel)
             .await
             .map_err(|e| e.to_string())?
     } else {
@@ -113,7 +122,7 @@ pub async fn resolve_k8s_values(
             .as_ref()
             .ok_or("Pod references configmaps but no ConfigMapResolver configured")?;
         resolver
-            .config_maps(namespace, &configmap_names)
+            .config_maps(namespace, &configmap_names, timeout, cancel)
             .await
             .map_err(|e| e.to_string())?
     } else {
@@ -225,6 +234,18 @@ mod tests {
         }
     }
 
+    /// Resolve with no timeout and a fresh (never-fired) cancel signal —
+    /// the common case for tests where the resolver should succeed on the
+    /// first try.
+    async fn resolve_no_wait(
+        pod: &PodSpec,
+        namespace: &str,
+        resolvers: &ResolverSet,
+    ) -> Result<ResolvedK8sValues, String> {
+        let (_tx, mut rx) = watch::channel(());
+        resolve_k8s_values(pod, namespace, resolvers, None, &mut rx).await
+    }
+
     #[tokio::test]
     async fn literal_env_values() {
         let pod = make_pod_with_envs(vec![Container {
@@ -236,7 +257,7 @@ mod tests {
             ..Default::default()
         }]);
 
-        let result = resolve_k8s_values(&pod, "default", &ResolverSet::default()).await.unwrap();
+        let result = resolve_no_wait(&pod, "default", &ResolverSet::default()).await.unwrap();
         let app = &result.containers["app"];
         assert_eq!(app.env["FOO"], "bar");
         assert_eq!(app.env["BAZ"], "qux");
@@ -262,7 +283,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_k8s_values(&pod, "default", &resolvers).await.unwrap();
+        let result = resolve_no_wait(&pod, "default", &resolvers).await.unwrap();
         // Individual env overrides node env
         assert_eq!(result.containers["app"].env["KEY"], "from-spec");
     }
@@ -285,6 +306,7 @@ mod tests {
                     secret_key_ref: Some(KeyRef {
                         name: "my-secret".to_string(),
                         key: "password".to_string(),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 }),
@@ -297,7 +319,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_k8s_values(&pod, "default", &resolvers).await.unwrap();
+        let result = resolve_no_wait(&pod, "default", &resolvers).await.unwrap();
         assert_eq!(result.containers["app"].env["DB_PASS"], "s3cret");
         assert!(result.containers["app"].secret_keys.contains("DB_PASS"));
     }
@@ -316,6 +338,7 @@ mod tests {
                     config_map_key_ref: Some(KeyRef {
                         name: "app-config".to_string(),
                         key: "port".to_string(),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 }),
@@ -328,7 +351,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_k8s_values(&pod, "default", &resolvers).await.unwrap();
+        let result = resolve_no_wait(&pod, "default", &resolvers).await.unwrap();
         assert_eq!(result.containers["app"].env["PORT"], "8080");
         assert!(!result.containers["app"].secret_keys.contains("PORT"));
     }
@@ -345,7 +368,7 @@ mod tests {
         let pod = make_pod_with_envs(vec![Container {
             name: "app".to_string(),
             env_from: vec![EnvFromSource {
-                secret_ref: Some(ObjectRef { name: "creds".to_string() }),
+                secret_ref: Some(ObjectRef { name: "creds".to_string(), ..Default::default() }),
                 ..Default::default()
             }],
             ..Default::default()
@@ -356,7 +379,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_k8s_values(&pod, "default", &resolvers).await.unwrap();
+        let result = resolve_no_wait(&pod, "default", &resolvers).await.unwrap();
         let app = &result.containers["app"];
         assert_eq!(app.env["USER"], "admin");
         assert_eq!(app.env["PASS"], "secret");
@@ -372,7 +395,7 @@ mod tests {
         let pod = make_pod_with_envs(vec![Container {
             name: "app".to_string(),
             env_from: vec![EnvFromSource {
-                config_map_ref: Some(ObjectRef { name: "settings".to_string() }),
+                config_map_ref: Some(ObjectRef { name: "settings".to_string(), ..Default::default() }),
                 ..Default::default()
             }],
             ..Default::default()
@@ -383,7 +406,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_k8s_values(&pod, "default", &resolvers).await.unwrap();
+        let result = resolve_no_wait(&pod, "default", &resolvers).await.unwrap();
         assert_eq!(result.containers["app"].env["LOG_LEVEL"], "debug");
     }
 
@@ -398,6 +421,7 @@ mod tests {
                     secret_key_ref: Some(KeyRef {
                         name: "sec".to_string(),
                         key: "k".to_string(),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 }),
@@ -405,7 +429,7 @@ mod tests {
             ..Default::default()
         }]);
 
-        let err = resolve_k8s_values(&pod, "default", &ResolverSet::default()).await.unwrap_err();
+        let err = resolve_no_wait(&pod, "default", &ResolverSet::default()).await.unwrap_err();
         assert!(err.contains("no SecretResolver"));
     }
 
@@ -440,7 +464,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_k8s_values(&pod, "default", &resolvers).await.unwrap();
+        let result = resolve_no_wait(&pod, "default", &resolvers).await.unwrap();
         let cm = &result.config_map_volumes["app-config"];
         assert_eq!(cm["app.conf"], "setting=value");
         assert_eq!(cm["log.yaml"], "level: info");
@@ -460,7 +484,7 @@ mod tests {
             ..Default::default()
         });
 
-        let err = resolve_k8s_values(&pod, "default", &ResolverSet::default()).await.unwrap_err();
+        let err = resolve_no_wait(&pod, "default", &ResolverSet::default()).await.unwrap_err();
         assert!(err.contains("no ConfigMapResolver"));
     }
 
@@ -476,7 +500,7 @@ mod tests {
             ..Default::default()
         }]);
 
-        let result = resolve_k8s_values(&pod, "default", &ResolverSet::default()).await.unwrap();
+        let result = resolve_no_wait(&pod, "default", &ResolverSet::default()).await.unwrap();
         assert_eq!(result.containers["app"].env["PLAIN"], "val");
     }
 }

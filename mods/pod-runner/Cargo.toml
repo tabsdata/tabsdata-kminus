@@ -108,6 +108,10 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 libc = { version = "0.2.183" }
 rstest = { version = "0.26" }
 serial_test = { version = "3" }
+# `test-util` enables `tokio::time::pause()` / `#[tokio::test(start_paused
+# = true)]` used by the resolver backoff tests so they can validate
+# multi-minute waits in milliseconds.
+tokio = { version = "1.50.0", features = ["test-util"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.2", features = ["signal", "process"] }

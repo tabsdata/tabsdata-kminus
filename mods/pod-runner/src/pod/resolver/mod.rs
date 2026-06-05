@@ -5,7 +5,26 @@
 //! Resolver traits define how external data is fetched. Implementations
 //! include file-based (reads YAML from disk) and kube-based (reads from
 //! K8s API via kubeconfig).
+//!
+//! The [`secret::SecretResolver`] and [`config_map::ConfigMapResolver`]
+//! traits both accept a timeout (sourced from the pod's
+//! `activeDeadlineSeconds`) and a cancellation signal. They wait for any
+//! missing entry to appear, retrying on the schedule defined in
+//! [`backoff::BACKOFF_SCHEDULE`].
+//!
+//! # Known limitations
+//!
+//! - **Entry-level existence only.** The wait checks whether the named
+//!   configmap/secret exists. It does not inspect or wait for individual
+//!   keys within an existing entry.
+//! - **`optional: true` is unsupported.** Pods using it are rejected at
+//!   admission time — see [`crate::pod::admission`].
+//! - **Pod-level wait barrier.** Resolution is invoked once per pod (from
+//!   [`crate::pod::prepare::prepare_pod`]) over the union of all
+//!   referenced configmaps/secrets, so the wait blocks the whole pod —
+//!   not individual containers as k8s does.
 
+pub mod backoff;
 pub mod config_map;
 pub mod k8s_values;
 pub mod secret;
