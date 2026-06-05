@@ -371,6 +371,9 @@ Three sources, evaluated in priority order (lowest to highest):
 - Output is redirected to rotating log files (100MB per file, 5 files)
 - On Unix, child processes can be configured to die with the parent (`prctl PR_SET_PDEATHSIG`)
 - Graceful shutdown: SIGTERM, wait grace period, then SIGKILL
+- Termination grace period (between SIGTERM and SIGKILL) is resolved as:
+  an explicit delete `gracePeriod` &rarr; the pod's
+  `terminationGracePeriodSeconds` &rarr; the runner's `defaultGracePeriodSecs`
 
 ### Restart Policies
 

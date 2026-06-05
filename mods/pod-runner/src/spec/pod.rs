@@ -265,6 +265,12 @@ pub struct PodSpecBody {
     /// available before the pod is transitioned to Failed. `None` means the
     /// wait is indefinite.
     pub active_deadline_seconds: Option<u64>,
+    /// K8s `terminationGracePeriodSeconds`. The grace period pod-runner gives
+    /// a container between SIGTERM and SIGKILL when it terminates the pod
+    /// (shutdown, probe-driven kill, or a delete with no explicit
+    /// `gracePeriod`). `None` falls back to the runner's configured default
+    /// grace period. `Some(0)` means immediate SIGKILL.
+    pub termination_grace_period_seconds: Option<u64>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -315,6 +321,15 @@ impl PodSpec {
     pub fn all_container_names(&self) -> Vec<String> {
         self.spec.all_containers().iter().map(|c| c.name.clone()).collect()
     }
+
+    /// The pod's `terminationGracePeriodSeconds` as a [`Duration`], if set.
+    /// Used as the grace between SIGTERM and SIGKILL when pod-runner
+    /// terminates the pod.
+    pub fn termination_grace_period(&self) -> Option<std::time::Duration> {
+        self.spec
+            .termination_grace_period_seconds
+            .map(std::time::Duration::from_secs)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +351,52 @@ pub struct PodObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn termination_grace_period_parses_and_converts() {
+        let yaml = r#"
+spec:
+  terminationGracePeriodSeconds: 45
+  containers:
+    - name: app
+      image: /dev/null
+"#;
+        let pod: PodSpec = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(pod.spec.termination_grace_period_seconds, Some(45));
+        assert_eq!(
+            pod.termination_grace_period(),
+            Some(std::time::Duration::from_secs(45))
+        );
+    }
+
+    #[test]
+    fn termination_grace_period_absent_is_none() {
+        let yaml = r#"
+spec:
+  containers:
+    - name: app
+      image: /dev/null
+"#;
+        let pod: PodSpec = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(pod.spec.termination_grace_period_seconds, None);
+        assert_eq!(pod.termination_grace_period(), None);
+    }
+
+    #[test]
+    fn termination_grace_period_zero_is_immediate() {
+        let yaml = r#"
+spec:
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: app
+      image: /dev/null
+"#;
+        let pod: PodSpec = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(
+            pod.termination_grace_period(),
+            Some(std::time::Duration::ZERO)
+        );
+    }
 
     #[test]
     fn config_map_volume_deserializes_from_yaml() {

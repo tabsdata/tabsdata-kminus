@@ -622,7 +622,12 @@ impl PodLogic {
         grace_period: Option<Duration>,
         delete_start: std::time::Instant,
     ) -> Result<(), LogicError> {
-        let grace = grace_period.unwrap_or(self.config.default_grace_period);
+        // Effective grace: an explicit delete `gracePeriod` wins; otherwise
+        // the pod's own `terminationGracePeriodSeconds`; otherwise the
+        // runner's configured default.
+        let grace = grace_period
+            .or_else(|| snap.spec.termination_grace_period())
+            .unwrap_or(self.config.default_grace_period);
 
         // Terminal — run cleanup and remove runtime.
         // The monitor task has already processed the Completed event and
@@ -1877,6 +1882,70 @@ mod tests {
 
             // Delete with None uses default_grace_period
             logic.delete_pod("default", "app", None).await.unwrap();
+            wait_for_removal(&store, "app").await;
+        }
+
+        // A container that ignores SIGTERM and only dies on SIGKILL — so the
+        // time to terminate (and thus removal) tracks the grace the kill
+        // path used. `wait_for_removal`'s 10s timeout is the discriminator:
+        // it only completes if the *short* grace was applied.
+        const SIGTERM_PROOF: &str = "trap '' TERM; while true; do sleep 0.2; done";
+
+        fn pod_spec_grace(name: &str, cmd: &str, grace_secs: Option<u64>) -> PodSpec {
+            let mut spec = make_pod_spec(name, cmd);
+            spec.spec.termination_grace_period_seconds = grace_secs;
+            spec
+        }
+
+        #[tokio::test]
+        async fn delete_uses_pod_termination_grace_when_unspecified() {
+            // Runner default grace is 30s, but the pod asks for 1s. A delete
+            // with no explicit gracePeriod must use the pod's 1s — otherwise
+            // the SIGTERM-ignoring container would survive ~30s and removal
+            // would time out.
+            let store = Arc::new(MemoryStore::new());
+            let (shutdown_tx, _) = watch::channel(());
+            let config = LogicConfig {
+                default_grace_period: Duration::from_secs(30),
+                ..Default::default()
+            };
+            let provider = make_provider();
+            let logic = PodLogic::new(
+                config,
+                test_cleanup_config(),
+                Arc::clone(&store) as Arc<dyn PodStore>,
+                provider,
+                ResolverSet::default(),
+                shutdown_tx,
+            );
+            logic
+                .create_pod(pod_spec_grace("app", SIGTERM_PROOF, Some(1)))
+                .await
+                .unwrap();
+
+            wait_for_phase(&logic, "app", PodPhase::Running).await;
+
+            logic.delete_pod("default", "app", None).await.unwrap();
+            // Completes only if the pod's 1s grace (not the 30s default) was used.
+            wait_for_removal(&store, "app").await;
+        }
+
+        #[tokio::test]
+        async fn delete_explicit_grace_overrides_pod_termination_grace() {
+            // Pod asks for 30s, but an explicit delete gracePeriod of 1s
+            // must win — otherwise removal would time out.
+            let (logic, store, _) = make_logic_with_store();
+            logic
+                .create_pod(pod_spec_grace("app", SIGTERM_PROOF, Some(30)))
+                .await
+                .unwrap();
+
+            wait_for_phase(&logic, "app", PodPhase::Running).await;
+
+            logic
+                .delete_pod("default", "app", Some(Duration::from_secs(1)))
+                .await
+                .unwrap();
             wait_for_removal(&store, "app").await;
         }
 

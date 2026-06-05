@@ -711,6 +711,14 @@ impl PodExecutor {
         let (kill_tx, kill_rx) = mpsc::channel(4);
         let (kill_watch_tx, kill_watch_rx) = watch::channel(false);
 
+        // The pod's terminationGracePeriodSeconds (if set) is the grace
+        // between SIGTERM and SIGKILL for every kill this executor
+        // initiates (shutdown, probe-driven kill, init/start-failure
+        // cleanup); otherwise the runner's configured default applies.
+        let shutdown_grace_period = pod
+            .termination_grace_period()
+            .unwrap_or(self.shutdown_grace_period);
+
         let config = Arc::new(ContainerConfig {
             work_dir: self.work_dir,
             pid_dir: self.pid_dir,
@@ -720,7 +728,7 @@ impl PodExecutor {
             die_with_parent: self.die_with_parent,
             max_restarts: self.max_restarts,
             restart_backoff_base: self.restart_backoff_base,
-            shutdown_grace_period: self.shutdown_grace_period,
+            shutdown_grace_period,
         });
 
         let log_dir = config.log_dir().cloned();
@@ -1550,8 +1558,10 @@ async fn monitor_main_containers(
                 match action {
                     Some(ProbeAction::KillContainer { container, reason }) => {
                         warn!(container = container.as_str(), "Probe killing container: {}", reason);
-                        // Kill via the kill signal — the monitor task will handle it
-                        let _ = kill_signal_tx.send(Some(Duration::from_secs(5)));
+                        // Kill via the kill signal — the monitor task will handle it.
+                        // Honor the pod's terminationGracePeriodSeconds (folded
+                        // into shutdown_grace_period at spawn).
+                        let _ = kill_signal_tx.send(Some(config.shutdown_grace_period));
                     }
                     Some(ProbeAction::ReadinessChanged { container, ready }) => {
                         debug!(container = container.as_str(), ready, "Readiness changed by probe");
@@ -1736,6 +1746,25 @@ mod tests {
             spec: PodSpecBody {
                 init_containers,
                 containers,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    fn pod_spec_with_grace(
+        containers: Vec<Container>,
+        grace_secs: Option<u64>,
+    ) -> Arc<PodSpec> {
+        Arc::new(PodSpec {
+            metadata: PodMetadata {
+                name: "test-pod".to_string(),
+                namespace: "default".to_string(),
+                ..Default::default()
+            },
+            spec: PodSpecBody {
+                containers,
+                termination_grace_period_seconds: grace_secs,
                 ..Default::default()
             },
             ..Default::default()
@@ -2402,6 +2431,50 @@ mod tests {
 
         let result = tokio::time::timeout(Duration::from_secs(10), h.wait_for_completion()).await;
         assert!(result.is_ok(), "should eventually complete after SIGKILL");
+    }
+
+    // ========================================================================
+    // terminationGracePeriodSeconds wired to the kill path
+    // ========================================================================
+
+    // A container that ignores SIGTERM and only dies on SIGKILL: the shell
+    // traps TERM, and the re-looping `sleep` means the single group-SIGTERM
+    // (which kills the current child sleep) doesn't end the process — only
+    // the SIGKILL fired after the grace deadline does. So the time from the
+    // kill decision to container exit tracks the grace the executor used.
+    const SIGTERM_PROOF_CMD: &str = "trap '' TERM; while true; do sleep 0.2; done";
+
+    #[tokio::test]
+    async fn test_pod_grace_honored_on_probe_kill() {
+        // A liveness probe fails immediately, so the executor kills the
+        // container (a kill path that *waits* for graceful termination,
+        // unlike runner shutdown). The container ignores SIGTERM, so the
+        // pod only goes terminal after the SIGKILL fired at the grace
+        // deadline. The pod asks for a 1s grace while the runner default is
+        // 30s — completion must land on the pod's 1s budget.
+        let mut c = container_with_liveness_exec("main", SIGTERM_PROOF_CMD, "exit 1");
+        // Fail fast: one failed check ~1s in triggers the kill.
+        c.liveness_probe.as_mut().unwrap().failure_threshold = 1;
+
+        let (_tx, rx) = shutdown();
+        let mut h = PodExecutor::new(pod_spec_with_grace(vec![c], Some(1)))
+            .shutdown_grace_period(Duration::from_secs(30))
+            .spawn(rx)
+            .await
+            .unwrap();
+
+        let t = Instant::now();
+        let phase = tokio::time::timeout(Duration::from_secs(15), h.wait_for_completion())
+            .await
+            .expect("probe-kill should terminate on the pod's 1s grace, not the 30s default")
+            .unwrap();
+
+        assert_eq!(phase, PodPhase::Failed);
+        assert!(
+            t.elapsed() < Duration::from_secs(12),
+            "expected SIGKILL on the pod's 1s grace; took {:?}",
+            t.elapsed()
+        );
     }
 
     // ========================================================================
