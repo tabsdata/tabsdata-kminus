@@ -156,6 +156,11 @@ pub struct YamlSysConfig {
     #[serde(alias = "podArchiveTtlDays")]
     pub pod_archive_ttl_days: u64,
 
+    /// Cadence between disk-usage scans for both per-pod and pod-runner
+    /// trackers (seconds).
+    #[serde(alias = "dirSizeScanIntervalSecs")]
+    pub dir_size_scan_interval_secs: u64,
+
     // -- metrics --
 
     #[serde(alias = "metricsUrl")]
@@ -192,6 +197,7 @@ impl Default for YamlSysConfig {
             keep_failed_pod_dir: true,
             deleted_pod_dir_ttl_hours: 24,
             pod_archive_ttl_days: 7,
+            dir_size_scan_interval_secs: 60,
             metrics_url: crate::metrics::DEFAULT_METRICS_URL.to_string(),
             secret_resolver: YamlResolverConfig { resolver_type: "kube".into(), ..Default::default() },
             config_map_resolver: YamlResolverConfig { resolver_type: "kube".into(), ..Default::default() },

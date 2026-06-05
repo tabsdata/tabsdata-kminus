@@ -227,6 +227,7 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
         keep_failed_pod_dir: sys.keep_failed_pod_dir,
         deleted_pod_dir_ttl_hours: sys.deleted_pod_dir_ttl_hours,
         pod_archive_ttl_days: sys.pod_archive_ttl_days,
+        dir_size_scan_interval_secs: sys.dir_size_scan_interval_secs,
 
         metrics_url: sys.metrics_url.clone(),
     })

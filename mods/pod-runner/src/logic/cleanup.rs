@@ -15,6 +15,7 @@ use flate2::Compression;
 use tracing::{debug, warn};
 
 use super::ExecutorProvider;
+use crate::utils::dir_size::SIZE_FILE;
 use crate::spec::constants::{
     ANN_KEEP_DELETED_POD_DIR, ANN_KEEP_FAILED_POD_DIR, FINISHED_SENTINEL, PodPhase,
 };
@@ -210,6 +211,10 @@ pub async fn cleanup_pod(
         ).await {
             warn!(pod = %id, error = %e, "Failed to create pod archive, continuing cleanup");
         }
+        // Remove the disk-usage cache file: the value is stale post-pod
+        // and meaningless to anyone scanning a kept pod_dir later.
+        // Idempotent — silently no-op if it never existed.
+        let _ = fs::remove_file(pod_dir.join(SIZE_FILE));
     }
 
     // Remove store entry
@@ -526,6 +531,67 @@ mod tests {
         // Archive is inside the pod dir: <work>/<pod_id>/archive.tgz
         let archive = work.join("archive.tgz");
         assert!(archive.exists(), "archive should be created");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_size_file_on_archival() {
+        let tmp = test_tmp();
+        let id = PodId::new("default", "app", "uid-archive-size");
+        let store = make_store_with_pod(&id, PodPhase::Succeeded).await;
+        let provider = StubProvider::new(&tmp);
+
+        let work = provider.work_dir(&id);
+        let log = provider.log_dir(&id).unwrap();
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(&log).unwrap();
+        // Plant a stale _size cache file.
+        fs::write(work.join(SIZE_FILE), "12345\n").unwrap();
+
+        let config = CleanupConfig {
+            keep_deleted_pod_dir: true,
+            keep_failed_pod_dir: true,
+            pod_archive_ttl_days: 7,
+            pods_dir: tmp.join("work"),
+            ..CleanupConfig::default()
+        };
+
+        cleanup_pod(&id, &store, &provider, &config).await;
+
+        assert!(work.join("archive.tgz").exists(), "archive should be created");
+        assert!(
+            !work.join(SIZE_FILE).exists(),
+            "_size file should be removed on archival",
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_size_file_idempotent_when_absent() {
+        let tmp = test_tmp();
+        let id = PodId::new("default", "app", "uid-archive-no-size");
+        let store = make_store_with_pod(&id, PodPhase::Succeeded).await;
+        let provider = StubProvider::new(&tmp);
+
+        let work = provider.work_dir(&id);
+        let log = provider.log_dir(&id).unwrap();
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(&log).unwrap();
+        // Note: no _size file planted.
+
+        let config = CleanupConfig {
+            keep_deleted_pod_dir: true,
+            keep_failed_pod_dir: true,
+            pod_archive_ttl_days: 7,
+            pods_dir: tmp.join("work"),
+            ..CleanupConfig::default()
+        };
+
+        // Should not panic even though _size doesn't exist.
+        cleanup_pod(&id, &store, &provider, &config).await;
+        assert!(work.join("archive.tgz").exists());
 
         let _ = fs::remove_dir_all(&tmp);
     }

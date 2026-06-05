@@ -14,6 +14,7 @@ use pod_runner::config::resolve::resolve_config;
 use pod_runner::logic::{
     CleanupConfig, DefaultExecutorProvider, ExecutorProvider, PodLogic, ResolverSet,
 };
+use pod_runner::logic::disk_usage::{DiskSizePodTask, DiskSizeRunnerTask};
 use pod_runner::metrics::Metrics;
 use pod_runner::server::app::{AppState, create_router};
 use pod_runner::store::file::{FileStore, FileStoreConfig};
@@ -111,7 +112,14 @@ async fn main() {
         resolvers,
         shutdown_tx.clone(),
     )
-    .with_metrics(Arc::clone(&metrics));
+    .with_metrics(Arc::clone(&metrics))
+    .register_task(Arc::new(DiskSizePodTask::with_interval(
+        std::time::Duration::from_secs(pr_config.dir_size_scan_interval_secs),
+    )))
+    .runner_work_dir(pr_config.run_dir.clone())
+    .register_runner_task(Arc::new(DiskSizeRunnerTask::with_interval(
+        std::time::Duration::from_secs(pr_config.dir_size_scan_interval_secs),
+    )));
 
     // Spawn purge daemon for expired work dirs and archives
     let _purge = pod_runner::logic::purge::spawn_purge_daemon(

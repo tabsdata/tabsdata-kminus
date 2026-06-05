@@ -331,6 +331,30 @@ impl PodHandle {
         }
     }
 
+    /// Wait for the orchestrator task to fully finish, including its
+    /// post-completion cleanup of registered [`PodTask`]s.
+    ///
+    /// Call this after observing a [`PodEventKind::Completed`] event
+    /// but **before** dropping the handle — otherwise
+    /// [`PodHandle::Drop`] aborts the orchestrator, which in turn
+    /// aborts in-flight registered tasks before they can run any
+    /// post-loop code (e.g. a final scan, a flush, an emit).
+    ///
+    /// The wait is naturally bounded by the executor's
+    /// `shutdown_grace_period`: the orchestrator's task-cleanup phase
+    /// uses that as its timeout, so this method returns within roughly
+    /// that window.
+    pub async fn wait_for_finish(&mut self) {
+        use std::future::{poll_fn, Future};
+        use std::pin::Pin;
+        // JoinHandle is `Unpin`. Poll via poll_fn so we drive the
+        // task to completion without consuming the JoinHandle —
+        // PodHandle::Drop can still call .abort() on a finished
+        // handle (idempotent), and the by-mutable-ref borrow keeps
+        // self valid for subsequent operations.
+        let _ = poll_fn(|cx| Pin::new(&mut self.orchestrator).poll(cx)).await;
+    }
+
     /// Create a [`PodLogHandle`] for streaming container logs.
     ///
     /// Use this when the `PodHandle` is owned by a monitor task and
@@ -729,7 +753,12 @@ impl PodExecutor {
                         pod_kill: kill_watch_tx_tasks.subscribe(),
                         runner_shutdown: shutdown.clone(),
                     };
-                    task_set.spawn(async move { task.run(ctx).await });
+                    // Inherit the orchestrator's pod span so events
+                    // emitted inside `task.run` carry pod context
+                    // (`pod = <ns>/<name>`) automatically.
+                    task_set.spawn(
+                        async move { task.run(ctx).await }.in_current_span(),
+                    );
                 }
 
                 run_orchestrator(

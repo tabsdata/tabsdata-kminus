@@ -208,6 +208,10 @@ pub struct PRConfig {
     /// TTL in days for archive tgz files before purge (default: 7).
     pub pod_archive_ttl_days: u64,
 
+    /// Cadence between disk-usage scans for the per-pod and pod-runner
+    /// disk-usage trackers (seconds, default: 60).
+    pub dir_size_scan_interval_secs: u64,
+
     // -- metrics --
 
     /// Metrics endpoint URL (HTTP only, e.g. `http://127.0.0.1:3001`).
@@ -256,6 +260,7 @@ impl Default for PRConfig {
             keep_failed_pod_dir: true,
             deleted_pod_dir_ttl_hours: 24,
             pod_archive_ttl_days: 7,
+            dir_size_scan_interval_secs: 60,
 
             metrics_url: crate::metrics::DEFAULT_METRICS_URL.to_string(),
         }

@@ -21,6 +21,7 @@
 //! - **Get / List**: thin wrappers over the store.
 
 pub mod cleanup;
+pub mod disk_usage;
 pub mod purge;
 
 use std::collections::HashMap;
@@ -956,6 +957,15 @@ async fn monitor_pod(
                 let completed = matches!(event.kind, PodEventKind::Completed { .. });
                 store.update_status(&id, event.status).await;
                 if completed {
+                    // Let the orchestrator's post-completion cleanup run
+                    // before we drop the handle. The orchestrator's
+                    // wrapper waits on registered PodTasks (with
+                    // shutdown_grace_period as a bound) so they can
+                    // finish their post-loop work — e.g. the
+                    // DiskSizePodTask's final scan. Without this wait,
+                    // PodHandle::Drop would abort the orchestrator
+                    // before any of that runs.
+                    handle.wait_for_finish().await;
                     break;
                 }
             }
