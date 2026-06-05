@@ -205,7 +205,8 @@ class MtlsClient:
         self._ctx.load_cert_chain(self._cert_path, self._key_path)
         self._ctx.load_verify_locations(self._ca_path)
 
-    def request(self, method, url, body=None):
+    def request_raw(self, method, url, body=None):
+        """Issue a request and return (status, raw bytes body)."""
         from urllib.parse import urlparse
         parsed = urlparse(url)
         path = parsed.path or "/"
@@ -220,10 +221,19 @@ class MtlsClient:
         resp = conn.getresponse()
         data = resp.read()
         conn.close()
-        return resp.status, json.loads(data) if data else None
+        return resp.status, data
+
+    def request(self, method, url, body=None):
+        status, data = self.request_raw(method, url, body)
+        return status, json.loads(data) if data else None
 
     def get(self, url):
         return self.request("GET", url)
+
+    def get_text(self, url):
+        """GET returning the raw response body as text (no JSON decode)."""
+        status, data = self.request_raw("GET", url)
+        return status, data.decode() if data else ""
 
     def post(self, url, body):
         return self.request("POST", url, body)

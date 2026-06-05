@@ -5,36 +5,56 @@
 //! Mount paths have already been rewritten to absolute physical paths
 //! by [`pod_prepare`](crate::pod::prepare::pod_prepare).
 //!
-//! - `emptyDir`: creates an empty directory at the mount path.
-//! - `hostPath`: creates a symlink from the mount path to the host path.
-//! - `configMap`: creates a directory at the mount path and writes one file
-//!   per configmap key (filename = key, contents = value). With
+//! Volumes are pod-level: each volume referenced by a `volumeMount` is
+//! materialized exactly once under `<pod_dir>/volumes/<volume_name>`, and
+//! every container mount path becomes a symlink to that volume directory.
+//! This makes volumes shared across containers (e.g. an `emptyDir`
+//! written by one container is visible to the others).
+//!
+//! - `hostPath`: `volumes/<name>` is a symlink to the host path.
+//! - `emptyDir`: `volumes/<name>` is an empty directory.
+//! - `configMap`: `volumes/<name>` is a directory with one file per
+//!   configmap key (filename = key, contents = value). With
 //!   `configMap.items` set, only the listed keys are written, each at its
 //!   relative `path`. The configmap data must be pre-resolved into
 //!   [`ResolvedK8sValues::config_map_volumes`]. The convention is to mount
 //!   configmaps at `/configmaps/<configmap-name>` (not enforced).
-//! - `projected`: merges multiple `configMap` sources flat into the single
-//!   mount directory (respecting each item's `path`). Matching k8s, keys from
-//!   later sources overwrite earlier ones on a path collision — but unlike
-//!   k8s (which is silent) pod-runner logs a warning. Only `configMap`
-//!   sources are supported; other source types are skipped with a warning.
-//!   `volumeMount.subPath` is not supported.
+//! - `projected`: `volumes/<name>` is a directory merging multiple
+//!   `configMap` sources flat (respecting each item's `path`). Matching
+//!   k8s, keys from later sources overwrite earlier ones on a path
+//!   collision — but unlike k8s (which is silent) pod-runner logs a
+//!   warning. Only `configMap` sources are supported; other source types
+//!   are skipped with a warning. `volumeMount.subPath` is not supported.
+//!
+//! Read-only mounts are NOT enforced (mounts are plain symlinks); the
+//! pod executor writes a warning at the beginning of the container log
+//! for each read-only mount instead (see
+//! [`crate::pod::container_log::read_only_mount_warning`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::path::{Component, Path};
+use std::io;
+use std::path::{Component, Path, PathBuf};
 
 use tracing::warn;
 
 use crate::pod::prepare::PrepareError;
 use crate::pod::resolver::k8s_values::ResolvedK8sValues;
-use crate::spec::pod::{KeyToPath, PodSpec};
+use crate::spec::pod::{KeyToPath, PodSpec, Volume, VolumeMount};
+
+/// Directory under the pod dir where volumes are materialized:
+/// `<pod_dir>/volumes/<volume_name>`.
+pub const VOLUMES_DIR: &str = "volumes";
 
 /// Information about a resolved mount.
 #[derive(Debug)]
 pub struct MountInfo {
     pub volume_name: String,
     pub mount_path: String,
+    /// Materialized volume directory (`<pod_dir>/volumes/<volume_name>`)
+    /// the mount path symlinks to.
+    pub volume_path: String,
+    /// For `hostPath` volumes, the host directory; empty otherwise.
     pub host_path: String,
     pub read_only: bool,
 }
@@ -45,19 +65,26 @@ pub struct ResolvedVolumes {
     pub containers: HashMap<String, Vec<MountInfo>>,
 }
 
-/// Create symlinks/directories/configmap files for all volume mounts.
+/// Materialize pod volumes under `<pod_dir>/volumes/` and symlink every
+/// container mount path to its volume directory.
 ///
 /// The pod must have been prepared first (paths rewritten) and configmap
 /// data referenced by `configMap` volumes must already be present in
-/// `resolved.config_map_volumes`.
+/// `resolved.config_map_volumes`. Each volume is materialized once,
+/// regardless of how many containers mount it.
 pub fn resolve_volumes(
     pod: &PodSpec,
     resolved: &ResolvedK8sValues,
+    pod_dir: &Path,
 ) -> Result<ResolvedVolumes, PrepareError> {
     let volume_map = pod.spec.volume_map();
+    let volumes_dir = pod_dir.join(VOLUMES_DIR);
     let mut result = ResolvedVolumes {
         containers: HashMap::new(),
     };
+    // Volume name -> materialized volume dir (None for unsupported volume
+    // types, which are skipped with a warning).
+    let mut materialized: HashMap<String, Option<PathBuf>> = HashMap::new();
 
     for c in pod.spec.all_containers() {
         let mut mounts = Vec::new();
@@ -70,121 +97,35 @@ pub fn resolve_volumes(
                 }
             })?;
 
-            if vol.empty_dir.is_some() {
-                fs::create_dir_all(&vm.mount_path).map_err(|source| PrepareError::Io {
-                    context: format!(
-                        "Failed to create emptyDir '{}' at {}",
-                        vm.name, vm.mount_path
-                    ),
-                    source,
-                })?;
-                mounts.push(MountInfo {
-                    volume_name: vm.name.clone(),
-                    mount_path: vm.mount_path.clone(),
-                    host_path: String::new(),
-                    read_only: false,
-                });
-            } else if let Some(ref cm) = vol.config_map {
-                let data = resolved.config_map_volumes.get(&cm.name).ok_or_else(|| {
-                    PrepareError::VolumeConfigMapMissing {
-                        volume: vm.name.clone(),
-                        name: cm.name.clone(),
-                    }
-                })?;
-                let plan = plan_projection(&[CmSource {
-                    name: &cm.name,
-                    items: &cm.items,
-                    data,
-                }]);
-                materialize_plan(&vm.mount_path, &vm.name, &plan)?;
-                mounts.push(MountInfo {
-                    volume_name: vm.name.clone(),
-                    mount_path: vm.mount_path.clone(),
-                    host_path: String::new(),
-                    read_only: vm.read_only,
-                });
-            } else if let Some(ref proj) = vol.projected {
-                // Gather configMap sources in declared order. Unsupported
-                // source types (secret, downwardAPI, serviceAccountToken) are
-                // skipped with a warning rather than silently dropped.
-                let mut sources = Vec::new();
-                for src in &proj.sources {
-                    match src.config_map {
-                        Some(ref cm) => {
-                            let data =
-                                resolved.config_map_volumes.get(&cm.name).ok_or_else(|| {
-                                    PrepareError::VolumeConfigMapMissing {
-                                        volume: vm.name.clone(),
-                                        name: cm.name.clone(),
-                                    }
-                                })?;
-                            sources.push(CmSource {
-                                name: &cm.name,
-                                items: &cm.items,
-                                data,
-                            });
-                        }
-                        None => warn!(
-                            volume = %vm.name,
-                            "projected volume has an unsupported source type \
-                             (only configMap is supported); skipping it"
-                        ),
-                    }
+            let vol_dir = match materialized.get(vm.name.as_str()) {
+                Some(dir) => dir.clone(),
+                None => {
+                    let dir = materialize_volume(vol, &volumes_dir, resolved)?;
+                    materialized.insert(vm.name.clone(), dir.clone());
+                    dir
                 }
-                let plan = plan_projection(&sources);
-                materialize_plan(&vm.mount_path, &vm.name, &plan)?;
-                mounts.push(MountInfo {
-                    volume_name: vm.name.clone(),
-                    mount_path: vm.mount_path.clone(),
-                    host_path: String::new(),
-                    read_only: vm.read_only,
-                });
-            } else if let Some(ref hp) = vol.host_path {
-                let host = &hp.path;
-                if !Path::new(host).is_dir() {
-                    return Err(PrepareError::HostPathMissing {
-                        volume: vm.name.clone(),
-                        path: host.clone(),
-                    });
-                }
+            };
+            let Some(vol_dir) = vol_dir else {
+                warn!(
+                    container = %c.name, volume = %vm.name,
+                    "volume has an unsupported type (only hostPath, emptyDir, \
+                     configMap and projected are supported); skipping mount"
+                );
+                continue;
+            };
 
-                // Create parent dir for the symlink
-                if let Some(parent) = Path::new(&vm.mount_path).parent() {
-                    fs::create_dir_all(parent).map_err(|source| PrepareError::Io {
-                        context: format!("Failed to create parent for mount '{}'", vm.name),
-                        source,
-                    })?;
-                }
-
-                // Remove existing symlink
-                let mount = Path::new(&vm.mount_path);
-                if mount.is_symlink() {
-                    let _ = fs::remove_file(mount);
-                }
-
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(host, &vm.mount_path).map_err(|source| {
-                    PrepareError::Io {
-                        context: format!("Failed to symlink '{}' -> '{}'", vm.mount_path, host),
-                        source,
-                    }
-                })?;
-
-                #[cfg(windows)]
-                std::os::windows::fs::symlink_dir(host, &vm.mount_path).map_err(|source| {
-                    PrepareError::Io {
-                        context: format!("Failed to symlink '{}' -> '{}'", vm.mount_path, host),
-                        source,
-                    }
-                })?;
-
-                mounts.push(MountInfo {
-                    volume_name: vm.name.clone(),
-                    mount_path: vm.mount_path.clone(),
-                    host_path: host.clone(),
-                    read_only: vm.read_only,
-                });
-            }
+            link_mount(&c.name, vm, &vol_dir)?;
+            mounts.push(MountInfo {
+                volume_name: vm.name.clone(),
+                mount_path: vm.mount_path.clone(),
+                volume_path: vol_dir.to_string_lossy().to_string(),
+                host_path: vol
+                    .host_path
+                    .as_ref()
+                    .map(|hp| hp.path.clone())
+                    .unwrap_or_default(),
+                read_only: vm.read_only,
+            });
         }
 
         if !mounts.is_empty() {
@@ -193,6 +134,154 @@ pub fn resolve_volumes(
     }
 
     Ok(result)
+}
+
+/// Materialize a volume at `<volumes_dir>/<volume_name>`.
+///
+/// Returns the volume directory, or `None` for unsupported volume types.
+fn materialize_volume(
+    vol: &Volume,
+    volumes_dir: &Path,
+    resolved: &ResolvedK8sValues,
+) -> Result<Option<PathBuf>, PrepareError> {
+    let vol_dir = volumes_dir.join(&vol.name);
+
+    if vol.empty_dir.is_some() {
+        fs::create_dir_all(&vol_dir).map_err(|source| PrepareError::Io {
+            context: format!(
+                "Failed to create emptyDir '{}' at {}",
+                vol.name,
+                vol_dir.display()
+            ),
+            source,
+        })?;
+    } else if let Some(ref cm) = vol.config_map {
+        let data = resolved.config_map_volumes.get(&cm.name).ok_or_else(|| {
+            PrepareError::VolumeConfigMapMissing {
+                volume: vol.name.clone(),
+                name: cm.name.clone(),
+            }
+        })?;
+        let plan = plan_projection(&[CmSource {
+            name: &cm.name,
+            items: &cm.items,
+            data,
+        }]);
+        materialize_plan(&vol_dir, &vol.name, &plan)?;
+    } else if let Some(ref proj) = vol.projected {
+        // Gather configMap sources in declared order. Unsupported
+        // source types (secret, downwardAPI, serviceAccountToken) are
+        // skipped with a warning rather than silently dropped.
+        let mut sources = Vec::new();
+        for src in &proj.sources {
+            match src.config_map {
+                Some(ref cm) => {
+                    let data = resolved.config_map_volumes.get(&cm.name).ok_or_else(|| {
+                        PrepareError::VolumeConfigMapMissing {
+                            volume: vol.name.clone(),
+                            name: cm.name.clone(),
+                        }
+                    })?;
+                    sources.push(CmSource {
+                        name: &cm.name,
+                        items: &cm.items,
+                        data,
+                    });
+                }
+                None => warn!(
+                    volume = %vol.name,
+                    "projected volume has an unsupported source type \
+                     (only configMap is supported); skipping it"
+                ),
+            }
+        }
+        let plan = plan_projection(&sources);
+        materialize_plan(&vol_dir, &vol.name, &plan)?;
+    } else if let Some(ref hp) = vol.host_path {
+        let host = &hp.path;
+        if !Path::new(host).is_dir() {
+            return Err(PrepareError::HostPathMissing {
+                volume: vol.name.clone(),
+                path: host.clone(),
+            });
+        }
+
+        fs::create_dir_all(volumes_dir).map_err(|source| PrepareError::Io {
+            context: format!("Failed to create volumes dir {}", volumes_dir.display()),
+            source,
+        })?;
+        // Replace a stale symlink (e.g. from an interrupted previous run).
+        if vol_dir.is_symlink() {
+            remove_symlink(&vol_dir);
+        }
+        symlink_dir(Path::new(host), &vol_dir).map_err(|source| PrepareError::Io {
+            context: format!("Failed to symlink '{}' -> '{}'", vol_dir.display(), host),
+            source,
+        })?;
+    } else {
+        return Ok(None);
+    }
+
+    Ok(Some(vol_dir))
+}
+
+/// Symlink a container mount path to its materialized volume directory.
+///
+/// The mount path's parent directories are created as needed. A stale
+/// symlink or an empty directory already at the mount path (e.g. created
+/// by an image template) is replaced; any other existing content is a
+/// [`PrepareError::MountPathConflict`].
+fn link_mount(container: &str, vm: &VolumeMount, vol_dir: &Path) -> Result<(), PrepareError> {
+    let mount = Path::new(&vm.mount_path);
+
+    if let Some(parent) = mount.parent() {
+        fs::create_dir_all(parent).map_err(|source| PrepareError::Io {
+            context: format!("Failed to create parent for mount '{}'", vm.name),
+            source,
+        })?;
+    }
+
+    if mount.is_symlink() {
+        remove_symlink(mount);
+    } else if mount.is_dir() {
+        // Only an empty directory may be replaced by the mount symlink.
+        fs::remove_dir(mount).map_err(|_| PrepareError::MountPathConflict {
+            container: container.to_string(),
+            volume: vm.name.clone(),
+            path: vm.mount_path.clone(),
+        })?;
+    } else if mount.exists() {
+        return Err(PrepareError::MountPathConflict {
+            container: container.to_string(),
+            volume: vm.name.clone(),
+            path: vm.mount_path.clone(),
+        });
+    }
+
+    symlink_dir(vol_dir, mount).map_err(|source| PrepareError::Io {
+        context: format!(
+            "Failed to symlink '{}' -> '{}'",
+            vm.mount_path,
+            vol_dir.display()
+        ),
+        source,
+    })
+}
+
+/// Create a directory symlink at `link` pointing to `target`.
+fn symlink_dir(target: &Path, link: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    return std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    return std::os::windows::fs::symlink_dir(target, link);
+}
+
+/// Remove a directory symlink (best-effort).
+fn remove_symlink(link: &Path) {
+    #[cfg(unix)]
+    let _ = fs::remove_file(link);
+    #[cfg(windows)]
+    let _ = fs::remove_dir(link).or_else(|_| fs::remove_file(link));
 }
 
 // ---------------------------------------------------------------------------
@@ -290,16 +379,19 @@ fn plan_projection(sources: &[CmSource]) -> ProjectionPlan {
     plan
 }
 
-/// Create the mount directory and write every planned file (creating parent
+/// Create the volume directory and write every planned file (creating parent
 /// directories for nested item paths). Logs a warning for each collision,
 /// missing key, and unsafe path.
 fn materialize_plan(
-    mount_path: &str,
+    vol_dir: &Path,
     volume_name: &str,
     plan: &ProjectionPlan,
 ) -> Result<(), PrepareError> {
-    fs::create_dir_all(mount_path).map_err(|source| PrepareError::Io {
-        context: format!("Failed to create volume dir '{volume_name}' at {mount_path}"),
+    fs::create_dir_all(vol_dir).map_err(|source| PrepareError::Io {
+        context: format!(
+            "Failed to create volume dir '{volume_name}' at {}",
+            vol_dir.display()
+        ),
         source,
     })?;
 
@@ -324,7 +416,7 @@ fn materialize_plan(
     }
 
     for (rel_path, contents) in &plan.files {
-        let file_path = Path::new(mount_path).join(rel_path);
+        let file_path = vol_dir.join(rel_path);
         if let Some(parent) = file_path.parent() {
             fs::create_dir_all(parent).map_err(|source| PrepareError::Io {
                 context: format!("Failed to create dir for '{}'", file_path.display()),
@@ -378,9 +470,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_dir_creates_directory() {
+    fn empty_dir_creates_directory_under_volumes_and_symlinks_mount() {
         let base = setup_dir("empty-dir");
-        let mount_path = base.join("app").join("data");
+        let mount_path = base.join("work").join("app").join("data");
 
         let pod = make_pod(
             vec![Container {
@@ -399,20 +491,72 @@ mod tests {
             }],
         );
 
-        let result = resolve_volumes(&pod, &ResolvedK8sValues::default()).unwrap();
-        assert!(mount_path.is_dir());
+        let result = resolve_volumes(&pod, &ResolvedK8sValues::default(), &base).unwrap();
+
+        // The volume is an empty directory under <pod_dir>/volumes/.
+        let vol_dir = base.join(VOLUMES_DIR).join("data");
+        assert!(vol_dir.is_dir());
+        assert!(!vol_dir.is_symlink());
+        assert!(fs::read_dir(&vol_dir).unwrap().next().is_none());
+
+        // The container mount is a symlink to the volume dir.
+        assert!(mount_path.is_symlink());
+        assert_eq!(fs::read_link(&mount_path).unwrap(), vol_dir);
+
+        // Writing through the mount lands in the volume dir.
+        fs::write(mount_path.join("f.txt"), "x").unwrap();
+        assert_eq!(fs::read_to_string(vol_dir.join("f.txt")).unwrap(), "x");
+
         assert_eq!(result.containers["app"].len(), 1);
         assert_eq!(result.containers["app"][0].volume_name, "data");
+        assert_eq!(
+            result.containers["app"][0].volume_path,
+            vol_dir.to_string_lossy()
+        );
     }
 
     #[test]
-    fn host_path_creates_symlink() {
+    fn empty_dir_is_shared_between_containers() {
+        let base = setup_dir("empty-dir-shared");
+        let mount_a = base.join("work").join("a").join("shared");
+        let mount_b = base.join("work").join("b").join("data");
+
+        let container = |name: &str, mount: &Path| Container {
+            name: name.to_string(),
+            volume_mounts: vec![VolumeMount {
+                name: "shared".to_string(),
+                mount_path: mount.to_string_lossy().to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let pod = make_pod(
+            vec![container("a", &mount_a), container("b", &mount_b)],
+            vec![Volume {
+                name: "shared".to_string(),
+                empty_dir: Some(EmptyDirVolume {}),
+                ..Default::default()
+            }],
+        );
+
+        resolve_volumes(&pod, &ResolvedK8sValues::default(), &base).unwrap();
+
+        // A write through one container's mount is visible through the other.
+        fs::write(mount_a.join("marker.txt"), "from-a").unwrap();
+        assert_eq!(
+            fs::read_to_string(mount_b.join("marker.txt")).unwrap(),
+            "from-a"
+        );
+    }
+
+    #[test]
+    fn host_path_volume_is_symlink_to_host() {
         let base = setup_dir("host-path");
         let host_dir = base.join("host-data");
         fs::create_dir_all(&host_dir).unwrap();
         fs::write(host_dir.join("file.txt"), "hello").unwrap();
 
-        let mount_path = base.join("app").join("mounted");
+        let mount_path = base.join("work").join("app").join("mounted");
 
         let pod = make_pod(
             vec![Container {
@@ -421,7 +565,6 @@ mod tests {
                     name: "vol".to_string(),
                     mount_path: mount_path.to_string_lossy().to_string(),
                     read_only: true,
-                    ..Default::default()
                 }],
                 ..Default::default()
             }],
@@ -435,13 +578,26 @@ mod tests {
             }],
         );
 
-        let result = resolve_volumes(&pod, &ResolvedK8sValues::default()).unwrap();
+        let result = resolve_volumes(&pod, &ResolvedK8sValues::default(), &base).unwrap();
+
+        // The volume is a symlink to the host path.
+        let vol_dir = base.join(VOLUMES_DIR).join("vol");
+        assert!(vol_dir.is_symlink());
+        assert_eq!(fs::read_link(&vol_dir).unwrap(), host_dir);
+
+        // The container mount is a symlink to the volume dir.
         assert!(mount_path.is_symlink());
+        assert_eq!(fs::read_link(&mount_path).unwrap(), vol_dir);
         assert_eq!(
             fs::read_to_string(mount_path.join("file.txt")).unwrap(),
             "hello"
         );
+
         assert_eq!(result.containers["app"][0].host_path, host_dir.to_string_lossy());
+        assert_eq!(
+            result.containers["app"][0].volume_path,
+            vol_dir.to_string_lossy()
+        );
         assert!(result.containers["app"][0].read_only);
     }
 
@@ -468,12 +624,13 @@ mod tests {
             }],
         );
 
-        let err = resolve_volumes(&pod, &ResolvedK8sValues::default()).unwrap_err();
+        let err = resolve_volumes(&pod, &ResolvedK8sValues::default(), &base).unwrap_err();
         assert!(matches!(err, PrepareError::HostPathMissing { .. }));
     }
 
     #[test]
     fn unknown_volume_errors() {
+        let base = setup_dir("unknown-volume");
         let pod = make_pod(
             vec![Container {
                 name: "app".to_string(),
@@ -487,14 +644,106 @@ mod tests {
             vec![],
         );
 
-        let err = resolve_volumes(&pod, &ResolvedK8sValues::default()).unwrap_err();
+        let err = resolve_volumes(&pod, &ResolvedK8sValues::default(), &base).unwrap_err();
         assert!(matches!(err, PrepareError::UnknownVolume { ref volume, .. } if volume == "missing"));
+    }
+
+    #[test]
+    fn mount_path_with_nonempty_dir_errors() {
+        let base = setup_dir("mount-conflict");
+        let mount_path = base.join("work").join("app").join("data");
+        fs::create_dir_all(&mount_path).unwrap();
+        fs::write(mount_path.join("existing.txt"), "from-image").unwrap();
+
+        let pod = make_pod(
+            vec![Container {
+                name: "app".to_string(),
+                volume_mounts: vec![VolumeMount {
+                    name: "data".to_string(),
+                    mount_path: mount_path.to_string_lossy().to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            vec![Volume {
+                name: "data".to_string(),
+                empty_dir: Some(EmptyDirVolume {}),
+                ..Default::default()
+            }],
+        );
+
+        let err = resolve_volumes(&pod, &ResolvedK8sValues::default(), &base).unwrap_err();
+        assert!(matches!(err, PrepareError::MountPathConflict { ref volume, .. } if volume == "data"));
+    }
+
+    #[test]
+    fn mount_path_with_empty_dir_is_replaced_by_symlink() {
+        let base = setup_dir("mount-empty-dir");
+        let mount_path = base.join("work").join("app").join("data");
+        fs::create_dir_all(&mount_path).unwrap();
+
+        let pod = make_pod(
+            vec![Container {
+                name: "app".to_string(),
+                volume_mounts: vec![VolumeMount {
+                    name: "data".to_string(),
+                    mount_path: mount_path.to_string_lossy().to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            vec![Volume {
+                name: "data".to_string(),
+                empty_dir: Some(EmptyDirVolume {}),
+                ..Default::default()
+            }],
+        );
+
+        resolve_volumes(&pod, &ResolvedK8sValues::default(), &base).unwrap();
+        assert!(mount_path.is_symlink());
+        assert_eq!(
+            fs::read_link(&mount_path).unwrap(),
+            base.join(VOLUMES_DIR).join("data")
+        );
+    }
+
+    #[test]
+    fn stale_mount_symlink_is_replaced() {
+        let base = setup_dir("mount-stale-symlink");
+        let mount_path = base.join("work").join("app").join("data");
+        let stale_target = base.join("stale-target");
+        fs::create_dir_all(&stale_target).unwrap();
+        fs::create_dir_all(mount_path.parent().unwrap()).unwrap();
+        symlink_dir(&stale_target, &mount_path).unwrap();
+
+        let pod = make_pod(
+            vec![Container {
+                name: "app".to_string(),
+                volume_mounts: vec![VolumeMount {
+                    name: "data".to_string(),
+                    mount_path: mount_path.to_string_lossy().to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            vec![Volume {
+                name: "data".to_string(),
+                empty_dir: Some(EmptyDirVolume {}),
+                ..Default::default()
+            }],
+        );
+
+        resolve_volumes(&pod, &ResolvedK8sValues::default(), &base).unwrap();
+        assert_eq!(
+            fs::read_link(&mount_path).unwrap(),
+            base.join(VOLUMES_DIR).join("data")
+        );
     }
 
     #[test]
     fn config_map_volume_creates_files_per_key() {
         let base = setup_dir("cm-vol");
-        let mount_path = base.join("app").join("etc").join("app");
+        let mount_path = base.join("work").join("app").join("etc").join("app");
 
         let pod = make_pod(
             vec![Container {
@@ -527,8 +776,15 @@ mod tests {
             .collect(),
         );
 
-        let result = resolve_volumes(&pod, &resolved).unwrap();
-        assert!(mount_path.is_dir());
+        let result = resolve_volumes(&pod, &resolved, &base).unwrap();
+
+        // Files are materialized under <pod_dir>/volumes/<volume_name>.
+        let vol_dir = base.join(VOLUMES_DIR).join("config");
+        assert!(vol_dir.is_dir());
+
+        // The container mount is a symlink to the volume dir.
+        assert!(mount_path.is_symlink());
+        assert_eq!(fs::read_link(&mount_path).unwrap(), vol_dir);
         assert_eq!(
             fs::read_to_string(mount_path.join("app.conf")).unwrap(),
             "setting=value"
@@ -564,12 +820,13 @@ mod tests {
             }],
         );
 
-        let err = resolve_volumes(&pod, &ResolvedK8sValues::default()).unwrap_err();
+        let err = resolve_volumes(&pod, &ResolvedK8sValues::default(), &base).unwrap_err();
         assert!(matches!(err, PrepareError::VolumeConfigMapMissing { .. }));
     }
 
     #[test]
     fn no_volumes_is_ok() {
+        let base = setup_dir("no-volumes");
         let pod = make_pod(
             vec![Container {
                 name: "app".to_string(),
@@ -578,8 +835,9 @@ mod tests {
             vec![],
         );
 
-        let result = resolve_volumes(&pod, &ResolvedK8sValues::default()).unwrap();
+        let result = resolve_volumes(&pod, &ResolvedK8sValues::default(), &base).unwrap();
         assert!(result.containers.is_empty());
+        assert!(!base.join(VOLUMES_DIR).exists());
     }
 
     // -- projected / configMap items: pure planner --
@@ -693,7 +951,7 @@ mod tests {
     #[test]
     fn projected_volume_merges_sources_flat() {
         let base = setup_dir("projected");
-        let mount_path = base.join("app").join("etc");
+        let mount_path = base.join("work").join("app").join("etc");
         let pod = projected_pod(
             &mount_path,
             vec![
@@ -712,7 +970,12 @@ mod tests {
         resolved.config_map_volumes.insert("cm-a".to_string(), data(&[("apiserver.yaml", "A")]));
         resolved.config_map_volumes.insert("cm-b".to_string(), data(&[("apiserver.log.yaml", "B")]));
 
-        let result = resolve_volumes(&pod, &resolved).unwrap();
+        let result = resolve_volumes(&pod, &resolved, &base).unwrap();
+        assert!(mount_path.is_symlink());
+        assert_eq!(
+            fs::read_link(&mount_path).unwrap(),
+            base.join(VOLUMES_DIR).join("cfg")
+        );
         assert_eq!(fs::read_to_string(mount_path.join("apiserver/apiserver.yaml")).unwrap(), "A");
         assert_eq!(fs::read_to_string(mount_path.join("apiserver/apiserver.log.yaml")).unwrap(), "B");
         assert!(result.containers["app"][0].read_only);
@@ -721,7 +984,7 @@ mod tests {
     #[test]
     fn projected_volume_collision_last_source_wins_on_disk() {
         let base = setup_dir("projected-collision");
-        let mount_path = base.join("app").join("etc");
+        let mount_path = base.join("work").join("app").join("etc");
         let pod = projected_pod(
             &mount_path,
             vec![
@@ -733,7 +996,7 @@ mod tests {
         resolved.config_map_volumes.insert("cm-a".to_string(), data(&[("v", "from-a")]));
         resolved.config_map_volumes.insert("cm-b".to_string(), data(&[("v", "from-b")]));
 
-        resolve_volumes(&pod, &resolved).unwrap();
+        resolve_volumes(&pod, &resolved, &base).unwrap();
         // Last source (cm-b) wins; pod-runner logs a warning (see materialize_plan).
         assert_eq!(fs::read_to_string(mount_path.join("shared.yaml")).unwrap(), "from-b");
     }
@@ -741,7 +1004,7 @@ mod tests {
     #[test]
     fn projected_volume_missing_configmap_data_errors() {
         let base = setup_dir("projected-missing");
-        let mount_path = base.join("app").join("etc");
+        let mount_path = base.join("work").join("app").join("etc");
         let pod = projected_pod(
             &mount_path,
             vec![VolumeProjection {
@@ -749,14 +1012,14 @@ mod tests {
                 ..Default::default()
             }],
         );
-        let err = resolve_volumes(&pod, &ResolvedK8sValues::default()).unwrap_err();
+        let err = resolve_volumes(&pod, &ResolvedK8sValues::default(), &base).unwrap_err();
         assert!(matches!(err, PrepareError::VolumeConfigMapMissing { .. }));
     }
 
     #[test]
     fn config_map_volume_items_select_keys() {
         let base = setup_dir("cm-items");
-        let mount_path = base.join("app").join("etc");
+        let mount_path = base.join("work").join("app").join("etc");
         let pod = make_pod(
             vec![Container {
                 name: "app".to_string(),
@@ -778,7 +1041,7 @@ mod tests {
             .config_map_volumes
             .insert("app-config".to_string(), data(&[("a.conf", "AA"), ("b.conf", "BB")]));
 
-        resolve_volumes(&pod, &resolved).unwrap();
+        resolve_volumes(&pod, &resolved, &base).unwrap();
         assert_eq!(fs::read_to_string(mount_path.join("nested/a.conf")).unwrap(), "AA");
         // b.conf was not selected by items.
         assert!(!mount_path.join("b.conf").exists());

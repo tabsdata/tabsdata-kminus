@@ -97,17 +97,65 @@ class TestEnvLiteral:
 class TestMounts:
     """Volume mounts: hostPath and emptyDir."""
 
-    def test_host_path_and_empty_dir(self, pod_runner, mtls_client, test_dir):
-        # Create a hostPath directory with test data
+    def _submit_mounts_pod(self, pod_runner, mtls_client, test_dir):
+        # Create a hostPath input directory with test data and an empty
+        # hostPath output directory.
         host_dir = os.path.join(test_dir, "host_input")
         os.makedirs(host_dir, exist_ok=True)
         with open(os.path.join(host_dir, "data.txt"), "w") as f:
             f.write("test-data-from-host")
+        host_out = os.path.join(test_dir, "host_output")
+        os.makedirs(host_out, exist_ok=True)
 
-        pod = load_pod_def("mounts", HOST_PATH=host_dir)
+        pod = load_pod_def("mounts", HOST_PATH=host_dir, HOST_OUT_PATH=host_out)
         name, ns = submit_pod(mtls_client, pod_runner, pod)
+        return name, ns, host_out
+
+    def test_host_path_and_empty_dir(self, pod_runner, mtls_client, test_dir):
+        name, ns, host_out = self._submit_mounts_pod(
+            pod_runner, mtls_client, test_dir)
         data = wait_for_pod_phase(mtls_client, pod_runner, ns, name,
                                   {"Succeeded"}, timeout=15)
+        assert data["phase"] == "Succeeded"
+
+        # hostPath volumes are symlinks to the host directory, so a write
+        # through the container's RW mount must land in the host directory.
+        out_file = os.path.join(host_out, "from-pod.txt")
+        assert os.path.exists(out_file), "write through hostPath mount missing"
+        with open(out_file) as f:
+            assert "wrote-to-host" in f.read()
+
+    def test_read_only_mount_warning_at_log_start(self, pod_runner,
+                                                  mtls_client, test_dir):
+        name, ns, _ = self._submit_mounts_pod(pod_runner, mtls_client, test_dir)
+        data = wait_for_pod_phase(mtls_client, pod_runner, ns, name,
+                                  {"Succeeded"}, timeout=15)
+        assert data["phase"] == "Succeeded"
+
+        st, text = mtls_client.get_text(
+            f"{pod_runner.url}/getContainerLogs"
+            f"?podName={name}&namespace={ns}&containerName=app"
+        )
+        assert st == 200, f"getContainerLogs failed ({st}): {text}"
+        lines = text.splitlines()
+        assert lines, "container log is empty"
+        # The read-only warning for input-vol is the very first log line,
+        # before any container output (CRI format: "<ts> stderr F <msg>").
+        assert "volume 'input-vol' has been mounted as read-only" in lines[0], \
+            f"first log line is not the read-only warning: {lines[0]}"
+        assert " stderr F " in lines[0]
+        # No warning for the read-write mounts.
+        assert "'scratch-vol'" not in text
+        assert "'output-vol'" not in text
+
+    def test_empty_dir_shared_between_containers(self, pod_runner,
+                                                 mtls_client):
+        # The reader container only exits 0 if it sees the file written by
+        # the writer container through its own mount of the same emptyDir.
+        pod = load_pod_def("shared-empty-dir")
+        name, ns = submit_pod(mtls_client, pod_runner, pod)
+        data = wait_for_pod_phase(mtls_client, pod_runner, ns, name,
+                                  {"Succeeded"}, timeout=20)
         assert data["phase"] == "Succeeded"
 
 

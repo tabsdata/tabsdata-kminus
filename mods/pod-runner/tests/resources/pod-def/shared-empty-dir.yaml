@@ -1,0 +1,36 @@
+# Pod with an emptyDir volume shared between two containers.
+#
+# Volumes are pod-level (materialized under <pod_dir>/volumes/ and
+# symlinked into each container's mount path), so a file written by one
+# container must be visible through the other container's mount.
+#
+# The writer creates a marker file through its mount; the reader polls
+# through its own mount until the marker appears (or fails after ~10s).
+# The pod only Succeeds when the emptyDir is genuinely shared.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: shared-empty-dir
+  namespace: default
+
+spec:
+  nodeName: virtual-node
+  restartPolicy: Never
+  containers:
+    - name: writer
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["echo 'shared-data' > $KM_CONTAINER_ROOT/mounts/shared/marker.txt"]
+      volumeMounts:
+        - name: shared-vol
+          mountPath: /mounts/shared
+    - name: reader
+      image: /dev/null
+      command: ["sh", "-c"]
+      args: ["i=0; while [ $i -lt 50 ]; do if [ -f $KM_CONTAINER_ROOT/mounts/shared/marker.txt ]; then grep -q 'shared-data' $KM_CONTAINER_ROOT/mounts/shared/marker.txt; exit $?; fi; i=$((i+1)); sleep 0.2; done; exit 1"]
+      volumeMounts:
+        - name: shared-vol
+          mountPath: /mounts/shared
+  volumes:
+    - name: shared-vol
+      emptyDir: {}

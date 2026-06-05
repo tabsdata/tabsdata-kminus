@@ -79,7 +79,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, debug_span, info, info_span, warn, Instrument};
 
-use crate::pod::container_log::ContainerLogStream;
+use crate::pod::container_log::{read_only_mount_warning, ContainerLogStream};
 use crate::pod::lifecycle::PodLifecycle;
 use crate::pod::probe::{self, ProbeAction};
 use crate::process::executor::{
@@ -837,7 +837,12 @@ impl ContainerConfig {
     ///
     /// Uses [`ContainerLogStream`] for K8s-style log naming:
     /// `<log_dir>/<container_name>/<restart_count>.log`
-    fn output_for(&self, container_name: &str, restart_count: u32) -> Box<dyn OutputRedirector> {
+    ///
+    /// Read-only mount warnings (one per `readOnly` volume mount) are
+    /// written at the very beginning of the log, before any container
+    /// output — pod-runner cannot enforce read-only mounts, so the
+    /// container is warned not to write into those volumes.
+    fn output_for(&self, container: &Container, restart_count: u32) -> Box<dyn OutputRedirector> {
         match &self.log_config {
             LogConfig::DevNull => Box::new(DevNullOutput),
             LogConfig::ContainerLog {
@@ -845,21 +850,25 @@ impl ContainerConfig {
                 max_size_bytes,
                 max_files,
             } => {
+                let warnings = read_only_mount_warnings(container);
                 if self.die_with_parent {
-                    Box::new(MergedOutput::new(ContainerLogStream::new(
-                        log_dir,
-                        container_name,
-                        restart_count,
-                        *max_size_bytes,
-                        *max_files,
-                    )))
+                    Box::new(MergedOutput::new(
+                        ContainerLogStream::new(
+                            log_dir,
+                            &container.name,
+                            restart_count,
+                            *max_size_bytes,
+                            *max_files,
+                        )
+                        .with_header_lines(warnings),
+                    ))
                 } else {
                     // Detached processes can't use piped output — fall back
                     // to direct file. Uses the same naming convention.
                     let path = log_dir
-                        .join(container_name)
+                        .join(&container.name)
                         .join(format!("{}.log", restart_count));
-                    Box::new(DirectFileOutput::merged(path))
+                    Box::new(DirectFileOutput::merged(path).with_header_lines(warnings))
                 }
             }
         }
@@ -907,9 +916,21 @@ impl ContainerConfig {
             builder = builder.envs(container_envs);
         }
 
-        builder = builder.output_boxed(self.output_for(&container.name, restart_count));
+        builder = builder.output_boxed(self.output_for(container, restart_count));
         builder
     }
+}
+
+/// One warning line per read-only volume mount of `container`, to be
+/// written at the very beginning of its log
+/// (see [`read_only_mount_warning`]).
+fn read_only_mount_warnings(container: &Container) -> Vec<String> {
+    container
+        .volume_mounts
+        .iter()
+        .filter(|vm| vm.read_only)
+        .map(|vm| read_only_mount_warning(&vm.name))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2091,6 +2112,101 @@ mod tests {
         let log = dir.join("main").join("0.log");
         assert!(log.exists(), "expected {}", log.display());
         assert!(std::fs::read_to_string(&log).unwrap().contains("hello_pod"));
+    }
+
+    #[tokio::test]
+    async fn test_read_only_mount_warning_at_log_start() {
+        use crate::spec::pod::VolumeMount;
+
+        let dir = test_dir!("logs-ro-warning");
+        let mut c = container("main", "echo container_output");
+        c.volume_mounts = vec![
+            VolumeMount {
+                name: "ro-vol".to_string(),
+                mount_path: "/mounts/input".to_string(),
+                read_only: true,
+            },
+            VolumeMount {
+                name: "rw-vol".to_string(),
+                mount_path: "/mounts/scratch".to_string(),
+                read_only: false,
+            },
+        ];
+        let (_tx, rx) = shutdown();
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
+            .log_dir(&dir).spawn(rx).await.unwrap();
+        let _ = h.wait_for_completion().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let log = std::fs::read_to_string(dir.join("main").join("0.log")).unwrap();
+        let first_line = log.lines().next().unwrap();
+        // The warning is the very first line, before any container output.
+        assert!(
+            first_line.contains(&read_only_mount_warning("ro-vol")),
+            "first line should be the read-only warning: {first_line}"
+        );
+        assert!(first_line.contains(" stderr F "), "warning is a stderr line: {first_line}");
+        assert!(
+            log.find(&read_only_mount_warning("ro-vol")).unwrap()
+                < log.find("container_output").unwrap(),
+            "warning must precede container output"
+        );
+        // No warning for the read-write mount.
+        assert!(!log.contains("'rw-vol'"));
+    }
+
+    #[tokio::test]
+    async fn test_read_only_mount_warning_written_for_each_restart_log() {
+        use crate::spec::pod::VolumeMount;
+
+        // Restarts re-create the output redirector via
+        // `output_for(container, restart_count)`, so the warning must
+        // appear at the top of every restart's log file (0.log, 1.log, …).
+        // The orchestrator doesn't drive restarts yet (always
+        // restart_count=0), so this exercises the seam restarts will use.
+        let dir = test_dir!("logs-ro-warning-restart");
+        let mut c = container("main", "true");
+        c.volume_mounts = vec![VolumeMount {
+            name: "ro-vol".to_string(),
+            mount_path: "/mounts/input".to_string(),
+            read_only: true,
+        }];
+
+        let config = ContainerConfig {
+            work_dir: None,
+            pid_dir: None,
+            log_config: LogConfig::ContainerLog {
+                log_dir: dir.clone(),
+                max_size_bytes: DEFAULT_LOG_MAX_SIZE_BYTES,
+                max_files: DEFAULT_LOG_MAX_FILES,
+            },
+            propagate_env: false,
+            extra_env: HashMap::new(),
+            die_with_parent: true,
+            max_restarts: 0,
+            restart_backoff_base: Duration::from_secs(2),
+            shutdown_grace_period: Duration::from_secs(1),
+        };
+
+        for restart_count in [0u32, 1, 2] {
+            // Driving the redirector with no process streams still opens
+            // the log writer, which writes the header lines.
+            let (_tx, rx) = shutdown();
+            config
+                .output_for(&c, restart_count)
+                .start(None, None, rx)
+                .await
+                .unwrap();
+
+            let log_path = dir.join("main").join(format!("{restart_count}.log"));
+            let log = std::fs::read_to_string(&log_path)
+                .unwrap_or_else(|e| panic!("missing {}: {e}", log_path.display()));
+            let first_line = log.lines().next().unwrap();
+            assert!(
+                first_line.contains(&read_only_mount_warning("ro-vol")),
+                "restart {restart_count}: first line should be the warning: {first_line}"
+            );
+        }
     }
 
     // -- drop ----------------------------------------------------------------

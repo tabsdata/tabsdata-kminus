@@ -432,6 +432,11 @@ pub struct DirectFileOutput {
     stderr_path: Option<PathBuf>,
     /// `true` when created via `merged()` — both streams share one fd.
     merged: bool,
+    /// Lines written at the very beginning of the output file (the merged
+    /// file, or the stderr file when split), before any process output —
+    /// e.g. read-only mount warnings. Written raw (one line per entry),
+    /// matching this redirector's unformatted output.
+    header_lines: Vec<String>,
 }
 
 impl DirectFileOutput {
@@ -447,6 +452,7 @@ impl DirectFileOutput {
             stdout_path: stdout_path.map(Into::into),
             stderr_path: stderr_path.map(Into::into),
             merged: false,
+            header_lines: Vec::new(),
         }
     }
 
@@ -459,7 +465,27 @@ impl DirectFileOutput {
             stdout_path: Some(path),
             stderr_path: None,
             merged: true,
+            header_lines: Vec::new(),
         }
+    }
+
+    /// Lines to write at the very beginning of the output file, before
+    /// any process output.
+    pub fn with_header_lines(mut self, lines: Vec<String>) -> Self {
+        self.header_lines = lines;
+        self
+    }
+
+    /// Write the header lines into a freshly-created output file.
+    fn write_header(&self, file: &mut std::fs::File) -> io::Result<()> {
+        use std::io::Write;
+        for line in &self.header_lines {
+            file.write_all(line.as_bytes())?;
+            if !line.ends_with('\n') {
+                file.write_all(b"\n")?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -498,31 +524,40 @@ impl OutputRedirector for DirectFileOutput {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let file = std::fs::File::create(path)?;
+            let mut file = std::fs::File::create(path)?;
+            self.write_header(&mut file)?;
             let file_clone = file.try_clone()?;
             return Ok((Stdio::from(file), Stdio::from(file_clone)));
         }
 
-        let stdout_stdio = match &self.stdout_path {
+        let mut stdout_file = match &self.stdout_path {
             Some(path) => {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                Stdio::from(std::fs::File::create(path)?)
+                Some(std::fs::File::create(path)?)
             }
-            None => Stdio::null(),
+            None => None,
         };
 
-        let stderr_stdio = match &self.stderr_path {
+        let mut stderr_file = match &self.stderr_path {
             Some(path) => {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                Stdio::from(std::fs::File::create(path)?)
+                Some(std::fs::File::create(path)?)
             }
-            None => Stdio::null(),
+            None => None,
         };
 
+        // Header lines go to the stderr file (they are warnings), falling
+        // back to the stdout file when stderr is discarded.
+        if let Some(file) = stderr_file.as_mut().or(stdout_file.as_mut()) {
+            self.write_header(file)?;
+        }
+
+        let stdout_stdio = stdout_file.map(Stdio::from).unwrap_or_else(Stdio::null);
+        let stderr_stdio = stderr_file.map(Stdio::from).unwrap_or_else(Stdio::null);
         Ok((stdout_stdio, stderr_stdio))
     }
 
@@ -2084,6 +2119,30 @@ mod tests {
         let content = fs::read_to_string(&out).unwrap();
         assert!(content.contains("only_out"));
         assert!(!content.contains("discard_err"));
+    }
+
+    #[tokio::test]
+    async fn test_direct_file_merged_header_lines_written_first() {
+        let dir = test_dir!();
+        let log = dir.join("merged.log");
+
+        let mut handle = ProcessExecutor::new("sh")
+            .args(["-c", "echo direct_out"])
+            .die_with_parent(false)
+            .output(
+                DirectFileOutput::merged(&log)
+                    .with_header_lines(vec!["WARNING: header line".to_string()]),
+            )
+            .spawn(shutdown())
+            .await
+            .unwrap();
+
+        assert_eq!(handle.wait().await.unwrap(), 0);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let content = fs::read_to_string(&log).unwrap();
+        let mut lines = content.lines();
+        assert_eq!(lines.next(), Some("WARNING: header line"));
+        assert!(lines.next().unwrap().contains("direct_out"));
     }
 
     // -- DirectFileOutput validation -----------------------------------------

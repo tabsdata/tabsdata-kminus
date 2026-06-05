@@ -18,13 +18,15 @@ spec:
     - name: app
       image: /dev/null
       command: ["sh", "-c"]
-      args: ["cat $KM_CONTAINER_ROOT/mounts/input/data.txt && echo 'wrote' > $KM_CONTAINER_ROOT/mounts/scratch/output.txt"]
+      args: ["cat $KM_CONTAINER_ROOT/mounts/input/data.txt && echo 'wrote' > $KM_CONTAINER_ROOT/mounts/scratch/output.txt && echo 'wrote-to-host' > $KM_CONTAINER_ROOT/mounts/output/from-pod.txt"]
       volumeMounts:
         - name: input-vol
           mountPath: /mounts/input
           readOnly: true
         - name: scratch-vol
           mountPath: /mounts/scratch
+        - name: output-vol
+          mountPath: /mounts/output
   volumes:
     - name: input-vol
       hostPath:
@@ -32,3 +34,7 @@ spec:
         type: Directory
     - name: scratch-vol
       emptyDir: {}
+    - name: output-vol
+      hostPath:
+        path: "{{HOST_OUT_PATH}}"
+        type: Directory

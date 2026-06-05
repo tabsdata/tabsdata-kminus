@@ -33,7 +33,25 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::pod::executor::PodState;
-use crate::process::executor::{StreamConfig, StreamWriter};
+use crate::process::executor::{LogStream, StreamConfig, StreamWriter};
+
+// ---------------------------------------------------------------------------
+// Read-only mount warning
+// ---------------------------------------------------------------------------
+
+/// Warning line written at the very beginning of a container's log for
+/// each read-only volume mount.
+///
+/// Pod-runner mounts volumes as plain symlinks and cannot enforce
+/// read-only access, so the container is warned that not writing into
+/// the volume is its own responsibility.
+pub fn read_only_mount_warning(volume: &str) -> String {
+    format!(
+        "WARNING: volume '{volume}' has been mounted as read-only; the \
+         pod-runner cannot enforce read-only mounts — it is the \
+         container's responsibility not to write into this volume"
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Log path resolution — used by log readers
@@ -202,6 +220,9 @@ pub struct ContainerLogStream {
     restart_count: u32,
     max_size_bytes: u64,
     max_files: usize,
+    /// Lines written (as stderr) at the very beginning of the log file,
+    /// before any container output — e.g. read-only mount warnings.
+    header_lines: Vec<String>,
 }
 
 impl ContainerLogStream {
@@ -218,7 +239,15 @@ impl ContainerLogStream {
             restart_count,
             max_size_bytes,
             max_files,
+            header_lines: Vec::new(),
         }
+    }
+
+    /// Lines to write (as stderr) at the very beginning of the log file,
+    /// before any container output.
+    pub fn with_header_lines(mut self, lines: Vec<String>) -> Self {
+        self.header_lines = lines;
+        self
     }
 
     /// The directory for this container's logs.
@@ -247,13 +276,17 @@ impl StreamConfig for ContainerLogStream {
         }
 
         let file = std::fs::File::create(&path)?;
-        Ok(Box::new(ContainerLogWriter {
+        let mut writer = ContainerLogWriter {
             path,
             file,
             current_size: 0,
             max_size: self.max_size_bytes,
             max_files: self.max_files,
-        }))
+        };
+        for line in &self.header_lines {
+            writer.write_line(line.as_bytes(), LogStream::Stderr)?;
+        }
+        Ok(Box::new(writer))
     }
 }
 
@@ -556,6 +589,35 @@ mod tests {
             .filter(|e| e.path().is_file())
             .count();
         assert_eq!(file_count, 1);
+    }
+
+    #[test]
+    fn test_container_log_header_lines_written_first_as_stderr() {
+        let dir = test_dir!();
+        let stream = Box::new(
+            ContainerLogStream::new(&dir, "main", 0, 1024, 5).with_header_lines(vec![
+                read_only_mount_warning("vol-a"),
+                read_only_mount_warning("vol-b"),
+            ]),
+        );
+        let mut writer = stream.open().unwrap();
+        writer.write_line(b"container output\n", LogStream::Stdout).unwrap();
+        writer.flush().unwrap();
+
+        let content = std::fs::read_to_string(dir.join("main").join("0.log")).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains(&read_only_mount_warning("vol-a")), "got: {}", lines[0]);
+        assert!(lines[0].contains(" stderr F "));
+        assert!(lines[1].contains(&read_only_mount_warning("vol-b")));
+        assert!(lines[2].contains("container output"));
+    }
+
+    #[test]
+    fn test_read_only_mount_warning_names_volume() {
+        let w = read_only_mount_warning("my-vol");
+        assert!(w.contains("'my-vol'"));
+        assert!(w.contains("read-only"));
     }
 
     // -- ProbeLogStream ------------------------------------------------------

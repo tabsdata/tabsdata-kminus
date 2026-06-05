@@ -10,8 +10,10 @@
 //!    fetch configmap data referenced by `configMap` volumes.
 //! 3. **[`create_container_dirs`]** — create container working directories and
 //!    copy image template directories.
-//! 4. **[`setup_volumes`]** — create emptyDir directories, hostPath symlinks,
-//!    and configMap volume directories (one file per key).
+//! 4. **[`setup_volumes`]** — materialize pod volumes under
+//!    `<pod_dir>/volumes/` (emptyDir directories, hostPath symlinks,
+//!    configMap volume directories with one file per key) and symlink
+//!    each container mount path to its volume directory.
 //!
 //! [`prepare_pod`] runs all four steps in order and returns the running spec.
 //!
@@ -93,6 +95,14 @@ pub enum PrepareError {
     /// A `hostPath` volume points at a non-existent directory.
     #[error("Volume '{volume}' hostPath does not exist: {path}")]
     HostPathMissing { volume: String, path: String },
+    /// A container mount path is occupied by content that cannot be
+    /// replaced by the mount symlink (a file or a non-empty directory).
+    #[error("Container '{container}' mount path for volume '{volume}' is occupied: {path}")]
+    MountPathConflict {
+        container: String,
+        volume: String,
+        path: String,
+    },
     /// Image archive file is missing for a container.
     #[error("Image archive for container '{container}' not found at {path}")]
     ImageArchiveMissing { container: String, path: String },
@@ -179,7 +189,7 @@ pub async fn prepare_pod(
         resolve_k8s_values(&prepared, namespace, resolvers, timeout, cancel).await?;
     apply_envs_and_substitute(&mut prepared, &resolved);
     create_container_dirs(&prepared, pod_dir, images_dir)?;
-    setup_volumes(&prepared, &resolved)?;
+    setup_volumes(&prepared, &resolved, pod_dir)?;
     Ok(prepared)
 }
 
@@ -541,10 +551,16 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), PrepareError> {
 // Step 4: set up volumes
 // ---------------------------------------------------------------------------
 
-/// Create emptyDir directories, hostPath symlinks, and configMap volume
-/// directories (one file per key).
-pub fn setup_volumes(spec: &PodSpec, resolved: &ResolvedK8sValues) -> Result<(), PrepareError> {
-    resolve_volumes(spec, resolved).map(|_| ())
+/// Materialize pod volumes under `<pod_dir>/volumes/` (emptyDir
+/// directories, hostPath symlinks, configMap volume directories with one
+/// file per key) and symlink each container mount path to its volume
+/// directory.
+pub fn setup_volumes(
+    spec: &PodSpec,
+    resolved: &ResolvedK8sValues,
+    pod_dir: &Path,
+) -> Result<(), PrepareError> {
+    resolve_volumes(spec, resolved, pod_dir).map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -930,9 +946,9 @@ mod tests {
     #[test]
     fn setup_empty_dir() {
         let dir = temp_dir("setup-empty");
+        let mount_path = dir.join("work/app/mnt/data");
         let mut container = make_container("app", "", vec![("data", "/mnt/data")]);
-        container.volume_mounts[0].mount_path =
-            dir.join("work/app/mnt/data").to_string_lossy().to_string();
+        container.volume_mounts[0].mount_path = mount_path.to_string_lossy().to_string();
 
         let pod = PodSpec {
             spec: PodSpecBody {
@@ -947,8 +963,12 @@ mod tests {
             ..make_pod(vec![], vec![])
         };
 
-        setup_volumes(&pod, &ResolvedK8sValues::default()).unwrap();
-        assert!(dir.join("work/app/mnt/data").is_dir());
+        setup_volumes(&pod, &ResolvedK8sValues::default(), &dir).unwrap();
+        // The volume is a directory under <pod_dir>/volumes/; the mount
+        // path is a symlink to it.
+        assert!(dir.join("volumes/data").is_dir());
+        assert!(mount_path.is_symlink());
+        assert_eq!(fs::read_link(&mount_path).unwrap(), dir.join("volumes/data"));
     }
 
     #[test]
@@ -978,8 +998,14 @@ mod tests {
             ..make_pod(vec![], vec![])
         };
 
-        setup_volumes(&pod, &ResolvedK8sValues::default()).unwrap();
+        setup_volumes(&pod, &ResolvedK8sValues::default(), &dir).unwrap();
+        // The volume is a symlink to the host path; the mount path is a
+        // symlink to the volume.
+        let vol_dir = dir.join("volumes/vol");
+        assert!(vol_dir.is_symlink());
+        assert_eq!(fs::read_link(&vol_dir).unwrap(), host_dir);
         assert!(mount_path.is_symlink());
+        assert_eq!(fs::read_link(&mount_path).unwrap(), vol_dir);
         assert_eq!(
             fs::read_to_string(mount_path.join("test.txt")).unwrap(),
             "hello"
@@ -1063,6 +1089,10 @@ mod tests {
             prepared.spec.containers[0].volume_mounts[0].mount_path,
             mount.to_string_lossy().to_string()
         );
+        // The mount is a symlink to the volume dir; reads through it see
+        // the materialized configmap files.
+        assert!(mount.is_symlink());
+        assert_eq!(fs::read_link(&mount).unwrap(), dir.join("volumes/config"));
         assert!(mount.is_dir());
         assert_eq!(
             fs::read_to_string(mount.join("app.conf")).unwrap(),
