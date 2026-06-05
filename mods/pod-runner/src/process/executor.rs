@@ -2743,7 +2743,6 @@ mod tests {
         eprintln!("[{label} n={n}] === Phase 2: Running (3s settle) ===");
         tokio::time::sleep(Duration::from_secs(3)).await;
 
-        let pids: Vec<u32> = handles.iter().map(|h| h.pid()).collect();
         let mut alive_before = 0;
         let mut dead_before = Vec::new();
         for (i, h) in handles.iter_mut().enumerate() {
@@ -2838,26 +2837,23 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // --- Phase 5: Final checks ---
+        //
+        // Phase 4 already `wait()`-ed every handle, which reaps the child
+        // and frees its PID. `still_alive` checks each handle directly —
+        // no PID-based scan, because once a PID is freed, the OS may
+        // reassign it to a process spawned by a concurrent test, which
+        // would look like a zombie to a naive `kill(pid, 0)` probe.
         eprintln!("[{label} n={n}] === Phase 5: Final checks ===");
         let mut still_alive = 0;
         for h in &mut handles {
             if h.try_wait().is_none() { still_alive += 1; }
         }
 
-        // Check only our own PIDs for zombies (avoids false positives
-        // from concurrent tests).
-        let mut zombies = 0u32;
-        for &pid in &pids {
-            if is_pid_alive(pid) {
-                zombies += 1;
-            }
-        }
-
         eprintln!(
             "[{label} n={n}] === SUMMARY ===\n\
              [{label} n={n}]   spawn={spawn_ms}ms kill={kill_ms}ms wait={wait_ms}ms\n\
              [{label} n={n}]   slow_spawns={slow_spawns} sigkills={sigkill_count} slow_waits={slow_waits}\n\
-             [{label} n={n}]   alive_before={alive_before} still_alive={still_alive} zombies={zombies}"
+             [{label} n={n}]   alive_before={alive_before} still_alive={still_alive}"
         );
 
         assert!(
@@ -2865,7 +2861,6 @@ mod tests {
             "{label} n={n}: only {alive_before}/{n} alive before kill (floor {min_alive_before})",
         );
         assert_eq!(still_alive, 0, "{label} n={n}: {still_alive} processes still alive after kill");
-        assert_eq!(zombies, 0, "{label} n={n}: {zombies} zombie processes");
 
         drop(handles);
     }
