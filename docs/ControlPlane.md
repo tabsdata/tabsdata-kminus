@@ -28,8 +28,11 @@ Kubernetes cluster:
 - Tracks all process PIDs for clean shutdown.
 
 The kube-controller-manager runs with a limited set of controllers
-(`--controllers=job,cronjob,ttl`). Leader election is disabled since
-this is a single-node setup.
+(`--controllers=job,cronjob,ttl-after-finished,garbagecollector`):
+job and cronjob lifecycle, deletion of finished jobs via
+`ttlSecondsAfterFinished`, and cascading deletion of dependents via
+`ownerReferences`. Leader election is disabled since this is a
+single-node setup.
 
 ## Services Started
 

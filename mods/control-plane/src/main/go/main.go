@@ -454,7 +454,7 @@ users:
 	kcmCmd := exec.CommandContext(ctx, kcmPath,
 		"--kubeconfig", kcmConfigPath,
 		"--leader-elect=false",
-		"--controllers=job,cronjob,ttl",
+		"--controllers=job,cronjob,ttl-after-finished,garbagecollector",
 		fmt.Sprintf("--concurrent-job-syncs=%d", cpSys.ConcurrentJobSyncs),
 		fmt.Sprintf("--kube-api-qps=%d", cpSys.KubeAPIQPS),
 		fmt.Sprintf("--kube-api-burst=%d", cpSys.KubeAPIBurst),
