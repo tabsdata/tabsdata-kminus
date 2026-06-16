@@ -40,6 +40,22 @@ pub fn remove_pid(dir: &Path, name: &str) {
     }
 }
 
+/// Read the PID recorded in `<dir>/<pid>.<name>` for `name`, if present.
+/// Returns the first match (there is normally at most one).
+pub fn read_pid(dir: &Path, name: &str) -> Option<u32> {
+    let suffix = format!(".{}", name);
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let fname = entry.file_name();
+        let fname = fname.to_string_lossy();
+        if let Some(pid_str) = fname.strip_suffix(&suffix)
+            && let Ok(pid) = pid_str.parse::<u32>()
+        {
+            return Some(pid);
+        }
+    }
+    None
+}
+
 /// Apply OS-specific creation flags so a spawned subprocess survives the
 /// parent's console/terminal closing. On Windows this sets
 /// `CREATE_NO_WINDOW`; on Unix this is a no-op.
@@ -59,7 +75,7 @@ pub fn apply_detached_flags(command: &mut Command) {
 /// Apply OS-specific creation flags for a long-running subprocess that
 /// must survive terminal close and accept targeted graceful shutdown.
 /// On Windows this sets `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`;
-/// on Unix this is a no-op.
+/// on Unix this puts the child in its own process group.
 pub fn apply_subprocess_flags(command: &mut Command) {
     #[cfg(target_os = "windows")]
     {
@@ -67,7 +83,23 @@ pub fn apply_subprocess_flags(command: &mut Command) {
         use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
         command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Put the child in its own process group (pgid == its own pid).
+        // The controlling terminal delivers Ctrl+C as SIGINT to *every*
+        // process in km's foreground group; without its own group a child
+        // would receive that SIGINT directly and race km's orderly
+        // shutdown — exiting before km can walk its process tree and
+        // orphaning grandchildren (etcd, kube-apiserver) that escaped to
+        // their own groups via setpgid. With its own group, km is the
+        // sole signal target and drives shutdown via terminate_process.
+        // Mirrors CREATE_NEW_PROCESS_GROUP on Windows; also makes the
+        // group-wide SIGKILL in force_kill_tree (kill(-pid)) target the
+        // child's own group.
+        command.process_group(0);
+    }
+    #[cfg(not(any(target_os = "windows", unix)))]
     {
         let _ = command;
     }
@@ -170,6 +202,38 @@ fn force_kill_tree(root: u32, descendants: &[u32]) {
             .arg("/T")
             .arg("/F")
             .status();
+    }
+}
+
+/// Best-effort: force-kill every process still parented under `root`
+/// (transitively), without touching `root` itself. Used as a teardown
+/// backstop for subprocesses that were spawned but whose PID files may
+/// not have been written yet (e.g. a Ctrl+C in the middle of startup).
+/// Each target's own process group is killed too, to catch isolated
+/// children that lead their own group.
+pub fn kill_descendants(root: u32) {
+    let descendants = collect_descendants(root);
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{self, Signal};
+        use nix::unistd::Pid as NixPid;
+        for pid in &descendants {
+            let _ = signal::kill(NixPid::from_raw(-(*pid as i32)), Signal::SIGKILL);
+            let _ = signal::kill(NixPid::from_raw(*pid as i32), Signal::SIGKILL);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        for pid in &descendants {
+            let mut command = Command::new("taskkill.exe");
+            apply_detached_flags(&mut command);
+            let _ = command
+                .arg("/PID")
+                .arg(pid.to_string())
+                .arg("/T")
+                .arg("/F")
+                .status();
+        }
     }
 }
 

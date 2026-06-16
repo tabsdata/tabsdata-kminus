@@ -12,6 +12,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use file_rotate::{ContentLimit, FileRotate, compression::Compression, suffix::AppendCount};
@@ -24,7 +25,10 @@ mod system;
 use config::{KM_SYSCONFIG_FILE, KmSysConfig};
 use process::{control_plane, pod_runner, virtual_kubelet};
 use system::file::{CONFIG_DIR, LOG_DIR};
-use system::pid::{BIN_KM, cleanup_stale_pids, kill_child, pids_dir, remove_pid, write_pid};
+use system::pid::{
+    BIN_KM, cleanup_stale_pids, kill_descendants, pids_dir, read_pid, remove_pid,
+    terminate_process, write_pid,
+};
 use system::port::check_port;
 
 /// Filename of km's own log file under `<logdir>/`.
@@ -104,6 +108,7 @@ struct StartArgs {
 // ---------------------------------------------------------------------------
 
 /// The set of paths needed by every subprocess and the lifecycle code.
+#[derive(Clone)]
 struct Paths {
     workdir: PathBuf,
     configdir: PathBuf,
@@ -304,19 +309,63 @@ fn print_status(
 // Shutdown
 // ---------------------------------------------------------------------------
 
-/// Stop all subprocesses in reverse start order and remove their PID
-/// files. Cleans up the km PID dir last.
-fn shutdown(paths: &Paths, vk: &mut Child, pr: &mut Child, cp: &mut Child) {
+/// Install signal-driven shutdown and block until it is armed.
+///
+/// A dedicated thread installs the SIGINT/SIGTERM (Ctrl+C/Ctrl+Break on
+/// Windows) handlers, signals readiness, then waits for a signal. On
+/// signal it tears the whole stack down from the recorded PID files and
+/// exits the process. This is installed *before* any subprocess is
+/// spawned so that a Ctrl+C during the multi-second startup still drives
+/// an orderly teardown instead of killing km outright (the default
+/// disposition) and orphaning whatever has already been launched — which
+/// matters precisely because the children run in their own process groups
+/// and so never receive the terminal's signal themselves.
+///
+/// Returns once the handlers are installed, closing the window where an
+/// early signal would hit the default disposition.
+fn install_signal_shutdown(paths: Paths) {
+    let (armed_tx, armed_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::Builder::new()
+        .name("km-signal".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(arm_and_wait_for_shutdown(armed_tx));
+            shutdown_from_pids(&paths);
+            std::process::exit(130);
+        })
+        .expect("spawn km-signal thread");
+    // Proceed only once the handlers are installed.
+    let _ = armed_rx.recv();
+}
+
+/// Stop the whole stack using the recorded PID files, in reverse start
+/// order, then remove the PID files. Runs on the signal thread, so it
+/// works at any point — including mid-startup, before the per-child
+/// `Child` handles exist. Terminating the control-plane also reaps its
+/// children (etcd, kube-apiserver, kube-controller-manager) via its
+/// process-tree kill. A final descendant sweep catches anything spawned
+/// but not yet recorded in a PID file.
+fn shutdown_from_pids(paths: &Paths) {
     info!("Shutting down...");
 
-    kill_child(vk, virtual_kubelet::BIN);
-    remove_pid(&paths.pids, virtual_kubelet::BIN);
+    for name in [
+        virtual_kubelet::BIN,
+        pod_runner::BIN,
+        control_plane::BIN,
+    ] {
+        if let Some(pid) = read_pid(&paths.pids, name) {
+            info!(name, pid, "Requesting graceful shutdown");
+            terminate_process(pid, Duration::from_secs(5));
+        }
+        remove_pid(&paths.pids, name);
+    }
 
-    kill_child(pr, pod_runner::BIN);
-    remove_pid(&paths.pids, pod_runner::BIN);
-
-    kill_child(cp, control_plane::BIN);
-    remove_pid(&paths.pids, control_plane::BIN);
+    // Backstop: SIGKILL anything still parented under km that the named
+    // teardown missed (e.g. spawned just before the signal arrived).
+    kill_descendants(std::process::id());
 
     let _ = fs::remove_dir_all(control_plane::pids_dir_in(&paths.workdir));
     let _ = fs::remove_dir_all(virtual_kubelet::pids_dir_in(&paths.workdir));
@@ -405,6 +454,11 @@ fn command_create(args: CreateArgs) {
 }
 
 /// Boot the cluster from an existing kminus instance in `args.workdir`.
+// The cp/pr/vk `Child` handles are intentionally not `wait()`ed: teardown
+// is owned by the km-signal thread (it stops them by PID file, then exits
+// the process), so the handles are held alive in the parked frame and the
+// kernel reaps the children once km exits — no lingering zombies.
+#[allow(clippy::zombie_processes)]
 fn command_start(args: StartArgs) {
     let paths = Paths::for_start(
         &args.workdir,
@@ -470,6 +524,11 @@ fn command_start(args: StartArgs) {
 
     clear_regenerated_configs(&paths.configdir);
 
+    // Install signal-driven shutdown BEFORE spawning anything, so a
+    // Ctrl+C at any point during the (multi-second) startup tears the
+    // stack down in order rather than orphaning it.
+    install_signal_shutdown(paths.clone());
+
     // Start subprocesses in dependency order.
     let mut cp = control_plane::start(
         &paths.workdir,
@@ -481,7 +540,7 @@ fn command_start(args: StartArgs) {
         &port_kcm,
         &vk_kubeconfig,
     );
-    let mut pr = pod_runner::start(
+    let pr = pod_runner::start(
         &paths.workdir,
         &paths.configdir,
         &paths.logdir,
@@ -495,7 +554,7 @@ fn command_start(args: StartArgs) {
         &mut cp,
     );
     control_plane::cleanup_stale_node_resources(&kubeconfig);
-    let mut vk = virtual_kubelet::start(
+    let vk = virtual_kubelet::start(
         &paths.workdir,
         &paths.configdir,
         &paths.logdir,
@@ -521,24 +580,25 @@ fn command_start(args: StartArgs) {
         &kubeconfig,
     );
 
-    // Wait for shutdown signal. On Windows, listen for both Ctrl+C and
-    // Ctrl+Break — `tdkserver stop` requests graceful shutdown via
-    // `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, ...)`, which only
-    // fires `ctrl_break`.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(wait_for_shutdown());
-
-    shutdown(&paths, &mut vk, &mut pr, &mut cp);
+    // Teardown is owned by the km-signal thread installed above (it exits
+    // the process on SIGINT/SIGTERM, stopping cp/pr/vk by PID file). Park
+    // here until then; the Child handles stay alive in this frame.
+    loop {
+        std::thread::park();
+    }
 }
 
+/// Install the SIGINT/SIGTERM (Ctrl+C/Ctrl+Break) handlers, signal that
+/// they are armed via `armed`, then resolve when a signal arrives. On
+/// Windows, listen for both Ctrl+C and Ctrl+Break — `tdkserver stop`
+/// requests graceful shutdown via `GenerateConsoleCtrlEvent(
+/// CTRL_BREAK_EVENT, ...)`, which only fires `ctrl_break`.
 #[cfg(unix)]
-async fn wait_for_shutdown() {
+async fn arm_and_wait_for_shutdown(armed: std::sync::mpsc::Sender<()>) {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    let _ = armed.send(());
     tokio::select! {
         _ = sigterm.recv() => {}
         _ = sigint.recv() => {}
@@ -546,10 +606,11 @@ async fn wait_for_shutdown() {
 }
 
 #[cfg(windows)]
-async fn wait_for_shutdown() {
+async fn arm_and_wait_for_shutdown(armed: std::sync::mpsc::Sender<()>) {
     use tokio::signal::windows::{ctrl_break, ctrl_c};
     let mut ctrlc = ctrl_c().expect("install Ctrl+C handler");
     let mut ctrlbreak = ctrl_break().expect("install Ctrl+Break handler");
+    let _ = armed.send(());
     tokio::select! {
         _ = ctrlc.recv() => {}
         _ = ctrlbreak.recv() => {}
