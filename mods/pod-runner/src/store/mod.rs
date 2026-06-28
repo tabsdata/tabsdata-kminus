@@ -199,6 +199,25 @@ pub trait PodStore: Send + Sync {
         self.len().await == 0
     }
 
+    /// Number of non-terminal (Pending/Running) pods.
+    ///
+    /// This is the count that matters for capacity admission: terminal
+    /// (Succeeded/Failed) pods hold no resources, so they must not consume
+    /// the capacity budget. Terminal pods can pile up in the store between
+    /// completion and the control plane's delete, so [`len`](Self::len)
+    /// would over-count and wrongly reject new pods.
+    ///
+    /// The default lists every snapshot and filters; in-memory stores
+    /// override this to count in place without cloning, since it runs on
+    /// the hot admission path.
+    async fn count_non_terminal(&self) -> usize {
+        self.list(SpecView::Running)
+            .await
+            .into_iter()
+            .filter(|snap| !snap.status.phase.is_terminal())
+            .count()
+    }
+
     /// Check if a pod exists.
     async fn contains(&self, id: &PodId) -> bool {
         self.get(id, SpecView::Running).await.is_some()

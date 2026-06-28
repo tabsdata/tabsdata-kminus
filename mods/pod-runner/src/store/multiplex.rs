@@ -85,6 +85,10 @@ impl PodStore for MultiplexStore {
     async fn len(&self) -> usize {
         self.primary.len().await
     }
+
+    async fn count_non_terminal(&self) -> usize {
+        self.primary.count_non_terminal().await
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -517,8 +517,12 @@ impl PodLogic {
             }
         }
 
-        // Capacity
-        if self.store.len().await >= self.config.max_pods {
+        // Capacity counts only non-terminal pods: Succeeded/Failed pods hold no
+        // resources, so they must not consume the capacity budget (otherwise an
+        // accumulation of completed-but-undeleted pods would wrongly block new
+        // admissions — they linger in the store until the control plane's
+        // delete arrives, which it may do late, out of order, or never).
+        if self.store.count_non_terminal().await >= self.config.max_pods {
             warn!(pod = %id, max = self.config.max_pods, "Capacity exceeded");
             return Err(LogicError::CapacityExceeded { max: self.config.max_pods });
         }
@@ -1697,6 +1701,34 @@ mod tests {
             logic.create_pod(make_pod_spec("first", "sleep 60")).await.unwrap();
             let err = logic.create_pod(make_pod_spec("second", "sleep 60")).await.unwrap_err();
             assert!(matches!(err, LogicError::CapacityExceeded { max: 1 }));
+        }
+
+        #[tokio::test]
+        async fn terminal_pods_do_not_count_against_capacity() {
+            let store = Arc::new(MemoryStore::new());
+            let (shutdown_tx, _) = watch::channel(());
+            let config = LogicConfig {
+                max_pods: 1,
+                ..Default::default()
+            };
+            let provider = make_provider();
+            let logic = PodLogic::new(config, test_cleanup_config(), Arc::clone(&store) as Arc<dyn PodStore>, provider, ResolverSet::default(), shutdown_tx);
+
+            // First pod runs to completion and is never deleted, so it lingers
+            // in the store in a terminal phase (as it would between completion
+            // and the control plane's delete).
+            logic.create_pod(make_pod_spec("first", "exit 0")).await.unwrap();
+            wait_for_terminal(&logic, "first").await;
+
+            // With max_pods=1 the old store.len() gate would reject this. A
+            // terminal pod holds no resources, so the second pod is admitted.
+            let snap = logic.create_pod(make_pod_spec("second", "sleep 60")).await.unwrap();
+            assert_eq!(snap.status.phase, PodPhase::Pending);
+
+            // The terminal pod is still in the store — it was skipped by the
+            // capacity count, not removed.
+            assert_eq!(store.len().await, 2);
+            assert_eq!(store.count_non_terminal().await, 1);
         }
 
         #[tokio::test]

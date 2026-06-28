@@ -123,5 +123,12 @@ impl PodStore for MemoryStore {
         let pods = self.pods.read().unwrap();
         pods.len()
     }
+
+    async fn count_non_terminal(&self) -> usize {
+        let pods = self.pods.read().unwrap();
+        pods.values()
+            .filter(|e| !e.status.phase.is_terminal())
+            .count()
+    }
 }
 
