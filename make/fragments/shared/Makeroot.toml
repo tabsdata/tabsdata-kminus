@@ -37,6 +37,7 @@ PROJECT_RS_POD_RUNNER_CARGO_TOML = { value = "${KM_ROOT}/mods/pod-runner/Cargo.t
 MAKE_LIBRARIES_PATH = { value = "${TABSDATA_ROOT}/make/make-os/libraries", normalize = true }
 
 FETCH_K8S_SCRIPT = { value = "${KM_ROOT}/make/scripts/fetch_k8s_deps.py", normalize = true }
+GET_GO_TARGET_SCRIPT = { value = "${KM_ROOT}/make/scripts/get_go_target.py", normalize = true }
 BUMP_VERSION_SCRIPT = { value = "${TABSDATA_ROOT}/devutils/automation/tasks/makers/td-scripts/bump_version.py", normalize = true }
 CHECK_NATIVE_LIBS_SCRIPT = { value = "${TABSDATA_ROOT}/devutils/automation/tasks/makers/td-scripts/check_native_libs.py", normalize = true }
 

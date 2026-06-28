@@ -11,10 +11,20 @@ script_runner = "@duckscript"
 script = '''
     !include_files ./make/libraries/log.ds
 
-    binary_extension = set ""
-    os_family = os_family
-    if eq ${os_family} "windows"
-        binary_extension = set ".exe"
+    go_target = exec --fail-on-error python ${GET_GO_TARGET_SCRIPT}
+    go_target_lines = split ${go_target.stdout} "\n"
+    go_os = array_get ${go_target_lines} 0
+    go_arch = array_get ${go_target_lines} 1
+    binary_extension = array_get ${go_target_lines} 2
+    go_os = trim ${go_os}
+    go_arch = trim ${go_arch}
+    binary_extension = trim ${binary_extension}
+    if not is_empty ${go_os}
+        set_env GOOS ${go_os}
+        set_env GOARCH ${go_arch}
+        debug "🎯 Cross-building Go for GOOS=${go_os} GOARCH=${go_arch}"
+    else
+        debug "🎯 Building Go for host target"
     end
 
     source_folder = set "${KM_ROOT}/mods/virtual-kubelet/src/main/go"

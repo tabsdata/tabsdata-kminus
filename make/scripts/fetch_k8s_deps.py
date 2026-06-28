@@ -14,7 +14,7 @@ Binaries fetched:
   - kube-controller-manager              (built from K8s source)
 
 Usage:
-    python fetch_k8s_deps.py <cache-folder> [k8s-version]
+    python fetch_k8s_deps.py <cache-folder> <k8s-version>
     e.g.: python fetch_k8s_deps.py ../cache 1.29
 """
 
@@ -27,8 +27,17 @@ import sys
 
 
 def detect_platform():
-    """Return (os_name, arch) for the current host, normalized to the
-    naming the rest of the script (and setup-envtest) expects."""
+    """Return (os_name, arch) for the build target, normalized to the naming
+    the rest of the script (and setup-envtest) expects.
+
+    Honors GOOS / GOARCH when set (the build exports them for cross builds);
+    otherwise falls back to the running host. The values are already in the
+    Go vocabulary the script uses (e.g. darwin, amd64, arm64)."""
+    goos = os.environ.get("GOOS", "").strip()
+    goarch = os.environ.get("GOARCH", "").strip()
+    if goos and goarch:
+        return goos, goarch
+
     os_name = host_platform.system().lower()
     machine = host_platform.machine().lower()
     arch = {
@@ -125,12 +134,12 @@ def build_kube_controller_manager(k8s_source, full_version, os_name, arch, cache
 
 
 def main():
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <cache-folder> [k8s-version]")
+    if len(sys.argv) < 3:
+        print(f"Usage: {sys.argv[0]} <cache-folder> <k8s-version>")
         sys.exit(1)
 
     cache_dir = sys.argv[1]
-    k8s_version = sys.argv[2] if len(sys.argv) > 2 else "1.29"
+    k8s_version = sys.argv[2]
 
     os_name, arch = detect_platform()
     platform = f"{os_name}-{arch}"
