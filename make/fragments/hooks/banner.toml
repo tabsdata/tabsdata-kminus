@@ -11,10 +11,10 @@ script_runner = "@duckscript"
 script = '''
     os = os_family
 
-    make_banners = get_env TD_MAKE_BANNERS
-    make_banners_true = eq ${make_banners} "true"
+    make_with_banners = get_env TD_MAKE_WITH_BANNERS
+    make_with_banners_true = eq ${make_with_banners} "true"
 
-   if ${make_banners_true}
+   if ${make_with_banners_true}
         if eq ${os} "windows"
             cm_run_task banner_windows
         elseif eq ${os} "mac"

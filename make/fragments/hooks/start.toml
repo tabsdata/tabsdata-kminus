@@ -53,9 +53,9 @@ script = [
         ok = touch ${ppid_marker}
     end
 
-    make_banners = get_env TD_MAKE_BANNERS
-    make_banners_true = eq ${make_banners} "true"
-    if ${make_banners_true}
+    make_with_banners = get_env TD_MAKE_WITH_BANNERS
+    make_with_banners_true = eq ${make_with_banners} "true"
+    if ${make_with_banners_true}
         cm_run_task banner
     end
 

@@ -17,34 +17,31 @@ script ='''
     if not ${is_meta_task}
         permit_done = get_env TD_PERMIT_DONE
         if is_empty ${permit_done}
-            no_permit = set false
+            with_permit = get_env TD_WITH_PERMIT
+            with_permit_false = eq ${with_permit} "false"
+            if ${with_permit_false}
+                with_permit = set false
+            else
+                with_permit = set true
+            end
             cli_args = split ${CARGO_MAKE_TASK_ARGS} ;
             for cli_arg in ${cli_args}
                 cli_arg = trim ${cli_arg}
                 is_no_permit = eq ${cli_arg} "--no-permit"
                 if ${is_no_permit}
-                    no_permit = set true
+                    with_permit = set false
                 end
             end
 
-            if ${no_permit}
-                warn "✈️ Skipping permit (--no-permit)"
+            if ${with_permit}
+                cm_run_task __km__permit
+                set_env TD_PERMIT_DONE "true"
+            else
+                warn "✈️ Skipping permit"
                 if is_warn
                     echo ""
                 end
                 set_env TD_PERMIT_DONE "true"
-            else
-                td_run_permit = get_env TD_RUN_PERMIT
-                if eq ${td_run_permit} "false"
-                    warn "✈️ Skipping permit"
-                    if is_warn
-                        echo ""
-                    end
-                    set_env TD_PERMIT_DONE "true"
-                else
-                    cm_run_task __km__permit
-                    set_env TD_PERMIT_DONE "true"
-                end
             end
         end
 
