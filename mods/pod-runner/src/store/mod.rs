@@ -96,6 +96,23 @@ impl PodId {
         format!("{}_{}_{}", self.namespace, self.name, self.uid)
     }
 
+    /// Inverse of [`full`](Self::full): parse a `namespace_name_uid` key
+    /// (e.g. a pod directory name) back into a `PodId`. Returns `None` if
+    /// the key isn't three non-empty underscore-separated parts. Safe to
+    /// split on `_` because K8s namespaces and names are DNS-1123 labels
+    /// (no underscore) and UIDs are UUIDs (no underscore), so only the
+    /// three separators we wrote are present.
+    pub fn from_full(full: &str) -> Option<PodId> {
+        let mut parts = full.splitn(3, '_');
+        let namespace = parts.next()?;
+        let name = parts.next()?;
+        let uid = parts.next()?;
+        if namespace.is_empty() || name.is_empty() || uid.is_empty() {
+            return None;
+        }
+        Some(PodId::new(namespace, name, uid))
+    }
+
     /// `namespace_name` format for name-based lookups.
     pub fn lookup_key(&self) -> String {
         format!("{}_{}", self.namespace, self.name)
@@ -397,6 +414,21 @@ mod tests {
         assert_eq!(id.short(), "prod/web");
         assert_eq!(id.full(), "prod_web_uid-1");
         assert_eq!(id.lookup_key(), "prod_web");
+    }
+
+    #[test]
+    fn test_pod_id_from_full_roundtrips() {
+        let id = PodId::new("prod", "web", "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(PodId::from_full(&id.full()), Some(id));
+        // Dashed uid (the pod-runner test convention) survives the split.
+        assert_eq!(
+            PodId::from_full("default_app_uid-app"),
+            Some(PodId::new("default", "app", "uid-app")),
+        );
+        // Malformed keys yield None rather than a bogus id.
+        assert_eq!(PodId::from_full("default_app"), None);
+        assert_eq!(PodId::from_full("nounderscores"), None);
+        assert_eq!(PodId::from_full("default__uid"), None);
     }
 
     // -- MemoryStore tests via the shared test suite --

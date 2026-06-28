@@ -11,6 +11,7 @@
 //! multiple expirations into a single scan.
 
 use std::fs;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::watch;
@@ -18,6 +19,7 @@ use tracing::{debug, info, info_span, warn, Instrument};
 
 use super::cleanup::CleanupConfig;
 use crate::spec::constants::FINISHED_SENTINEL;
+use crate::store::{PodId, PodStore};
 
 /// 15-minute buffer added to sleep durations to batch expirations.
 const BATCH_BUFFER: Duration = Duration::from_secs(15 * 60);
@@ -34,17 +36,22 @@ const INITIAL_DELAY: Duration = Duration::from_secs(60);
 /// and archives. It shuts down cleanly when the shutdown signal fires.
 pub fn spawn_purge_daemon(
     config: CleanupConfig,
+    store: Arc<dyn PodStore>,
     shutdown_rx: watch::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(
         async move {
-            purge_loop(config, shutdown_rx).await;
+            purge_loop(config, store, shutdown_rx).await;
         }
         .instrument(info_span!("purge_daemon")),
     )
 }
 
-async fn purge_loop(config: CleanupConfig, mut shutdown_rx: watch::Receiver<()>) {
+async fn purge_loop(
+    config: CleanupConfig,
+    store: Arc<dyn PodStore>,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
     info!("Purge daemon started");
 
     // Initial delay
@@ -58,7 +65,7 @@ async fn purge_loop(config: CleanupConfig, mut shutdown_rx: watch::Receiver<()>)
 
     loop {
         debug!("Starting purge scan");
-        let next_expiry = purge_scan(&config, &mut shutdown_rx).await;
+        let next_expiry = purge_scan(&config, &store, &mut shutdown_rx).await;
 
         // If shutdown was signalled during scan, exit
         if shutdown_rx.has_changed().unwrap_or(true) {
@@ -106,6 +113,7 @@ fn idle_sleep_duration(config: &CleanupConfig) -> Duration {
 /// inside pod dirs are cleaned up when the pod dir is removed.
 async fn purge_scan(
     config: &CleanupConfig,
+    store: &Arc<dyn PodStore>,
     shutdown_rx: &mut watch::Receiver<()>,
 ) -> Option<Duration> {
     use crate::server::config::{PODS_SUBDIR, PREV_RUN_DIRS_TO_KEEP};
@@ -119,13 +127,17 @@ async fn purge_scan(
         // Scan the LIVE run/pods/ directory — finished pods whose
         // FINISHED sentinel is older than the TTL get purged. This
         // handles pods that clients never explicitly /deletePod'd
-        // (e.g. async K8s Job deletion that didn't propagate).
+        // (e.g. async K8s Job deletion that didn't propagate). These pods
+        // are still tracked in the store, so pass it: reaping the dir also
+        // evicts the lingering store entry (self-heal) rather than leaking
+        // it until restart.
         dirs_purged += scan_work_dirs(
             &config.pods_dir,
             work_ttl,
             now,
             &mut earliest_remaining,
             shutdown_rx,
+            Some(store),
         )
         .await;
 
@@ -133,12 +145,15 @@ async fn purge_scan(
         if let Some(workdir) = config.pods_dir.parent().and_then(|r| r.parent()) {
             for i in 0..PREV_RUN_DIRS_TO_KEEP {
                 let run_pods = workdir.join(format!("run.{}", i)).join(PODS_SUBDIR);
+                // Rotated run dirs belong to previous incarnations and are
+                // not tracked in the current store, so no store eviction.
                 dirs_purged += scan_work_dirs(
                     &run_pods,
                     work_ttl,
                     now,
                     &mut earliest_remaining,
                     shutdown_rx,
+                    None,
                 )
                 .await;
             }
@@ -160,6 +175,7 @@ async fn scan_work_dirs(
     now: SystemTime,
     earliest: &mut Option<Duration>,
     shutdown_rx: &mut watch::Receiver<()>,
+    store: Option<&Arc<dyn PodStore>>,
 ) -> u32 {
     let mut count: u32 = 0;
     let entries = match fs::read_dir(work_dir) {
@@ -194,6 +210,17 @@ async fn scan_work_dirs(
                 warn!(error = %e, dir = ?path, "Failed to purge work dir");
             } else {
                 count += 1;
+            }
+            // Self-heal: a finished pod still in the store past the TTL was
+            // never deleted by the control plane (delete dropped or never
+            // sent). Evict the lingering entry so it stops occupying memory.
+            // `remove` is a no-op if it was already deleted normally — not a
+            // failure (the dir can outlive the entry via keep_*_pod_dir).
+            if let Some(store) = store
+                && let Some(id) =
+                    path.file_name().and_then(|n| n.to_str()).and_then(PodId::from_full)
+            {
+                store.remove(&id).await;
             }
             tokio::time::sleep(THROTTLE_DELAY).await;
         } else {
@@ -239,6 +266,11 @@ mod tests {
         dir
     }
 
+    /// An empty store for tests that only exercise dir reaping.
+    fn dummy_store() -> Arc<dyn PodStore> {
+        Arc::new(crate::store::memory::MemoryStore::new())
+    }
+
     #[tokio::test]
     async fn purge_removes_expired_work_dir() {
         let tmp = make_tmp_dir().join("expired-work");
@@ -256,7 +288,7 @@ mod tests {
         filetime::set_file_mtime(&sentinel, filetime::FileTime::from_system_time(old)).unwrap();
 
         let (_tx, mut rx) = watch::channel(());
-        let result = purge_scan(&config, &mut rx).await;
+        let result = purge_scan(&config, &dummy_store(), &mut rx).await;
 
         assert!(!pod_dir.exists(), "expired work dir should be removed");
         assert!(result.is_none(), "nothing remaining");
@@ -277,7 +309,7 @@ mod tests {
         // mtime is now — well within TTL
 
         let (_tx, mut rx) = watch::channel(());
-        let result = purge_scan(&config, &mut rx).await;
+        let result = purge_scan(&config, &dummy_store(), &mut rx).await;
 
         assert!(pod_dir.exists(), "fresh work dir should survive");
         assert!(result.is_some(), "should have remaining TTL");
@@ -297,9 +329,47 @@ mod tests {
         // No FINISHED file
 
         let (_tx, mut rx) = watch::channel(());
-        purge_scan(&config, &mut rx).await;
+        purge_scan(&config, &dummy_store(), &mut rx).await;
 
         assert!(pod_dir.exists(), "dir without FINISHED should survive");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn purge_evicts_store_entry_for_expired_live_pod() {
+        use crate::spec::pod::PodSpec;
+        use crate::spec::status::PodStatus;
+        use crate::store::memory::MemoryStore;
+
+        let tmp = make_tmp_dir().join("evict-live");
+        let config = test_config(&tmp);
+
+        // A finished pod in the LIVE run/pods dir whose sentinel has expired
+        // and was never /deletePod'd — its store entry would otherwise leak.
+        let pod_dir = config.pods_dir.join("default_app_uid-1");
+        fs::create_dir_all(&pod_dir).unwrap();
+        let sentinel = pod_dir.join(FINISHED_SENTINEL);
+        fs::write(&sentinel, "done").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(7200); // TTL is 1h
+        filetime::set_file_mtime(&sentinel, filetime::FileTime::from_system_time(old)).unwrap();
+
+        let store: Arc<dyn PodStore> = Arc::new(MemoryStore::new());
+        let id = PodId::new("default", "app", "uid-1");
+        let spec = Arc::new(PodSpec::default());
+        store
+            .put(id.clone(), Arc::clone(&spec), spec, PodStatus::default())
+            .await;
+        assert!(store.contains(&id).await);
+
+        let (_tx, mut rx) = watch::channel(());
+        purge_scan(&config, &store, &mut rx).await;
+
+        assert!(!pod_dir.exists(), "expired live pod dir should be removed");
+        assert!(
+            !store.contains(&id).await,
+            "lingering store entry should be evicted",
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -359,7 +429,7 @@ mod tests {
         let config = test_config(&tmp);
 
         let (tx, rx) = watch::channel(());
-        let handle = spawn_purge_daemon(config, rx);
+        let handle = spawn_purge_daemon(config, dummy_store(), rx);
 
         // Send shutdown immediately
         tx.send(()).unwrap();

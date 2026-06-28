@@ -104,6 +104,9 @@ async fn main() {
 
     let (shutdown_tx, _) = watch::channel(());
     let cleanup_config = CleanupConfig::from(&pr_config);
+    // Shared with the purge daemon so it can evict store entries for
+    // finished pods whose delete never arrived (same store instance).
+    let purge_store = Arc::clone(&store);
     let logic = PodLogic::new(
         &pr_config,
         cleanup_config.clone(),
@@ -124,6 +127,7 @@ async fn main() {
     // Spawn purge daemon for expired work dirs and archives
     let _purge = pod_runner::logic::purge::spawn_purge_daemon(
         cleanup_config,
+        purge_store,
         shutdown_tx.subscribe(),
     );
 
