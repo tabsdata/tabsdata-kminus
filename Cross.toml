@@ -1,0 +1,47 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+# docker run -it --rm --platform linux/amd64 ghcr.io/cross-rs/x86_64-unknown-linux-musl:main bash
+
+[target.x86_64-unknown-linux-musl]
+pre-build = [
+    "echo ...",
+]
+
+[target.x86_64-unknown-linux-musl.env]
+volumes = ["TABSDATA_SOLUTION_HOME"]
+passthrough = [
+    # >>> passthrough:MOUNTS:BEGIN >>>
+    "TABSDATA_SOLUTION_HOME",
+    # >>> passthrough:MOUNTS:END >>>
+    "TD_CROSS_BUILD=true",
+    "GITHUB_TOKEN",
+    # >>> passthrough:MAKE:BEGIN >>>
+    "TD_ON_GA",
+    "CARGO_TERM_COLOR",
+    "RUST_BACKTRACE",
+    "RUST_LOG",
+    "RUSTDOC_LOG",
+    "RUST_TEST_THREADS",
+    "TD_CLI_SHOW",
+    "TD_SHOW_ENV",
+    # <<< passthrough:MAKE:END <<<
+    # >>> passthrough:PLATFORM:BEGIN >>>
+    "TDX_OS",
+    "TDX_ARCHITECTURE",
+    "TDX_PLATFORM",
+    "RUST_CHANNEL",
+    "RUST_TARGET",
+    "RUST_TOOLCHAIN",
+    "TD_CHANNEL",
+    "TD_TARGET",
+    "TD_TOOLCHAIN",
+    "TD_CROSS",
+    "RUST_PROFILE",
+    "MARKERS",
+    "PYTHONIOENCODING",
+    "TABSDATA_VERSION",
+    "K8S_VERSION",
+    # <<< passthrough:PLATFORM:END <<<
+]
