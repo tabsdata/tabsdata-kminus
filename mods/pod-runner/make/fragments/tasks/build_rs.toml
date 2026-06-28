@@ -5,7 +5,7 @@
 [tasks.__km__build_rs_pod_runner]
 plugin = "td-task-tracker"
 category = "03 - Build"
-description = "Task 'build' for pod_runner project"
+description = "Task 'build' for pod-runner project"
 cwd = "${KM_ROOT}/mods/pod-runner"
 script_runner = "@duckscript"
 script = '''

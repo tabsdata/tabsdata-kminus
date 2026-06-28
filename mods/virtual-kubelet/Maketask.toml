@@ -16,6 +16,15 @@ extend = [
     { path = "./mods/virtual-kubelet/make/fragments/tasks/build_go.toml", relative = "git" },
     { path = "./mods/virtual-kubelet/make/fragments/tasks/test_go.toml", relative = "git" },
     { path = "./mods/virtual-kubelet/make/fragments/tasks/itest_go.toml", relative = "git" },
+    { path = "./mods/virtual-kubelet/make/fragments/tasks/check_go.toml", relative = "git" },
+    { path = "./mods/virtual-kubelet/make/fragments/tasks/clippy_go.toml", relative = "git" },
+    { path = "./mods/virtual-kubelet/make/fragments/tasks/fmt_go.toml", relative = "git" },
+    { path = "./mods/virtual-kubelet/make/fragments/tasks/license_go.toml", relative = "git" },
+    { path = "./mods/virtual-kubelet/make/fragments/tasks/outdated_go.toml", relative = "git" },
+    { path = "./mods/virtual-kubelet/make/fragments/tasks/machete_go.toml", relative = "git" },
+    { path = "./mods/virtual-kubelet/make/fragments/tasks/audit_go.toml", relative = "git" },
+    { path = "./mods/virtual-kubelet/make/fragments/tasks/deny_go.toml", relative = "git" },
+    { path = "./mods/virtual-kubelet/make/fragments/tasks/pants_go.toml", relative = "git" },
 
     # itest needs control-plane alongside virtual-kubelet; bring in its
     # build task plus the assembly copy step so `cargo make itest` works
@@ -58,3 +67,95 @@ plugin = "td-task-tracker"
 category = "04 - Test"
 description = "Run virtual-kubelet integration tests"
 alias = "__km__itest_go_virtual_kubelet"
+
+[tasks.check]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Check virtual-kubelet"
+alias = "__km__check_go_virtual_kubelet"
+
+[tasks.clippy]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Run clippy on virtual-kubelet"
+alias = "__km__clippy_go_virtual_kubelet"
+
+[tasks.fmt]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Format virtual-kubelet"
+alias = "__km__fmt_go_virtual_kubelet"
+
+[tasks.license]
+plugin = "td-task-tracker"
+category = "06 - Compliance"
+description = "Report licenses for virtual-kubelet"
+alias = "__km__license_go_virtual_kubelet"
+
+[tasks.outdated]
+plugin = "td-task-tracker"
+category = "05 - Inspect"
+description = "Report outdated dependencies for virtual-kubelet"
+alias = "__km__outdated_go_virtual_kubelet"
+
+[tasks.machete]
+plugin = "td-task-tracker"
+category = "05 - Inspect"
+description = "Run machete on virtual-kubelet"
+alias = "__km__machete_go_virtual_kubelet"
+
+[tasks.audit]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Audit virtual-kubelet"
+alias = "__km__audit_go_virtual_kubelet"
+
+[tasks.deny]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Run deny on virtual-kubelet"
+alias = "__km__deny_go_virtual_kubelet"
+
+[tasks.pants]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Run pants on virtual-kubelet"
+alias = "__km__pants_go_virtual_kubelet"
+
+[tasks.compose]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Task 'compose' for virtual-kubelet project"
+private = true
+run_task = [
+    { name = [
+        "build",
+        "test",
+        "check",
+        "clippy",
+        "fmt",
+        "license",
+        "outdated",
+        "machete",
+        "audit",
+        "deny",
+        "pants"
+    ] }
+]
+
+[tasks.make]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Full build and verification"
+run_task = [
+    { name = [
+        "clean",
+        "compose"], condition = { env = { "CLEAN" = "true" } } },
+    { name = [
+        "compose"
+    ] }
+]
+
+[tasks.default]
+plugin = "td-task-tracker"
+alias = "make"

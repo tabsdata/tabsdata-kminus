@@ -1,0 +1,15 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+[tasks.__km__audit_go_virtual_kubelet]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Task 'audit' for virtual-kubelet project"
+cwd = "${KM_ROOT}/mods/virtual-kubelet"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/libraries/log.ds
+
+    debug "🚧 Task 'audit' for virtual-kubelet is not implemented yet."
+'''

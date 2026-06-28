@@ -16,6 +16,15 @@ extend = [
     { path = "./mods/kminus/make/fragments/tasks/build_rs.toml", relative = "git" },
     { path = "./mods/kminus/make/fragments/tasks/test_rs.toml", relative = "git" },
     { path = "./mods/kminus/make/fragments/tasks/itest_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/fragments/tasks/check_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/fragments/tasks/clippy_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/fragments/tasks/fmt_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/fragments/tasks/license_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/fragments/tasks/outdated_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/fragments/tasks/machete_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/fragments/tasks/audit_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/fragments/tasks/deny_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/fragments/tasks/pants_rs.toml", relative = "git" },
 
     # itest spawns the full kminus stack via the km orchestrator, which
     # in turn launches control-plane, pod-runner, and virtual-kubelet.
@@ -62,3 +71,95 @@ plugin = "td-task-tracker"
 category = "04 - Test"
 description = "Run kminus integration tests"
 alias = "__km__itest_rs_kminus"
+
+[tasks.check]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Check kminus"
+alias = "__km__check_rs_kminus"
+
+[tasks.clippy]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Run clippy on kminus"
+alias = "__km__clippy_rs_kminus"
+
+[tasks.fmt]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Format kminus"
+alias = "__km__fmt_rs_kminus"
+
+[tasks.license]
+plugin = "td-task-tracker"
+category = "06 - Compliance"
+description = "Report licenses for kminus"
+alias = "__km__license_rs_kminus"
+
+[tasks.outdated]
+plugin = "td-task-tracker"
+category = "05 - Inspect"
+description = "Report outdated dependencies for kminus"
+alias = "__km__outdated_rs_kminus"
+
+[tasks.machete]
+plugin = "td-task-tracker"
+category = "05 - Inspect"
+description = "Run machete on kminus"
+alias = "__km__machete_rs_kminus"
+
+[tasks.audit]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Audit kminus"
+alias = "__km__audit_rs_kminus"
+
+[tasks.deny]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Run deny on kminus"
+alias = "__km__deny_rs_kminus"
+
+[tasks.pants]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Run pants on kminus"
+alias = "__km__pants_rs_kminus"
+
+[tasks.compose]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Task 'compose' for kminus project"
+private = true
+run_task = [
+    { name = [
+        "build",
+        "test",
+        "check",
+        "clippy",
+        "fmt",
+        "license",
+        "outdated",
+        "machete",
+        "audit",
+        "deny",
+        "pants"
+    ] }
+]
+
+[tasks.make]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Full build and verification"
+run_task = [
+    { name = [
+        "clean",
+        "compose"], condition = { env = { "CLEAN" = "true" } } },
+    { name = [
+        "compose"
+    ] }
+]
+
+[tasks.default]
+plugin = "td-task-tracker"
+alias = "make"

@@ -1,0 +1,15 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+[tasks.__km__fmt_go_control_plane]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Task 'fmt' for control-plane project"
+cwd = "${KM_ROOT}/mods/control-plane"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/libraries/log.ds
+
+    debug "🚧 Task 'fmt' for control-plane is not implemented yet."
+'''

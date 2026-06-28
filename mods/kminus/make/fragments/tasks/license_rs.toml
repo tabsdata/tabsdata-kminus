@@ -1,0 +1,15 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+[tasks.__km__license_rs_kminus]
+plugin = "td-task-tracker"
+category = "06 - Compliance"
+description = "Task 'license' for kminus project"
+cwd = "${KM_ROOT}/mods/kminus"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/libraries/log.ds
+
+    debug "🚧 Task 'license' for kminus is not implemented yet."
+'''

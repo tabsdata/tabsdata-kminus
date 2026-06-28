@@ -1,0 +1,15 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+[tasks.__km__check_rs_kminus]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Task 'check' for kminus project"
+cwd = "${KM_ROOT}/mods/kminus"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/libraries/log.ds
+
+    debug "🚧 Task 'check' for kminus is not implemented yet."
+'''

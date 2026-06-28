@@ -16,6 +16,15 @@ extend = [
     { path = "./mods/control-plane/make/fragments/tasks/build_go.toml", relative = "git" },
     { path = "./mods/control-plane/make/fragments/tasks/test_go.toml", relative = "git" },
     { path = "./mods/control-plane/make/fragments/tasks/itest_go.toml", relative = "git" },
+    { path = "./mods/control-plane/make/fragments/tasks/check_go.toml", relative = "git" },
+    { path = "./mods/control-plane/make/fragments/tasks/clippy_go.toml", relative = "git" },
+    { path = "./mods/control-plane/make/fragments/tasks/fmt_go.toml", relative = "git" },
+    { path = "./mods/control-plane/make/fragments/tasks/license_go.toml", relative = "git" },
+    { path = "./mods/control-plane/make/fragments/tasks/outdated_go.toml", relative = "git" },
+    { path = "./mods/control-plane/make/fragments/tasks/machete_go.toml", relative = "git" },
+    { path = "./mods/control-plane/make/fragments/tasks/audit_go.toml", relative = "git" },
+    { path = "./mods/control-plane/make/fragments/tasks/deny_go.toml", relative = "git" },
+    { path = "./mods/control-plane/make/fragments/tasks/pants_go.toml", relative = "git" },
 
     { path = "./make/fragments/hooks/banner.toml", relative = "git" },
     { path = "./make/fragments/hooks/start.toml", relative = "git" },
@@ -52,3 +61,95 @@ plugin = "td-task-tracker"
 category = "04 - Test"
 description = "Run control-plane integration tests"
 alias = "__km__itest_go_control_plane"
+
+[tasks.check]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Check control-plane"
+alias = "__km__check_go_control_plane"
+
+[tasks.clippy]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Run clippy on control-plane"
+alias = "__km__clippy_go_control_plane"
+
+[tasks.fmt]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Format control-plane"
+alias = "__km__fmt_go_control_plane"
+
+[tasks.license]
+plugin = "td-task-tracker"
+category = "06 - Compliance"
+description = "Report licenses for control-plane"
+alias = "__km__license_go_control_plane"
+
+[tasks.outdated]
+plugin = "td-task-tracker"
+category = "05 - Inspect"
+description = "Report outdated dependencies for control-plane"
+alias = "__km__outdated_go_control_plane"
+
+[tasks.machete]
+plugin = "td-task-tracker"
+category = "05 - Inspect"
+description = "Run machete on control-plane"
+alias = "__km__machete_go_control_plane"
+
+[tasks.audit]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Audit control-plane"
+alias = "__km__audit_go_control_plane"
+
+[tasks.deny]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Run deny on control-plane"
+alias = "__km__deny_go_control_plane"
+
+[tasks.pants]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Run pants on control-plane"
+alias = "__km__pants_go_control_plane"
+
+[tasks.compose]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Task 'compose' for control-plane project"
+private = true
+run_task = [
+    { name = [
+        "build",
+        "test",
+        "check",
+        "clippy",
+        "fmt",
+        "license",
+        "outdated",
+        "machete",
+        "audit",
+        "deny",
+        "pants"
+    ] }
+]
+
+[tasks.make]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Full build and verification"
+run_task = [
+    { name = [
+        "clean",
+        "compose"], condition = { env = { "CLEAN" = "true" } } },
+    { name = [
+        "compose"
+    ] }
+]
+
+[tasks.default]
+plugin = "td-task-tracker"
+alias = "make"

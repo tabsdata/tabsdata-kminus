@@ -1,0 +1,14 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+[tasks.sourcetrack]
+plugin = "td-task-tracker"
+category = "90 - Lifecycle"
+description = "Track source provenance"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/libraries/log.ds
+
+    debug "🚧 Task 'sourcetrack' is not implemented yet."
+'''

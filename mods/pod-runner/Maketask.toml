@@ -16,6 +16,15 @@ extend = [
     { path = "./mods/pod-runner/make/fragments/tasks/build_rs.toml", relative = "git" },
     { path = "./mods/pod-runner/make/fragments/tasks/test_rs.toml", relative = "git" },
     { path = "./mods/pod-runner/make/fragments/tasks/itest_rs.toml", relative = "git" },
+    { path = "./mods/pod-runner/make/fragments/tasks/check_rs.toml", relative = "git" },
+    { path = "./mods/pod-runner/make/fragments/tasks/clippy_rs.toml", relative = "git" },
+    { path = "./mods/pod-runner/make/fragments/tasks/fmt_rs.toml", relative = "git" },
+    { path = "./mods/pod-runner/make/fragments/tasks/license_rs.toml", relative = "git" },
+    { path = "./mods/pod-runner/make/fragments/tasks/outdated_rs.toml", relative = "git" },
+    { path = "./mods/pod-runner/make/fragments/tasks/machete_rs.toml", relative = "git" },
+    { path = "./mods/pod-runner/make/fragments/tasks/audit_rs.toml", relative = "git" },
+    { path = "./mods/pod-runner/make/fragments/tasks/deny_rs.toml", relative = "git" },
+    { path = "./mods/pod-runner/make/fragments/tasks/pants_rs.toml", relative = "git" },
 
     { path = "./make/fragments/hooks/banner.toml", relative = "git" },
     { path = "./make/fragments/hooks/start.toml", relative = "git" },
@@ -52,3 +61,95 @@ plugin = "td-task-tracker"
 category = "04 - Test"
 description = "Run pod-runner integration tests"
 alias = "__km__itest_rs_pod_runner"
+
+[tasks.check]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Check pod-runner"
+alias = "__km__check_rs_pod_runner"
+
+[tasks.clippy]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Run clippy on pod-runner"
+alias = "__km__clippy_rs_pod_runner"
+
+[tasks.fmt]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Format pod-runner"
+alias = "__km__fmt_rs_pod_runner"
+
+[tasks.license]
+plugin = "td-task-tracker"
+category = "06 - Compliance"
+description = "Report licenses for pod-runner"
+alias = "__km__license_rs_pod_runner"
+
+[tasks.outdated]
+plugin = "td-task-tracker"
+category = "05 - Inspect"
+description = "Report outdated dependencies for pod-runner"
+alias = "__km__outdated_rs_pod_runner"
+
+[tasks.machete]
+plugin = "td-task-tracker"
+category = "05 - Inspect"
+description = "Run machete on pod-runner"
+alias = "__km__machete_rs_pod_runner"
+
+[tasks.audit]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Audit pod-runner"
+alias = "__km__audit_rs_pod_runner"
+
+[tasks.deny]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Run deny on pod-runner"
+alias = "__km__deny_rs_pod_runner"
+
+[tasks.pants]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Run pants on pod-runner"
+alias = "__km__pants_rs_pod_runner"
+
+[tasks.compose]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Task 'compose' for pod-runner project"
+private = true
+run_task = [
+    { name = [
+        "build",
+        "test",
+        "check",
+        "clippy",
+        "fmt",
+        "license",
+        "outdated",
+        "machete",
+        "audit",
+        "deny",
+        "pants"
+    ] }
+]
+
+[tasks.make]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Full build and verification"
+run_task = [
+    { name = [
+        "clean",
+        "compose"], condition = { env = { "CLEAN" = "true" } } },
+    { name = [
+        "compose"
+    ] }
+]
+
+[tasks.default]
+plugin = "td-task-tracker"
+alias = "make"

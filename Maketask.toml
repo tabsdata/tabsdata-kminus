@@ -6,6 +6,185 @@ extend = [
     { path = "./make/fragments/shared/Maketask.toml", relative = "git" },
 ]
 
+[tasks.make]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Full build and verification"
+run_task = [
+    { name = [
+        "make_go",
+        "make_rs"
+    ] }
+]
+
+[tasks.make_go]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Task 'make' for Go projects"
+run_task = [
+    { name = [
+        "clean_go",
+        "compose_go"], condition = { env = { "CLEAN" = "true" } } },
+    { name = [
+        "compose_go"
+    ] }
+]
+
+[tasks.make_rs]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Task 'make' for Rust projects"
+run_task = [
+    { name = [
+        "clean_rs",
+        "compose_rs"], condition = { env = { "CLEAN" = "true" } } },
+    { name = [
+        "compose_rs"
+    ] }
+]
+
+[tasks.compose]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Full build and verification orchestration"
+private = true
+run_task = [
+    { name = [
+        "compose_go",
+        "compose_rs",
+    ] }
+]
+
+[tasks.compose_control_plane]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Task 'compose' for control-plane project"
+private = true
+run_task = [
+    { name = [
+        "__km__build_go_control_plane",
+        "__km__test_go_control_plane",
+        "__km__check_go_control_plane",
+        "__km__clippy_go_control_plane",
+        "__km__fmt_go_control_plane",
+        "__km__license_go_control_plane",
+        "__km__outdated_go_control_plane",
+        "__km__machete_go_control_plane",
+        "__km__audit_go_control_plane",
+        "__km__deny_go_control_plane",
+        "__km__pants_go_control_plane"
+    ] }
+]
+
+[tasks.compose_virtual_kubelet]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Task 'compose' for virtual-kubelet project"
+private = true
+run_task = [
+    { name = [
+        "__km__build_go_virtual_kubelet",
+        "__km__test_go_virtual_kubelet",
+        "__km__check_go_virtual_kubelet",
+        "__km__clippy_go_virtual_kubelet",
+        "__km__fmt_go_virtual_kubelet",
+        "__km__license_go_virtual_kubelet",
+        "__km__outdated_go_virtual_kubelet",
+        "__km__machete_go_virtual_kubelet",
+        "__km__audit_go_virtual_kubelet",
+        "__km__deny_go_virtual_kubelet",
+        "__km__pants_go_virtual_kubelet"
+    ] }
+]
+
+[tasks.compose_kcommon]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Task 'compose' for kcommon project"
+private = true
+run_task = [
+    { name = [
+        "__km__build_rs_kcommon",
+        "__km__test_rs_kcommon",
+        "__km__check_rs_kcommon",
+        "__km__clippy_rs_kcommon",
+        "__km__fmt_rs_kcommon",
+        "__km__license_rs_kcommon",
+        "__km__outdated_rs_kcommon",
+        "__km__machete_rs_kcommon",
+        "__km__audit_rs_kcommon",
+        "__km__deny_rs_kcommon",
+        "__km__pants_rs_kcommon"
+    ] }
+]
+
+[tasks.compose_pod_runner]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Task 'compose' for pod-runner project"
+private = true
+run_task = [
+    { name = [
+        "__km__build_rs_pod_runner",
+        "__km__test_rs_pod_runner",
+        "__km__check_rs_pod_runner",
+        "__km__clippy_rs_pod_runner",
+        "__km__fmt_rs_pod_runner",
+        "__km__license_rs_pod_runner",
+        "__km__outdated_rs_pod_runner",
+        "__km__machete_rs_pod_runner",
+        "__km__audit_rs_pod_runner",
+        "__km__deny_rs_pod_runner",
+        "__km__pants_rs_pod_runner"
+    ] }
+]
+
+[tasks.compose_kminus]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Task 'compose' for kminus project"
+private = true
+run_task = [
+    { name = [
+        "__km__build_rs_kminus",
+        "__km__test_rs_kminus",
+        "__km__check_rs_kminus",
+        "__km__clippy_rs_kminus",
+        "__km__fmt_rs_kminus",
+        "__km__license_rs_kminus",
+        "__km__outdated_rs_kminus",
+        "__km__machete_rs_kminus",
+        "__km__audit_rs_kminus",
+        "__km__deny_rs_kminus",
+        "__km__pants_rs_kminus"
+    ] }
+]
+
+[tasks.compose_go]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Task 'compose' for Go projects"
+private = true
+run_task = [
+    { name = [
+        "compose_control_plane",
+        "compose_virtual_kubelet"
+    ] }
+]
+
+[tasks.compose_rs]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Task 'compose' for Rust projects"
+private = true
+run_task = [
+    { name = [
+        "compose_kcommon",
+        "compose_pod_runner",
+        "compose_kminus"
+    ] }
+]
+
 [tasks.clean]
 plugin = "td-task-tracker"
 category = "01 - Clean"
@@ -175,6 +354,258 @@ description = "Gather all final binaries into target/dist/"
 dependencies = [
     "build",
     "__km__assembly_root",
+]
+
+[tasks.outdated]
+plugin = "td-task-tracker"
+category = "05 - Inspect"
+description = "Task 'outdated' for all modules"
+dependencies = [
+    "outdated_go",
+    "outdated_rs",
+]
+
+[tasks.outdated_go]
+plugin = "td-task-tracker"
+category = "05 - Inspect"
+description = "Task 'outdated' for Go projects"
+dependencies = [
+    "__km__outdated_go_control_plane",
+    "__km__outdated_go_virtual_kubelet",
+]
+
+[tasks.outdated_rs]
+plugin = "td-task-tracker"
+category = "05 - Inspect"
+description = "Task 'outdated' for Rust projects"
+dependencies = [
+    "__km__outdated_rs_kcommon",
+    "__km__outdated_rs_pod_runner",
+    "__km__outdated_rs_kminus",
+]
+
+[tasks.machete]
+plugin = "td-task-tracker"
+category = "05 - Inspect"
+description = "Task 'machete' for all modules"
+dependencies = [
+    "machete_go",
+    "machete_rs",
+]
+
+[tasks.machete_go]
+plugin = "td-task-tracker"
+category = "05 - Inspect"
+description = "Task 'machete' for Go projects"
+dependencies = [
+    "__km__machete_go_control_plane",
+    "__km__machete_go_virtual_kubelet",
+]
+
+[tasks.machete_rs]
+plugin = "td-task-tracker"
+category = "05 - Inspect"
+description = "Task 'machete' for Rust projects"
+dependencies = [
+    "__km__machete_rs_kcommon",
+    "__km__machete_rs_pod_runner",
+    "__km__machete_rs_kminus",
+]
+
+[tasks.license]
+plugin = "td-task-tracker"
+category = "06 - Compliance"
+description = "Task 'license' for all modules"
+dependencies = [
+    "license_go",
+    "license_rs",
+]
+
+[tasks.license_go]
+plugin = "td-task-tracker"
+category = "06 - Compliance"
+description = "Task 'license' for Go projects"
+dependencies = [
+    "__km__license_go_control_plane",
+    "__km__license_go_virtual_kubelet",
+]
+
+[tasks.license_rs]
+plugin = "td-task-tracker"
+category = "06 - Compliance"
+description = "Task 'license' for Rust projects"
+dependencies = [
+    "__km__license_rs_kcommon",
+    "__km__license_rs_pod_runner",
+    "__km__license_rs_kminus",
+]
+
+[tasks.audit]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Task 'audit' for all modules"
+dependencies = [
+    "audit_go",
+    "audit_rs",
+]
+
+[tasks.audit_go]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Task 'audit' for Go projects"
+dependencies = [
+    "__km__audit_go_control_plane",
+    "__km__audit_go_virtual_kubelet",
+]
+
+[tasks.audit_rs]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Task 'audit' for Rust projects"
+dependencies = [
+    "__km__audit_rs_kcommon",
+    "__km__audit_rs_pod_runner",
+    "__km__audit_rs_kminus",
+]
+
+[tasks.deny]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Task 'deny' for all modules"
+dependencies = [
+    "deny_go",
+    "deny_rs",
+]
+
+[tasks.deny_go]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Task 'deny' for Go projects"
+dependencies = [
+    "__km__deny_go_control_plane",
+    "__km__deny_go_virtual_kubelet",
+]
+
+[tasks.deny_rs]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Task 'deny' for Rust projects"
+dependencies = [
+    "__km__deny_rs_kcommon",
+    "__km__deny_rs_pod_runner",
+    "__km__deny_rs_kminus",
+]
+
+[tasks.pants]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Task 'pants' for all modules"
+dependencies = [
+    "pants_go",
+    "pants_rs",
+]
+
+[tasks.pants_go]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Task 'pants' for Go projects"
+dependencies = [
+    "__km__pants_go_control_plane",
+    "__km__pants_go_virtual_kubelet",
+]
+
+[tasks.pants_rs]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Task 'pants' for Rust projects"
+dependencies = [
+    "__km__pants_rs_kcommon",
+    "__km__pants_rs_pod_runner",
+    "__km__pants_rs_kminus",
+]
+
+[tasks.check]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Task 'check' for all modules"
+dependencies = [
+    "check_go",
+    "check_rs",
+]
+
+[tasks.check_go]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Task 'check' for Go projects"
+dependencies = [
+    "__km__check_go_control_plane",
+    "__km__check_go_virtual_kubelet",
+]
+
+[tasks.check_rs]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Task 'check' for Rust projects"
+dependencies = [
+    "__km__check_rs_kcommon",
+    "__km__check_rs_pod_runner",
+    "__km__check_rs_kminus",
+]
+
+[tasks.clippy]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Task 'clippy' for all modules"
+dependencies = [
+    "clippy_go",
+    "clippy_rs",
+]
+
+[tasks.clippy_go]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Task 'clippy' for Go projects"
+dependencies = [
+    "__km__clippy_go_control_plane",
+    "__km__clippy_go_virtual_kubelet",
+]
+
+[tasks.clippy_rs]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Task 'clippy' for Rust projects"
+dependencies = [
+    "__km__clippy_rs_kcommon",
+    "__km__clippy_rs_pod_runner",
+    "__km__clippy_rs_kminus",
+]
+
+[tasks.fmt]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Task 'fmt' for all modules"
+dependencies = [
+    "fmt_go",
+    "fmt_rs",
+]
+
+[tasks.fmt_go]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Task 'fmt' for Go projects"
+dependencies = [
+    "__km__fmt_go_control_plane",
+    "__km__fmt_go_virtual_kubelet",
+]
+
+[tasks.fmt_rs]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Task 'fmt' for Rust projects"
+dependencies = [
+    "__km__fmt_rs_kcommon",
+    "__km__fmt_rs_pod_runner",
+    "__km__fmt_rs_kminus",
 ]
 
 [tasks.permit]

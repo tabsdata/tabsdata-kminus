@@ -1,0 +1,7 @@
+#
+# Copyright 2026 Tabs Data Inc.
+#
+
+[tasks.default]
+plugin = "td-task-tracker"
+alias = "make"

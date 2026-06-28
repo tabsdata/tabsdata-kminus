@@ -5,7 +5,7 @@
 [tasks.__km__clean_rs_pod_runner]
 plugin = "td-task-tracker"
 category = "01 - Clean"
-description = "Task 'clean' for pod_runner project"
+description = "Task 'clean' for pod-runner project"
 cwd = "${KM_ROOT}/mods/pod-runner"
 script_runner = "@duckscript"
 script = '''
