@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessStatus, ProcessesToUpdate, System};
 use tracing::{info, warn};
 
 pub const DATA_DIR: &str = "data";
@@ -109,7 +109,10 @@ pub fn apply_subprocess_flags(command: &mut Command) {
 pub fn is_alive(pid: u32) -> bool {
     let mut system = System::new();
     system.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
-    system.process(Pid::from_u32(pid)).is_some()
+    match system.process(Pid::from_u32(pid)) {
+        Some(process) => process.status() != ProcessStatus::Zombie,
+        None => false,
+    }
 }
 
 /// Walk the process table by PPID and return every descendant of `root`.
