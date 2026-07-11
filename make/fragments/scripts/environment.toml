@@ -283,15 +283,6 @@ env_scripts = [
         end
     end
 
-    is_musl = eq ${td-target} "x86_64-unknown-linux-musl"
-    if ${is_musl}
-        PROJECT_RS_KCOMMON_CARGO_TOML = set "mods/kcommon/Cargo.toml"
-        PROJECT_RS_KMINUS_CARGO_TOML = set "mods/kminus/Cargo.toml"
-        PROJECT_RS_POD_RUNNER_CARGO_TOML = set "mods/pod-runner/Cargo.toml"
-        set_env PROJECT_RS_KCOMMON_CARGO_TOML ${PROJECT_RS_KCOMMON_CARGO_TOML}
-        set_env PROJECT_RS_KMINUS_CARGO_TOML ${PROJECT_RS_KMINUS_CARGO_TOML}
-        set_env PROJECT_RS_POD_RUNNER_CARGO_TOML ${PROJECT_RS_POD_RUNNER_CARGO_TOML}
-    end
     PROJECT_RS_KCOMMON_CARGO_TOML = get_env PROJECT_RS_KCOMMON_CARGO_TOML
     PROJECT_RS_KMINUS_CARGO_TOML = get_env PROJECT_RS_KMINUS_CARGO_TOML
     PROJECT_RS_POD_RUNNER_CARGO_TOML = get_env PROJECT_RS_POD_RUNNER_CARGO_TOML

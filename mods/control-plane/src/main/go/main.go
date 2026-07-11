@@ -266,12 +266,18 @@ func writeChildPids(pidsDir string) {
 	}
 }
 
+// processAlive reports whether a process with the given pid is running.
+func processAlive(pid int) bool {
+	exists, err := process.PidExists(int32(pid))
+	return err == nil && exists
+}
+
 // waitForDeath waits up to timeout for a process to exit.
 // Returns true if the process is gone.
 func waitForDeath(pid int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if err := syscall.Kill(pid, 0); err != nil {
+		if !processAlive(pid) {
 			return true
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -279,13 +285,17 @@ func waitForDeath(pid int, timeout time.Duration) bool {
 	return false
 }
 
-// killAndWait sends SIGTERM, waits, then SIGKILL if needed.
+// killAndWait requests graceful termination, waits, then force-kills if needed.
 func killAndWait(pid int) {
-	syscall.Kill(pid, syscall.SIGTERM)
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return
+	}
+	proc.Signal(syscall.SIGTERM)
 	if waitForDeath(pid, 5*time.Second) {
 		return
 	}
-	syscall.Kill(pid, syscall.SIGKILL)
+	proc.Kill()
 	waitForDeath(pid, 2*time.Second)
 }
 
@@ -314,7 +324,7 @@ func stopAndCleanPid(pidsDir, processName string, info func(string, ...any)) {
 		return
 	}
 	// Check if still alive
-	if err := syscall.Kill(pid, 0); err != nil {
+	if !processAlive(pid) {
 		os.Remove(path)
 		return
 	}
