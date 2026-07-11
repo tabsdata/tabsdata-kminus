@@ -287,6 +287,7 @@ fn setup_logging(logdir: &Path, max_size_mb: u32, max_files: u32, loglevel: LogL
         AppendCount::new(max_files - 1),
         ContentLimit::Bytes((max_size_mb as usize) * 1024 * 1024),
         Compression::None,
+        #[cfg(unix)]
         None,
     );
     let writer = std::sync::Mutex::new(writer);
