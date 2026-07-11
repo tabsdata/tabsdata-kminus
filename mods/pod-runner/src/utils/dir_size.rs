@@ -119,8 +119,7 @@ fn allocated_stat(_path: &Path, meta: &std::fs::Metadata) -> DirSizeStat {
 #[cfg(windows)]
 fn allocated_stat(path: &Path, meta: &std::fs::Metadata) -> DirSizeStat {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::INVALID_FILE_SIZE;
-    use windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW;
+    use windows_sys::Win32::Storage::FileSystem::{GetCompressedFileSizeW, INVALID_FILE_SIZE};
 
     // GetCompressedFileSizeW is not meaningful for directories.
     if meta.is_dir() {
