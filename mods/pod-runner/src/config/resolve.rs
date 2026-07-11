@@ -402,6 +402,7 @@ mod tests {
             metrics_port: None,
             logmaxsizemb: 100,
             logmaxfiles: 3,
+            loglevel: crate::config::loglevel::LogLevel::Debug,
         };
 
         let config = resolve_config(&cli).unwrap();
@@ -477,6 +478,7 @@ keepDeletedPodDir: true
             metrics_port: None,
             logmaxsizemb: 100,
             logmaxfiles: 3,
+            loglevel: crate::config::loglevel::LogLevel::Debug,
         };
 
         let config = resolve_config(&cli).unwrap();
@@ -531,6 +533,7 @@ keepDeletedPodDir: true
             metrics_port: None,
             logmaxsizemb: 100,
             logmaxfiles: 3,
+            loglevel: crate::config::loglevel::LogLevel::Debug,
         };
 
         let config = resolve_config(&cli).unwrap();
@@ -576,6 +579,7 @@ keepDeletedPodDir: true
             metrics_port: None,
             logmaxsizemb: 100,
             logmaxfiles: 3,
+            loglevel: crate::config::loglevel::LogLevel::Debug,
         };
 
         let c = resolve_config(&cli).unwrap();
@@ -617,6 +621,7 @@ keepDeletedPodDir: true
             metrics_port: None,
             logmaxsizemb: 100,
             logmaxfiles: 3,
+            loglevel: crate::config::loglevel::LogLevel::Debug,
         };
 
         let c = resolve_config(&cli).unwrap();
@@ -660,6 +665,7 @@ keepDeletedPodDir: true
             metrics_port: None,
             logmaxsizemb: 100,
             logmaxfiles: 3,
+            loglevel: crate::config::loglevel::LogLevel::Debug,
         };
 
         let c = resolve_config(&cli).unwrap();
@@ -727,6 +733,7 @@ capacity:
             metrics_port: None,
             logmaxsizemb: 100,
             logmaxfiles: 3,
+            loglevel: crate::config::loglevel::LogLevel::Debug,
         };
 
         let c = resolve_config(&cli).unwrap();

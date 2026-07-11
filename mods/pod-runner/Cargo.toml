@@ -88,6 +88,7 @@ rustls-pemfile = { version = "2" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149" }
 serde_yaml_ng = { version = "0.10" }
+strum = { version = "0.28.0", features = ["derive"] }
 tar = { version = "0.4" }
 thiserror = { version = "2" }
 time = { version = "0.3" }

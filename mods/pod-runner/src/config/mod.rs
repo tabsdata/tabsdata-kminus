@@ -10,6 +10,7 @@
 //! 5. Regenerate `vk-prconfig.yaml` ([`vk_config`])
 
 pub mod cli;
+pub mod loglevel;
 pub mod pki;
 pub mod resolve;
 pub mod template;

@@ -6,6 +6,7 @@ use clap::Parser;
 use file_rotate::{ContentLimit, FileRotate, compression::Compression, suffix::AppendCount};
 use tokio::sync::watch;
 use tracing::info;
+use tracing_subscriber::filter::LevelFilter;
 
 use pod_runner::config::cli::CliArgs;
 use pod_runner::config::resolve::resolve_config;
@@ -56,7 +57,8 @@ async fn main() {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::default()
+                .add_directive(LevelFilter::from(cli.loglevel).into()),
         )
         .with_writer(writer)
         .with_ansi(false)
@@ -66,6 +68,7 @@ async fn main() {
         log = %log_path.display(),
         max_size_mb = cli.logmaxsizemb,
         max_files = cli.logmaxfiles,
+        loglevel = %cli.loglevel,
         "Logging initialized (size-based rotation)",
     );
 

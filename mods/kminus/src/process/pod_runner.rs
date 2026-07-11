@@ -10,6 +10,7 @@ use std::time::Duration;
 use tracing::{error, info};
 
 use crate::config::KmSysConfig;
+use crate::loglevel::LogLevel;
 use crate::process::control_plane;
 use crate::system::file::wait_for_file;
 use crate::system::pid::{apply_subprocess_flags, kill_child, remove_pid, write_pid};
@@ -58,12 +59,14 @@ pub fn start(
     kubeconfig: &Path,
     vk_prconfig: &Path,
     imagesdir: Option<&str>,
+    loglevel: LogLevel,
     cp: &mut Child,
 ) -> Child {
     info!("Starting {}...", BIN);
     let pr_bin = resolve_binary(BIN);
     let log_max_size = sys_cfg.log.max_size_mb.to_string();
     let log_max_files = sys_cfg.log.max_files.to_string();
+    let loglevel = loglevel.to_string();
     let mut command = Command::new(&pr_bin);
     command
         .args([
@@ -79,6 +82,8 @@ pub fn start(
             &log_max_size,
             "--logmaxfiles",
             &log_max_files,
+            "--loglevel",
+            &loglevel,
             "--port",
             port_pr,
             "--metrics-port",

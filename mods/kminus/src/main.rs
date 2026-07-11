@@ -20,10 +20,14 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand};
 use file_rotate::{ContentLimit, FileRotate, compression::Compression, suffix::AppendCount};
 use tracing::{error, info, warn};
+use tracing_subscriber::filter::LevelFilter;
 
 mod config;
+mod loglevel;
 mod process;
 mod system;
+
+use loglevel::LogLevel;
 
 use config::{KM_SYSCONFIG_FILE, KmSysConfig};
 use process::{control_plane, pod_runner, virtual_kubelet};
@@ -143,6 +147,11 @@ struct StartArgs {
     /// `prsysconfig.yaml`, then to `./images`.
     #[arg(long)]
     imagesdir: Option<String>,
+
+    /// Level for km's own log file and, forwarded verbatim, for the
+    /// pod-runner's. Independent of `RUST_LOG`, which is ignored.
+    #[arg(long, value_enum, default_value_t = LogLevel::Debug)]
+    loglevel: LogLevel,
 }
 
 /// Stop-time arguments. Terminates a running instance.
@@ -270,7 +279,7 @@ impl Paths {
 
 /// Initialize tracing to write to `<logdir>/km.log` with size-based
 /// rotation. Idempotent — safe to call once per process.
-fn setup_logging(logdir: &Path, max_size_mb: u32, max_files: u32) -> PathBuf {
+fn setup_logging(logdir: &Path, max_size_mb: u32, max_files: u32, loglevel: LogLevel) -> PathBuf {
     let km_log_path = logdir.join(KM_LOG_FILE);
     let max_files = max_files.max(1) as usize;
     let writer = FileRotate::new(
@@ -283,7 +292,8 @@ fn setup_logging(logdir: &Path, max_size_mb: u32, max_files: u32) -> PathBuf {
     let writer = std::sync::Mutex::new(writer);
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::default()
+                .add_directive(LevelFilter::from(loglevel).into()),
         )
         .with_writer(writer)
         .with_ansi(false)
@@ -292,6 +302,7 @@ fn setup_logging(logdir: &Path, max_size_mb: u32, max_files: u32) -> PathBuf {
         log = %km_log_path.display(),
         max_size_mb,
         max_files,
+        %loglevel,
         "Logging initialized (size-based rotation)",
     );
     km_log_path
@@ -632,6 +643,7 @@ fn command_start(args: StartArgs) {
         &paths.logdir,
         sys_cfg.log.max_size_mb,
         sys_cfg.log.max_files,
+        args.loglevel,
     );
 
     let port_api = sys_cfg.ports.api.to_string();
@@ -709,6 +721,7 @@ fn command_start(args: StartArgs) {
         &kubeconfig,
         &vk_prconfig,
         args.imagesdir.as_deref(),
+        args.loglevel,
         &mut cp,
     );
     step_done(phase);

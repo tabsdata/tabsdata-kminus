@@ -4,6 +4,8 @@
 
 use clap::Parser;
 
+use crate::config::loglevel::LogLevel;
+
 /// Default config directory (under cwd when standalone).
 pub const DEFAULT_CONFIGDIR: &str = "config";
 /// Default working directory.
@@ -74,6 +76,11 @@ pub struct CliArgs {
     /// Set to 0 to disable metrics. Default: 3001
     #[arg(long)]
     pub metrics_port: Option<u16>,
+
+    /// Level for pod-runner's own log file. Independent of `RUST_LOG`,
+    /// which is ignored. km forwards its own `--loglevel` here.
+    #[arg(long, value_enum, default_value_t = LogLevel::Debug)]
+    pub loglevel: LogLevel,
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +101,7 @@ mod tests {
         assert!(args.imagesdir.is_none());
         assert!(args.port.is_none());
         assert!(args.metrics_port.is_none());
+        assert_eq!(args.loglevel, LogLevel::Debug);
     }
 
     #[test]
@@ -114,6 +122,8 @@ mod tests {
             "9000",
             "--metrics-port",
             "9001",
+            "--loglevel",
+            "warn",
         ])
         .unwrap();
         assert_eq!(args.kubeconfig.as_deref(), Some("/etc/kube/config"));
@@ -123,6 +133,7 @@ mod tests {
         assert_eq!(args.workdir.as_deref(), Some("/var/pr"));
         assert_eq!(args.logdir.as_deref(), Some("/var/log/pr"));
         assert_eq!(args.imagesdir.as_deref(), Some("/var/lib/kminus/images"));
+        assert_eq!(args.loglevel, LogLevel::Warn);
     }
 
     #[test]
