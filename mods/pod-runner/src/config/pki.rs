@@ -10,7 +10,10 @@ use std::fs;
 use std::path::Path;
 
 use base64::Engine;
-use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, CertifiedKey, DnType, IsCa, KeyPair, KeyUsagePurpose, ExtendedKeyUsagePurpose, SanType};
+use rcgen::{
+    BasicConstraints, CertificateParams, CertifiedIssuer, CertifiedKey, DnType,
+    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
+};
 use time::{Duration, OffsetDateTime};
 use tracing::info;
 
@@ -51,7 +54,9 @@ pub fn generate_pki(address: &str) -> PkiBundle {
 fn generate_ca() -> (CertifiedIssuer<'static, KeyPair>, String, String) {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.distinguished_name.push(DnType::CommonName, "podrunner-ca");
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "podrunner-ca");
     params.not_before = OffsetDateTime::now_utc();
     params.not_after = OffsetDateTime::now_utc() + Duration::days(3650);
     params.key_usages = vec![
@@ -76,11 +81,15 @@ fn generate_server_cert(ca: &CertifiedIssuer<'_, KeyPair>, address: &str) -> Cer
             sans.push(SanType::IpAddress(ip));
         }
     } else if address != "localhost" {
-        sans.push(SanType::DnsName(rcgen::string::Ia5String::try_from(address).unwrap()));
+        sans.push(SanType::DnsName(
+            rcgen::string::Ia5String::try_from(address).unwrap(),
+        ));
     }
 
     let mut params = CertificateParams::new(vec![]).expect("server cert params");
-    params.distinguished_name.push(DnType::CommonName, "podrunner-server");
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "podrunner-server");
     params.not_before = OffsetDateTime::now_utc();
     params.not_after = OffsetDateTime::now_utc() + Duration::days(365);
     params.subject_alt_names = sans;
@@ -93,7 +102,10 @@ fn generate_server_cert(ca: &CertifiedIssuer<'_, KeyPair>, address: &str) -> Cer
     let cert = params
         .signed_by(&key, ca)
         .expect("server cert signing failed");
-    CertifiedKey { cert, signing_key: key }
+    CertifiedKey {
+        cert,
+        signing_key: key,
+    }
 }
 
 fn generate_client_cert(ca: &CertifiedIssuer<'_, KeyPair>, id: &str) -> CertifiedKey<KeyPair> {
@@ -107,7 +119,10 @@ fn generate_client_cert(ca: &CertifiedIssuer<'_, KeyPair>, id: &str) -> Certifie
     let cert = params
         .signed_by(&key, ca)
         .expect("client cert signing failed");
-    CertifiedKey { cert, signing_key: key }
+    CertifiedKey {
+        cert,
+        signing_key: key,
+    }
 }
 
 fn b64(pem: &str) -> String {
@@ -127,8 +142,7 @@ pub fn generate_and_write_configs(
     port: u16,
     metrics_port: u16,
 ) -> Result<(), String> {
-    fs::create_dir_all(configdir)
-        .map_err(|e| format!("Failed to create configdir: {e}"))?;
+    fs::create_dir_all(configdir).map_err(|e| format!("Failed to create configdir: {e}"))?;
 
     let pki = generate_pki(address);
     let url = format!("https://{address}:{port}");
@@ -230,7 +244,10 @@ mod tests {
         generate_and_write_configs(&tmp, "127.0.0.1", 10300, 3001).unwrap();
 
         assert!(tmp.join(PRCONFIG_FILENAME).exists());
-        assert!(tmp.join(crate::config::template::VK_PRCONFIG_FILENAME).exists());
+        assert!(
+            tmp.join(crate::config::template::VK_PRCONFIG_FILENAME)
+                .exists()
+        );
         // CA key is no longer written to disk
 
         // Verify prconfig.yaml is parseable

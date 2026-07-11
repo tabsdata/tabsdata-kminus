@@ -225,10 +225,7 @@ pub(crate) async fn scan_dir(
 /// Recursive walker. Honors `_skip` markers at every level but does
 /// not touch `_size` files in subdirectories — only [`scan_dir`]
 /// writes the size file, and only at the root it was called on.
-async fn walk(
-    dir: &Path,
-    shutdown_rx: &mut watch::Receiver<()>,
-) -> ScanResult<DirSizeStat> {
+async fn walk(dir: &Path, shutdown_rx: &mut watch::Receiver<()>) -> ScanResult<DirSizeStat> {
     if shutdown_rx.has_changed().unwrap_or(true) {
         return Ok(DirSizeStat::default());
     }
@@ -243,15 +240,13 @@ async fn walk(
     let mut total = DirSizeStat::default();
 
     // Count the directory entry's own allocation (matches `du`).
-    let dir_meta = fs::symlink_metadata(dir).await.map_err(|e| io_err(dir, e))?;
+    let dir_meta = fs::symlink_metadata(dir)
+        .await
+        .map_err(|e| io_err(dir, e))?;
     total.add(allocated_stat(dir, &dir_meta));
 
     let mut entries = fs::read_dir(dir).await.map_err(|e| io_err(dir, e))?;
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|e| io_err(dir, e))?
-    {
+    while let Some(entry) = entries.next_entry().await.map_err(|e| io_err(dir, e))? {
         if shutdown_rx.has_changed().unwrap_or(true) {
             return Ok(total);
         }
@@ -395,8 +390,14 @@ mod tests {
         scan_dir(&tmp, &mut rx).await.unwrap();
 
         assert!(tmp.join(SIZE_FILE).exists(), "root _size should exist");
-        assert!(!sub.join(SIZE_FILE).exists(), "subdir _size should NOT exist");
-        assert!(!deeper.join(SIZE_FILE).exists(), "deeper subdir _size should NOT exist");
+        assert!(
+            !sub.join(SIZE_FILE).exists(),
+            "subdir _size should NOT exist"
+        );
+        assert!(
+            !deeper.join(SIZE_FILE).exists(),
+            "deeper subdir _size should NOT exist"
+        );
 
         let _ = stdfs::remove_dir_all(&tmp);
     }
@@ -474,7 +475,10 @@ mod tests {
         let (_tx, mut rx) = watch::channel(());
         let stat = scan_dir(&tmp, &mut rx).await.unwrap();
 
-        assert!(stat.bytes >= 8192, "deeply nested payload should be counted");
+        assert!(
+            stat.bytes >= 8192,
+            "deeply nested payload should be counted"
+        );
 
         let _ = stdfs::remove_dir_all(&tmp);
     }
@@ -491,7 +495,10 @@ mod tests {
         let (_tx, mut rx) = watch::channel(());
         let stat = scan_dir(&tmp, &mut rx).await.unwrap();
 
-        assert!(stat.bytes >= 3 * 8192, "all peer subtrees should be counted");
+        assert!(
+            stat.bytes >= 3 * 8192,
+            "all peer subtrees should be counted"
+        );
 
         let _ = stdfs::remove_dir_all(&tmp);
     }

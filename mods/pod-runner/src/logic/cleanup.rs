@@ -10,16 +10,16 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use flate2::write::GzEncoder;
 use flate2::Compression;
+use flate2::write::GzEncoder;
 use tracing::{debug, warn};
 
 use super::ExecutorProvider;
-use crate::utils::dir_size::SIZE_FILE;
 use crate::spec::constants::{
     ANN_KEEP_DELETED_POD_DIR, ANN_KEEP_FAILED_POD_DIR, FINISHED_SENTINEL, PodPhase,
 };
 use crate::store::{PodId, PodStore, SpecView};
+use crate::utils::dir_size::SIZE_FILE;
 
 // ---------------------------------------------------------------------------
 // CleanupConfig
@@ -80,8 +80,8 @@ pub fn should_keep_work_dir(
     keep_deleted_pod_dir: bool,
     keep_failed_pod_dir: bool,
 ) -> bool {
-    let keep_failed = parse_bool_annotation(annotations, ANN_KEEP_FAILED_POD_DIR)
-        .unwrap_or(keep_failed_pod_dir);
+    let keep_failed =
+        parse_bool_annotation(annotations, ANN_KEEP_FAILED_POD_DIR).unwrap_or(keep_failed_pod_dir);
     let keep_deleted = parse_bool_annotation(annotations, ANN_KEEP_DELETED_POD_DIR)
         .unwrap_or(keep_deleted_pod_dir);
 
@@ -117,8 +117,7 @@ pub async fn create_pod_archive(
 
     // Add original spec
     if let Some(snap) = store.get(id, SpecView::Original).await {
-        let json = serde_json::to_vec_pretty(&*snap.spec)
-            .map_err(|e| io::Error::other(e))?;
+        let json = serde_json::to_vec_pretty(&*snap.spec).map_err(|e| io::Error::other(e))?;
         let mut header = tar::Header::new_gnu();
         header.set_size(json.len() as u64);
         header.set_mode(0o644);
@@ -130,9 +129,10 @@ pub async fn create_pod_archive(
 
     // Add log files
     if let Some(log_dir) = log_dir
-        && log_dir.is_dir() {
-            append_dir_recursive(&mut tar, log_dir, Path::new("logs"))?;
-        }
+        && log_dir.is_dir()
+    {
+        append_dir_recursive(&mut tar, log_dir, Path::new("logs"))?;
+    }
 
     tar.into_inner()?.finish()?;
     debug!(pod = %id, path = ?archive_path, "Pod archive created");
@@ -203,12 +203,7 @@ pub async fn cleanup_pod(
     let pod_dir = executor_provider.work_dir(id);
     if config.pod_archive_ttl_days > 0 {
         let log_dir = executor_provider.log_dir(id);
-        if let Err(e) = create_pod_archive(
-            &pod_dir,
-            id,
-            store,
-            log_dir.as_deref(),
-        ).await {
+        if let Err(e) = create_pod_archive(&pod_dir, id, store, log_dir.as_deref()).await {
             warn!(pod = %id, error = %e, "Failed to create pod archive, continuing cleanup");
         }
         // Remove the disk-usage cache file: the value is stale post-pod
@@ -236,9 +231,10 @@ pub async fn cleanup_pod(
         // gone through monitor_pod completion yet).
         let sentinel = work_dir.join(FINISHED_SENTINEL);
         if !sentinel.exists()
-            && let Err(e) = fs::write(&sentinel, chrono::Utc::now().to_rfc3339()) {
-                warn!(error = %e, "Failed to write FINISHED sentinel");
-            }
+            && let Err(e) = fs::write(&sentinel, chrono::Utc::now().to_rfc3339())
+        {
+            warn!(error = %e, "Failed to write FINISHED sentinel");
+        }
         debug!(%phase, "Work directory kept");
     }
 }
@@ -299,7 +295,12 @@ mod tests {
     #[tokio::test]
     async fn keep_work_dir_succeeded_without_keep() {
         let ann = HashMap::new();
-        assert!(!should_keep_work_dir(PodPhase::Succeeded, &ann, false, false));
+        assert!(!should_keep_work_dir(
+            PodPhase::Succeeded,
+            &ann,
+            false,
+            false
+        ));
     }
 
     #[tokio::test]
@@ -330,11 +331,8 @@ mod tests {
 
     fn test_tmp() -> PathBuf {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "pr-cleanup-test-{}-{}",
-            std::process::id(),
-            n,
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("pr-cleanup-test-{}-{}", std::process::id(), n,));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -344,7 +342,9 @@ mod tests {
         let spec = Arc::new(PodSpec::default());
         let mut status = PodStatus::default();
         status.phase = phase;
-        store.put(id.clone(), Arc::clone(&spec), Arc::clone(&spec), status).await;
+        store
+            .put(id.clone(), Arc::clone(&spec), Arc::clone(&spec), status)
+            .await;
         store
     }
 
@@ -363,11 +363,7 @@ mod tests {
     }
 
     impl super::super::ExecutorProvider for StubProvider {
-        fn create(
-            &self,
-            _pod: Arc<PodSpec>,
-            _id: &PodId,
-        ) -> crate::pod::executor::PodExecutor {
+        fn create(&self, _pod: Arc<PodSpec>, _id: &PodId) -> crate::pod::executor::PodExecutor {
             unimplemented!("stub")
         }
         fn work_dir(&self, id: &PodId) -> PathBuf {
@@ -384,7 +380,14 @@ mod tests {
         let store = MemoryStore::new();
         let id = PodId::new("default", "app", "uid-1");
         let spec = Arc::new(PodSpec::default());
-        store.put(id.clone(), Arc::clone(&spec), Arc::clone(&spec), PodStatus::default()).await;
+        store
+            .put(
+                id.clone(),
+                Arc::clone(&spec),
+                Arc::clone(&spec),
+                PodStatus::default(),
+            )
+            .await;
 
         let pod_dir = tmp.join("pod-dir");
         fs::create_dir_all(&pod_dir).unwrap();
@@ -395,7 +398,11 @@ mod tests {
         fs::write(container_log_dir.join("0.log"), "log line 1\n").unwrap();
 
         let result = create_pod_archive(&pod_dir, &id, &store, Some(&log_dir)).await;
-        assert!(result.is_ok(), "archive creation failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "archive creation failed: {:?}",
+            result.err()
+        );
 
         let archive_path = result.unwrap();
         assert!(archive_path.exists());
@@ -422,7 +429,14 @@ mod tests {
         let store = MemoryStore::new();
         let id = PodId::new("default", "app", "uid-2");
         let spec = Arc::new(PodSpec::default());
-        store.put(id.clone(), Arc::clone(&spec), Arc::clone(&spec), PodStatus::default()).await;
+        store
+            .put(
+                id.clone(),
+                Arc::clone(&spec),
+                Arc::clone(&spec),
+                PodStatus::default(),
+            )
+            .await;
 
         let pod_dir = tmp.join("pod-dir");
         fs::create_dir_all(&pod_dir).unwrap();
@@ -471,7 +485,10 @@ mod tests {
 
         assert!(!work.exists(), "work dir should be deleted");
         assert!(!log.exists(), "log dir should be deleted");
-        assert!(store.get(&id, SpecView::Original).await.is_none(), "store entry should be removed");
+        assert!(
+            store.get(&id, SpecView::Original).await.is_none(),
+            "store entry should be removed"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -498,7 +515,10 @@ mod tests {
         cleanup_pod(&id, &store, &provider, &config).await;
 
         assert!(work.exists(), "work dir should be kept for failed pod");
-        assert!(work.join(FINISHED_SENTINEL).exists(), "FINISHED sentinel should exist");
+        assert!(
+            work.join(FINISHED_SENTINEL).exists(),
+            "FINISHED sentinel should exist"
+        );
         assert!(log.exists(), "log dir should be kept (inside work dir)");
 
         let _ = fs::remove_dir_all(&tmp);
@@ -519,7 +539,7 @@ mod tests {
         fs::write(container_log.join("0.log"), "hello").unwrap();
 
         let config = CleanupConfig {
-            keep_deleted_pod_dir: true,  // keep so we can inspect the archive
+            keep_deleted_pod_dir: true, // keep so we can inspect the archive
             keep_failed_pod_dir: true,
             pod_archive_ttl_days: 7,
             pods_dir: tmp.join("work"),
@@ -559,7 +579,10 @@ mod tests {
 
         cleanup_pod(&id, &store, &provider, &config).await;
 
-        assert!(work.join("archive.tgz").exists(), "archive should be created");
+        assert!(
+            work.join("archive.tgz").exists(),
+            "archive should be created"
+        );
         assert!(
             !work.join(SIZE_FILE).exists(),
             "_size file should be removed on archival",
@@ -614,7 +637,10 @@ mod tests {
 
         cleanup_pod(&id, &store, &provider, &config).await;
 
-        assert!(!work.join("archive.tgz").exists(), "archive should not be created");
+        assert!(
+            !work.join("archive.tgz").exists(),
+            "archive should not be created"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -641,7 +667,10 @@ mod tests {
         cleanup_pod(&id, &store, &provider, &config).await;
 
         assert!(!work.exists(), "work dir should still not exist");
-        assert!(store.get(&id, SpecView::Original).await.is_none(), "store should be removed");
+        assert!(
+            store.get(&id, SpecView::Original).await.is_none(),
+            "store should be removed"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }

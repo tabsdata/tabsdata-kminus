@@ -115,7 +115,13 @@ async fn run_scan_loop(
     // Initial scan.
     {
         let mut cancel = runner_shutdown.clone();
-        one_scan(&work_dir, &mut cancel, labels.initial_ok, labels.initial_err).await;
+        one_scan(
+            &work_dir,
+            &mut cancel,
+            labels.initial_ok,
+            labels.initial_err,
+        )
+        .await;
     }
 
     let mut ticker = time::interval(interval);
@@ -148,7 +154,13 @@ async fn run_scan_loop(
     // Final scan. Fresh, un-fired cancel so this scan can complete
     // even when runner_shutdown has already fired.
     let (_keep_tx, mut never_fires) = watch::channel(());
-    one_scan(&work_dir, &mut never_fires, labels.final_ok, labels.final_err).await;
+    one_scan(
+        &work_dir,
+        &mut never_fires,
+        labels.final_ok,
+        labels.final_err,
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -166,7 +178,9 @@ pub struct DiskSizePodTask {
 impl DiskSizePodTask {
     /// Create with the default [`DEFAULT_SCAN_INTERVAL`].
     pub fn new() -> Self {
-        Self { interval: DEFAULT_SCAN_INTERVAL }
+        Self {
+            interval: DEFAULT_SCAN_INTERVAL,
+        }
     }
 
     /// Create with a custom scan interval (mainly for tests).
@@ -212,7 +226,9 @@ pub struct DiskSizeRunnerTask {
 impl DiskSizeRunnerTask {
     /// Create with the default [`DEFAULT_SCAN_INTERVAL`].
     pub fn new() -> Self {
-        Self { interval: DEFAULT_SCAN_INTERVAL }
+        Self {
+            interval: DEFAULT_SCAN_INTERVAL,
+        }
     }
 
     /// Create with a custom scan interval (mainly for tests).
@@ -390,7 +406,10 @@ mod tests {
             .expect("task did not finish in time")
             .expect("task panicked");
 
-        assert!(work_dir.join("_size").exists(), "root _size should be written");
+        assert!(
+            work_dir.join("_size").exists(),
+            "root _size should be written"
+        );
         assert!(
             !sub.join("_size").exists(),
             "subdir _size should NOT be written (no subtree caching)",
@@ -469,7 +488,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(found, "initial scan should write _size before the first interval tick");
+        assert!(
+            found,
+            "initial scan should write _size before the first interval tick"
+        );
 
         let _ = std::fs::remove_dir_all(&work_dir);
     }
@@ -497,7 +519,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(found, "initial scan should write _size before the first interval tick");
+        assert!(
+            found,
+            "initial scan should write _size before the first interval tick"
+        );
 
         let _ = std::fs::remove_dir_all(&work_dir);
     }

@@ -101,13 +101,12 @@ impl FileConfigMapResolver {
                     ));
                 }
             };
-            let doc: serde_json::Value =
-                serde_yaml_ng::from_str(&content).map_err(|e| {
-                    ConfigMapResolverError::other(
-                        name,
-                        format!("invalid YAML in {}: {}", path.display(), e),
-                    )
-                })?;
+            let doc: serde_json::Value = serde_yaml_ng::from_str(&content).map_err(|e| {
+                ConfigMapResolverError::other(
+                    name,
+                    format!("invalid YAML in {}: {}", path.display(), e),
+                )
+            })?;
 
             let mut data = HashMap::new();
             if let Some(obj) = doc.get("data").and_then(|d| d.as_object()) {
@@ -336,12 +335,7 @@ mod tests {
         });
 
         let err = resolver
-            .config_maps(
-                "default",
-                &["never-comes".to_string()],
-                None,
-                &mut rx,
-            )
+            .config_maps("default", &["never-comes".to_string()], None, &mut rx)
             .await
             .unwrap_err();
         canceller.await.unwrap();

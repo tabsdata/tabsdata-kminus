@@ -13,9 +13,7 @@ pub mod server;
 use std::sync::Arc;
 use std::time::Instant;
 
-use prometheus::{
-    Gauge, Histogram, HistogramOpts, HistogramVec, IntCounter, IntGauge, Registry,
-};
+use prometheus::{Gauge, Histogram, HistogramOpts, HistogramVec, IntCounter, IntGauge, Registry};
 
 /// Default metrics port.
 pub const DEFAULT_METRICS_PORT: u16 = 3001;
@@ -56,49 +54,31 @@ impl Metrics {
     pub fn new() -> Arc<Self> {
         let registry = Registry::new();
 
-        let pods_running = IntGauge::new("pr_pods_running", "Number of currently running pods")
-            .unwrap();
+        let pods_running =
+            IntGauge::new("pr_pods_running", "Number of currently running pods").unwrap();
         let containers_running = IntGauge::new(
             "pr_containers_running",
             "Number of currently running containers",
         )
         .unwrap();
-        let tokio_tasks = IntGauge::new(
-            "pr_tokio_tasks_active",
-            "Number of active tokio tasks",
-        )
-        .unwrap();
-        let memory_physical_bytes = IntGauge::new(
-            "pr_memory_physical_bytes",
-            "Physical memory (RSS) in bytes",
-        )
-        .unwrap();
-        let memory_virtual_bytes = IntGauge::new(
-            "pr_memory_virtual_bytes",
-            "Virtual memory in bytes",
-        )
-        .unwrap();
-        let uptime_seconds = Gauge::new(
-            "pr_uptime_seconds",
-            "Seconds since the pod runner started",
-        )
-        .unwrap();
+        let tokio_tasks =
+            IntGauge::new("pr_tokio_tasks_active", "Number of active tokio tasks").unwrap();
+        let memory_physical_bytes =
+            IntGauge::new("pr_memory_physical_bytes", "Physical memory (RSS) in bytes").unwrap();
+        let memory_virtual_bytes =
+            IntGauge::new("pr_memory_virtual_bytes", "Virtual memory in bytes").unwrap();
+        let uptime_seconds =
+            Gauge::new("pr_uptime_seconds", "Seconds since the pod runner started").unwrap();
 
-        let pods_created_total = IntCounter::new(
-            "pr_pods_created_total",
-            "Total pods created since startup",
-        )
-        .unwrap();
+        let pods_created_total =
+            IntCounter::new("pr_pods_created_total", "Total pods created since startup").unwrap();
         let pods_started_total = IntCounter::new(
             "pr_pods_started_total",
             "Total pods that reached Running phase",
         )
         .unwrap();
-        let pods_deleted_total = IntCounter::new(
-            "pr_pods_deleted_total",
-            "Total pods deleted since startup",
-        )
-        .unwrap();
+        let pods_deleted_total =
+            IntCounter::new("pr_pods_deleted_total", "Total pods deleted since startup").unwrap();
         let pods_failed_total = IntCounter::new(
             "pr_pods_failed_total",
             "Total pods that reached Failed phase",
@@ -120,19 +100,13 @@ impl Metrics {
         ];
 
         let pod_creation_seconds = Histogram::with_opts(
-            HistogramOpts::new(
-                "pr_pod_creation_seconds",
-                "Pod creation latency in seconds",
-            )
-            .buckets(latency_buckets.clone()),
+            HistogramOpts::new("pr_pod_creation_seconds", "Pod creation latency in seconds")
+                .buckets(latency_buckets.clone()),
         )
         .unwrap();
         let pod_deletion_seconds = Histogram::with_opts(
-            HistogramOpts::new(
-                "pr_pod_deletion_seconds",
-                "Pod deletion latency in seconds",
-            )
-            .buckets(latency_buckets.clone()),
+            HistogramOpts::new("pr_pod_deletion_seconds", "Pod deletion latency in seconds")
+                .buckets(latency_buckets.clone()),
         )
         .unwrap();
         let http_request_duration = HistogramVec::new(
@@ -146,18 +120,37 @@ impl Metrics {
         .unwrap();
 
         // Register all metrics
-        for g in [&pods_running, &containers_running, &tokio_tasks, &memory_physical_bytes, &memory_virtual_bytes] {
+        for g in [
+            &pods_running,
+            &containers_running,
+            &tokio_tasks,
+            &memory_physical_bytes,
+            &memory_virtual_bytes,
+        ] {
             registry.register(Box::new(g.clone())).unwrap();
         }
         registry.register(Box::new(uptime_seconds.clone())).unwrap();
 
-        for c in [&pods_created_total, &pods_started_total, &pods_deleted_total, &pods_failed_total, &containers_started_total, &containers_failed_total] {
+        for c in [
+            &pods_created_total,
+            &pods_started_total,
+            &pods_deleted_total,
+            &pods_failed_total,
+            &containers_started_total,
+            &containers_failed_total,
+        ] {
             registry.register(Box::new(c.clone())).unwrap();
         }
 
-        registry.register(Box::new(pod_creation_seconds.clone())).unwrap();
-        registry.register(Box::new(pod_deletion_seconds.clone())).unwrap();
-        registry.register(Box::new(http_request_duration.clone())).unwrap();
+        registry
+            .register(Box::new(pod_creation_seconds.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(pod_deletion_seconds.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(http_request_duration.clone()))
+            .unwrap();
 
         Arc::new(Self {
             registry,

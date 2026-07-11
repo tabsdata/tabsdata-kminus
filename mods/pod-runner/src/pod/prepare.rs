@@ -54,11 +54,11 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::debug;
 
+use crate::pod::resolver::ResolverSet;
 use crate::pod::resolver::config_map::ConfigMapResolverError;
-use crate::pod::resolver::k8s_values::{resolve_k8s_values, ResolvedK8sValues};
+use crate::pod::resolver::k8s_values::{ResolvedK8sValues, resolve_k8s_values};
 use crate::pod::resolver::secret::SecretResolverError;
 use crate::pod::resolver::volume::resolve_volumes;
-use crate::pod::resolver::ResolverSet;
 use crate::spec::pod::{EnvVar, PodSpec};
 
 // ---------------------------------------------------------------------------
@@ -185,8 +185,7 @@ pub async fn prepare_pod(
     cancel: &mut watch::Receiver<()>,
 ) -> Result<PodSpec, PrepareError> {
     let mut prepared = rewrite_pod_paths(spec, pod_dir)?;
-    let resolved =
-        resolve_k8s_values(&prepared, namespace, resolvers, timeout, cancel).await?;
+    let resolved = resolve_k8s_values(&prepared, namespace, resolvers, timeout, cancel).await?;
     apply_envs_and_substitute(&mut prepared, &resolved);
     create_container_dirs(&prepared, pod_dir, images_dir)?;
     setup_volumes(&prepared, &resolved, pod_dir)?;
@@ -283,8 +282,7 @@ pub async fn resolve_pod_k8s_values(
 /// substitutions. A user-defined `KM_CONTAINER_ROOT` entry is dropped.
 pub fn apply_envs_and_substitute(spec: &mut PodSpec, resolved: &ResolvedK8sValues) {
     for c in spec.spec.all_containers_mut() {
-        let individual_names: HashSet<String> =
-            c.env.iter().map(|e| e.name.clone()).collect();
+        let individual_names: HashSet<String> = c.env.iter().map(|e| e.name.clone()).collect();
 
         let mut new_env: Vec<EnvVar> = Vec::new();
         let mut available: HashMap<String, String> = HashMap::new();
@@ -622,10 +620,7 @@ mod tests {
 
     #[test]
     fn rewrites_working_dir() {
-        let pod = make_pod(
-            vec![make_container("app", "/usr/src/app", vec![])],
-            vec![],
-        );
+        let pod = make_pod(vec![make_container("app", "/usr/src/app", vec![])], vec![]);
         let prepared = rewrite_pod_paths(&pod, Path::new("/data/pods/mypod")).unwrap();
         assert_eq!(
             prepared.spec.containers[0].working_dir,
@@ -750,7 +745,10 @@ mod tests {
 
         let work = dir.join("work/app");
         assert!(work.join("app.conf").exists());
-        assert_eq!(fs::read_to_string(work.join("app.conf")).unwrap(), "setting=value");
+        assert_eq!(
+            fs::read_to_string(work.join("app.conf")).unwrap(),
+            "setting=value"
+        );
         assert!(work.join("subdir/nested.txt").exists());
     }
 
@@ -768,8 +766,8 @@ mod tests {
 
     #[test]
     fn extracts_tar_gz_image() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
 
         let dir = temp_dir("image-targz");
@@ -785,7 +783,9 @@ mod tests {
         hdr.set_size(payload.len() as u64);
         hdr.set_mode(0o644);
         hdr.set_cksum();
-        builder.append_data(&mut hdr, "app.conf", &payload[..]).unwrap();
+        builder
+            .append_data(&mut hdr, "app.conf", &payload[..])
+            .unwrap();
         let nested = b"nested";
         let mut hdr2 = tar::Header::new_gnu();
         hdr2.set_size(nested.len() as u64);
@@ -816,8 +816,8 @@ mod tests {
 
     #[test]
     fn extracts_tar_gz_with_tar_gz_suffix() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
 
         let dir = temp_dir("image-tar-gz-suffix");
         fs::create_dir_all(&dir).unwrap();
@@ -831,7 +831,9 @@ mod tests {
         hdr.set_size(payload.len() as u64);
         hdr.set_mode(0o644);
         hdr.set_cksum();
-        builder.append_data(&mut hdr, "greet.txt", &payload[..]).unwrap();
+        builder
+            .append_data(&mut hdr, "greet.txt", &payload[..])
+            .unwrap();
         builder.into_inner().unwrap().finish().unwrap();
 
         let mut pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
@@ -896,7 +898,10 @@ mod tests {
         let prepared = rewrite_pod_paths(&pod, &dir).unwrap();
         let result = create_container_dirs(&prepared, &dir, Path::new(""));
         let err = result.unwrap_err();
-        assert!(matches!(err, PrepareError::ImageDirMissing { .. }), "got: {err}");
+        assert!(
+            matches!(err, PrepareError::ImageDirMissing { .. }),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -908,7 +913,10 @@ mod tests {
         let prepared = rewrite_pod_paths(&pod, &dir).unwrap();
         let result = create_container_dirs(&prepared, &dir, Path::new(""));
         let err = result.unwrap_err();
-        assert!(matches!(err, PrepareError::ImageArchiveMissing { .. }), "got: {err}");
+        assert!(
+            matches!(err, PrepareError::ImageArchiveMissing { .. }),
+            "got: {err}"
+        );
     }
 
     // -- resolve_image_path / image_kind --
@@ -968,7 +976,10 @@ mod tests {
         // path is a symlink to it.
         assert!(dir.join("volumes/data").is_dir());
         assert!(mount_path.is_symlink());
-        assert_eq!(fs::read_link(&mount_path).unwrap(), dir.join("volumes/data"));
+        assert_eq!(
+            fs::read_link(&mount_path).unwrap(),
+            dir.join("volumes/data")
+        );
     }
 
     #[test]
@@ -1375,7 +1386,10 @@ mod tests {
         );
         let resolved = resolved_for(
             "app",
-            vec![("SUBDIR", "data"), ("TARGET", "$(KM_CONTAINER_ROOT)/$(SUBDIR)")],
+            vec![
+                ("SUBDIR", "data"),
+                ("TARGET", "$(KM_CONTAINER_ROOT)/$(SUBDIR)"),
+            ],
         );
 
         apply_envs_and_substitute(&mut spec, &resolved);
@@ -1401,8 +1415,7 @@ mod tests {
             }],
             vec![],
         );
-        let resolved =
-            resolved_for("app", vec![("FILE", "$(KM_CONTAINER_ROOT)/data.txt")]);
+        let resolved = resolved_for("app", vec![("FILE", "$(KM_CONTAINER_ROOT)/data.txt")]);
 
         apply_envs_and_substitute(&mut spec, &resolved);
 
@@ -1414,8 +1427,9 @@ mod tests {
 
     #[test]
     fn substitute_dollar_resolves_known_vars() {
-        let env: HashMap<String, String> =
-            [("ROOT".to_string(), "/work/app".to_string())].into_iter().collect();
+        let env: HashMap<String, String> = [("ROOT".to_string(), "/work/app".to_string())]
+            .into_iter()
+            .collect();
         assert_eq!(substitute_dollar("$(ROOT)/foo", &env), "/work/app/foo");
         assert_eq!(substitute_dollar("a$(ROOT)b", &env), "a/work/appb");
     }
@@ -1428,8 +1442,9 @@ mod tests {
 
     #[test]
     fn substitute_dollar_escapes_double_dollar() {
-        let env: HashMap<String, String> =
-            [("V".to_string(), "value".to_string())].into_iter().collect();
+        let env: HashMap<String, String> = [("V".to_string(), "value".to_string())]
+            .into_iter()
+            .collect();
         // $$ -> $; then "(V)" is plain text, so $(V) literal stays
         assert_eq!(substitute_dollar("$$(V)", &env), "$(V)");
         // No false re-expansion: $$ -> $ only

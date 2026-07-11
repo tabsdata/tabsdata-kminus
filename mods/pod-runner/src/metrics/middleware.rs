@@ -39,20 +39,17 @@ pub async fn track_request_duration(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::routing::get;
     use axum::Router;
+    use axum::routing::get;
 
     #[tokio::test]
     async fn middleware_records_duration() {
         let metrics = Metrics::new();
         let metrics_clone = Arc::clone(&metrics);
 
-        let app = Router::new()
-            .route("/test", get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn_with_state(
-                metrics_clone,
-                track_request_duration,
-            ));
+        let app = Router::new().route("/test", get(|| async { "ok" })).layer(
+            axum::middleware::from_fn_with_state(metrics_clone, track_request_duration),
+        );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

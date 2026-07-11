@@ -53,7 +53,6 @@ pub struct ResolverSet {
     pub node_envs: HashMap<String, String>,
 }
 
-
 impl ResolverSet {
     /// Build a ResolverSet from configuration.
     pub async fn from_configs(
@@ -70,15 +69,17 @@ impl ResolverSet {
                         .configs
                         .get("dir")
                         .ok_or("FileSecretResolver requires 'dir' config")?;
-                    Some(Box::new(secret::FileSecretResolver::new(PathBuf::from(dir))?))
+                    Some(Box::new(secret::FileSecretResolver::new(PathBuf::from(
+                        dir,
+                    ))?))
                 }
                 "kube" => {
-                    let kc = secret_config.configs.get("kubeconfig")
+                    let kc = secret_config
+                        .configs
+                        .get("kubeconfig")
                         .map(|s| s.as_str())
                         .unwrap_or(kubeconfig);
-                    Some(Box::new(
-                        secret::KubeSecretResolver::new(kc).await?,
-                    ))
+                    Some(Box::new(secret::KubeSecretResolver::new(kc).await?))
                 }
                 t => return Err(format!("Unknown secret resolver type: '{}'", t)),
             };
@@ -96,12 +97,12 @@ impl ResolverSet {
                     )?))
                 }
                 "kube" => {
-                    let kc = config_map_config.configs.get("kubeconfig")
+                    let kc = config_map_config
+                        .configs
+                        .get("kubeconfig")
                         .map(|s| s.as_str())
                         .unwrap_or(kubeconfig);
-                    Some(Box::new(
-                        config_map::KubeConfigMapResolver::new(kc).await?,
-                    ))
+                    Some(Box::new(config_map::KubeConfigMapResolver::new(kc).await?))
                 }
                 t => return Err(format!("Unknown config map resolver type: '{}'", t)),
             };

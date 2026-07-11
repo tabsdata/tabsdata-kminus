@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::watch;
-use tracing::{debug, info, info_span, warn, Instrument};
+use tracing::{Instrument, debug, info, info_span, warn};
 
 use super::cleanup::CleanupConfig;
 use crate::spec::constants::FINISHED_SENTINEL;
@@ -79,7 +79,10 @@ async fn purge_loop(
             None => idle_sleep_duration(&config) + BATCH_BUFFER,
         };
 
-        debug!(sleep_secs = sleep_duration.as_secs(), "Purge scan complete, sleeping");
+        debug!(
+            sleep_secs = sleep_duration.as_secs(),
+            "Purge scan complete, sleeping"
+        );
 
         tokio::select! {
             _ = tokio::time::sleep(sleep_duration) => {},
@@ -217,8 +220,10 @@ async fn scan_work_dirs(
             // `remove` is a no-op if it was already deleted normally — not a
             // failure (the dir can outlive the entry via keep_*_pod_dir).
             if let Some(store) = store
-                && let Some(id) =
-                    path.file_name().and_then(|n| n.to_str()).and_then(PodId::from_full)
+                && let Some(id) = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(PodId::from_full)
             {
                 store.remove(&id).await;
             }

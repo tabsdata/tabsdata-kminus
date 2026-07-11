@@ -69,7 +69,10 @@ pub struct FileSecretResolver {
 impl FileSecretResolver {
     pub fn new(dir: PathBuf) -> Result<Self, String> {
         if !dir.is_dir() {
-            return Err(format!("Secret directory does not exist: {}", dir.display()));
+            return Err(format!(
+                "Secret directory does not exist: {}",
+                dir.display()
+            ));
         }
         Ok(Self { dir })
     }
@@ -99,13 +102,12 @@ impl FileSecretResolver {
                     ));
                 }
             };
-            let doc: serde_json::Value =
-                serde_yaml_ng::from_str(&content).map_err(|e| {
-                    SecretResolverError::other(
-                        name,
-                        format!("invalid YAML in {}: {}", path.display(), e),
-                    )
-                })?;
+            let doc: serde_json::Value = serde_yaml_ng::from_str(&content).map_err(|e| {
+                SecretResolverError::other(
+                    name,
+                    format!("invalid YAML in {}: {}", path.display(), e),
+                )
+            })?;
             result.insert(name.clone(), extract_secret_data(&doc, name)?);
         }
         Ok(result)
@@ -313,7 +315,11 @@ mod tests {
     #[tokio::test]
     async fn file_resolver_reads_string_data() {
         let dir = setup_secret_dir("str");
-        fs::write(dir.join("plain.yaml"), "stringData:\n  api_key: \"sk-12345\"\n").unwrap();
+        fs::write(
+            dir.join("plain.yaml"),
+            "stringData:\n  api_key: \"sk-12345\"\n",
+        )
+        .unwrap();
 
         let resolver = FileSecretResolver::new(dir).unwrap();
         let (_tx, mut rx) = cancel_channel();
@@ -360,7 +366,11 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind, SecretResolverErrorKind::Timeout);
         assert!(err.message.contains("timed out"), "got: {}", err.message);
-        assert!(err.message.contains("file not found"), "got: {}", err.message);
+        assert!(
+            err.message.contains("file not found"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[tokio::test(start_paused = true)]

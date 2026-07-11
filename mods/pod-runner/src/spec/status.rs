@@ -51,7 +51,8 @@ impl ContainerStatus {
             STATE_KEY_WAITING.to_string(),
             serde_json::to_value(ContainerStateWaiting {
                 reason: REASON_POD_INITIALIZING.to_string(),
-            }).unwrap(),
+            })
+            .unwrap(),
         );
         Self {
             name: name.to_string(),
@@ -68,7 +69,8 @@ impl ContainerStatus {
             STATE_KEY_WAITING.to_string(),
             serde_json::to_value(ContainerStateWaiting {
                 reason: reason.to_string(),
-            }).unwrap(),
+            })
+            .unwrap(),
         );
         self.ready = false;
         self.started = false;
@@ -76,7 +78,11 @@ impl ContainerStatus {
 
     pub fn set_running(&mut self, started_at: Option<&str>) {
         let ts = started_at.unwrap_or("").to_string();
-        let ts = if ts.is_empty() { chrono::Utc::now().to_rfc3339() } else { ts };
+        let ts = if ts.is_empty() {
+            chrono::Utc::now().to_rfc3339()
+        } else {
+            ts
+        };
         self.state.clear();
         self.state.insert(
             STATE_KEY_RUNNING.to_string(),
@@ -87,7 +93,9 @@ impl ContainerStatus {
     }
 
     pub fn set_terminated(&mut self, exit_code: i32, reason: &str) {
-        let started_at = self.state.get(STATE_KEY_RUNNING)
+        let started_at = self
+            .state
+            .get(STATE_KEY_RUNNING)
             .and_then(|v| v.get("startedAt"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
@@ -100,7 +108,8 @@ impl ContainerStatus {
                 reason: reason.to_string(),
                 started_at,
                 finished_at: chrono::Utc::now().to_rfc3339(),
-            }).unwrap(),
+            })
+            .unwrap(),
         );
         self.ready = false;
         self.started = false;
@@ -115,7 +124,8 @@ impl ContainerStatus {
     }
 
     pub fn terminated_exit_code(&self) -> Option<i32> {
-        self.state.get(STATE_KEY_TERMINATED)
+        self.state
+            .get(STATE_KEY_TERMINATED)
             .and_then(|v| v.get("exitCode"))
             .and_then(|v| v.as_i64())
             .map(|v| v as i32)
@@ -169,9 +179,17 @@ fn is_zero_f64(v: &f64) -> bool {
 
 impl PodStatus {
     pub fn set_condition(&mut self, cond_type: &str, status: bool, reason: &str, message: &str) {
-        let status_str = if status { CONDITION_TRUE } else { CONDITION_FALSE };
+        let status_str = if status {
+            CONDITION_TRUE
+        } else {
+            CONDITION_FALSE
+        };
         let ts = chrono::Utc::now().to_rfc3339();
-        if let Some(cond) = self.conditions.iter_mut().find(|c| c.condition_type == cond_type) {
+        if let Some(cond) = self
+            .conditions
+            .iter_mut()
+            .find(|c| c.condition_type == cond_type)
+        {
             cond.status = status_str.to_string();
             cond.reason = reason.to_string();
             cond.message = message.to_string();
@@ -188,7 +206,8 @@ impl PodStatus {
     }
 
     pub fn is_condition_true(&self, cond_type: &str) -> bool {
-        self.conditions.iter()
+        self.conditions
+            .iter()
             .any(|c| c.condition_type == cond_type && c.status == CONDITION_TRUE)
     }
 
@@ -201,21 +220,41 @@ impl PodStatus {
     }
 
     pub fn mark_not_initialized(&mut self, reason: &str) {
-        self.set_condition(CONDITION_INITIALIZED, false, REASON_INIT_CONTAINERS_RUNNING, reason);
+        self.set_condition(
+            CONDITION_INITIALIZED,
+            false,
+            REASON_INIT_CONTAINERS_RUNNING,
+            reason,
+        );
     }
 
     pub fn mark_containers_ready(&mut self) {
-        self.set_condition(CONDITION_CONTAINERS_READY, true, REASON_CONTAINERS_READY, "");
+        self.set_condition(
+            CONDITION_CONTAINERS_READY,
+            true,
+            REASON_CONTAINERS_READY,
+            "",
+        );
         self.set_condition(CONDITION_READY, true, REASON_POD_READY, "");
     }
 
     pub fn mark_containers_not_ready(&mut self, reason: &str) {
-        self.set_condition(CONDITION_CONTAINERS_READY, false, REASON_CONTAINERS_NOT_READY, reason);
+        self.set_condition(
+            CONDITION_CONTAINERS_READY,
+            false,
+            REASON_CONTAINERS_NOT_READY,
+            reason,
+        );
         self.set_condition(CONDITION_READY, false, REASON_CONTAINERS_NOT_READY, reason);
     }
 
     pub fn mark_disruption_target(&mut self) {
-        self.set_condition(CONDITION_DISRUPTION_TARGET, true, REASON_DELETION_TRIGGERED, "");
+        self.set_condition(
+            CONDITION_DISRUPTION_TARGET,
+            true,
+            REASON_DELETION_TRIGGERED,
+            "",
+        );
         self.set_condition(CONDITION_READY, false, REASON_DELETION_TRIGGERED, "");
     }
 
@@ -224,11 +263,15 @@ impl PodStatus {
     }
 
     pub fn find_container_status_mut(&mut self, name: &str) -> Option<&mut ContainerStatus> {
-        self.container_statuses.iter_mut().find(|cs| cs.name == name)
+        self.container_statuses
+            .iter_mut()
+            .find(|cs| cs.name == name)
     }
 
     pub fn find_init_container_status(&self, name: &str) -> Option<&ContainerStatus> {
-        self.init_container_statuses.iter().find(|cs| cs.name == name)
+        self.init_container_statuses
+            .iter()
+            .find(|cs| cs.name == name)
     }
 }
 

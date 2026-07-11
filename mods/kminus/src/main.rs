@@ -12,7 +12,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Child;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use file_rotate::{ContentLimit, FileRotate, compression::Compression, suffix::AppendCount};
@@ -219,6 +219,33 @@ fn setup_logging(logdir: &Path, max_size_mb: u32, max_files: u32) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// Startup progress
+// ---------------------------------------------------------------------------
+
+/// A startup phase in progress: its label and start time, returned by
+/// [`step`] and closed by [`step_done`].
+struct Step {
+    label: &'static str,
+    start: Instant,
+}
+
+/// Announce the start of a phase to stdout and begin timing it.
+fn step(label: &'static str) -> Step {
+    println!("  {label} ...");
+    info!("{label}");
+    Step {
+        label,
+        start: Instant::now(),
+    }
+}
+
+/// Report a phase complete, with how long it took.
+fn step_done(step: Step) {
+    let secs = step.start.elapsed().as_secs_f64();
+    println!("  {} done ({:.1}s)", step.label, secs);
+}
+
+// ---------------------------------------------------------------------------
 // Status banner
 // ---------------------------------------------------------------------------
 
@@ -278,7 +305,7 @@ fn print_status(
     println!();
 
     // Existing pods on this node (best-effort kmc query).
-    let pods = control_plane::list_pods_on_node(kubeconfig, "tdknode");
+    let pods = control_plane::list_pods_on_node(kubeconfig, control_plane::NODE_NAME);
     if pods.is_empty() {
         println!("  Pods: (none)");
     } else {
@@ -348,17 +375,37 @@ fn install_signal_shutdown(paths: Paths) {
 /// children (etcd, kube-apiserver, kube-controller-manager) via its
 /// process-tree kill. A final descendant sweep catches anything spawned
 /// but not yet recorded in a PID file.
+/// Grace before km escalates to SIGKILL. The pod-runner needs much more than
+/// the others: on shutdown it drains every pod (SIGTERM each container, then
+/// wait up to that pod's termination grace, then SIGKILL) and only then exits.
+/// A pod like the database also runs its own stop on that SIGTERM (stopping the
+/// embedded postgres it owns). Killing pod-runner after only a few seconds
+/// SIGKILLs it mid-drain, so those pod stops never complete and their servers
+/// are orphaned. The other components own no pods and stop promptly.
+const POD_RUNNER_SHUTDOWN_GRACE: Duration = Duration::from_secs(90);
+const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+fn shutdown_grace_for(name: &str) -> Duration {
+    if name == pod_runner::BIN {
+        POD_RUNNER_SHUTDOWN_GRACE
+    } else {
+        DEFAULT_SHUTDOWN_GRACE
+    }
+}
+
 fn shutdown_from_pids(paths: &Paths) {
     info!("Shutting down...");
 
-    for name in [
-        virtual_kubelet::BIN,
-        pod_runner::BIN,
-        control_plane::BIN,
-    ] {
+    for name in [virtual_kubelet::BIN, pod_runner::BIN, control_plane::BIN] {
         if let Some(pid) = read_pid(&paths.pids, name) {
-            info!(name, pid, "Requesting graceful shutdown");
-            terminate_process(pid, Duration::from_secs(5));
+            let grace = shutdown_grace_for(name);
+            info!(
+                name,
+                pid,
+                grace_secs = grace.as_secs(),
+                "Requesting graceful shutdown"
+            );
+            terminate_process(pid, grace);
         }
         remove_pid(&paths.pids, name);
     }
@@ -529,7 +576,12 @@ fn command_start(args: StartArgs) {
     // stack down in order rather than orphaning it.
     install_signal_shutdown(paths.clone());
 
-    // Start subprocesses in dependency order.
+    // Start subprocesses in dependency order, reporting each phase to stdout
+    // so the (multi-second) startup shows live progress instead of a silent
+    // gap before the ready banner.
+    let started = Instant::now();
+
+    let mut phase = step("Starting control-plane");
     let mut cp = control_plane::start(
         &paths.workdir,
         &paths.configdir,
@@ -540,6 +592,9 @@ fn command_start(args: StartArgs) {
         &port_kcm,
         &vk_kubeconfig,
     );
+    step_done(phase);
+
+    phase = step("Starting pod-runner");
     let pr = pod_runner::start(
         &paths.workdir,
         &paths.configdir,
@@ -553,7 +608,13 @@ fn command_start(args: StartArgs) {
         args.imagesdir.as_deref(),
         &mut cp,
     );
+    step_done(phase);
+
+    phase = step("Cleaning up stale node resources");
     control_plane::cleanup_stale_node_resources(&kubeconfig);
+    step_done(phase);
+
+    phase = step("Starting virtual-kubelet");
     let vk = virtual_kubelet::start(
         &paths.workdir,
         &paths.configdir,
@@ -564,7 +625,12 @@ fn command_start(args: StartArgs) {
         &vk_kubeconfig,
         &vk_prconfig,
     );
+    step_done(phase);
 
+    println!(
+        "  all components ready in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
     info!("K- ready");
 
     print_status(

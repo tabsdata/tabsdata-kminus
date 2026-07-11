@@ -19,6 +19,9 @@ use crate::system::proc::resolve_binary;
 /// Binary name for the control-plane subprocess.
 pub const BIN: &str = "control-plane";
 
+/// Name of the single node the virtual-kubelet registers.
+pub const NODE_NAME: &str = "tdknode";
+
 /// Binary name for the kmc helper used by status gathering and
 /// node cleanup. Kept here because both consumers live in this module.
 pub const BIN_KMC: &str = "kmc";

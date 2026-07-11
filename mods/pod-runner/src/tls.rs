@@ -94,7 +94,9 @@ impl CertSource {
     /// Validate that path and data are not both set.
     pub fn validate(&self, name: &str) -> Result<(), TlsError> {
         if self.path.is_some() && self.data.is_some() {
-            return Err(TlsError::BothPathAndData { name: name.to_string() });
+            return Err(TlsError::BothPathAndData {
+                name: name.to_string(),
+            });
         }
         Ok(())
     }
@@ -120,7 +122,9 @@ impl CertSource {
                     source,
                 })
         } else {
-            Err(TlsError::NotConfigured { name: name.to_string() })
+            Err(TlsError::NotConfigured {
+                name: name.to_string(),
+            })
         }
     }
 }
@@ -244,14 +248,20 @@ mod tests {
 
     #[test]
     fn cert_source_path_only() {
-        let s = CertSource { path: Some("cert.pem".into()), data: None };
+        let s = CertSource {
+            path: Some("cert.pem".into()),
+            data: None,
+        };
         assert!(s.is_configured());
         assert!(s.validate("test").is_ok());
     }
 
     #[test]
     fn cert_source_data_only() {
-        let s = CertSource { path: None, data: Some("base64".into()) };
+        let s = CertSource {
+            path: None,
+            data: Some("base64".into()),
+        };
         assert!(s.is_configured());
         assert!(s.validate("test").is_ok());
     }
@@ -267,9 +277,7 @@ mod tests {
 
     #[test]
     fn cert_source_resolve_from_file() {
-        let tmp = std::env::temp_dir().join(format!(
-            "pr-cert-test-{}", std::process::id(),
-        ));
+        let tmp = std::env::temp_dir().join(format!("pr-cert-test-{}", std::process::id(),));
         std::fs::create_dir_all(&tmp).unwrap();
         let cert_path = tmp.join("test.pem");
         std::fs::write(&cert_path, b"PEM DATA").unwrap();
@@ -288,7 +296,10 @@ mod tests {
     fn cert_source_resolve_from_base64() {
         use base64::Engine;
         let encoded = base64::engine::general_purpose::STANDARD.encode(b"PEM DATA");
-        let s = CertSource { path: None, data: Some(encoded) };
+        let s = CertSource {
+            path: None,
+            data: Some(encoded),
+        };
         let bytes = s.resolve("test").unwrap();
         assert_eq!(bytes, b"PEM DATA");
     }
@@ -335,9 +346,7 @@ mod tests {
 
     #[test]
     fn resolve_cert_bytes_from_file() {
-        let tmp = std::env::temp_dir().join(format!(
-            "cert-test-{}.pem", std::process::id(),
-        ));
+        let tmp = std::env::temp_dir().join(format!("cert-test-{}.pem", std::process::id(),));
         std::fs::write(&tmp, b"PEM DATA").unwrap();
 
         let bytes = resolve_cert_bytes(&tmp, "").unwrap();
@@ -362,9 +371,7 @@ mod tests {
 
     #[test]
     fn resolve_cert_bytes_file_takes_precedence() {
-        let tmp = std::env::temp_dir().join(format!(
-            "cert-prio-test-{}.pem", std::process::id(),
-        ));
+        let tmp = std::env::temp_dir().join(format!("cert-prio-test-{}.pem", std::process::id(),));
         std::fs::write(&tmp, b"FROM FILE").unwrap();
 
         let bytes = resolve_cert_bytes(&tmp, "base64ignored").unwrap();
@@ -390,10 +397,15 @@ mod tests {
     fn generate_ca() -> rcgen::CertifiedKey<rcgen::KeyPair> {
         let mut params = rcgen::CertificateParams::default();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        params.distinguished_name.push(rcgen::DnType::CommonName, "test-ca");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "test-ca");
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = params.self_signed(&key).unwrap();
-        rcgen::CertifiedKey { cert, signing_key: key }
+        rcgen::CertifiedKey {
+            cert,
+            signing_key: key,
+        }
     }
 
     #[test]

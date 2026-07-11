@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 use crate::pod::executor::PodState;
 use crate::process::executor::{LogStream, StreamConfig, StreamWriter};
@@ -95,7 +95,6 @@ pub struct ContainerLogOptions {
     /// Prefix each line with its CRI timestamp (kubectl --timestamps).
     pub timestamps: bool,
 }
-
 
 /// Read buffer size for log streaming.
 const LOG_CHUNK_SIZE: usize = 8192;
@@ -443,7 +442,8 @@ impl ContainerLogStream {
 
     /// The path of the current log file.
     fn log_path(&self) -> PathBuf {
-        self.container_dir().join(format!("{}.log", self.restart_count))
+        self.container_dir()
+            .join(format!("{}.log", self.restart_count))
     }
 }
 
@@ -457,7 +457,11 @@ impl StreamConfig for ContainerLogStream {
         // If a file for this restart_count already exists (e.g. from
         // an interrupted previous run), shift it into the rotation
         // so we start fresh.
-        if path.exists() && std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false) {
+        if path.exists()
+            && std::fs::metadata(&path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+        {
             shift_files(&path, self.max_files);
         }
 
@@ -582,7 +586,11 @@ impl StreamWriter for ContainerLogWriter {
     /// `<RFC3339Nano timestamp> <stdout|stderr> F <message>\n`
     ///
     /// Example: `2026-04-14T15:30:00.000000000Z stdout F hello world\n`
-    fn write_line(&mut self, line: &[u8], stream: crate::process::executor::LogStream) -> io::Result<()> {
+    fn write_line(
+        &mut self,
+        line: &[u8],
+        stream: crate::process::executor::LogStream,
+    ) -> io::Result<()> {
         // CRI prefix: "<timestamp> <stream> F "
         let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.9fZ");
         let prefix = format!("{} {} F ", ts, stream.as_str());
@@ -590,7 +598,11 @@ impl StreamWriter for ContainerLogWriter {
         self.current_size += prefix.len() as u64;
 
         // Strip trailing newline from the message (we add our own)
-        let msg = if line.ends_with(b"\n") { &line[..line.len() - 1] } else { line };
+        let msg = if line.ends_with(b"\n") {
+            &line[..line.len() - 1]
+        } else {
+            line
+        };
         self.file.write_all(msg)?;
         self.file.write_all(b"\n")?;
         self.current_size += msg.len() as u64 + 1;
@@ -724,7 +736,9 @@ mod tests {
         // first write triggers rotation.
         let stream = Box::new(ContainerLogStream::new(&dir, "main", 0, 55, 5));
         let mut writer = stream.open().unwrap();
-        writer.write_line(b"aaaaaaaaaaaaaaaaaaa\n", LogStream::Stdout).unwrap(); // triggers rotation
+        writer
+            .write_line(b"aaaaaaaaaaaaaaaaaaa\n", LogStream::Stdout)
+            .unwrap(); // triggers rotation
         writer.write_line(b"current\n", LogStream::Stdout).unwrap();
         writer.flush().unwrap();
 
@@ -744,9 +758,15 @@ mod tests {
         let stream = Box::new(ContainerLogStream::new(&dir, "main", 0, 10, 3));
         let mut writer = stream.open().unwrap();
         // Write enough to trigger multiple rotations
-        writer.write_line(b"aaaaaaaaaa\n", LogStream::Stdout).unwrap();
-        writer.write_line(b"bbbbbbbbbb\n", LogStream::Stdout).unwrap();
-        writer.write_line(b"cccccccccc\n", LogStream::Stdout).unwrap();
+        writer
+            .write_line(b"aaaaaaaaaa\n", LogStream::Stdout)
+            .unwrap();
+        writer
+            .write_line(b"bbbbbbbbbb\n", LogStream::Stdout)
+            .unwrap();
+        writer
+            .write_line(b"cccccccccc\n", LogStream::Stdout)
+            .unwrap();
         writer.write_line(b"current\n", LogStream::Stdout).unwrap();
         writer.flush().unwrap();
 
@@ -763,7 +783,9 @@ mod tests {
 
         let stream = Box::new(ContainerLogStream::new(&dir, "main", 0, 10, 1));
         let mut writer = stream.open().unwrap();
-        writer.write_line(b"aaaaaaaaaa\n", LogStream::Stdout).unwrap();
+        writer
+            .write_line(b"aaaaaaaaaa\n", LogStream::Stdout)
+            .unwrap();
         writer.write_line(b"current\n", LogStream::Stdout).unwrap();
         writer.flush().unwrap();
 
@@ -787,13 +809,19 @@ mod tests {
             ]),
         );
         let mut writer = stream.open().unwrap();
-        writer.write_line(b"container output\n", LogStream::Stdout).unwrap();
+        writer
+            .write_line(b"container output\n", LogStream::Stdout)
+            .unwrap();
         writer.flush().unwrap();
 
         let content = std::fs::read_to_string(dir.join("main").join("0.log")).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 3);
-        assert!(lines[0].contains(&read_only_mount_warning("vol-a")), "got: {}", lines[0]);
+        assert!(
+            lines[0].contains(&read_only_mount_warning("vol-a")),
+            "got: {}",
+            lines[0]
+        );
         assert!(lines[0].contains(" stderr F "));
         assert!(lines[1].contains(&read_only_mount_warning("vol-b")));
         assert!(lines[2].contains("container output"));
@@ -813,7 +841,9 @@ mod tests {
         let dir = test_dir!();
         let stream = Box::new(ProbeLogStream::new(&dir, "main", "startup", 1024, 5));
         let mut writer = stream.open().unwrap();
-        writer.write_line(b"probe check 1\n", LogStream::Stdout).unwrap();
+        writer
+            .write_line(b"probe check 1\n", LogStream::Stdout)
+            .unwrap();
         writer.flush().unwrap();
 
         let log = dir.join("main/probe-startup.log");
@@ -840,8 +870,16 @@ mod tests {
         w2.flush().unwrap();
 
         let content = std::fs::read_to_string(dir.join("main/probe-liveness.log")).unwrap();
-        assert!(content.contains("run-1"), "first run should be present: {}", content);
-        assert!(content.contains("run-2"), "second run should be present: {}", content);
+        assert!(
+            content.contains("run-1"),
+            "first run should be present: {}",
+            content
+        );
+        assert!(
+            content.contains("run-2"),
+            "second run should be present: {}",
+            content
+        );
     }
 
     #[test]
@@ -851,7 +889,9 @@ mod tests {
         // Same as container rotation test: CRI prefix adds ~40 bytes per line.
         let stream = Box::new(ProbeLogStream::new(&dir, "main", "readiness", 55, 5));
         let mut writer = stream.open().unwrap();
-        writer.write_line(b"aaaaaaaaaaaaaaaaaaa\n", LogStream::Stdout).unwrap(); // triggers rotation
+        writer
+            .write_line(b"aaaaaaaaaaaaaaaaaaa\n", LogStream::Stdout)
+            .unwrap(); // triggers rotation
         writer.write_line(b"current\n", LogStream::Stdout).unwrap();
         writer.flush().unwrap();
 
@@ -867,7 +907,11 @@ mod tests {
         for probe_type in &["startup", "liveness", "readiness"] {
             let s = Box::new(ProbeLogStream::new(&dir, "app", *probe_type, 1024, 5));
             let mut w = s.open().unwrap();
-            w.write_line(format!("{}-check\n", probe_type).as_bytes(), LogStream::Stdout).unwrap();
+            w.write_line(
+                format!("{}-check\n", probe_type).as_bytes(),
+                LogStream::Stdout,
+            )
+            .unwrap();
             w.flush().unwrap();
         }
 
@@ -893,10 +937,11 @@ mod tests {
 
     #[test]
     fn test_cri_formatter_strips_prefix() {
-        let s = fmt_all(false, &[
-            "2026-04-14T15:30:00.000000000Z stdout F hello world\n\
-             2026-04-14T15:30:01.000000000Z stderr F warn line\n",
-        ]);
+        let s = fmt_all(
+            false,
+            &["2026-04-14T15:30:00.000000000Z stdout F hello world\n\
+             2026-04-14T15:30:01.000000000Z stderr F warn line\n"],
+        );
         assert_eq!(s, "hello world\nwarn line\n");
     }
 
@@ -908,11 +953,14 @@ mod tests {
 
     #[test]
     fn test_cri_formatter_line_across_chunks() {
-        let s = fmt_all(false, &[
-            "2026-04-14T15:30:00.000000000Z std",
-            "out F spl",
-            "it line\n2026-04-14T15:30:01.000000000Z stdout F next\n",
-        ]);
+        let s = fmt_all(
+            false,
+            &[
+                "2026-04-14T15:30:00.000000000Z std",
+                "out F spl",
+                "it line\n2026-04-14T15:30:01.000000000Z stdout F next\n",
+            ],
+        );
         assert_eq!(s, "split line\nnext\n");
     }
 
@@ -929,10 +977,11 @@ mod tests {
     fn test_cri_formatter_empty_message_and_trailing_partial() {
         // Empty message keeps its line; trailing partial (no newline)
         // is flushed by finish() without adding a newline.
-        let s = fmt_all(false, &[
-            "2026-04-14T15:30:00.000000000Z stdout F \n\
-             2026-04-14T15:30:01.000000000Z stdout F no newline",
-        ]);
+        let s = fmt_all(
+            false,
+            &["2026-04-14T15:30:00.000000000Z stdout F \n\
+             2026-04-14T15:30:01.000000000Z stdout F no newline"],
+        );
         assert_eq!(s, "\nno newline");
     }
 
@@ -949,7 +998,11 @@ mod tests {
         assert!(!path.exists(), "original should be renamed");
         let rolled = dir.join("test.log.1");
         assert!(rolled.exists());
-        assert!(std::fs::read_to_string(&rolled).unwrap().contains("original"));
+        assert!(
+            std::fs::read_to_string(&rolled)
+                .unwrap()
+                .contains("original")
+        );
     }
 
     #[test]
@@ -965,9 +1018,21 @@ mod tests {
         shift_files(&path, 5);
 
         assert!(!path.exists());
-        assert!(std::fs::read_to_string(dir.join("test.log.1")).unwrap().contains("current"));
-        assert!(std::fs::read_to_string(dir.join("test.log.2")).unwrap().contains("rolled-1"));
-        assert!(std::fs::read_to_string(dir.join("test.log.3")).unwrap().contains("rolled-2"));
+        assert!(
+            std::fs::read_to_string(dir.join("test.log.1"))
+                .unwrap()
+                .contains("current")
+        );
+        assert!(
+            std::fs::read_to_string(dir.join("test.log.2"))
+                .unwrap()
+                .contains("rolled-1")
+        );
+        assert!(
+            std::fs::read_to_string(dir.join("test.log.3"))
+                .unwrap()
+                .contains("rolled-2")
+        );
     }
 
     #[test]
@@ -982,8 +1047,16 @@ mod tests {
         shift_files(&path, 3); // max=3: current + .1 + .2
 
         // .2 (oldest) should have been deleted, then rebuilt from shift
-        assert!(std::fs::read_to_string(dir.join("test.log.1")).unwrap().contains("current"));
-        assert!(std::fs::read_to_string(dir.join("test.log.2")).unwrap().contains("r1"));
+        assert!(
+            std::fs::read_to_string(dir.join("test.log.1"))
+                .unwrap()
+                .contains("current")
+        );
+        assert!(
+            std::fs::read_to_string(dir.join("test.log.2"))
+                .unwrap()
+                .contains("r1")
+        );
         assert!(!dir.join("test.log.3").exists());
     }
 

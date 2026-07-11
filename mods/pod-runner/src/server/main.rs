@@ -3,24 +3,22 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use file_rotate::{
-    compression::Compression, suffix::AppendCount, ContentLimit, FileRotate,
-};
+use file_rotate::{ContentLimit, FileRotate, compression::Compression, suffix::AppendCount};
 use tokio::sync::watch;
 use tracing::info;
 
 use pod_runner::config::cli::CliArgs;
 use pod_runner::config::resolve::resolve_config;
+use pod_runner::logic::disk_usage::{DiskSizePodTask, DiskSizeRunnerTask};
 use pod_runner::logic::{
     CleanupConfig, DefaultExecutorProvider, ExecutorProvider, PodLogic, ResolverSet,
 };
-use pod_runner::logic::disk_usage::{DiskSizePodTask, DiskSizeRunnerTask};
 use pod_runner::metrics::Metrics;
 use pod_runner::server::app::{AppState, create_router};
+use pod_runner::store::PodStore;
 use pod_runner::store::file::{FileStore, FileStoreConfig};
 use pod_runner::store::memory::MemoryStore;
 use pod_runner::store::multiplex::MultiplexStore;
-use pod_runner::store::PodStore;
 
 #[tokio::main]
 async fn main() {
@@ -58,8 +56,7 @@ async fn main() {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_writer(writer)
         .with_ansi(false)
@@ -162,10 +159,7 @@ async fn main() {
         info!("Shutting down...");
         let _ = shutdown_tx.send(());
     });
-    pod_runner::server::tls::axum_serve_tls(
-        listener, app, server_config, shutdown,
-    )
-    .await;
+    pod_runner::server::tls::axum_serve_tls(listener, app, server_config, shutdown).await;
 
     // Wait for all running pods to finish cleanup before exiting.
     // Timeout is 2x the grace period to allow for SIGTERM + SIGKILL + archive.
@@ -176,7 +170,7 @@ async fn main() {
 
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let mut sigquit = signal(SignalKind::quit()).expect("install SIGQUIT handler");
@@ -195,9 +189,7 @@ async fn wait_for_shutdown_signal() {
 
 #[cfg(windows)]
 async fn wait_for_shutdown_signal() {
-    use tokio::signal::windows::{
-        ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown,
-    };
+    use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown};
     let mut ctrlc = ctrl_c().expect("install Ctrl+C handler");
     let mut ctrlbreak = ctrl_break().expect("install Ctrl+Break handler");
     let mut ctrlclose = ctrl_close().expect("install Ctrl+Close handler");

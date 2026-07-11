@@ -65,7 +65,11 @@ pub struct PodId {
 }
 
 impl PodId {
-    pub fn new(namespace: impl Into<String>, name: impl Into<String>, uid: impl Into<String>) -> Self {
+    pub fn new(
+        namespace: impl Into<String>,
+        name: impl Into<String>,
+        uid: impl Into<String>,
+    ) -> Self {
         Self {
             namespace: namespace.into(),
             name: name.into(),
@@ -196,7 +200,8 @@ pub trait PodStore: Send + Sync {
     async fn get(&self, id: &PodId, view: SpecView) -> Option<PodSnapshot>;
 
     /// Look up a pod by namespace and name (ignoring uid).
-    async fn get_by_name(&self, namespace: &str, name: &str, view: SpecView) -> Option<PodSnapshot>;
+    async fn get_by_name(&self, namespace: &str, name: &str, view: SpecView)
+    -> Option<PodSnapshot>;
 
     /// List all pods.
     async fn list(&self, view: SpecView) -> Vec<PodSnapshot>;
@@ -247,10 +252,10 @@ pub trait PodStore: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::file::{FileStore, FileStoreConfig};
     use super::memory::MemoryStore;
     use super::multiplex::MultiplexStore;
+    use super::*;
     use crate::spec::constants::PodPhase;
     use crate::spec::pod::{PodMetadata, PodSpecBody};
     use std::sync::Arc as StdArc;
@@ -288,7 +293,14 @@ mod tests {
         let original = make_spec("default", "my-pod", "uid-1");
         let running = make_running_spec("default", "my-pod", "uid-1");
         let id = PodId::from_spec(&original);
-        store.put(id.clone(), original, running, make_status(PodPhase::Pending)).await;
+        store
+            .put(
+                id.clone(),
+                original,
+                running,
+                make_status(PodPhase::Pending),
+            )
+            .await;
 
         let snap = store.get(&id, SpecView::Running).await.unwrap();
         assert_eq!(snap.id.name, "my-pod");
@@ -304,22 +316,47 @@ mod tests {
         assert!(store.get(&nope, SpecView::Running).await.is_none());
 
         // -- update status --
-        store.update_status(&id, make_status(PodPhase::Running)).await;
+        store
+            .update_status(&id, make_status(PodPhase::Running))
+            .await;
         let snap = store.get(&id, SpecView::Running).await.unwrap();
         assert_eq!(snap.status.phase, PodPhase::Running);
 
         // -- get by name --
-        let snap = store.get_by_name("default", "my-pod", SpecView::Running).await.unwrap();
+        let snap = store
+            .get_by_name("default", "my-pod", SpecView::Running)
+            .await
+            .unwrap();
         assert_eq!(snap.spec.metadata.uid, "uid-1_running");
-        let snap = store.get_by_name("default", "my-pod", SpecView::Original).await.unwrap();
+        let snap = store
+            .get_by_name("default", "my-pod", SpecView::Original)
+            .await
+            .unwrap();
         assert_eq!(snap.spec.metadata.uid, "uid-1");
-        assert!(store.get_by_name("default", "nope", SpecView::Running).await.is_none());
-        assert!(store.get_by_name("staging", "my-pod", SpecView::Running).await.is_none());
+        assert!(
+            store
+                .get_by_name("default", "nope", SpecView::Running)
+                .await
+                .is_none()
+        );
+        assert!(
+            store
+                .get_by_name("staging", "my-pod", SpecView::Running)
+                .await
+                .is_none()
+        );
 
         // -- put replaces --
         let original2 = make_spec("default", "my-pod", "uid-1");
         let running2 = make_running_spec("default", "my-pod", "uid-1");
-        store.put(id.clone(), original2, running2, make_status(PodPhase::Succeeded)).await;
+        store
+            .put(
+                id.clone(),
+                original2,
+                running2,
+                make_status(PodPhase::Succeeded),
+            )
+            .await;
         let snap = store.get(&id, SpecView::Running).await.unwrap();
         assert_eq!(snap.status.phase, PodPhase::Succeeded);
         assert_eq!(store.len().await, 1);
@@ -339,55 +376,89 @@ mod tests {
 
         for i in 0..3 {
             let original = make_spec("default", &format!("pod-{}", i), &format!("uid-{}", i));
-            let running = make_running_spec("default", &format!("pod-{}", i), &format!("uid-{}", i));
+            let running =
+                make_running_spec("default", &format!("pod-{}", i), &format!("uid-{}", i));
             let id = PodId::from_spec(&original);
-            store.put(id, original, running, make_status(PodPhase::Pending)).await;
+            store
+                .put(id, original, running, make_status(PodPhase::Pending))
+                .await;
         }
 
         // -- list with running view --
         let pods = store.list(SpecView::Running).await;
         assert_eq!(pods.len(), 3);
-        assert!(pods.iter().all(|s| s.spec.metadata.uid.ends_with("_running")));
+        assert!(
+            pods.iter()
+                .all(|s| s.spec.metadata.uid.ends_with("_running"))
+        );
 
         // -- list with original view --
         let pods = store.list(SpecView::Original).await;
         assert_eq!(pods.len(), 3);
-        assert!(pods.iter().all(|s| !s.spec.metadata.uid.ends_with("_running")));
+        assert!(
+            pods.iter()
+                .all(|s| !s.spec.metadata.uid.ends_with("_running"))
+        );
 
         assert_eq!(store.len().await, 3);
         assert!(!store.is_empty().await);
     }
 
     async fn run_namespace_tests(store: &dyn PodStore) {
-        store.put(
-            PodId::new("ns1", "a", "1"),
-            make_spec("ns1", "a", "1"),
-            make_running_spec("ns1", "a", "1"),
-            make_status(PodPhase::Running),
-        ).await;
-        store.put(
-            PodId::new("ns1", "b", "2"),
-            make_spec("ns1", "b", "2"),
-            make_running_spec("ns1", "b", "2"),
-            make_status(PodPhase::Running),
-        ).await;
-        store.put(
-            PodId::new("ns2", "c", "3"),
-            make_spec("ns2", "c", "3"),
-            make_running_spec("ns2", "c", "3"),
-            make_status(PodPhase::Running),
-        ).await;
+        store
+            .put(
+                PodId::new("ns1", "a", "1"),
+                make_spec("ns1", "a", "1"),
+                make_running_spec("ns1", "a", "1"),
+                make_status(PodPhase::Running),
+            )
+            .await;
+        store
+            .put(
+                PodId::new("ns1", "b", "2"),
+                make_spec("ns1", "b", "2"),
+                make_running_spec("ns1", "b", "2"),
+                make_status(PodPhase::Running),
+            )
+            .await;
+        store
+            .put(
+                PodId::new("ns2", "c", "3"),
+                make_spec("ns2", "c", "3"),
+                make_running_spec("ns2", "c", "3"),
+                make_status(PodPhase::Running),
+            )
+            .await;
 
         let ns1 = store.list_in_namespace("ns1", SpecView::Running).await;
         assert_eq!(ns1.len(), 2);
-        assert!(ns1.iter().all(|s| s.spec.metadata.uid.ends_with("_running")));
+        assert!(
+            ns1.iter()
+                .all(|s| s.spec.metadata.uid.ends_with("_running"))
+        );
 
         let ns1_orig = store.list_in_namespace("ns1", SpecView::Original).await;
         assert_eq!(ns1_orig.len(), 2);
-        assert!(ns1_orig.iter().all(|s| !s.spec.metadata.uid.ends_with("_running")));
+        assert!(
+            ns1_orig
+                .iter()
+                .all(|s| !s.spec.metadata.uid.ends_with("_running"))
+        );
 
-        assert_eq!(store.list_in_namespace("ns2", SpecView::Running).await.len(), 1);
-        assert_eq!(store.list_in_namespace("ns3", SpecView::Running).await.len(), 0);
+        assert_eq!(
+            store
+                .list_in_namespace("ns2", SpecView::Running)
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_in_namespace("ns3", SpecView::Running)
+                .await
+                .len(),
+            0
+        );
     }
 
     // -- PodId unit tests (independent of store impl) --
@@ -461,8 +532,16 @@ mod tests {
         let store = StdArc::new(MemoryStore::new());
         for i in 0..10 {
             let original = make_spec("default", &format!("pod-{}", i), &format!("uid-{}", i));
-            let running = make_running_spec("default", &format!("pod-{}", i), &format!("uid-{}", i));
-            store.put(PodId::from_spec(&original), original, running, make_status(PodPhase::Running)).await;
+            let running =
+                make_running_spec("default", &format!("pod-{}", i), &format!("uid-{}", i));
+            store
+                .put(
+                    PodId::from_spec(&original),
+                    original,
+                    running,
+                    make_status(PodPhase::Running),
+                )
+                .await;
         }
 
         let handles: Vec<_> = (0..5)

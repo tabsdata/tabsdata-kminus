@@ -55,7 +55,6 @@ impl MemoryStore {
             pods: RwLock::new(HashMap::new()),
         }
     }
-
 }
 
 impl Default for MemoryStore {
@@ -66,16 +65,25 @@ impl Default for MemoryStore {
 
 #[async_trait]
 impl PodStore for MemoryStore {
-    async fn put(&self, id: PodId, original_spec: Arc<PodSpec>, running_spec: Arc<PodSpec>, status: PodStatus) {
+    async fn put(
+        &self,
+        id: PodId,
+        original_spec: Arc<PodSpec>,
+        running_spec: Arc<PodSpec>,
+        status: PodStatus,
+    ) {
         let _span = debug_span!("store", pod = %id).entered();
         debug!(phase = ?status.phase, "Pod added");
         let mut pods = self.pods.write().unwrap();
-        pods.insert(id.clone(), PodEntry {
-            id,
-            original_spec,
-            running_spec,
-            status,
-        });
+        pods.insert(
+            id.clone(),
+            PodEntry {
+                id,
+                original_spec,
+                running_spec,
+                status,
+            },
+        );
     }
 
     async fn update_status(&self, id: &PodId, status: PodStatus) {
@@ -92,7 +100,12 @@ impl PodStore for MemoryStore {
         pods.get(id).map(|e| e.snapshot(view))
     }
 
-    async fn get_by_name(&self, namespace: &str, name: &str, view: SpecView) -> Option<PodSnapshot> {
+    async fn get_by_name(
+        &self,
+        namespace: &str,
+        name: &str,
+        view: SpecView,
+    ) -> Option<PodSnapshot> {
         let pods = self.pods.read().unwrap();
         pods.values()
             .find(|e| e.id.namespace == namespace && e.id.name == name)
@@ -131,4 +144,3 @@ impl PodStore for MemoryStore {
             .count()
     }
 }
-

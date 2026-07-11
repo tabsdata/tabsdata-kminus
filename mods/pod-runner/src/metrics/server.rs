@@ -4,11 +4,11 @@
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
 use prometheus::Encoder;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -20,11 +20,7 @@ use super::Metrics;
 /// Serves `GET /metrics` in Prometheus text format. Refreshes gauges
 /// (memory, uptime, tokio tasks) on each scrape. Shuts down when
 /// the shutdown signal fires.
-pub async fn serve_metrics(
-    port: u16,
-    metrics: Arc<Metrics>,
-    mut shutdown_rx: watch::Receiver<()>,
-) {
+pub async fn serve_metrics(port: u16, metrics: Arc<Metrics>, mut shutdown_rx: watch::Receiver<()>) {
     let app = Router::new()
         .route("/metrics", get(handle_metrics))
         .with_state(metrics);
@@ -103,9 +99,9 @@ mod tests {
     }
 
     async fn reqwest_lite(url: &str) -> String {
+        use http_body_util::BodyExt;
         use hyper_util::client::legacy::Client;
         use hyper_util::rt::TokioExecutor;
-        use http_body_util::BodyExt;
 
         let client = Client::builder(TokioExecutor::new())
             .build_http::<http_body_util::Full<bytes::Bytes>>();

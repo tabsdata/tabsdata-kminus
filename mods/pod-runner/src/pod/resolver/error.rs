@@ -164,12 +164,10 @@ mod tests {
 
     #[test]
     fn display_uses_resource_label() {
-        let s: SecretResolverError =
-            ResolverError::not_found("creds", "file missing");
+        let s: SecretResolverError = ResolverError::not_found("creds", "file missing");
         assert_eq!(format!("{s}"), "secret 'creds': file missing");
 
-        let c: ConfigMapResolverError =
-            ResolverError::not_found("settings", "file missing");
+        let c: ConfigMapResolverError = ResolverError::not_found("settings", "file missing");
         assert_eq!(format!("{c}"), "configmap 'settings': file missing");
     }
 
@@ -199,8 +197,9 @@ mod tests {
 
     #[test]
     fn from_poll_cancelled_uses_resource_label() {
-        let poll_err: PollError<ConfigMapResolverError> =
-            PollError::Cancelled { elapsed: Duration::from_secs(1) };
+        let poll_err: PollError<ConfigMapResolverError> = PollError::Cancelled {
+            elapsed: Duration::from_secs(1),
+        };
         let err: ConfigMapResolverError = poll_err.into();
         assert_eq!(err.kind, ResolverErrorKind::Cancelled);
         assert!(err.message.contains("configmap resolution cancelled"));

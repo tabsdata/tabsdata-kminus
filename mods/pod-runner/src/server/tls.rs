@@ -18,7 +18,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use super::config::PRConfig;
-use crate::tls::{load_certs, load_private_key, TlsError};
+use crate::tls::{TlsError, load_certs, load_private_key};
 
 /// Return the process-default CryptoProvider, falling back to `aws-lc-rs`.
 fn crypto_provider() -> Arc<CryptoProvider> {
@@ -40,7 +40,10 @@ pub fn build_server_config(pr_config: &PRConfig) -> Result<ServerConfig, TlsErro
     pr_config.tls.validate()?;
 
     let cert_pem = pr_config.tls.certificate.resolve("tls.certificate")?;
-    let key_pem = pr_config.tls.certificate_key.resolve("tls.certificate_key")?;
+    let key_pem = pr_config
+        .tls
+        .certificate_key
+        .resolve("tls.certificate_key")?;
     let ca_pem = pr_config.tls.client_ca.resolve("tls.client_ca")?;
 
     let certs = load_certs(&cert_pem)?;
@@ -62,11 +65,11 @@ fn build_mtls_config(
         root_store.add(cert).map_err(TlsError::AddCaCert)?;
     }
     let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-            Arc::new(root_store),
-            crypto_provider(),
-        )
-        .build()
-        .map_err(|e| TlsError::BuildVerifier(e.to_string()))?;
+        Arc::new(root_store),
+        crypto_provider(),
+    )
+    .build()
+    .map_err(|e| TlsError::BuildVerifier(e.to_string()))?;
 
     ServerConfig::builder_with_provider(crypto_provider())
         .with_safe_default_protocol_versions()
@@ -187,13 +190,13 @@ mod tests {
             .push(rcgen::DnType::CommonName, "test-server");
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = params.signed_by(&key, ca).unwrap();
-        rcgen::CertifiedKey { cert, signing_key: key }
+        rcgen::CertifiedKey {
+            cert,
+            signing_key: key,
+        }
     }
 
-    fn make_tls_config(
-        cert_pem: &str,
-        key_pem: &str,
-    ) -> PRConfig {
+    fn make_tls_config(cert_pem: &str, key_pem: &str) -> PRConfig {
         let mut c = PRConfig::default();
         c.tls = ServerTlsConfig {
             certificate: CertSource {
@@ -215,11 +218,7 @@ mod tests {
         c
     }
 
-    fn make_mtls_config(
-        cert_pem: &str,
-        key_pem: &str,
-        ca_pem: &str,
-    ) -> PRConfig {
+    fn make_mtls_config(cert_pem: &str, key_pem: &str, ca_pem: &str) -> PRConfig {
         let mut c = make_tls_config(cert_pem, key_pem);
         c.tls.client_ca = CertSource {
             path: None,
@@ -295,7 +294,6 @@ mod tests {
                 "not a key",
             )),
         };
-        
 
         let result = build_server_config(&config);
         assert!(result.is_err());

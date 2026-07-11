@@ -50,8 +50,7 @@ impl YamlPRConfig {
     }
 
     pub fn from_str(yaml: &str) -> Result<Self, String> {
-        serde_yaml_ng::from_str(yaml)
-            .map_err(|e| format!("Failed to parse prconfig YAML: {e}"))
+        serde_yaml_ng::from_str(yaml).map_err(|e| format!("Failed to parse prconfig YAML: {e}"))
     }
 
     /// Validate TLS fields and URL scheme.
@@ -61,10 +60,15 @@ impl YamlPRConfig {
             return Err("server.tls: cannot set both certificate and certificate-data".into());
         }
         if !tls.certificate_key.is_empty() && !tls.certificate_key_data.is_empty() {
-            return Err("server.tls: cannot set both certificate-key and certificate-key-data".into());
+            return Err(
+                "server.tls: cannot set both certificate-key and certificate-key-data".into(),
+            );
         }
         if !tls.certificate_authority.is_empty() && !tls.certificate_authority_data.is_empty() {
-            return Err("server.tls: cannot set both certificate-authority and certificate-authority-data".into());
+            return Err(
+                "server.tls: cannot set both certificate-authority and certificate-authority-data"
+                    .into(),
+            );
         }
 
         if !self.url.is_empty() && !self.url.starts_with("https://") {
@@ -74,7 +78,8 @@ impl YamlPRConfig {
         if self.url.starts_with("https://") {
             let has_cert = !tls.certificate.is_empty() || !tls.certificate_data.is_empty();
             let has_key = !tls.certificate_key.is_empty() || !tls.certificate_key_data.is_empty();
-            let has_ca = !tls.certificate_authority.is_empty() || !tls.certificate_authority_data.is_empty();
+            let has_ca =
+                !tls.certificate_authority.is_empty() || !tls.certificate_authority_data.is_empty();
             if !has_cert || !has_key {
                 return Err("HTTPS requires server certificate and key".into());
             }
@@ -105,7 +110,6 @@ pub struct YamlSysConfig {
     pub capacity: YamlCapacityConfig,
 
     // -- pod limits --
-
     #[serde(alias = "maxPods")]
     pub max_pods: usize,
 
@@ -122,7 +126,6 @@ pub struct YamlSysConfig {
     pub clean_up_force_kill_wait_secs: u64,
 
     // -- executor --
-
     #[serde(alias = "propagateEnv")]
     pub propagate_env: bool,
 
@@ -130,12 +133,10 @@ pub struct YamlSysConfig {
     pub die_with_parent: bool,
 
     // -- security --
-
     #[serde(alias = "writeSecretsToContainerShellScript")]
     pub write_secrets_to_container_shell_script: bool,
 
     // -- images --
-
     /// Root directory used to resolve relative `image` paths in pod specs.
     /// Absolute `image` paths are used as-is. Empty (default) means the
     /// container `image` field is used verbatim.
@@ -143,7 +144,6 @@ pub struct YamlSysConfig {
     pub images_dir: String,
 
     // -- cleanup --
-
     #[serde(alias = "keepDeletedPodDir")]
     pub keep_deleted_pod_dir: bool,
 
@@ -162,12 +162,10 @@ pub struct YamlSysConfig {
     pub dir_size_scan_interval_secs: u64,
 
     // -- metrics --
-
     #[serde(alias = "metricsUrl")]
     pub metrics_url: String,
 
     // -- resolvers --
-
     #[serde(alias = "secretResolver")]
     pub secret_resolver: YamlResolverConfig,
 
@@ -199,9 +197,18 @@ impl Default for YamlSysConfig {
             pod_archive_ttl_days: 7,
             dir_size_scan_interval_secs: 60,
             metrics_url: crate::metrics::DEFAULT_METRICS_URL.to_string(),
-            secret_resolver: YamlResolverConfig { resolver_type: "kube".into(), ..Default::default() },
-            config_map_resolver: YamlResolverConfig { resolver_type: "kube".into(), ..Default::default() },
-            node_envs_resolver: YamlResolverConfig { resolver_type: "none".into(), ..Default::default() },
+            secret_resolver: YamlResolverConfig {
+                resolver_type: "kube".into(),
+                ..Default::default()
+            },
+            config_map_resolver: YamlResolverConfig {
+                resolver_type: "kube".into(),
+                ..Default::default()
+            },
+            node_envs_resolver: YamlResolverConfig {
+                resolver_type: "none".into(),
+                ..Default::default()
+            },
         }
     }
 }
@@ -214,8 +221,7 @@ impl YamlSysConfig {
     }
 
     pub fn from_str(yaml: &str) -> Result<Self, String> {
-        serde_yaml_ng::from_str(yaml)
-            .map_err(|e| format!("Failed to parse prsysconfig YAML: {e}"))
+        serde_yaml_ng::from_str(yaml).map_err(|e| format!("Failed to parse prsysconfig YAML: {e}"))
     }
 }
 
@@ -260,7 +266,11 @@ pub struct YamlCapacityConfig {
 
 impl Default for YamlCapacityConfig {
     fn default() -> Self {
-        Self { cpu: 100, memory_gb: 100, pods: 100 }
+        Self {
+            cpu: 100,
+            memory_gb: 100,
+            pods: 100,
+        }
     }
 }
 

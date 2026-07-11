@@ -44,12 +44,14 @@ impl PodStore for MultiplexStore {
         running_spec: Arc<PodSpec>,
         status: PodStatus,
     ) {
-        self.primary.put(
-            id.clone(),
-            Arc::clone(&original_spec),
-            Arc::clone(&running_spec),
-            status.clone(),
-        ).await;
+        self.primary
+            .put(
+                id.clone(),
+                Arc::clone(&original_spec),
+                Arc::clone(&running_spec),
+                status.clone(),
+            )
+            .await;
         self.secondary
             .put(id, original_spec, running_spec, status)
             .await;
@@ -64,7 +66,12 @@ impl PodStore for MultiplexStore {
         self.primary.get(id, view).await
     }
 
-    async fn get_by_name(&self, namespace: &str, name: &str, view: SpecView) -> Option<PodSnapshot> {
+    async fn get_by_name(
+        &self,
+        namespace: &str,
+        name: &str,
+        view: SpecView,
+    ) -> Option<PodSnapshot> {
         self.primary.get_by_name(namespace, name, view).await
     }
 
@@ -146,7 +153,8 @@ mod tests {
             make_spec("default", "app", "uid-1"),
             make_running_spec("default", "app", "uid-1"),
             make_status(PodPhase::Pending),
-        ).await;
+        )
+        .await;
 
         assert!(primary.contains(&id).await);
         assert!(secondary.contains(&id).await);
@@ -162,7 +170,8 @@ mod tests {
             make_spec("default", "app", "uid-1"),
             make_running_spec("default", "app", "uid-1"),
             make_status(PodPhase::Pending),
-        ).await;
+        )
+        .await;
         mpx.update_status(&id, make_status(PodPhase::Running)).await;
 
         let p = primary.get(&id, SpecView::Running).await.unwrap();
@@ -177,21 +186,32 @@ mod tests {
         let id = PodId::new("default", "app", "uid-1");
 
         // Put only in primary (bypass multiplex)
-        primary.put(
-            id.clone(),
-            make_spec("default", "app", "uid-1"),
-            make_running_spec("default", "app", "uid-1"),
-            make_status(PodPhase::Pending),
-        ).await;
+        primary
+            .put(
+                id.clone(),
+                make_spec("default", "app", "uid-1"),
+                make_running_spec("default", "app", "uid-1"),
+                make_status(PodPhase::Pending),
+            )
+            .await;
 
         // Multiplex reads from primary
         assert!(mpx.get(&id, SpecView::Running).await.is_some());
         assert_eq!(mpx.len().await, 1);
         assert!(!mpx.is_empty().await);
         assert!(mpx.contains(&id).await);
-        assert!(mpx.get_by_name("default", "app", SpecView::Running).await.is_some());
+        assert!(
+            mpx.get_by_name("default", "app", SpecView::Running)
+                .await
+                .is_some()
+        );
         assert_eq!(mpx.list(SpecView::Running).await.len(), 1);
-        assert_eq!(mpx.list_in_namespace("default", SpecView::Running).await.len(), 1);
+        assert_eq!(
+            mpx.list_in_namespace("default", SpecView::Running)
+                .await
+                .len(),
+            1
+        );
 
         // Secondary is empty — doesn't affect reads
         assert_eq!(secondary.len().await, 0);
@@ -207,7 +227,8 @@ mod tests {
             make_spec("default", "app", "uid-1"),
             make_running_spec("default", "app", "uid-1"),
             make_status(PodPhase::Pending),
-        ).await;
+        )
+        .await;
 
         let snap = mpx.remove(&id).await.unwrap();
         assert_eq!(snap.id.name, "app");
@@ -226,10 +247,13 @@ mod tests {
             make_spec("default", "app", "uid-1"),
             make_running_spec("default", "app", "uid-1"),
             make_status(PodPhase::Pending),
-        ).await;
+        )
+        .await;
 
         // Update only primary status (bypass multiplex)
-        primary.update_status(&id, make_status(PodPhase::Running)).await;
+        primary
+            .update_status(&id, make_status(PodPhase::Running))
+            .await;
 
         // Remove returns primary's snapshot (Running), not secondary's (Pending)
         let snap = mpx.remove(&id).await.unwrap();
@@ -246,7 +270,8 @@ mod tests {
             make_spec("default", "app", "uid-1"),
             make_running_spec("default", "app", "uid-1"),
             make_status(PodPhase::Pending),
-        ).await;
+        )
+        .await;
 
         let original = mpx.get(&id, SpecView::Original).await.unwrap();
         let running = mpx.get(&id, SpecView::Running).await.unwrap();

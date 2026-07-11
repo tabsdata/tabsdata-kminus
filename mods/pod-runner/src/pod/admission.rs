@@ -95,7 +95,12 @@ pub fn admit(spec: &PodSpec) -> Result<(), AdmissionError> {
     for v in &spec.spec.volumes {
         check_supported_volume(v)?;
     }
-    for c in spec.spec.init_containers.iter().chain(spec.spec.containers.iter()) {
+    for c in spec
+        .spec
+        .init_containers
+        .iter()
+        .chain(spec.spec.containers.iter())
+    {
         check_no_optional_refs(c)?;
         check_supported_probes(c)?;
         check_no_subpath_mounts(c)?;
@@ -173,7 +178,9 @@ fn check_no_subpath_mounts(c: &Container) -> Result<(), AdmissionError> {
 /// Reject any configmap/secret reference on `c` that sets `optional: true`.
 fn check_no_optional_refs(c: &Container) -> Result<(), AdmissionError> {
     for ev in &c.env {
-        let Some(ref vf) = ev.value_from else { continue };
+        let Some(ref vf) = ev.value_from else {
+            continue;
+        };
         if let Some(ref r) = vf.secret_key_ref
             && r.optional == Some(true)
         {
@@ -200,20 +207,14 @@ fn check_no_optional_refs(c: &Container) -> Result<(), AdmissionError> {
             && r.optional == Some(true)
         {
             return Err(AdmissionError::OptionalNotSupported {
-                location: format!(
-                    "container '{}', envFrom secretRef '{}'",
-                    c.name, r.name
-                ),
+                location: format!("container '{}', envFrom secretRef '{}'", c.name, r.name),
             });
         }
         if let Some(ref r) = ef.config_map_ref
             && r.optional == Some(true)
         {
             return Err(AdmissionError::OptionalNotSupported {
-                location: format!(
-                    "container '{}', envFrom configMapRef '{}'",
-                    c.name, r.name
-                ),
+                location: format!("container '{}', envFrom configMapRef '{}'", c.name, r.name),
             });
         }
     }

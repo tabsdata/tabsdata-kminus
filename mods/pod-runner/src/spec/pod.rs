@@ -62,7 +62,6 @@ pub struct ExecAction {
     pub command: Vec<String>,
 }
 
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct HttpGetAction {
@@ -78,9 +77,15 @@ pub struct TcpSocketAction {
     pub host: String,
 }
 
-fn default_10() -> u32 { 10 }
-fn default_1() -> u32 { 1 }
-fn default_3() -> u32 { 3 }
+fn default_10() -> u32 {
+    10
+}
+fn default_1() -> u32 {
+    1
+}
+fn default_3() -> u32 {
+    3
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -281,11 +286,17 @@ pub struct PodSpecBody {
 
 impl PodSpecBody {
     pub fn all_containers(&self) -> Vec<&Container> {
-        self.init_containers.iter().chain(self.containers.iter()).collect()
+        self.init_containers
+            .iter()
+            .chain(self.containers.iter())
+            .collect()
     }
 
     pub fn all_containers_mut(&mut self) -> Vec<&mut Container> {
-        self.init_containers.iter_mut().chain(self.containers.iter_mut()).collect()
+        self.init_containers
+            .iter_mut()
+            .chain(self.containers.iter_mut())
+            .collect()
     }
 
     pub fn volume_map(&self) -> HashMap<&str, &Volume> {
@@ -323,7 +334,11 @@ pub struct PodSpec {
 
 impl PodSpec {
     pub fn all_container_names(&self) -> Vec<String> {
-        self.spec.all_containers().iter().map(|c| c.name.clone()).collect()
+        self.spec
+            .all_containers()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect()
     }
 
     /// The pod's `terminationGracePeriodSeconds` as a [`Duration`], if set.

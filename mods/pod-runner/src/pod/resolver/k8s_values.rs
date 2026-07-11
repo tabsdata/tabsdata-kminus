@@ -159,7 +159,12 @@ pub async fn resolve_k8s_values(
         let mut secret_keys: HashSet<String> = HashSet::new();
 
         // 1. Node-level envs (lowest priority)
-        env.extend(resolvers.node_envs.iter().map(|(k, v)| (k.clone(), v.clone())));
+        env.extend(
+            resolvers
+                .node_envs
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
 
         // 2. envFrom (bulk loading, in order)
         for ef in &c.env_from {
@@ -168,10 +173,11 @@ pub async fn resolve_k8s_values(
                     env.extend(cm_data.iter().map(|(k, v)| (k.clone(), v.clone())));
                 }
             } else if let Some(ref sec_ref) = ef.secret_ref
-                && let Some(sec_data) = resolved_secrets.get(&sec_ref.name) {
-                    env.extend(sec_data.iter().map(|(k, v)| (k.clone(), v.clone())));
-                    secret_keys.extend(sec_data.keys().cloned());
-                }
+                && let Some(sec_data) = resolved_secrets.get(&sec_ref.name)
+            {
+                env.extend(sec_data.iter().map(|(k, v)| (k.clone(), v.clone())));
+                secret_keys.extend(sec_data.keys().cloned());
+            }
         }
 
         // 3. Individual env entries (highest priority)
@@ -181,15 +187,17 @@ pub async fn resolve_k8s_values(
             } else if let Some(ref vf) = ev.value_from {
                 if let Some(ref sec_ref) = vf.secret_key_ref {
                     if let Some(sec_data) = resolved_secrets.get(&sec_ref.name)
-                        && let Some(val) = sec_data.get(&sec_ref.key) {
-                            env.insert(ev.name.clone(), val.clone());
-                            secret_keys.insert(ev.name.clone());
-                        }
+                        && let Some(val) = sec_data.get(&sec_ref.key)
+                    {
+                        env.insert(ev.name.clone(), val.clone());
+                        secret_keys.insert(ev.name.clone());
+                    }
                 } else if let Some(ref cm_ref) = vf.config_map_key_ref
                     && let Some(cm_data) = resolved_configmaps.get(&cm_ref.name)
-                        && let Some(val) = cm_data.get(&cm_ref.key) {
-                            env.insert(ev.name.clone(), val.clone());
-                        }
+                    && let Some(val) = cm_data.get(&cm_ref.key)
+                {
+                    env.insert(ev.name.clone(), val.clone());
+                }
             }
         }
 
@@ -262,13 +270,23 @@ mod tests {
         let pod = make_pod_with_envs(vec![Container {
             name: "app".to_string(),
             env: vec![
-                EnvVar { name: "FOO".to_string(), value: Some("bar".to_string()), value_from: None },
-                EnvVar { name: "BAZ".to_string(), value: Some("qux".to_string()), value_from: None },
+                EnvVar {
+                    name: "FOO".to_string(),
+                    value: Some("bar".to_string()),
+                    value_from: None,
+                },
+                EnvVar {
+                    name: "BAZ".to_string(),
+                    value: Some("qux".to_string()),
+                    value_from: None,
+                },
             ],
             ..Default::default()
         }]);
 
-        let result = resolve_no_wait(&pod, "default", &ResolverSet::default()).await.unwrap();
+        let result = resolve_no_wait(&pod, "default", &ResolverSet::default())
+            .await
+            .unwrap();
         let app = &result.containers["app"];
         assert_eq!(app.env["FOO"], "bar");
         assert_eq!(app.env["BAZ"], "qux");
@@ -379,7 +397,10 @@ mod tests {
         let pod = make_pod_with_envs(vec![Container {
             name: "app".to_string(),
             env_from: vec![EnvFromSource {
-                secret_ref: Some(ObjectRef { name: "creds".to_string(), ..Default::default() }),
+                secret_ref: Some(ObjectRef {
+                    name: "creds".to_string(),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }],
             ..Default::default()
@@ -406,7 +427,10 @@ mod tests {
         let pod = make_pod_with_envs(vec![Container {
             name: "app".to_string(),
             env_from: vec![EnvFromSource {
-                config_map_ref: Some(ObjectRef { name: "settings".to_string(), ..Default::default() }),
+                config_map_ref: Some(ObjectRef {
+                    name: "settings".to_string(),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }],
             ..Default::default()
@@ -440,7 +464,9 @@ mod tests {
             ..Default::default()
         }]);
 
-        let err = resolve_no_wait(&pod, "default", &ResolverSet::default()).await.unwrap_err();
+        let err = resolve_no_wait(&pod, "default", &ResolverSet::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, PrepareError::NoSecretResolver));
     }
 
@@ -497,7 +523,9 @@ mod tests {
             ..Default::default()
         });
 
-        let err = resolve_no_wait(&pod, "default", &ResolverSet::default()).await.unwrap_err();
+        let err = resolve_no_wait(&pod, "default", &ResolverSet::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, PrepareError::NoConfigMapResolver));
     }
 
@@ -513,7 +541,9 @@ mod tests {
             ..Default::default()
         }]);
 
-        let result = resolve_no_wait(&pod, "default", &ResolverSet::default()).await.unwrap();
+        let result = resolve_no_wait(&pod, "default", &ResolverSet::default())
+            .await
+            .unwrap();
         assert_eq!(result.containers["app"].env["PLAIN"], "val");
     }
 
@@ -521,7 +551,11 @@ mod tests {
     async fn projected_configmap_sources_resolved() {
         let dir = setup_dir("proj-cm");
         fs::write(dir.join("cm-a.yaml"), "data:\n  apiserver.yaml: \"A\"\n").unwrap();
-        fs::write(dir.join("cm-b.yaml"), "data:\n  apiserver.log.yaml: \"B\"\n").unwrap();
+        fs::write(
+            dir.join("cm-b.yaml"),
+            "data:\n  apiserver.log.yaml: \"B\"\n",
+        )
+        .unwrap();
 
         let mut pod = make_pod_with_envs(vec![Container {
             name: "app".to_string(),

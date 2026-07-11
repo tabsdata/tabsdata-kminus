@@ -37,10 +37,7 @@ pub type SharedState = Arc<AppState>;
 ///
 /// If `metrics` is provided, adds a middleware layer that records
 /// HTTP request duration in the Prometheus histogram.
-pub fn create_router(
-    state: SharedState,
-    metrics: Option<Arc<crate::metrics::Metrics>>,
-) -> Router {
+pub fn create_router(state: SharedState, metrics: Option<Arc<crate::metrics::Metrics>>) -> Router {
     let router = Router::new()
         .route("/createPod", post(handle_create_pod))
         .route("/deletePod", delete(handle_delete_pod))
@@ -115,7 +112,13 @@ fn error_response(err: LogicError) -> Response {
         LogicError::Admission(_) => StatusCode::BAD_REQUEST,
         LogicError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    (code, Json(ErrorResponse { error: err.to_string() })).into_response()
+    (
+        code,
+        Json(ErrorResponse {
+            error: err.to_string(),
+        }),
+    )
+        .into_response()
 }
 
 fn missing_param(name: &str) -> Response {
@@ -126,7 +129,11 @@ fn missing_param(name: &str) -> Response {
 }
 
 fn bad_request(message: String) -> Response {
-    (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: message })).into_response()
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse { error: message }),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +191,11 @@ async fn handle_get_pod(
     };
     let namespace = params.namespace;
 
-    match state.logic.get_pod(&namespace, &name, SpecView::Running).await {
+    match state
+        .logic
+        .get_pod(&namespace, &name, SpecView::Running)
+        .await
+    {
         Ok(snap) => {
             let pod = PodObject {
                 metadata: snap.spec.metadata.clone(),
@@ -262,7 +273,12 @@ async fn handle_get_container_logs(
 
     let rx = match state
         .logic
-        .stream_container_logs(&params.namespace, &pod_name, params.container_name.as_deref(), options)
+        .stream_container_logs(
+            &params.namespace,
+            &pod_name,
+            params.container_name.as_deref(),
+            options,
+        )
         .await
     {
         Ok(rx) => rx,
@@ -301,8 +317,8 @@ mod tests {
     use super::*;
     use crate::logic::{DefaultExecutorProvider, LogicConfig};
     use crate::pod::resolver::ResolverSet;
-    use crate::store::memory::MemoryStore;
     use crate::store::PodStore;
+    use crate::store::memory::MemoryStore;
     use crate::testutils::shell_cmd;
 
     use http_body_util::BodyExt;
@@ -312,10 +328,8 @@ mod tests {
     /// Start a test server on a random port, return the address.
     async fn start_server() -> (std::net::SocketAddr, watch::Sender<()>) {
         let store = Arc::new(MemoryStore::new());
-        let base = std::env::temp_dir().join(format!(
-            "pod-runner-rs2-test-server-{}",
-            std::process::id(),
-        ));
+        let base = std::env::temp_dir()
+            .join(format!("pod-runner-rs2-test-server-{}", std::process::id(),));
         let provider = Arc::new(DefaultExecutorProvider {
             pods_dir: base.join("pods"),
             pid_dir: base.join("pids"),
@@ -327,7 +341,7 @@ mod tests {
         });
         let cleanup = crate::logic::CleanupConfig {
             pods_dir: base.join("pods"),
-            
+
             ..crate::logic::CleanupConfig::default()
         };
         let (shutdown_tx, _) = watch::channel(());
@@ -358,10 +372,9 @@ mod tests {
         path: &str,
         body: Option<serde_json::Value>,
     ) -> (StatusCode, serde_json::Value) {
-        let client = hyper_util::client::legacy::Client::builder(
-            hyper_util::rt::TokioExecutor::new(),
-        )
-        .build_http();
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build_http();
 
         let uri = format!("http://{}{}", addr, path);
         let req_body = body
@@ -411,7 +424,13 @@ mod tests {
     async fn create_pod_success() {
         let (addr, _) = start_server().await;
 
-        let (status, body) = request(&addr, "POST", "/createPod", Some(pod_spec_json("app", "exit 0"))).await;
+        let (status, body) = request(
+            &addr,
+            "POST",
+            "/createPod",
+            Some(pod_spec_json("app", "exit 0")),
+        )
+        .await;
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(body["phase"], "Pending");
         assert!(body["podId"].as_str().unwrap().contains("app"));
@@ -421,7 +440,13 @@ mod tests {
     async fn create_pod_invalid_json() {
         let (addr, _) = start_server().await;
 
-        let (status, body) = request(&addr, "POST", "/createPod", Some(serde_json::json!("not a spec"))).await;
+        let (status, body) = request(
+            &addr,
+            "POST",
+            "/createPod",
+            Some(serde_json::json!("not a spec")),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["error"].as_str().unwrap().contains("Invalid pod spec"));
     }
@@ -432,8 +457,20 @@ mod tests {
 
         // Same name, new uid, old pod still live → conflict (retryable);
         // the old pod is terminated so a later retry can proceed.
-        request(&addr, "POST", "/createPod", Some(pod_spec_json("app", "sleep 60"))).await;
-        let (status, body) = request(&addr, "POST", "/createPod", Some(pod_spec_json_uid("app", "uid-app-2", "sleep 60"))).await;
+        request(
+            &addr,
+            "POST",
+            "/createPod",
+            Some(pod_spec_json("app", "sleep 60")),
+        )
+        .await;
+        let (status, body) = request(
+            &addr,
+            "POST",
+            "/createPod",
+            Some(pod_spec_json_uid("app", "uid-app-2", "sleep 60")),
+        )
+        .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(body["error"].as_str().unwrap().contains("already exists"));
     }
@@ -444,7 +481,13 @@ mod tests {
     async fn delete_pod_success() {
         let (addr, _) = start_server().await;
 
-        request(&addr, "POST", "/createPod", Some(pod_spec_json("app", "exit 0"))).await;
+        request(
+            &addr,
+            "POST",
+            "/createPod",
+            Some(pod_spec_json("app", "exit 0")),
+        )
+        .await;
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         let (status, body) = request(&addr, "DELETE", "/deletePod?name=app", None).await;
@@ -476,7 +519,13 @@ mod tests {
     async fn get_pod_success() {
         let (addr, _) = start_server().await;
 
-        request(&addr, "POST", "/createPod", Some(pod_spec_json("app", "sleep 60"))).await;
+        request(
+            &addr,
+            "POST",
+            "/createPod",
+            Some(pod_spec_json("app", "sleep 60")),
+        )
+        .await;
 
         let (status, body) = request(&addr, "GET", "/getPod?name=app", None).await;
         assert_eq!(status, StatusCode::OK);
@@ -507,7 +556,13 @@ mod tests {
     async fn get_pod_status_success() {
         let (addr, _) = start_server().await;
 
-        request(&addr, "POST", "/createPod", Some(pod_spec_json("app", "sleep 60"))).await;
+        request(
+            &addr,
+            "POST",
+            "/createPod",
+            Some(pod_spec_json("app", "sleep 60")),
+        )
+        .await;
 
         let (status, body) = request(&addr, "GET", "/getPodStatus?name=app", None).await;
         assert_eq!(status, StatusCode::OK);
@@ -537,8 +592,20 @@ mod tests {
     async fn get_pods_multiple() {
         let (addr, _) = start_server().await;
 
-        request(&addr, "POST", "/createPod", Some(pod_spec_json("a", "sleep 60"))).await;
-        request(&addr, "POST", "/createPod", Some(pod_spec_json("b", "sleep 60"))).await;
+        request(
+            &addr,
+            "POST",
+            "/createPod",
+            Some(pod_spec_json("a", "sleep 60")),
+        )
+        .await;
+        request(
+            &addr,
+            "POST",
+            "/createPod",
+            Some(pod_spec_json("b", "sleep 60")),
+        )
+        .await;
 
         let (status, body) = request(&addr, "GET", "/getPods", None).await;
         assert_eq!(status, StatusCode::OK);
@@ -552,7 +619,13 @@ mod tests {
         let (addr, _) = start_server().await;
 
         // Create a pod that writes output and exits
-        request(&addr, "POST", "/createPod", Some(pod_spec_json("logger", "echo hello-log"))).await;
+        request(
+            &addr,
+            "POST",
+            "/createPod",
+            Some(pod_spec_json("logger", "echo hello-log")),
+        )
+        .await;
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         let (status, _body) = request(&addr, "GET", "/getContainerLogs?podName=logger", None).await;
@@ -631,7 +704,10 @@ mod tests {
                 },
                 StatusCode::CONFLICT,
             ),
-            (LogicError::CapacityExceeded { max: 10 }, StatusCode::FORBIDDEN),
+            (
+                LogicError::CapacityExceeded { max: 10 },
+                StatusCode::FORBIDDEN,
+            ),
             (
                 LogicError::Admission(AdmissionError::OptionalNotSupported {
                     location: "container 'app', env 'PORT', secretKeyRef 'creds/pass'".into(),
@@ -644,7 +720,10 @@ mod tests {
                 }),
                 StatusCode::BAD_REQUEST,
             ),
-            (LogicError::Internal("boom".into()), StatusCode::INTERNAL_SERVER_ERROR),
+            (
+                LogicError::Internal("boom".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
         ];
 
         for (err, expected) in cases {

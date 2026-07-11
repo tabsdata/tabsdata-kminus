@@ -75,11 +75,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use tracing::{debug, debug_span, info, info_span, warn, Instrument};
+use tracing::{Instrument, debug, debug_span, info, info_span, warn};
 
-use crate::pod::container_log::{read_only_mount_warning, ContainerLogStream};
+use crate::pod::container_log::{ContainerLogStream, read_only_mount_warning};
 use crate::pod::lifecycle::PodLifecycle;
 use crate::pod::probe::{self, ProbeAction};
 use crate::process::executor::{
@@ -345,7 +345,7 @@ impl PodHandle {
     /// uses that as its timeout, so this method returns within roughly
     /// that window.
     pub async fn wait_for_finish(&mut self) {
-        use std::future::{poll_fn, Future};
+        use std::future::{Future, poll_fn};
         use std::pin::Pin;
         // JoinHandle is `Unpin`. Poll via poll_fn so we drive the
         // task to completion without consuming the JoinHandle —
@@ -448,9 +448,7 @@ impl PodLogHandle {
                 .containers
                 .first()
                 .map(|c| c.name.clone())
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "pod has no containers")
-                })?,
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "pod has no containers"))?,
         };
 
         let log_dir = self.log_dir.clone().ok_or_else(|| {
@@ -480,11 +478,16 @@ impl PodLogHandle {
                 options.previous,
             );
 
-            if let Err(e) =
-                container_log::stream_log_file(
-                    &tx, &log_path, options.tail_lines, options.follow, options.timestamps,
-                    &state, &mut kill_watch,
-                ).await
+            if let Err(e) = container_log::stream_log_file(
+                &tx,
+                &log_path,
+                options.tail_lines,
+                options.follow,
+                options.timestamps,
+                &state,
+                &mut kill_watch,
+            )
+            .await
             {
                 let _ = tx.send(Err(e)).await;
             }
@@ -765,9 +768,7 @@ impl PodExecutor {
                     // Inherit the orchestrator's pod span so events
                     // emitted inside `task.run` carry pod context
                     // (`pod = <ns>/<name>`) automatically.
-                    task_set.spawn(
-                        async move { task.run(ctx).await }.in_current_span(),
-                    );
+                    task_set.spawn(async move { task.run(ctx).await }.in_current_span());
                 }
 
                 run_orchestrator(
@@ -992,7 +993,14 @@ async fn transition_phase(
     drop(st); // release before emitting
 
     info!("Phase transition: {} -> {}", old, new_phase);
-    emit(event_tx, PodEventKind::PhaseChanged { from: old, to: new_phase }, &snapshot);
+    emit(
+        event_tx,
+        PodEventKind::PhaseChanged {
+            from: old,
+            to: new_phase,
+        },
+        &snapshot,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,15 +1043,21 @@ async fn spawn_container(
         // spawned; on reject we log and preserve state rather than
         // corrupt it further.
         if let Some(cl) = st.lifecycle.container_by_role_mut(&container.name, role)
-            && let Err(e) = cl.on_started(&now) {
-                warn!("Rejected container start transition: {}", e);
-            }
+            && let Err(e) = cl.on_started(&now)
+        {
+            warn!("Rejected container start transition: {}", e);
+        }
         st.status()
     };
 
-    emit(event_tx, PodEventKind::ContainerStarted {
-        name: container.name.clone(), role,
-    }, &snapshot);
+    emit(
+        event_tx,
+        PodEventKind::ContainerStarted {
+            name: container.name.clone(),
+            role,
+        },
+        &snapshot,
+    );
 
     Ok(())
 }
@@ -1067,13 +1081,19 @@ async fn mark_container_finished(
         // Route through the lifecycle validator; rejects terminating
         // a container that isn't Running (e.g. double-exit).
         if let Some(cl) = st.lifecycle.container_by_role_mut(name, role)
-            && let Err(e) = cl.on_exited(exit_code, &now) {
-                warn!("Rejected container exit transition: {}", e);
-            }
+            && let Err(e) = cl.on_exited(exit_code, &now)
+        {
+            warn!("Rejected container exit transition: {}", e);
+        }
         let kind = if exit_code == 0 {
-            PodEventKind::ContainerSucceeded { name: name.to_string() }
+            PodEventKind::ContainerSucceeded {
+                name: name.to_string(),
+            }
         } else {
-            PodEventKind::ContainerFailed { name: name.to_string(), exit_code }
+            PodEventKind::ContainerFailed {
+                name: name.to_string(),
+                exit_code,
+            }
         };
         (kind, st.status())
     };
@@ -1176,20 +1196,34 @@ async fn run_orchestrator(
     // Phase 1: init containers (sequential, sidecars async)
     let phase_start = Instant::now();
     let init_result = run_init_containers(
-        &pod, &state, &config, &event_tx, &mut kill_watch, &mut shutdown,
-    ).await;
+        &pod,
+        &state,
+        &config,
+        &event_tx,
+        &mut kill_watch,
+        &mut shutdown,
+    )
+    .await;
     let init_ms = phase_start.elapsed().as_millis();
     if let Err(e) = init_result {
         warn!("Init containers failed: {}", e);
         kill_all_in_state(&state, config.shutdown_grace_period).await;
         fail_pod(&state, &event_tx, &format!("Init failed: {}", e)).await;
-        info!(init_ms, total_ms = pod_start.elapsed().as_millis(), "Pod timing (failed in init)");
+        info!(
+            init_ms,
+            total_ms = pod_start.elapsed().as_millis(),
+            "Pod timing (failed in init)"
+        );
         return;
     }
     if shutdown.has_changed().unwrap_or(true) || *kill_watch.borrow() {
         kill_all_in_state(&state, config.shutdown_grace_period).await;
         fail_pod(&state, &event_tx, "Shutdown/kill during init").await;
-        info!(init_ms, total_ms = pod_start.elapsed().as_millis(), "Pod timing (killed in init)");
+        info!(
+            init_ms,
+            total_ms = pod_start.elapsed().as_millis(),
+            "Pod timing (killed in init)"
+        );
         return;
     }
     {
@@ -1204,7 +1238,11 @@ async fn run_orchestrator(
     if pod.spec.containers.is_empty() {
         terminate_sidecars(&pod, &state, &event_tx).await;
         succeed_pod(&state, &event_tx, "No containers to run").await;
-        info!(init_ms, total_ms = pod_start.elapsed().as_millis(), "Pod timing (no containers)");
+        info!(
+            init_ms,
+            total_ms = pod_start.elapsed().as_millis(),
+            "Pod timing (no containers)"
+        );
         return;
     }
     let start_result = start_main_containers(&pod, &state, &config, &event_tx, &shutdown).await;
@@ -1212,16 +1250,19 @@ async fn run_orchestrator(
         warn!("Failed to start main containers: {}", e);
         kill_all_in_state(&state, config.shutdown_grace_period).await;
         fail_pod(&state, &event_tx, &format!("Container start failed: {}", e)).await;
-        info!(init_ms, total_ms = pod_start.elapsed().as_millis(), "Pod timing (start failed)");
+        info!(
+            init_ms,
+            total_ms = pod_start.elapsed().as_millis(),
+            "Pod timing (start failed)"
+        );
         return;
     }
     transition_phase(&state, &event_tx, PodPhase::Running).await;
 
     // Phase 3: monitor main containers + probes (concurrent, with kill/shutdown)
     let phase_start = Instant::now();
-    let final_phase = monitor_main_containers(
-        &pod, &state, &config, &event_tx, kill_rx, &mut shutdown,
-    ).await;
+    let final_phase =
+        monitor_main_containers(&pod, &state, &config, &event_tx, kill_rx, &mut shutdown).await;
     let main_ms = phase_start.elapsed().as_millis();
 
     // Phase 4: terminate sidecars
@@ -1258,9 +1299,22 @@ async fn fail_pod(state: &Mutex<PodState>, event_tx: &mpsc::Sender<PodEvent>, me
     };
     if old != PodPhase::Failed {
         info!("Phase transition: {} -> {}", old, PodPhase::Failed);
-        emit(event_tx, PodEventKind::PhaseChanged { from: old, to: PodPhase::Failed }, &snapshot);
+        emit(
+            event_tx,
+            PodEventKind::PhaseChanged {
+                from: old,
+                to: PodPhase::Failed,
+            },
+            &snapshot,
+        );
     }
-    emit(event_tx, PodEventKind::Completed { phase: PodPhase::Failed }, &snapshot);
+    emit(
+        event_tx,
+        PodEventKind::Completed {
+            phase: PodPhase::Failed,
+        },
+        &snapshot,
+    );
 }
 
 async fn succeed_pod(state: &Mutex<PodState>, event_tx: &mpsc::Sender<PodEvent>, message: &str) {
@@ -1268,16 +1322,32 @@ async fn succeed_pod(state: &Mutex<PodState>, event_tx: &mpsc::Sender<PodEvent>,
     let (old, snapshot) = {
         let mut st = state.lock().await;
         let old = st.lifecycle.phase();
-        if let Err(e) = st.lifecycle.succeed(message, &chrono::Utc::now().to_rfc3339()) {
+        if let Err(e) = st
+            .lifecycle
+            .succeed(message, &chrono::Utc::now().to_rfc3339())
+        {
             warn!("Rejected succeed transition: {}", e);
         }
         (old, st.status())
     };
     if old != PodPhase::Succeeded {
         info!("Phase transition: {} -> {}", old, PodPhase::Succeeded);
-        emit(event_tx, PodEventKind::PhaseChanged { from: old, to: PodPhase::Succeeded }, &snapshot);
+        emit(
+            event_tx,
+            PodEventKind::PhaseChanged {
+                from: old,
+                to: PodPhase::Succeeded,
+            },
+            &snapshot,
+        );
     }
-    emit(event_tx, PodEventKind::Completed { phase: PodPhase::Succeeded }, &snapshot);
+    emit(
+        event_tx,
+        PodEventKind::Completed {
+            phase: PodPhase::Succeeded,
+        },
+        &snapshot,
+    );
 }
 
 /// Kill all containers whose handles are currently in shared state.
@@ -1312,7 +1382,10 @@ async fn run_init_containers(
     {
         let mut st = state.lock().await;
         let ts = chrono::Utc::now().to_rfc3339();
-        if let Err(e) = st.lifecycle.mark_not_initialized("init containers running", &ts) {
+        if let Err(e) = st
+            .lifecycle
+            .mark_not_initialized("init containers running", &ts)
+        {
             warn!("Rejected mark_not_initialized transition: {}", e);
         }
     }
@@ -1326,13 +1399,39 @@ async fn run_init_containers(
         }
 
         if container.is_sidecar() {
-            info!(container = container.name.as_str(), step = idx + 1, total, "Starting sidecar");
-            spawn_container(container, ContainerRole::Sidecar, 0, config, state, event_tx, shutdown)
-                .await?;
+            info!(
+                container = container.name.as_str(),
+                step = idx + 1,
+                total,
+                "Starting sidecar"
+            );
+            spawn_container(
+                container,
+                ContainerRole::Sidecar,
+                0,
+                config,
+                state,
+                event_tx,
+                shutdown,
+            )
+            .await?;
         } else {
-            info!(container = container.name.as_str(), step = idx + 1, total, "Running init container");
-            spawn_container(container, ContainerRole::Init, 0, config, state, event_tx, shutdown)
-                .await?;
+            info!(
+                container = container.name.as_str(),
+                step = idx + 1,
+                total,
+                "Running init container"
+            );
+            spawn_container(
+                container,
+                ContainerRole::Init,
+                0,
+                config,
+                state,
+                event_tx,
+                shutdown,
+            )
+            .await?;
 
             // Wait for init container to exit, with shutdown AND kill support.
             // kill_watch is checked here so PodHandle::kill() during init
@@ -1349,13 +1448,19 @@ async fn run_init_containers(
             };
 
             mark_container_finished(
-                &container.name, exit_code, ContainerRole::Init, state, event_tx,
-            ).await;
+                &container.name,
+                exit_code,
+                ContainerRole::Init,
+                state,
+                event_tx,
+            )
+            .await;
 
             if exit_code != 0 {
-                return Err(io::Error::other(
-                    format!("init container '{}' failed with exit code {}", container.name, exit_code),
-                ));
+                return Err(io::Error::other(format!(
+                    "init container '{}' failed with exit code {}",
+                    container.name, exit_code
+                )));
             }
         }
     }
@@ -1377,11 +1482,22 @@ async fn start_main_containers(
     info!("Starting {} main container(s)", pod.spec.containers.len());
 
     for container in &pod.spec.containers {
-        spawn_container(container, ContainerRole::Main, 0, config, state, event_tx, shutdown)
-            .await?;
+        spawn_container(
+            container,
+            ContainerRole::Main,
+            0,
+            config,
+            state,
+            event_tx,
+            shutdown,
+        )
+        .await?;
 
         if container.readiness_probe.is_none() {
-            debug!(container = container.name.as_str(), "Container ready (no readiness probe)");
+            debug!(
+                container = container.name.as_str(),
+                "Container ready (no readiness probe)"
+            );
             let snapshot = {
                 let mut st = state.lock().await;
                 if let Some(cl) = st.lifecycle.container_mut(&container.name) {
@@ -1389,9 +1505,13 @@ async fn start_main_containers(
                 }
                 st.status()
             };
-            emit(event_tx, PodEventKind::ContainerReady {
-                name: container.name.clone(),
-            }, &snapshot);
+            emit(
+                event_tx,
+                PodEventKind::ContainerReady {
+                    name: container.name.clone(),
+                },
+                &snapshot,
+            );
         }
     }
 
@@ -1472,32 +1592,40 @@ async fn monitor_main_containers(
         let (stop_tx, _) = watch::channel(false);
         stop_txs.insert(name.clone(), stop_tx);
 
-        monitor_set.spawn(async move {
-            let mut handle = {
-                let mut st = state_clone.lock().await;
-                match st.handles.remove(&name) {
-                    Some(h) => h,
-                    None => return ContainerExited { name, exit_code: -1 },
-                }
-            };
+        monitor_set.spawn(
+            async move {
+                let mut handle = {
+                    let mut st = state_clone.lock().await;
+                    match st.handles.remove(&name) {
+                        Some(h) => h,
+                        None => {
+                            return ContainerExited {
+                                name,
+                                exit_code: -1,
+                            };
+                        }
+                    }
+                };
 
-            let exit_code = tokio::select! {
-                result = handle.wait() => result.unwrap_or(-1),
-                Ok(()) = kill_signal.changed() => {
-                    let grace = kill_signal.borrow().unwrap_or(Duration::from_secs(5));
-                    warn!("Kill signal received, killing process");
-                    handle.kill(grace).await;
-                    handle.wait().await.unwrap_or(-1)
-                }
-            };
+                let exit_code = tokio::select! {
+                    result = handle.wait() => result.unwrap_or(-1),
+                    Ok(()) = kill_signal.changed() => {
+                        let grace = kill_signal.borrow().unwrap_or(Duration::from_secs(5));
+                        warn!("Kill signal received, killing process");
+                        handle.kill(grace).await;
+                        handle.wait().await.unwrap_or(-1)
+                    }
+                };
 
-            {
-                let mut st = state_clone.lock().await;
-                st.handles.insert(name.clone(), handle);
+                {
+                    let mut st = state_clone.lock().await;
+                    st.handles.insert(name.clone(), handle);
+                }
+
+                ContainerExited { name, exit_code }
             }
-
-            ContainerExited { name, exit_code }
-        }.instrument(monitor_span));
+            .instrument(monitor_span),
+        );
     }
 
     // Probe JoinSet — aborted on drop (when this function returns).
@@ -1591,9 +1719,24 @@ async fn monitor_main_containers(
             // Shutdown
             _ = shutdown.changed() => {
                 warn!("Shutdown during container monitoring — killing all");
+                // Broadcast the kill to the per-container monitor tasks, which
+                // own the live handles: each runs `handle.kill(grace)` (SIGTERM,
+                // then SIGKILL after the pod's termination grace) and lets the
+                // container run its own shutdown — e.g. the database container
+                // stopping the embedded postgres it owns. Then wait for those
+                // tasks to finish before returning; returning immediately would
+                // drop `monitor_set` and abort them mid-kill, orphaning the
+                // container processes.
                 let _ = kill_signal_tx.send(Some(config.shutdown_grace_period));
+                let drain_timeout = config.shutdown_grace_period + Duration::from_secs(10);
+                let _ = tokio::time::timeout(drain_timeout, async {
+                    while monitor_set.join_next().await.is_some() {}
+                })
+                .await;
+                // Backstop: on a drain timeout some tasks may have re-inserted
+                // their (already-signaled) handles without exiting. Kill anything
+                // still recorded; a no-op for processes already gone.
                 kill_all_in_state(state, config.shutdown_grace_period).await;
-                // Both JoinSets dropped → all tasks aborted
                 return PodPhase::Failed;
             }
         }
@@ -1606,7 +1749,11 @@ async fn monitor_main_containers(
         update_readiness_conditions(&mut st);
     }
 
-    if all_succeeded { PodPhase::Succeeded } else { PodPhase::Failed }
+    if all_succeeded {
+        PodPhase::Succeeded
+    } else {
+        PodPhase::Failed
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1622,7 +1769,9 @@ async fn terminate_sidecars(
     event_tx: &mpsc::Sender<PodEvent>,
 ) {
     let sidecar_names: Vec<String> = pod
-        .spec.init_containers.iter()
+        .spec
+        .init_containers
+        .iter()
         .filter(|c| c.is_sidecar())
         .map(|c| c.name.clone())
         .collect();
@@ -1643,10 +1792,8 @@ async fn terminate_sidecars(
     // most sidecars will be dying concurrently. The sequential wait
     // just collects results. Force-kill on timeout.
     for name in &sidecar_names {
-        let wait_result = tokio::time::timeout(
-            SIDECAR_KILL_TIMEOUT,
-            wait_container(name, state),
-        ).await;
+        let wait_result =
+            tokio::time::timeout(SIDECAR_KILL_TIMEOUT, wait_container(name, state)).await;
 
         let exit_code = match wait_result {
             Ok(Ok(code)) => code,
@@ -1752,10 +1899,7 @@ mod tests {
         })
     }
 
-    fn pod_spec_with_grace(
-        containers: Vec<Container>,
-        grace_secs: Option<u64>,
-    ) -> Arc<PodSpec> {
+    fn pod_spec_with_grace(containers: Vec<Container>, grace_secs: Option<u64>) -> Arc<PodSpec> {
         Arc::new(PodSpec {
             metadata: PodMetadata {
                 name: "test-pod".to_string(),
@@ -1778,7 +1922,9 @@ mod tests {
                 Ok(event) => {
                     let done = matches!(&event.kind, PodEventKind::Completed { .. });
                     events.push(event);
-                    if done { break; }
+                    if done {
+                        break;
+                    }
                 }
                 Err(_) => break,
             }
@@ -1792,7 +1938,9 @@ mod tests {
     async fn test_single_container_succeeds() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
         assert_eq!(h.wait_for_completion().await.unwrap(), PodPhase::Succeeded);
     }
 
@@ -1800,7 +1948,9 @@ mod tests {
     async fn test_single_container_fails() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 1")]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
         assert_eq!(h.wait_for_completion().await.unwrap(), PodPhase::Failed);
     }
 
@@ -1808,25 +1958,39 @@ mod tests {
     async fn test_no_containers_succeeds() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
         assert_eq!(h.wait_for_completion().await.unwrap(), PodPhase::Succeeded);
     }
 
     #[tokio::test]
     async fn test_multiple_containers_all_succeed() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![
-            container("a", "exit 0"), container("b", "exit 0"), container("c", "exit 0"),
-        ])).spawn(rx).await.unwrap();
+        let mut h = PodExecutor::new(pod_spec(
+            vec![],
+            vec![
+                container("a", "exit 0"),
+                container("b", "exit 0"),
+                container("c", "exit 0"),
+            ],
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
         assert_eq!(h.wait_for_completion().await.unwrap(), PodPhase::Succeeded);
     }
 
     #[tokio::test]
     async fn test_multiple_containers_one_fails() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![
-            container("ok", "exit 0"), container("fail", "exit 42"),
-        ])).spawn(rx).await.unwrap();
+        let mut h = PodExecutor::new(pod_spec(
+            vec![],
+            vec![container("ok", "exit 0"), container("fail", "exit 42")],
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
         assert_eq!(h.wait_for_completion().await.unwrap(), PodPhase::Failed);
     }
 
@@ -1836,38 +2000,57 @@ mod tests {
     async fn test_events_contain_started_and_completed() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
         let events = collect_events(&mut h).await;
 
         assert!(events.iter().any(|e| matches!(&e.kind,
             PodEventKind::ContainerStarted { name, .. } if name == "main")));
         assert!(events.iter().any(|e| matches!(&e.kind,
             PodEventKind::ContainerSucceeded { name } if name == "main")));
-        assert!(events.iter().any(|e| matches!(&e.kind,
-            PodEventKind::Completed { phase: PodPhase::Succeeded })));
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            PodEventKind::Completed {
+                phase: PodPhase::Succeeded
+            }
+        )));
     }
 
     #[tokio::test]
     async fn test_events_contain_failed_container() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![container("bad", "exit 7")]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
         let events = collect_events(&mut h).await;
 
-        assert!(events.iter().any(|e| matches!(&e.kind,
-            PodEventKind::ContainerFailed { name, exit_code } if name == "bad" && *exit_code == 7)));
+        assert!(
+            events.iter().any(|e| matches!(&e.kind,
+            PodEventKind::ContainerFailed { name, exit_code } if name == "bad" && *exit_code == 7))
+        );
     }
 
     #[tokio::test]
     async fn test_events_contain_phase_transitions() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
         let events = collect_events(&mut h).await;
 
-        let transitions: Vec<_> = events.iter().filter_map(|e| {
-            if let PodEventKind::PhaseChanged { from, to } = &e.kind { Some((*from, *to)) } else { None }
-        }).collect();
+        let transitions: Vec<_> = events
+            .iter()
+            .filter_map(|e| {
+                if let PodEventKind::PhaseChanged { from, to } = &e.kind {
+                    Some((*from, *to))
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert!(transitions.contains(&(PodPhase::Pending, PodPhase::Running)));
         assert!(transitions.contains(&(PodPhase::Running, PodPhase::Succeeded)));
     }
@@ -1876,10 +2059,15 @@ mod tests {
     async fn test_event_status_snapshot_is_current() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
         let events = collect_events(&mut h).await;
 
-        let completed = events.iter().find(|e| matches!(&e.kind, PodEventKind::Completed { .. })).unwrap();
+        let completed = events
+            .iter()
+            .find(|e| matches!(&e.kind, PodEventKind::Completed { .. }))
+            .unwrap();
         assert_eq!(completed.status.phase, PodPhase::Succeeded);
     }
 
@@ -1887,7 +2075,9 @@ mod tests {
     async fn test_container_ready_event_no_readiness_probe() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "sleep 0.1")]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
         let events = collect_events(&mut h).await;
 
         assert!(events.iter().any(|e| matches!(&e.kind,
@@ -1904,7 +2094,10 @@ mod tests {
         let mut h = PodExecutor::new(pod_spec(
             vec![container("init", &format!("touch {}", marker.display()))],
             vec![container("main", &format!("test -f {}", marker.display()))],
-        )).spawn(rx).await.unwrap();
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
         assert_eq!(h.wait_for_completion().await.unwrap(), PodPhase::Succeeded);
     }
 
@@ -1914,10 +2107,18 @@ mod tests {
         let mut h = PodExecutor::new(pod_spec(
             vec![container("init", "exit 1")],
             vec![container("main", "exit 0")],
-        )).spawn(rx).await.unwrap();
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
         let events = collect_events(&mut h).await;
 
-        assert!(events.iter().any(|e| matches!(&e.kind, PodEventKind::Completed { phase: PodPhase::Failed })));
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            PodEventKind::Completed {
+                phase: PodPhase::Failed
+            }
+        )));
         assert!(!events.iter().any(|e| matches!(&e.kind,
             PodEventKind::ContainerStarted { name, .. } if name == "main")));
     }
@@ -1931,10 +2132,16 @@ mod tests {
         let mut h = PodExecutor::new(pod_spec(
             vec![
                 container("init1", &format!("touch {}", f1.display())),
-                container("init2", &format!("test -f {} && touch {}", f1.display(), f2.display())),
+                container(
+                    "init2",
+                    &format!("test -f {} && touch {}", f1.display(), f2.display()),
+                ),
             ],
             vec![container("main", &format!("test -f {}", f2.display()))],
-        )).spawn(rx).await.unwrap();
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
         assert_eq!(h.wait_for_completion().await.unwrap(), PodPhase::Succeeded);
     }
 
@@ -1946,9 +2153,18 @@ mod tests {
         let marker = dir.join("sidecar_alive");
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(
-            vec![sidecar("sidecar", &format!("touch {} && sleep 60", marker.display()))],
-            vec![container("main", &format!("sleep 0.3 && test -f {}", marker.display()))],
-        )).spawn(rx).await.unwrap();
+            vec![sidecar(
+                "sidecar",
+                &format!("touch {} && sleep 60", marker.display()),
+            )],
+            vec![container(
+                "main",
+                &format!("sleep 0.3 && test -f {}", marker.display()),
+            )],
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
         assert_eq!(h.wait_for_completion().await.unwrap(), PodPhase::Succeeded);
     }
 
@@ -1958,7 +2174,10 @@ mod tests {
         let mut h = PodExecutor::new(pod_spec(
             vec![sidecar("sidecar", "sleep 60")],
             vec![container("main", "exit 0")],
-        )).spawn(rx).await.unwrap();
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
         let events = collect_events(&mut h).await;
 
         assert!(events.iter().any(|e| matches!(&e.kind,
@@ -1972,12 +2191,16 @@ mod tests {
     async fn test_kill_terminates_running_containers() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![container("long", "sleep 60")]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         // Wait for started
         loop {
             let ev = h.wait().await.unwrap();
-            if matches!(&ev.kind, PodEventKind::ContainerStarted { .. }) { break; }
+            if matches!(&ev.kind, PodEventKind::ContainerStarted { .. }) {
+                break;
+            }
         }
 
         h.kill(Duration::from_secs(1));
@@ -1990,15 +2213,25 @@ mod tests {
     #[tokio::test]
     async fn test_kill_concurrent_does_not_deadlock() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![
-            container("a", "sleep 60"), container("b", "sleep 60"), container("c", "sleep 60"),
-        ])).spawn(rx).await.unwrap();
+        let mut h = PodExecutor::new(pod_spec(
+            vec![],
+            vec![
+                container("a", "sleep 60"),
+                container("b", "sleep 60"),
+                container("c", "sleep 60"),
+            ],
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
 
         // Wait for all started
         let mut started = 0;
         while started < 3 {
             let ev = h.wait().await.unwrap();
-            if matches!(&ev.kind, PodEventKind::ContainerStarted { .. }) { started += 1; }
+            if matches!(&ev.kind, PodEventKind::ContainerStarted { .. }) {
+                started += 1;
+            }
         }
 
         h.kill(Duration::from_millis(500));
@@ -2013,11 +2246,15 @@ mod tests {
     async fn test_shutdown_kills_running_containers() {
         let (tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![container("long", "sleep 60")]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         loop {
             let ev = h.wait().await.unwrap();
-            if matches!(&ev.kind, PodEventKind::ContainerStarted { .. }) { break; }
+            if matches!(&ev.kind, PodEventKind::ContainerStarted { .. }) {
+                break;
+            }
         }
 
         tx.send(()).unwrap();
@@ -2033,7 +2270,10 @@ mod tests {
         let mut h = PodExecutor::new(pod_spec(
             vec![container("slow-init", "sleep 60")],
             vec![container("main", "exit 0")],
-        )).spawn(rx).await.unwrap();
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
 
         tokio::time::sleep(Duration::from_millis(300)).await;
         tx.send(()).unwrap();
@@ -2049,7 +2289,9 @@ mod tests {
     async fn test_status_updated_on_wait() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
         assert_eq!(h.status().phase, PodPhase::Pending);
         let _ = h.wait_for_completion().await;
         assert!(h.status().phase.is_terminal());
@@ -2059,11 +2301,21 @@ mod tests {
     async fn test_live_status() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "sleep 0.5")]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         loop {
             let ev = h.wait().await.unwrap();
-            if matches!(&ev.kind, PodEventKind::PhaseChanged { to: PodPhase::Running, .. }) { break; }
+            if matches!(
+                &ev.kind,
+                PodEventKind::PhaseChanged {
+                    to: PodPhase::Running,
+                    ..
+                }
+            ) {
+                break;
+            }
         }
         assert_eq!(h.live_status().await.phase, PodPhase::Running);
         let _ = h.wait_for_completion().await;
@@ -2074,13 +2326,27 @@ mod tests {
     #[tokio::test]
     async fn test_container_statuses_in_final_status() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![
-            container("ok", "exit 0"), container("fail", "exit 3"),
-        ])).spawn(rx).await.unwrap();
+        let mut h = PodExecutor::new(pod_spec(
+            vec![],
+            vec![container("ok", "exit 0"), container("fail", "exit 3")],
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
         let _ = h.wait_for_completion().await;
 
-        let ok = h.status().container_statuses.iter().find(|cs| cs.name == "ok").unwrap();
-        let fail = h.status().container_statuses.iter().find(|cs| cs.name == "fail").unwrap();
+        let ok = h
+            .status()
+            .container_statuses
+            .iter()
+            .find(|cs| cs.name == "ok")
+            .unwrap();
+        let fail = h
+            .status()
+            .container_statuses
+            .iter()
+            .find(|cs| cs.name == "fail")
+            .unwrap();
         assert!(ok.is_terminated());
         assert_eq!(ok.terminated_exit_code(), Some(0));
         assert!(fail.is_terminated());
@@ -2093,10 +2359,18 @@ mod tests {
         let mut h = PodExecutor::new(pod_spec(
             vec![container("init", "exit 0")],
             vec![container("main", "exit 0")],
-        )).spawn(rx).await.unwrap();
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
         let _ = h.wait_for_completion().await;
 
-        let init = h.status().init_container_statuses.iter().find(|cs| cs.name == "init").unwrap();
+        let init = h
+            .status()
+            .init_container_statuses
+            .iter()
+            .find(|cs| cs.name == "init")
+            .unwrap();
         assert!(init.is_terminated());
         assert_eq!(init.terminated_exit_code(), Some(0));
     }
@@ -2108,9 +2382,17 @@ mod tests {
         let dir = test_dir!();
         let out = dir.join("env.txt");
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![
-            container("main", &format!("echo $MY_POD_VAR > {}", out.display())),
-        ])).env("MY_POD_VAR", "pod_value").spawn(rx).await.unwrap();
+        let mut h = PodExecutor::new(pod_spec(
+            vec![],
+            vec![container(
+                "main",
+                &format!("echo $MY_POD_VAR > {}", out.display()),
+            )],
+        ))
+        .env("MY_POD_VAR", "pod_value")
+        .spawn(rx)
+        .await
+        .unwrap();
         let _ = h.wait_for_completion().await;
         assert!(std::fs::read_to_string(&out).unwrap().contains("pod_value"));
     }
@@ -2120,9 +2402,16 @@ mod tests {
         let dir = test_dir!();
         let out = dir.join("env.txt");
         let mut c = container("main", &format!("echo $CONTAINER_VAR > {}", out.display()));
-        c.env.push(EnvVar { name: "CONTAINER_VAR".to_string(), value: Some("cv".to_string()), value_from: None });
+        c.env.push(EnvVar {
+            name: "CONTAINER_VAR".to_string(),
+            value: Some("cv".to_string()),
+            value_from: None,
+        });
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![c])).spawn(rx).await.unwrap();
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
+            .spawn(rx)
+            .await
+            .unwrap();
         let _ = h.wait_for_completion().await;
         assert!(std::fs::read_to_string(&out).unwrap().contains("cv"));
     }
@@ -2134,7 +2423,10 @@ mod tests {
         let dir = test_dir!("logs");
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "echo hello_pod")]))
-            .log_dir(&dir).spawn(rx).await.unwrap();
+            .log_dir(&dir)
+            .spawn(rx)
+            .await
+            .unwrap();
         let _ = h.wait_for_completion().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -2166,7 +2458,10 @@ mod tests {
         ];
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .log_dir(&dir).spawn(rx).await.unwrap();
+            .log_dir(&dir)
+            .spawn(rx)
+            .await
+            .unwrap();
         let _ = h.wait_for_completion().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -2177,7 +2472,10 @@ mod tests {
             first_line.contains(&read_only_mount_warning("ro-vol")),
             "first line should be the read-only warning: {first_line}"
         );
-        assert!(first_line.contains(" stderr F "), "warning is a stderr line: {first_line}");
+        assert!(
+            first_line.contains(" stderr F "),
+            "warning is a stderr line: {first_line}"
+        );
         assert!(
             log.find(&read_only_mount_warning("ro-vol")).unwrap()
                 < log.find("container_output").unwrap(),
@@ -2268,9 +2566,10 @@ mod tests {
     async fn test_log_stream_strips_cri_prefix() {
         let dir = test_dir!("logs-stream-strip");
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![
-            container("main", "echo first && echo second"),
-        ]))
+        let mut h = PodExecutor::new(pod_spec(
+            vec![],
+            vec![container("main", "echo first && echo second")],
+        ))
         .log_dir(&dir)
         .spawn(rx)
         .await
@@ -2279,18 +2578,29 @@ mod tests {
         let _ = h.wait_for_completion().await;
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let stream = log_handle.stream(None, ContainerLogOptions::default()).unwrap();
+        let stream = log_handle
+            .stream(None, ContainerLogOptions::default())
+            .unwrap();
         let out = collect_stream(stream, 10).await;
         assert_eq!(out, "first\nsecond\n");
 
         // With timestamps, each line is "<RFC3339Nano ts> <message>".
         let stream = log_handle
-            .stream(None, ContainerLogOptions { timestamps: true, ..Default::default() })
+            .stream(
+                None,
+                ContainerLogOptions {
+                    timestamps: true,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         let out = collect_stream(stream, 10).await;
         let first = out.lines().next().unwrap();
         let (ts, msg) = first.split_once(' ').unwrap();
-        assert!(ts.ends_with('Z') && ts.contains('T'), "not a timestamp: {ts}");
+        assert!(
+            ts.ends_with('Z') && ts.contains('T'),
+            "not a timestamp: {ts}"
+        );
         assert_eq!(msg, "first");
     }
 
@@ -2312,7 +2622,13 @@ mod tests {
 
         let log_handle = h.log_handle();
         let stream = log_handle
-            .stream(None, ContainerLogOptions { follow: true, ..Default::default() })
+            .stream(
+                None,
+                ContainerLogOptions {
+                    follow: true,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         let collector = tokio::spawn(collect_stream(stream, 20));
 
@@ -2338,7 +2654,9 @@ mod tests {
     async fn test_drop_aborts_orchestrator() {
         let (_tx, rx) = shutdown();
         let h = PodExecutor::new(pod_spec(vec![], vec![container("long", "sleep 60")]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
         drop(h);
         tokio::time::sleep(Duration::from_millis(200)).await;
         // No panic or hang = success
@@ -2349,17 +2667,34 @@ mod tests {
     #[tokio::test]
     async fn test_fast_container_exit_detected_before_slow() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![
-            container("slow", "sleep 2 && exit 0"),
-            container("fast", "exit 0"),
-        ])).spawn(rx).await.unwrap();
+        let mut h = PodExecutor::new(pod_spec(
+            vec![],
+            vec![
+                container("slow", "sleep 2 && exit 0"),
+                container("fast", "exit 0"),
+            ],
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
         let events = collect_events(&mut h).await;
 
-        let succeeded: Vec<String> = events.iter().filter_map(|e| {
-            if let PodEventKind::ContainerSucceeded { name } = &e.kind { Some(name.clone()) } else { None }
-        }).collect();
+        let succeeded: Vec<String> = events
+            .iter()
+            .filter_map(|e| {
+                if let PodEventKind::ContainerSucceeded { name } = &e.kind {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(succeeded.len(), 2);
-        assert_eq!(succeeded[0], "fast", "fast should be reported first: {:?}", succeeded);
+        assert_eq!(
+            succeeded[0], "fast",
+            "fast should be reported first: {:?}",
+            succeeded
+        );
     }
 
     // ========================================================================
@@ -2370,23 +2705,29 @@ mod tests {
     async fn test_container_killed_by_signal() {
         // Container kills itself with SIGKILL — no exit code
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![
-            container("crash", "kill -KILL $$"),
-        ])).spawn(rx).await.unwrap();
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("crash", "kill -KILL $$")]))
+            .spawn(rx)
+            .await
+            .unwrap();
         let events = collect_events(&mut h).await;
 
         assert!(events.iter().any(|e| matches!(&e.kind,
             PodEventKind::ContainerFailed { name, exit_code } if name == "crash" && *exit_code == -1)));
-        assert!(events.iter().any(|e| matches!(&e.kind,
-            PodEventKind::Completed { phase: PodPhase::Failed })));
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            PodEventKind::Completed {
+                phase: PodPhase::Failed
+            }
+        )));
     }
 
     #[tokio::test]
     async fn test_container_segfault() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![
-            container("segv", "kill -SEGV $$"),
-        ])).spawn(rx).await.unwrap();
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("segv", "kill -SEGV $$")]))
+            .spawn(rx)
+            .await
+            .unwrap();
 
         let phase = h.wait_for_completion().await.unwrap();
         assert_eq!(phase, PodPhase::Failed);
@@ -2395,18 +2736,32 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_containers_some_crash() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![
-            container("ok", "exit 0"),
-            container("crash", "kill -KILL $$"),
-            container("also-ok", "exit 0"),
-        ])).spawn(rx).await.unwrap();
+        let mut h = PodExecutor::new(pod_spec(
+            vec![],
+            vec![
+                container("ok", "exit 0"),
+                container("crash", "kill -KILL $$"),
+                container("also-ok", "exit 0"),
+            ],
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
 
         let phase = h.wait_for_completion().await.unwrap();
         assert_eq!(phase, PodPhase::Failed, "any crash should fail the pod");
 
         let status = h.status();
-        let ok = status.container_statuses.iter().find(|cs| cs.name == "ok").unwrap();
-        let crash = status.container_statuses.iter().find(|cs| cs.name == "crash").unwrap();
+        let ok = status
+            .container_statuses
+            .iter()
+            .find(|cs| cs.name == "ok")
+            .unwrap();
+        let crash = status
+            .container_statuses
+            .iter()
+            .find(|cs| cs.name == "crash")
+            .unwrap();
         assert!(ok.is_terminated());
         assert!(crash.is_terminated());
         assert_eq!(crash.terminated_exit_code(), Some(-1));
@@ -2419,14 +2774,20 @@ mod tests {
     #[tokio::test]
     async fn test_kill_container_that_ignores_sigterm() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![
-            container("stubborn", "trap '' TERM; sleep 60"),
-        ])).spawn(rx).await.unwrap();
+        let mut h = PodExecutor::new(pod_spec(
+            vec![],
+            vec![container("stubborn", "trap '' TERM; sleep 60")],
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
 
         // Wait for started
         loop {
             let ev = h.wait().await.unwrap();
-            if matches!(&ev.kind, PodEventKind::ContainerStarted { .. }) { break; }
+            if matches!(&ev.kind, PodEventKind::ContainerStarted { .. }) {
+                break;
+            }
         }
 
         // Kill with short grace — should escalate to SIGKILL via process executor
@@ -2490,12 +2851,16 @@ mod tests {
         let mut h = PodExecutor::new(pod_spec(
             vec![container("slow-init", "sleep 60")],
             vec![container("main", "exit 0")],
-        )).spawn(rx).await.unwrap();
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
 
         // Wait for init to start
         loop {
             let ev = h.wait().await.unwrap();
-            if matches!(&ev.kind, PodEventKind::ContainerStarted { name, .. } if name == "slow-init") {
+            if matches!(&ev.kind, PodEventKind::ContainerStarted { name, .. } if name == "slow-init")
+            {
                 break;
             }
         }
@@ -2517,11 +2882,18 @@ mod tests {
         let mut h = PodExecutor::new(pod_spec(
             vec![container("init-crash", "kill -KILL $$")],
             vec![container("main", "exit 0")],
-        )).spawn(rx).await.unwrap();
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
         let events = collect_events(&mut h).await;
 
-        assert!(events.iter().any(|e| matches!(&e.kind,
-            PodEventKind::Completed { phase: PodPhase::Failed })));
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            PodEventKind::Completed {
+                phase: PodPhase::Failed
+            }
+        )));
         // Main should never start
         assert!(!events.iter().any(|e| matches!(&e.kind,
             PodEventKind::ContainerStarted { name, .. } if name == "main")));
@@ -2537,15 +2909,18 @@ mod tests {
         let mut h = PodExecutor::new(pod_spec(
             vec![sidecar("stubborn-sidecar", "trap '' TERM; sleep 60")],
             vec![container("main", "sleep 0.3 && exit 0")],
-        )).spawn(rx).await.unwrap();
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
 
         // Should complete — sidecar gets SIGTERM then eventually force-killed
-        let result = tokio::time::timeout(
-            Duration::from_secs(30),
-            h.wait_for_completion(),
-        ).await;
+        let result = tokio::time::timeout(Duration::from_secs(30), h.wait_for_completion()).await;
 
-        assert!(result.is_ok(), "pod should complete even with stubborn sidecar");
+        assert!(
+            result.is_ok(),
+            "pod should complete even with stubborn sidecar"
+        );
         // Main succeeded, so pod should succeed (sidecar termination is cleanup)
         assert_eq!(result.unwrap().unwrap(), PodPhase::Succeeded);
     }
@@ -2560,14 +2935,14 @@ mod tests {
         let mut h = PodExecutor::new(pod_spec(
             vec![sidecar("sidecar", "sleep 60")],
             vec![], // no main containers
-        )).spawn(rx).await.unwrap();
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
 
         // With no main containers, pod should succeed immediately
         // and terminate the sidecar
-        let result = tokio::time::timeout(
-            Duration::from_secs(20),
-            h.wait_for_completion(),
-        ).await;
+        let result = tokio::time::timeout(Duration::from_secs(20), h.wait_for_completion()).await;
 
         assert!(result.is_ok(), "sidecar-only pod should complete");
         assert_eq!(result.unwrap().unwrap(), PodPhase::Succeeded);
@@ -2586,10 +2961,10 @@ mod tests {
             ..Default::default()
         };
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![
-            container("ok", "sleep 60"),
-            bad,
-        ])).spawn(rx).await.unwrap();
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("ok", "sleep 60"), bad]))
+            .spawn(rx)
+            .await
+            .unwrap();
 
         let phase = h.wait_for_completion().await.unwrap();
         assert_eq!(phase, PodPhase::Failed, "spawn failure should fail the pod");
@@ -2603,10 +2978,10 @@ mod tests {
             ..Default::default()
         };
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(
-            vec![bad],
-            vec![container("main", "exit 0")],
-        )).spawn(rx).await.unwrap();
+        let mut h = PodExecutor::new(pod_spec(vec![bad], vec![container("main", "exit 0")]))
+            .spawn(rx)
+            .await
+            .unwrap();
 
         let phase = h.wait_for_completion().await.unwrap();
         assert_eq!(phase, PodPhase::Failed);
@@ -2616,7 +2991,7 @@ mod tests {
     // Probes
     // ========================================================================
 
-    use crate::spec::pod::{ExecAction, Probe, HttpGetAction, TcpSocketAction};
+    use crate::spec::pod::{ExecAction, HttpGetAction, Probe, TcpSocketAction};
 
     /// Create a container with an exec readiness probe.
     fn container_with_readiness_exec(name: &str, cmd: &str, probe_cmd: &str) -> Container {
@@ -2683,7 +3058,9 @@ mod tests {
         let c = container_with_readiness_exec("app", &cmd, &probe_cmd);
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         // Wait for ContainerReady or Completed
         let mut got_ready = false;
@@ -2697,7 +3074,8 @@ mod tests {
                     break;
                 }
             }
-        }).await;
+        })
+        .await;
 
         assert!(result.is_ok(), "should complete within timeout");
         assert!(got_ready, "should have received ContainerReady event");
@@ -2715,7 +3093,9 @@ mod tests {
         let c = container_with_readiness_exec("app", &cmd, &probe_cmd);
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         let mut probe_results = Vec::new();
         let mut got_ready = false;
@@ -2732,12 +3112,21 @@ mod tests {
                     break;
                 }
             }
-        }).await;
+        })
+        .await;
 
         assert!(result.is_ok(), "should complete within timeout");
         // Should have some failures then a success
-        assert!(probe_results.contains(&false), "should have probe failures: {:?}", probe_results);
-        assert!(probe_results.contains(&true), "should have probe success: {:?}", probe_results);
+        assert!(
+            probe_results.contains(&false),
+            "should have probe failures: {:?}",
+            probe_results
+        );
+        assert!(
+            probe_results.contains(&true),
+            "should have probe success: {:?}",
+            probe_results
+        );
         assert!(got_ready, "should eventually become ready");
     }
 
@@ -2747,10 +3136,15 @@ mod tests {
         let c = container_with_liveness_exec("app", "sleep 60", "exit 1");
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         let result = tokio::time::timeout(Duration::from_secs(15), h.wait_for_completion()).await;
-        assert!(result.is_ok(), "liveness failure should kill container and complete pod");
+        assert!(
+            result.is_ok(),
+            "liveness failure should kill container and complete pod"
+        );
         assert_eq!(result.unwrap().unwrap(), PodPhase::Failed);
     }
 
@@ -2765,8 +3159,11 @@ mod tests {
         let mut c = container("app", &cmd);
         c.startup_probe = Some(Probe {
             exec_action: Some(ExecAction {
-                command: vec!["sh".to_string(), "-c".to_string(),
-                    format!("test -f {}", marker.display())],
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("test -f {}", marker.display()),
+                ],
             }),
             initial_delay_seconds: 0,
             period_seconds: 1,
@@ -2789,14 +3186,21 @@ mod tests {
 
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         let mut probe_events = Vec::new();
         let mut got_ready = false;
         let result = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 let ev = h.wait().await.unwrap();
-                if let PodEventKind::ProbeResult { probe_type, success, .. } = &ev.kind {
+                if let PodEventKind::ProbeResult {
+                    probe_type,
+                    success,
+                    ..
+                } = &ev.kind
+                {
                     probe_events.push((probe_type.clone(), *success));
                 }
                 if matches!(&ev.kind, PodEventKind::ContainerReady { .. }) {
@@ -2806,12 +3210,17 @@ mod tests {
                     break;
                 }
             }
-        }).await;
+        })
+        .await;
 
         assert!(result.is_ok(), "should complete within timeout");
         // Startup probe should have run first
         assert!(!probe_events.is_empty(), "should have probe events");
-        assert_eq!(probe_events[0].0, "startup", "first probe should be startup: {:?}", probe_events);
+        assert_eq!(
+            probe_events[0].0, "startup",
+            "first probe should be startup: {:?}",
+            probe_events
+        );
         assert!(got_ready, "readiness probe should eventually pass");
     }
 
@@ -2821,7 +3230,9 @@ mod tests {
         let c = container_with_startup_exec("app", "sleep 60", "exit 1");
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         let result = tokio::time::timeout(Duration::from_secs(15), h.wait_for_completion()).await;
         assert!(result.is_ok(), "startup failure should kill container");
@@ -2849,7 +3260,9 @@ mod tests {
         };
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         let mut got_ready = false;
         let result = tokio::time::timeout(Duration::from_secs(10), async {
@@ -2862,7 +3275,8 @@ mod tests {
                     break;
                 }
             }
-        }).await;
+        })
+        .await;
 
         assert!(result.is_ok(), "should complete within timeout");
         assert!(got_ready, "TCP probe should detect listening port");
@@ -2876,7 +3290,9 @@ mod tests {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
             .log_dir(&dir)
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         // Wait for at least one probe result
         let result = tokio::time::timeout(Duration::from_secs(10), async {
@@ -2889,16 +3305,25 @@ mod tests {
                     break;
                 }
             }
-        }).await;
+        })
+        .await;
         assert!(result.is_ok());
 
         // Give pump a moment to flush
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let probe_log = dir.join("app").join("probe-readiness.log");
-        assert!(probe_log.exists(), "probe log should exist at {}", probe_log.display());
+        assert!(
+            probe_log.exists(),
+            "probe log should exist at {}",
+            probe_log.display()
+        );
         let content = std::fs::read_to_string(&probe_log).unwrap();
-        assert!(content.contains("probe_output"), "probe log should contain output: {}", content);
+        assert!(
+            content.contains("probe_output"),
+            "probe log should contain output: {}",
+            content
+        );
 
         h.kill(Duration::from_secs(1));
         let _ = h.wait_for_completion().await;
@@ -2909,11 +3334,19 @@ mod tests {
         // Container without probes should not emit ProbeResult events
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "sleep 0.5")]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
         let events = collect_events(&mut h).await;
 
-        let probe_events: Vec<_> = events.iter().filter(|e| matches!(&e.kind, PodEventKind::ProbeResult { .. })).collect();
-        assert!(probe_events.is_empty(), "no probes defined, should have no probe events");
+        let probe_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(&e.kind, PodEventKind::ProbeResult { .. }))
+            .collect();
+        assert!(
+            probe_events.is_empty(),
+            "no probes defined, should have no probe events"
+        );
     }
 
     #[tokio::test]
@@ -2937,14 +3370,26 @@ mod tests {
         };
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
         let events = collect_events(&mut h).await;
 
         // Should have probe failures but no ContainerReady
-        let failures: Vec<_> = events.iter().filter(|e| matches!(&e.kind,
-            PodEventKind::ProbeResult { success, .. } if !success)).collect();
-        assert!(!failures.is_empty(), "should have probe failures for non-listening port");
-        let ready = events.iter().any(|e| matches!(&e.kind, PodEventKind::ContainerReady { .. }));
+        let failures: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                matches!(&e.kind,
+            PodEventKind::ProbeResult { success, .. } if !success)
+            })
+            .collect();
+        assert!(
+            !failures.is_empty(),
+            "should have probe failures for non-listening port"
+        );
+        let ready = events
+            .iter()
+            .any(|e| matches!(&e.kind, PodEventKind::ContainerReady { .. }));
         assert!(!ready, "should not become ready on non-listening port");
     }
 
@@ -2954,7 +3399,9 @@ mod tests {
         let c = container_with_readiness_exec("app", "sleep 3", "exit 2");
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         let mut had_failure = false;
         let result = tokio::time::timeout(Duration::from_secs(10), async {
@@ -2963,9 +3410,12 @@ mod tests {
                 if matches!(&ev.kind, PodEventKind::ProbeResult { success, .. } if !success) {
                     had_failure = true;
                 }
-                if matches!(&ev.kind, PodEventKind::Completed { .. }) { break; }
+                if matches!(&ev.kind, PodEventKind::Completed { .. }) {
+                    break;
+                }
             }
-        }).await;
+        })
+        .await;
         assert!(result.is_ok());
         assert!(had_failure, "exit code 2 should be a probe failure");
     }
@@ -2976,16 +3426,26 @@ mod tests {
         let c = container_with_liveness_exec("app", "sleep 60", "exit 1");
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         let events = collect_events(&mut h).await;
 
         // Container must have a ContainerFailed event (killed by liveness)
-        let failed = events.iter().any(|e| matches!(&e.kind,
-            PodEventKind::ContainerFailed { name, .. } if name == "app"));
+        let failed = events.iter().any(|e| {
+            matches!(&e.kind,
+            PodEventKind::ContainerFailed { name, .. } if name == "app")
+        });
         assert!(failed, "container should be killed and reported as failed");
         assert_eq!(
-            events.iter().find_map(|e| if let PodEventKind::Completed { phase } = &e.kind { Some(*phase) } else { None }),
+            events
+                .iter()
+                .find_map(|e| if let PodEventKind::Completed { phase } = &e.kind {
+                    Some(*phase)
+                } else {
+                    None
+                }),
             Some(PodPhase::Failed),
         );
     }
@@ -3010,16 +3470,25 @@ mod tests {
         };
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
         let events = collect_events(&mut h).await;
 
         // No probe should have run (initial delay > container lifetime)
-        let probe_events: Vec<_> = events.iter().filter(|e|
-            matches!(&e.kind, PodEventKind::ProbeResult { .. })).collect();
-        assert!(probe_events.is_empty(),
-            "probe should not run before initial_delay expires: {:?}", probe_events);
+        let probe_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(&e.kind, PodEventKind::ProbeResult { .. }))
+            .collect();
+        assert!(
+            probe_events.is_empty(),
+            "probe should not run before initial_delay expires: {:?}",
+            probe_events
+        );
         // Container should not be marked ready (no probe ran)
-        let ready = events.iter().any(|e| matches!(&e.kind, PodEventKind::ContainerReady { .. }));
+        let ready = events
+            .iter()
+            .any(|e| matches!(&e.kind, PodEventKind::ContainerReady { .. }));
         assert!(!ready, "should not be ready — probe never ran");
     }
 
@@ -3033,8 +3502,11 @@ mod tests {
         let mut c = container("app", &cmd);
         c.startup_probe = Some(Probe {
             exec_action: Some(ExecAction {
-                command: vec!["sh".to_string(), "-c".to_string(),
-                    format!("test -f {}", marker.display())],
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("test -f {}", marker.display()),
+                ],
             }),
             period_seconds: 1,
             success_threshold: 1,
@@ -3062,7 +3534,9 @@ mod tests {
 
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         let mut probe_types: Vec<String> = Vec::new();
         let mut got_ready = false;
@@ -3078,15 +3552,24 @@ mod tests {
                     got_ready = true;
                     break; // we've seen enough
                 }
-                if matches!(&ev.kind, PodEventKind::Completed { .. }) { break; }
+                if matches!(&ev.kind, PodEventKind::Completed { .. }) {
+                    break;
+                }
             }
-        }).await;
+        })
+        .await;
 
         assert!(result.is_ok(), "should complete within timeout");
-        assert!(probe_types.contains(&"startup".to_string()),
-            "startup probe should run: {:?}", probe_types);
-        assert!(probe_types.contains(&"readiness".to_string()),
-            "readiness probe should run after startup passes: {:?}", probe_types);
+        assert!(
+            probe_types.contains(&"startup".to_string()),
+            "startup probe should run: {:?}",
+            probe_types
+        );
+        assert!(
+            probe_types.contains(&"readiness".to_string()),
+            "readiness probe should run after startup passes: {:?}",
+            probe_types
+        );
         assert!(got_ready, "readiness probe should eventually pass");
 
         h.kill(Duration::from_secs(1));
@@ -3099,11 +3582,16 @@ mod tests {
         let c = container_with_readiness_exec("app", "exit 0", "exit 0");
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         // Should complete quickly — probe task stops when container exits
         let result = tokio::time::timeout(Duration::from_secs(5), h.wait_for_completion()).await;
-        assert!(result.is_ok(), "pod should complete — probe should stop when container exits");
+        assert!(
+            result.is_ok(),
+            "pod should complete — probe should stop when container exits"
+        );
     }
 
     #[tokio::test]
@@ -3128,14 +3616,19 @@ mod tests {
                 failure_threshold: 15,
                 ..Default::default()
             }),
-            ..container("app", &format!(
-                "python3 -m http.server {} 2>/dev/null || python -m SimpleHTTPServer {} 2>/dev/null || sleep 10",
-                port, port
-            ))
+            ..container(
+                "app",
+                &format!(
+                    "python3 -m http.server {} 2>/dev/null || python -m SimpleHTTPServer {} 2>/dev/null || sleep 10",
+                    port, port
+                ),
+            )
         };
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         let mut got_ready = false;
         let result = tokio::time::timeout(Duration::from_secs(25), async {
@@ -3145,9 +3638,12 @@ mod tests {
                     got_ready = true;
                     break;
                 }
-                if matches!(&ev.kind, PodEventKind::Completed { .. }) { break; }
+                if matches!(&ev.kind, PodEventKind::Completed { .. }) {
+                    break;
+                }
             }
-        }).await;
+        })
+        .await;
 
         assert!(result.is_ok(), "should complete within timeout");
         assert!(got_ready, "HTTP probe should detect 200 response");
@@ -3164,12 +3660,16 @@ mod tests {
         let c = container_with_readiness_exec("app", "sleep 60", "sleep 60");
         let (tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         // Wait for container to start
         loop {
             let ev = h.wait().await.unwrap();
-            if matches!(&ev.kind, PodEventKind::ContainerStarted { .. }) { break; }
+            if matches!(&ev.kind, PodEventKind::ContainerStarted { .. }) {
+                break;
+            }
         }
 
         // Let probe start executing
@@ -3179,7 +3679,10 @@ mod tests {
         tx.send(()).unwrap();
 
         let result = tokio::time::timeout(Duration::from_secs(10), h.wait_for_completion()).await;
-        assert!(result.is_ok(), "shutdown should interrupt probe and complete pod");
+        assert!(
+            result.is_ok(),
+            "shutdown should interrupt probe and complete pod"
+        );
         assert_eq!(result.unwrap().unwrap(), PodPhase::Failed);
     }
 
@@ -3190,7 +3693,9 @@ mod tests {
         let c = container_with_readiness_exec("app", "sleep 0.5", "sleep 60");
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         // Pod should complete quickly (container exits after 0.5s, probe stops)
         let result = tokio::time::timeout(Duration::from_secs(10), h.wait_for_completion()).await;
@@ -3203,12 +3708,16 @@ mod tests {
         let c = container_with_readiness_exec("app", "sleep 60", "sleep 60");
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         // Wait for container to start
         loop {
             let ev = h.wait().await.unwrap();
-            if matches!(&ev.kind, PodEventKind::ContainerStarted { .. }) { break; }
+            if matches!(&ev.kind, PodEventKind::ContainerStarted { .. }) {
+                break;
+            }
         }
 
         // Let probe start
@@ -3217,7 +3726,10 @@ mod tests {
         h.kill(Duration::from_secs(1));
 
         let result = tokio::time::timeout(Duration::from_secs(10), h.wait_for_completion()).await;
-        assert!(result.is_ok(), "kill should interrupt probe and complete pod");
+        assert!(
+            result.is_ok(),
+            "kill should interrupt probe and complete pod"
+        );
     }
 
     // -- probe edge cases ---------------------------------------------------
@@ -3234,7 +3746,9 @@ mod tests {
         });
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         let mut had_failure = false;
         let result = tokio::time::timeout(Duration::from_secs(8), async {
@@ -3243,9 +3757,12 @@ mod tests {
                 if matches!(&ev.kind, PodEventKind::ProbeResult { success, .. } if !success) {
                     had_failure = true;
                 }
-                if matches!(&ev.kind, PodEventKind::Completed { .. }) { break; }
+                if matches!(&ev.kind, PodEventKind::Completed { .. }) {
+                    break;
+                }
             }
-        }).await;
+        })
+        .await;
         assert!(result.is_ok());
         assert!(had_failure, "empty command probe should report failure");
     }
@@ -3269,13 +3786,25 @@ mod tests {
         };
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
         let events = collect_events(&mut h).await;
 
-        let failures: Vec<_> = events.iter().filter(|e| matches!(&e.kind,
-            PodEventKind::ProbeResult { success, .. } if !success)).collect();
-        assert!(!failures.is_empty(), "HTTP probe to closed port should fail");
-        let ready = events.iter().any(|e| matches!(&e.kind, PodEventKind::ContainerReady { .. }));
+        let failures: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                matches!(&e.kind,
+            PodEventKind::ProbeResult { success, .. } if !success)
+            })
+            .collect();
+        assert!(
+            !failures.is_empty(),
+            "HTTP probe to closed port should fail"
+        );
+        let ready = events
+            .iter()
+            .any(|e| matches!(&e.kind, PodEventKind::ContainerReady { .. }));
         assert!(!ready, "should not become ready");
     }
 
@@ -3297,11 +3826,16 @@ mod tests {
                 ..Default::default()
             }),
             // python http.server returns 404 for missing paths
-            ..container("app", "python3 -m http.server 18767 2>/dev/null || sleep 10")
+            ..container(
+                "app",
+                "python3 -m http.server 18767 2>/dev/null || sleep 10",
+            )
         };
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         let mut had_failure = false;
         let result = tokio::time::timeout(Duration::from_secs(10), async {
@@ -3311,9 +3845,12 @@ mod tests {
                     had_failure = true;
                     break;
                 }
-                if matches!(&ev.kind, PodEventKind::Completed { .. }) { break; }
+                if matches!(&ev.kind, PodEventKind::Completed { .. }) {
+                    break;
+                }
             }
-        }).await;
+        })
+        .await;
         assert!(result.is_ok());
         assert!(had_failure, "404 response should be a probe failure");
 
@@ -3331,7 +3868,8 @@ mod tests {
         // Create marker, then remove it after 2s
         let cmd = format!(
             "touch {} && sleep 2 && rm -f {} && sleep 10",
-            marker.display(), marker.display()
+            marker.display(),
+            marker.display()
         );
         let probe_cmd = format!("test -f {}", marker.display());
 
@@ -3351,7 +3889,9 @@ mod tests {
         };
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
 
         let mut readiness_changes = Vec::new();
         let result = tokio::time::timeout(Duration::from_secs(15), async {
@@ -3363,7 +3903,9 @@ mod tests {
                     }
                     PodEventKind::ProbeResult { success: _, .. } => {
                         // Track readiness in status
-                        let ready = ev.status.container_statuses
+                        let ready = ev
+                            .status
+                            .container_statuses
                             .iter()
                             .find(|cs| cs.name == "app")
                             .map(|cs| cs.ready)
@@ -3378,12 +3920,14 @@ mod tests {
                     _ => {}
                 }
             }
-        }).await;
+        })
+        .await;
 
         assert!(result.is_ok(), "should complete within timeout");
         assert!(
             readiness_changes == vec![true, false],
-            "should toggle ready→not-ready: {:?}", readiness_changes,
+            "should toggle ready→not-ready: {:?}",
+            readiness_changes,
         );
 
         h.kill(Duration::from_secs(1));
@@ -3410,15 +3954,20 @@ mod tests {
         };
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
         let events = collect_events(&mut h).await;
 
-        let probe_count = events.iter().filter(|e|
-            matches!(&e.kind, PodEventKind::ProbeResult { .. })).count();
+        let probe_count = events
+            .iter()
+            .filter(|e| matches!(&e.kind, PodEventKind::ProbeResult { .. }))
+            .count();
         // With 5s runtime and 2s period, expect 2-3 probes (not 10)
         assert!(
             probe_count >= 1 && probe_count <= 4,
-            "with period=2s over 5s, expected 2-3 probes, got {}", probe_count,
+            "with period=2s over 5s, expected 2-3 probes, got {}",
+            probe_count,
         );
     }
 
@@ -3449,10 +3998,7 @@ mod tests {
                 },
                 ..Default::default()
             });
-            let h = PodExecutor::new(spec)
-                .spawn(rx.clone())
-                .await
-                .unwrap();
+            let h = PodExecutor::new(spec).spawn(rx.clone()).await.unwrap();
             handles.push(h);
         }
 
@@ -3464,7 +4010,9 @@ mod tests {
                 phases.push(h.wait_for_completion().await.unwrap());
             }
             phases
-        }).await.expect("timed out — pods did not complete (possible busy-loop regression)");
+        })
+        .await
+        .expect("timed out — pods did not complete (possible busy-loop regression)");
 
         assert_eq!(phases.len(), n);
         for phase in &phases {
@@ -3478,46 +4026,48 @@ mod tests {
     async fn test_concurrent_mixed_pods_all_complete() {
         let (_tx, rx) = shutdown();
 
-        let specs: Vec<Arc<PodSpec>> = (0..15).map(|i| {
-            let (init, containers) = match i % 3 {
-                // No init, no sidecar
-                0 => (vec![], vec![
-                    container(&format!("app-{}", i), "sleep 1"),
-                ]),
-                // Init containers + sidecar
-                1 => (vec![
-                    container(&format!("init-{}", i), "sleep 0"),
-                    sidecar(&format!("sc-{}", i), "trap exit TERM; sleep 3600 & wait $!"),
-                ], vec![
-                    container(&format!("app-{}", i), "sleep 1"),
-                ]),
-                // Multiple main containers
-                _ => (vec![], vec![
-                    container(&format!("a-{}", i), "sleep 1"),
-                    container(&format!("b-{}", i), "exit 1"),
-                ]),
-            };
+        let specs: Vec<Arc<PodSpec>> = (0..15)
+            .map(|i| {
+                let (init, containers) = match i % 3 {
+                    // No init, no sidecar
+                    0 => (vec![], vec![container(&format!("app-{}", i), "sleep 1")]),
+                    // Init containers + sidecar
+                    1 => (
+                        vec![
+                            container(&format!("init-{}", i), "sleep 0"),
+                            sidecar(&format!("sc-{}", i), "trap exit TERM; sleep 3600 & wait $!"),
+                        ],
+                        vec![container(&format!("app-{}", i), "sleep 1")],
+                    ),
+                    // Multiple main containers
+                    _ => (
+                        vec![],
+                        vec![
+                            container(&format!("a-{}", i), "sleep 1"),
+                            container(&format!("b-{}", i), "exit 1"),
+                        ],
+                    ),
+                };
 
-            Arc::new(PodSpec {
-                metadata: PodMetadata {
-                    name: format!("mixed-{}", i),
-                    namespace: "default".to_string(),
+                Arc::new(PodSpec {
+                    metadata: PodMetadata {
+                        name: format!("mixed-{}", i),
+                        namespace: "default".to_string(),
+                        ..Default::default()
+                    },
+                    spec: PodSpecBody {
+                        init_containers: init,
+                        containers,
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                spec: PodSpecBody {
-                    init_containers: init,
-                    containers,
-                    ..Default::default()
-                },
-                ..Default::default()
+                })
             })
-        }).collect();
+            .collect();
 
         let mut handles = Vec::with_capacity(specs.len());
         for spec in specs {
-            handles.push(
-                PodExecutor::new(spec).spawn(rx.clone()).await.unwrap()
-            );
+            handles.push(PodExecutor::new(spec).spawn(rx.clone()).await.unwrap());
         }
 
         let phases = tokio::time::timeout(Duration::from_secs(30), async {
@@ -3526,11 +4076,17 @@ mod tests {
                 phases.push(h.wait_for_completion().await.unwrap());
             }
             phases
-        }).await.expect("timed out — mixed pods did not complete (possible busy-loop regression)");
+        })
+        .await
+        .expect("timed out — mixed pods did not complete (possible busy-loop regression)");
 
         assert_eq!(phases.len(), 15);
         for (i, phase) in phases.iter().enumerate() {
-            let expected = if i % 3 == 2 { PodPhase::Failed } else { PodPhase::Succeeded };
+            let expected = if i % 3 == 2 {
+                PodPhase::Failed
+            } else {
+                PodPhase::Succeeded
+            };
             assert_eq!(*phase, expected, "pod mixed-{} expected {:?}", i, expected);
         }
     }
@@ -3544,7 +4100,9 @@ mod tests {
     async fn test_lifecycle_tracks_successful_run() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
         assert_eq!(h.wait_for_completion().await.unwrap(), PodPhase::Succeeded);
 
         // After completion, the lifecycle must be in the terminal phase
@@ -3561,7 +4119,9 @@ mod tests {
     async fn test_lifecycle_tracks_failed_run() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 7")]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
         assert_eq!(h.wait_for_completion().await.unwrap(), PodPhase::Failed);
 
         let st = h.state.lock().await;
@@ -3577,7 +4137,10 @@ mod tests {
         let mut h = PodExecutor::new(pod_spec(
             vec![container("init", "exit 1")],
             vec![container("main", "exit 0")],
-        )).spawn(rx).await.unwrap();
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
         assert_eq!(h.wait_for_completion().await.unwrap(), PodPhase::Failed);
 
         let st = h.state.lock().await;
@@ -3600,17 +4163,21 @@ mod tests {
         let (_tx, rx) = shutdown();
         let c = container_with_readiness_exec("app", "sleep 2", "true");
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
-            .spawn(rx).await.unwrap();
+            .spawn(rx)
+            .await
+            .unwrap();
         let _ = h.wait_for_completion().await.unwrap();
 
         let st = h.state.lock().await;
         let cl = st.lifecycle.container("app").unwrap();
         // Probe was registered and recorded at least one result
-        let phase = cl.probe_phase(ProbeKind::Readiness)
+        let phase = cl
+            .probe_phase(ProbeKind::Readiness)
             .expect("readiness probe should be registered");
         assert!(
             matches!(phase, ProbePhase::Passing { consecutive } if *consecutive >= 1),
-            "expected Passing phase, got {:?}", phase,
+            "expected Passing phase, got {:?}",
+            phase,
         );
     }
 
@@ -3625,14 +4192,21 @@ mod tests {
         let mut h = PodExecutor::new(pod_spec(
             vec![],
             vec![container("a", "exit 0"), container("b", "exit 0")],
-        )).spawn(rx).await.unwrap();
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
         assert_eq!(h.wait_for_completion().await.unwrap(), PodPhase::Succeeded);
 
         let st = h.state.lock().await;
-        let cr = st.lifecycle.condition(PodConditionKey::ContainersReady)
+        let cr = st
+            .lifecycle
+            .condition(PodConditionKey::ContainersReady)
             .expect("ContainersReady condition should be set");
         assert!(cr.status, "ContainersReady should be True after all exited");
-        let r = st.lifecycle.condition(PodConditionKey::Ready)
+        let r = st
+            .lifecycle
+            .condition(PodConditionKey::Ready)
             .expect("Ready condition should be set");
         assert!(r.status, "Ready should be True after all exited");
     }
@@ -3736,8 +4310,14 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), &mut h.orchestrator).await;
 
         assert!(started.load(Ordering::SeqCst), "task did not start");
-        assert!(via_kill.load(Ordering::SeqCst), "task should have exited via pod_kill");
-        assert!(!via_shutdown.load(Ordering::SeqCst), "runner_shutdown should not have fired");
+        assert!(
+            via_kill.load(Ordering::SeqCst),
+            "task should have exited via pod_kill"
+        );
+        assert!(
+            !via_shutdown.load(Ordering::SeqCst),
+            "runner_shutdown should not have fired"
+        );
         assert_eq!(work_dir.lock().await.as_ref().unwrap(), &dir);
         assert_eq!(pod_name.lock().await.as_deref(), Some("test-pod"));
     }
@@ -3758,18 +4338,18 @@ mod tests {
         });
 
         // Long-running container so the pod doesn't complete on its own.
-        let mut h = PodExecutor::new(pod_spec(
-            vec![],
-            vec![container("main", "sleep 30")],
-        ))
-        .register_task(task)
-        .spawn(rx)
-        .await
-        .unwrap();
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "sleep 30")]))
+            .register_task(task)
+            .spawn(rx)
+            .await
+            .unwrap();
 
         // Wait briefly so the task is definitely spawned.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(started.load(Ordering::SeqCst), "task did not start before shutdown");
+        assert!(
+            started.load(Ordering::SeqCst),
+            "task did not start before shutdown"
+        );
 
         // Fire runner shutdown — orchestrator should kill containers and
         // exit, and tasks should observe runner_shutdown.
@@ -3791,9 +4371,15 @@ mod tests {
     async fn multiple_tasks_all_spawn() {
         let (_tx, rx) = shutdown();
         let count = Arc::new(AtomicU32::new(0));
-        let a = Arc::new(CountingTask { spawn_count: Arc::clone(&count) });
-        let b = Arc::new(CountingTask { spawn_count: Arc::clone(&count) });
-        let c = Arc::new(CountingTask { spawn_count: Arc::clone(&count) });
+        let a = Arc::new(CountingTask {
+            spawn_count: Arc::clone(&count),
+        });
+        let b = Arc::new(CountingTask {
+            spawn_count: Arc::clone(&count),
+        });
+        let c = Arc::new(CountingTask {
+            spawn_count: Arc::clone(&count),
+        });
 
         let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
             .register_task(a)
@@ -3813,7 +4399,9 @@ mod tests {
     async fn hanging_task_is_aborted_after_grace_period() {
         let (_tx, rx) = shutdown();
         let aborted = Arc::new(AtomicBool::new(false));
-        let task = Arc::new(HangingTask { aborted: Arc::clone(&aborted) });
+        let task = Arc::new(HangingTask {
+            aborted: Arc::clone(&aborted),
+        });
 
         let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
             .shutdown_grace_period(Duration::from_millis(200))
@@ -3826,7 +4414,10 @@ mod tests {
         // Orchestrator's task-grace timeout (200ms) plus a margin.
         let _ = tokio::time::timeout(Duration::from_secs(3), &mut h.orchestrator).await;
 
-        assert!(aborted.load(Ordering::SeqCst), "hanging task was not aborted");
+        assert!(
+            aborted.load(Ordering::SeqCst),
+            "hanging task was not aborted"
+        );
     }
 
     #[tokio::test]
@@ -3844,16 +4435,15 @@ mod tests {
     async fn dropping_pod_handle_aborts_tasks() {
         let (_tx, rx) = shutdown();
         let aborted = Arc::new(AtomicBool::new(false));
-        let task = Arc::new(HangingTask { aborted: Arc::clone(&aborted) });
+        let task = Arc::new(HangingTask {
+            aborted: Arc::clone(&aborted),
+        });
 
-        let h = PodExecutor::new(pod_spec(
-            vec![],
-            vec![container("main", "sleep 30")],
-        ))
-        .register_task(task)
-        .spawn(rx)
-        .await
-        .unwrap();
+        let h = PodExecutor::new(pod_spec(vec![], vec![container("main", "sleep 30")]))
+            .register_task(task)
+            .spawn(rx)
+            .await
+            .unwrap();
 
         // Let the task start.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -3861,6 +4451,9 @@ mod tests {
         // Drop aborts the orchestrator JoinHandle. JoinSet inside the
         // orchestrator drops with it, aborting registered tasks.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(aborted.load(Ordering::SeqCst), "task should be aborted when handle is dropped");
+        assert!(
+            aborted.load(Ordering::SeqCst),
+            "task should be aborted when handle is dropped"
+        );
     }
 }

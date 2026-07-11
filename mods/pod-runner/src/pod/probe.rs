@@ -41,9 +41,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{Mutex, watch};
 use tokio::task::JoinSet;
-use tracing::{debug, info, info_span, warn, Instrument};
+use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::pod::container_log::ProbeLogStream;
 use crate::pod::executor::{PodEvent, PodEventKind, PodState};
@@ -150,24 +150,25 @@ pub(crate) fn spawn_probe_tasks(
             .map(|tx| tx.subscribe())
             .unwrap_or_else(|| watch::channel(false).1);
 
-        let span = info_span!(
-            "probes",
-            container = container_name.as_str(),
-        );
+        let span = info_span!("probes", container = container_name.as_str(),);
 
-        join_set.spawn(async move {
-            run_container_probes(
-                &container_name,
-                &working_dir,
-                &probes,
-                &action_tx,
-                &event_tx,
-                &state,
-                log_dir.as_deref(),
-                shutdown,
-                stop,
-            ).await;
-        }.instrument(span));
+        join_set.spawn(
+            async move {
+                run_container_probes(
+                    &container_name,
+                    &working_dir,
+                    &probes,
+                    &action_tx,
+                    &event_tx,
+                    &state,
+                    log_dir.as_deref(),
+                    shutdown,
+                    stop,
+                )
+                .await;
+            }
+            .instrument(span),
+        );
     }
 }
 
@@ -266,10 +267,19 @@ async fn run_container_probes(
             // (and any child ProcessExecutor) inherit the probe context.
             let probe_result = async {
                 execute_probe_interruptible(
-                    probe, container_name, working_dir, probe_type,
-                    log_dir, timeout, &mut shutdown, &mut stop,
-                ).await
-            }.instrument(probe_span.clone()).await;
+                    probe,
+                    container_name,
+                    working_dir,
+                    probe_type,
+                    log_dir,
+                    timeout,
+                    &mut shutdown,
+                    &mut stop,
+                )
+                .await
+            }
+            .instrument(probe_span.clone())
+            .await;
 
             let success = match probe_result {
                 Some(s) => s,
@@ -349,8 +359,7 @@ async fn run_container_probes(
                         warn!("Startup probe failed — killing container");
                         let _ = action_tx.try_send(ProbeAction::KillContainer {
                             container: container_name.to_string(),
-                            reason: "startup probe failed (threshold reached)"
-                                .to_string(),
+                            reason: "startup probe failed (threshold reached)".to_string(),
                         });
                         return;
                     }
@@ -360,8 +369,7 @@ async fn run_container_probes(
                         warn!("Liveness probe failed — killing container");
                         let _ = action_tx.try_send(ProbeAction::KillContainer {
                             container: container_name.to_string(),
-                            reason: "liveness probe failed (threshold reached)"
-                                .to_string(),
+                            reason: "liveness probe failed (threshold reached)".to_string(),
                         });
                         return;
                     }
@@ -438,9 +446,16 @@ async fn execute_probe_interruptible(
     // waiting for it and the signals.
     if let Some(ref exec_action) = probe.exec_action {
         return execute_exec_probe_interruptible(
-            &exec_action.command, container_name, working_dir,
-            probe_type, log_dir, timeout, shutdown, stop,
-        ).await;
+            &exec_action.command,
+            container_name,
+            working_dir,
+            probe_type,
+            log_dir,
+            timeout,
+            shutdown,
+            stop,
+        )
+        .await;
     }
 
     // For HTTP/TCP probes, the future is lightweight (just a TCP connection).
@@ -561,13 +576,18 @@ async fn execute_exec_probe_interruptible(
 // ---------------------------------------------------------------------------
 
 /// Execute an HTTP GET probe: connect, send GET, 2xx/3xx = success.
-async fn execute_http_probe(
-    http_get: &crate::spec::pod::HttpGetAction,
-    timeout: Duration,
-) -> bool {
-    let host = if http_get.host.is_empty() { "127.0.0.1" } else { &http_get.host };
+async fn execute_http_probe(http_get: &crate::spec::pod::HttpGetAction, timeout: Duration) -> bool {
+    let host = if http_get.host.is_empty() {
+        "127.0.0.1"
+    } else {
+        &http_get.host
+    };
     let port = http_get.port.unwrap_or(80);
-    let path = if http_get.path.is_empty() { "/" } else { &http_get.path };
+    let path = if http_get.path.is_empty() {
+        "/"
+    } else {
+        &http_get.path
+    };
     let addr = format!("{}:{}", host, port);
 
     match tokio::time::timeout(timeout, async {
@@ -584,7 +604,9 @@ async fn execute_http_probe(
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         Ok::<u16, std::io::Error>(code)
-    }).await {
+    })
+    .await
+    {
         Ok(Ok(code)) => {
             let success = (200..400).contains(&code);
             debug!(status_code = code, success, "HTTP probe completed");
@@ -610,7 +632,11 @@ async fn execute_tcp_probe(
     tcp_socket: &crate::spec::pod::TcpSocketAction,
     timeout: Duration,
 ) -> bool {
-    let host = if tcp_socket.host.is_empty() { "127.0.0.1" } else { &tcp_socket.host };
+    let host = if tcp_socket.host.is_empty() {
+        "127.0.0.1"
+    } else {
+        &tcp_socket.host
+    };
     let port = tcp_socket.port.unwrap_or(0);
     let addr = format!("{}:{}", host, port);
 
@@ -659,7 +685,10 @@ mod tests {
     }
 
     /// Accept one connection, read the request, write `response`, close.
-    fn spawn_http_once(listener: TcpListener, response: &'static [u8]) -> tokio::task::JoinHandle<()> {
+    fn spawn_http_once(
+        listener: TcpListener,
+        response: &'static [u8],
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut buf = [0u8; 1024];
@@ -673,17 +702,26 @@ mod tests {
 
     #[test]
     fn probe_kind_from_str_startup() {
-        assert!(matches!(probe_kind_from_str(PROBE_STARTUP), Some(ProbeKind::Startup)));
+        assert!(matches!(
+            probe_kind_from_str(PROBE_STARTUP),
+            Some(ProbeKind::Startup)
+        ));
     }
 
     #[test]
     fn probe_kind_from_str_liveness() {
-        assert!(matches!(probe_kind_from_str(PROBE_LIVENESS), Some(ProbeKind::Liveness)));
+        assert!(matches!(
+            probe_kind_from_str(PROBE_LIVENESS),
+            Some(ProbeKind::Liveness)
+        ));
     }
 
     #[test]
     fn probe_kind_from_str_readiness() {
-        assert!(matches!(probe_kind_from_str(PROBE_READINESS), Some(ProbeKind::Readiness)));
+        assert!(matches!(
+            probe_kind_from_str(PROBE_READINESS),
+            Some(ProbeKind::Readiness)
+        ));
     }
 
     #[test]
@@ -700,7 +738,10 @@ mod tests {
         // Keep the listener alive and accepting for the duration of the probe.
         let accept = tokio::spawn(async move { listener.accept().await });
 
-        let action = TcpSocketAction { port: Some(port), host: "127.0.0.1".to_string() };
+        let action = TcpSocketAction {
+            port: Some(port),
+            host: "127.0.0.1".to_string(),
+        };
         assert!(execute_tcp_probe(&action, Duration::from_secs(1)).await);
         accept.abort();
     }
@@ -711,7 +752,10 @@ mod tests {
         let accept = tokio::spawn(async move { listener.accept().await });
 
         // Empty host → code uses 127.0.0.1.
-        let action = TcpSocketAction { port: Some(port), host: String::new() };
+        let action = TcpSocketAction {
+            port: Some(port),
+            host: String::new(),
+        };
         assert!(execute_tcp_probe(&action, Duration::from_secs(1)).await);
         accept.abort();
     }
@@ -722,7 +766,10 @@ mod tests {
         let (listener, port) = bind_ephemeral().await;
         drop(listener);
 
-        let action = TcpSocketAction { port: Some(port), host: "127.0.0.1".to_string() };
+        let action = TcpSocketAction {
+            port: Some(port),
+            host: "127.0.0.1".to_string(),
+        };
         assert!(!execute_tcp_probe(&action, Duration::from_secs(1)).await);
     }
 
@@ -767,7 +814,11 @@ mod tests {
             b"HTTP/1.0 301 Moved Permanently\r\nLocation: /new\r\n\r\n",
         );
 
-        let action = HttpGetAction { path: "/old".to_string(), port: Some(port), host: String::new() };
+        let action = HttpGetAction {
+            path: "/old".to_string(),
+            port: Some(port),
+            host: String::new(),
+        };
         assert!(execute_http_probe(&action, Duration::from_secs(1)).await);
         server.await.unwrap();
     }
@@ -777,7 +828,11 @@ mod tests {
         let (listener, port) = bind_ephemeral().await;
         let server = spawn_http_once(listener, b"HTTP/1.0 404 Not Found\r\n\r\n");
 
-        let action = HttpGetAction { path: "/".to_string(), port: Some(port), host: String::new() };
+        let action = HttpGetAction {
+            path: "/".to_string(),
+            port: Some(port),
+            host: String::new(),
+        };
         assert!(!execute_http_probe(&action, Duration::from_secs(1)).await);
         server.await.unwrap();
     }
@@ -787,7 +842,11 @@ mod tests {
         let (listener, port) = bind_ephemeral().await;
         let server = spawn_http_once(listener, b"HTTP/1.0 500 Internal Server Error\r\n\r\n");
 
-        let action = HttpGetAction { path: "/".to_string(), port: Some(port), host: String::new() };
+        let action = HttpGetAction {
+            path: "/".to_string(),
+            port: Some(port),
+            host: String::new(),
+        };
         assert!(!execute_http_probe(&action, Duration::from_secs(1)).await);
         server.await.unwrap();
     }
@@ -842,7 +901,11 @@ mod tests {
             let _ = sock.write_all(b"HTTP/1.0 200 OK\r\n\r\n").await;
         });
 
-        let action = HttpGetAction { path: String::new(), port: Some(port), host: String::new() };
+        let action = HttpGetAction {
+            path: String::new(),
+            port: Some(port),
+            host: String::new(),
+        };
         assert!(execute_http_probe(&action, Duration::from_secs(1)).await);
         server.await.unwrap();
 
@@ -919,10 +982,15 @@ mod tests {
 
         let result = execute_exec_probe_interruptible(
             &["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
-            "c", Path::new(""), PROBE_LIVENESS, None,
+            "c",
+            Path::new(""),
+            PROBE_LIVENESS,
+            None,
             Duration::from_secs(5),
-            &mut shutdown_rx, &mut stop_rx,
-        ).await;
+            &mut shutdown_rx,
+            &mut stop_rx,
+        )
+        .await;
         assert_eq!(result, Some(true));
     }
 
@@ -934,10 +1002,15 @@ mod tests {
 
         let result = execute_exec_probe_interruptible(
             &["sh".to_string(), "-c".to_string(), "exit 1".to_string()],
-            "c", Path::new(""), PROBE_LIVENESS, None,
+            "c",
+            Path::new(""),
+            PROBE_LIVENESS,
+            None,
             Duration::from_secs(5),
-            &mut shutdown_rx, &mut stop_rx,
-        ).await;
+            &mut shutdown_rx,
+            &mut stop_rx,
+        )
+        .await;
         assert_eq!(result, Some(false));
     }
 
@@ -948,10 +1021,16 @@ mod tests {
         let (_st_tx, mut stop_rx) = stop_pair();
 
         let result = execute_exec_probe_interruptible(
-            &[], "c", Path::new(""), PROBE_LIVENESS, None,
+            &[],
+            "c",
+            Path::new(""),
+            PROBE_LIVENESS,
+            None,
             Duration::from_secs(1),
-            &mut shutdown_rx, &mut stop_rx,
-        ).await;
+            &mut shutdown_rx,
+            &mut stop_rx,
+        )
+        .await;
         assert_eq!(result, Some(false));
     }
 
@@ -964,10 +1043,15 @@ mod tests {
         // A command that doesn't exist anywhere in PATH or at the given path.
         let result = execute_exec_probe_interruptible(
             &["/no/such/binary-xyz-12345".to_string()],
-            "c", Path::new(""), PROBE_LIVENESS, None,
+            "c",
+            Path::new(""),
+            PROBE_LIVENESS,
+            None,
             Duration::from_secs(1),
-            &mut shutdown_rx, &mut stop_rx,
-        ).await;
+            &mut shutdown_rx,
+            &mut stop_rx,
+        )
+        .await;
         assert_eq!(result, Some(false));
     }
 
@@ -980,13 +1064,22 @@ mod tests {
         let start = tokio::time::Instant::now();
         let result = execute_exec_probe_interruptible(
             &["sh".to_string(), "-c".to_string(), "sleep 10".to_string()],
-            "c", Path::new(""), PROBE_LIVENESS, None,
+            "c",
+            Path::new(""),
+            PROBE_LIVENESS,
+            None,
             Duration::from_millis(200),
-            &mut shutdown_rx, &mut stop_rx,
-        ).await;
+            &mut shutdown_rx,
+            &mut stop_rx,
+        )
+        .await;
         let elapsed = start.elapsed();
         assert_eq!(result, Some(false));
-        assert!(elapsed < Duration::from_secs(3), "timeout did not fire promptly: {:?}", elapsed);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "timeout did not fire promptly: {:?}",
+            elapsed
+        );
     }
 
     #[cfg(unix)]
@@ -1004,14 +1097,27 @@ mod tests {
         let start = tokio::time::Instant::now();
         let result = execute_exec_probe_interruptible(
             &["sh".to_string(), "-c".to_string(), "sleep 10".to_string()],
-            "c", Path::new(""), PROBE_LIVENESS, None,
+            "c",
+            Path::new(""),
+            PROBE_LIVENESS,
+            None,
             Duration::from_secs(30),
-            &mut shutdown_rx, &mut stop_rx,
-        ).await;
+            &mut shutdown_rx,
+            &mut stop_rx,
+        )
+        .await;
         let elapsed = start.elapsed();
         signal.await.unwrap();
-        assert!(result.is_none(), "expected None on stop interrupt, got {:?}", result);
-        assert!(elapsed < Duration::from_secs(3), "stop did not interrupt promptly: {:?}", elapsed);
+        assert!(
+            result.is_none(),
+            "expected None on stop interrupt, got {:?}",
+            result
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "stop did not interrupt promptly: {:?}",
+            elapsed
+        );
     }
 
     #[cfg(unix)]
@@ -1028,14 +1134,27 @@ mod tests {
         let start = tokio::time::Instant::now();
         let result = execute_exec_probe_interruptible(
             &["sh".to_string(), "-c".to_string(), "sleep 10".to_string()],
-            "c", Path::new(""), PROBE_LIVENESS, None,
+            "c",
+            Path::new(""),
+            PROBE_LIVENESS,
+            None,
             Duration::from_secs(30),
-            &mut shutdown_rx, &mut stop_rx,
-        ).await;
+            &mut shutdown_rx,
+            &mut stop_rx,
+        )
+        .await;
         let elapsed = start.elapsed();
         signal.await.unwrap();
-        assert!(result.is_none(), "expected None on shutdown interrupt, got {:?}", result);
-        assert!(elapsed < Duration::from_secs(3), "shutdown did not interrupt promptly: {:?}", elapsed);
+        assert!(
+            result.is_none(),
+            "expected None on shutdown interrupt, got {:?}",
+            result
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "shutdown did not interrupt promptly: {:?}",
+            elapsed
+        );
     }
 
     // -- execute_probe_interruptible -----------------------------------------
@@ -1053,10 +1172,16 @@ mod tests {
             ..Default::default()
         };
         let result = execute_probe_interruptible(
-            &probe, "c", Path::new(""), PROBE_READINESS, None,
+            &probe,
+            "c",
+            Path::new(""),
+            PROBE_READINESS,
+            None,
             Duration::from_secs(5),
-            &mut shutdown_rx, &mut stop_rx,
-        ).await;
+            &mut shutdown_rx,
+            &mut stop_rx,
+        )
+        .await;
         assert_eq!(result, Some(true));
     }
 
@@ -1076,10 +1201,16 @@ mod tests {
             ..Default::default()
         };
         let result = execute_probe_interruptible(
-            &probe, "c", Path::new(""), PROBE_READINESS, None,
+            &probe,
+            "c",
+            Path::new(""),
+            PROBE_READINESS,
+            None,
             Duration::from_secs(1),
-            &mut shutdown_rx, &mut stop_rx,
-        ).await;
+            &mut shutdown_rx,
+            &mut stop_rx,
+        )
+        .await;
         assert_eq!(result, Some(true));
         accept.abort();
     }
@@ -1105,13 +1236,23 @@ mod tests {
         };
         let start = tokio::time::Instant::now();
         let result = execute_probe_interruptible(
-            &probe, "c", Path::new(""), PROBE_READINESS, None,
+            &probe,
+            "c",
+            Path::new(""),
+            PROBE_READINESS,
+            None,
             Duration::from_secs(30),
-            &mut shutdown_rx, &mut stop_rx,
-        ).await;
+            &mut shutdown_rx,
+            &mut stop_rx,
+        )
+        .await;
         let elapsed = start.elapsed();
         signal.await.unwrap();
-        assert!(result.is_none(), "expected None on stop interrupt, got {:?}", result);
+        assert!(
+            result.is_none(),
+            "expected None on stop interrupt, got {:?}",
+            result
+        );
         assert!(elapsed < Duration::from_secs(3));
     }
 
@@ -1134,10 +1275,16 @@ mod tests {
         };
         let start = tokio::time::Instant::now();
         let result = execute_probe_interruptible(
-            &probe, "c", Path::new(""), PROBE_READINESS, None,
+            &probe,
+            "c",
+            Path::new(""),
+            PROBE_READINESS,
+            None,
             Duration::from_secs(30),
-            &mut shutdown_rx, &mut stop_rx,
-        ).await;
+            &mut shutdown_rx,
+            &mut stop_rx,
+        )
+        .await;
         let elapsed = start.elapsed();
         signal.await.unwrap();
         assert!(result.is_none());
@@ -1151,10 +1298,16 @@ mod tests {
 
         let probe = Probe::default(); // no exec, http, or tcp
         let result = execute_probe_interruptible(
-            &probe, "c", Path::new(""), PROBE_READINESS, None,
+            &probe,
+            "c",
+            Path::new(""),
+            PROBE_READINESS,
+            None,
             Duration::from_secs(1),
-            &mut shutdown_rx, &mut stop_rx,
-        ).await;
+            &mut shutdown_rx,
+            &mut stop_rx,
+        )
+        .await;
         assert_eq!(result, Some(true));
     }
 }

@@ -250,7 +250,9 @@ fn build_client(config: &Option<VKPRConfig>) -> Result<reqwest::Client, String> 
         }
     }
 
-    builder.build().map_err(|e| format!("Failed to build HTTP client: {e}"))
+    builder
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -284,13 +286,8 @@ async fn handle_response(resp: reqwest::Response) -> u8 {
     }
 
     // Error response
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .unwrap_or(serde_json::Value::Null);
-    let msg = body[FIELD_ERROR]
-        .as_str()
-        .unwrap_or("Unknown error");
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    let msg = body[FIELD_ERROR].as_str().unwrap_or("Unknown error");
     let cid = body[FIELD_CORRELATION_ID].as_str().unwrap_or("");
     if cid.is_empty() {
         eprintln!("Error ({status}): {msg}");
@@ -363,12 +360,7 @@ async fn cmd_create(client: &reqwest::Client, base_url: &str, deployment: &str) 
     handle_response(resp).await
 }
 
-async fn cmd_delete(
-    client: &reqwest::Client,
-    base_url: &str,
-    name: &str,
-    namespace: &str,
-) -> u8 {
+async fn cmd_delete(client: &reqwest::Client, base_url: &str, name: &str, namespace: &str) -> u8 {
     let resp = match client
         .delete(format!("{base_url}{ENDPOINT_DELETE_POD}"))
         .query(&[(PARAM_NAME, name), (PARAM_NAMESPACE, namespace)])
@@ -381,12 +373,7 @@ async fn cmd_delete(
     handle_response(resp).await
 }
 
-async fn cmd_get(
-    client: &reqwest::Client,
-    base_url: &str,
-    name: &str,
-    namespace: &str,
-) -> u8 {
+async fn cmd_get(client: &reqwest::Client, base_url: &str, name: &str, namespace: &str) -> u8 {
     let resp = match client
         .get(format!("{base_url}{ENDPOINT_GET_POD}"))
         .query(&[(PARAM_NAME, name), (PARAM_NAMESPACE, namespace)])
@@ -399,12 +386,7 @@ async fn cmd_get(
     handle_response(resp).await
 }
 
-async fn cmd_status(
-    client: &reqwest::Client,
-    base_url: &str,
-    name: &str,
-    namespace: &str,
-) -> u8 {
+async fn cmd_status(client: &reqwest::Client, base_url: &str, name: &str, namespace: &str) -> u8 {
     let resp = match client
         .get(format!("{base_url}{ENDPOINT_GET_POD_STATUS}"))
         .query(&[(PARAM_NAME, name), (PARAM_NAMESPACE, namespace)])
@@ -542,11 +524,7 @@ async fn cmd_metrics(metrics_url: &str) -> u8 {
         eprintln!("Error: metrics URL must use http:// (got {metrics_url})");
         return EXIT_VALIDATION;
     }
-    let url = format!(
-        "{}{}",
-        metrics_url.trim_end_matches('/'),
-        ENDPOINT_METRICS,
-    );
+    let url = format!("{}{}", metrics_url.trim_end_matches('/'), ENDPOINT_METRICS,);
     // Metrics endpoint is plain HTTP — use a simple client without TLS.
     let client = reqwest::Client::new();
     let resp = match client.get(&url).send().await {
@@ -588,13 +566,11 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use pod_runner::logic::{
-        CleanupConfig, DefaultExecutorProvider, PodLogic,
-    };
+    use pod_runner::logic::{CleanupConfig, DefaultExecutorProvider, PodLogic};
     use pod_runner::pod::resolver::ResolverSet;
     use pod_runner::server::app::{AppState, create_router};
-    use pod_runner::store::memory::MemoryStore;
     use pod_runner::store::PodStore;
+    use pod_runner::store::memory::MemoryStore;
 
     fn shell_cmd(cmd: &str) -> Vec<String> {
         if cfg!(windows) {
@@ -607,10 +583,7 @@ mod tests {
     /// Start a test HTTP server on a random port, return the base URL.
     async fn start_test_server() -> (String, tokio::sync::watch::Sender<()>) {
         let store = Arc::new(MemoryStore::new());
-        let base = std::env::temp_dir().join(format!(
-            "td-prc-test-{}",
-            std::process::id(),
-        ));
+        let base = std::env::temp_dir().join(format!("td-prc-test-{}", std::process::id(),));
         let provider = Arc::new(DefaultExecutorProvider {
             pods_dir: base.join("pods"),
             pid_dir: base.join("pids"),
@@ -622,7 +595,7 @@ mod tests {
         });
         let cleanup = CleanupConfig {
             pods_dir: base.join("pods"),
-            
+
             ..CleanupConfig::default()
         };
         let (shutdown_tx, _) = tokio::sync::watch::channel(());
@@ -915,9 +888,16 @@ spec:
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         let code = cmd_logs(
-            &client, &url, "logger", DEFAULT_NAMESPACE, "main",
-            false, None, false,
-        ).await;
+            &client,
+            &url,
+            "logger",
+            DEFAULT_NAMESPACE,
+            "main",
+            false,
+            None,
+            false,
+        )
+        .await;
         assert_eq!(code, EXIT_OK);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -929,9 +909,16 @@ spec:
         let client = test_client();
 
         let code = cmd_logs(
-            &client, &url, "nope", DEFAULT_NAMESPACE, "main",
-            false, None, false,
-        ).await;
+            &client,
+            &url,
+            "nope",
+            DEFAULT_NAMESPACE,
+            "main",
+            false,
+            None,
+            false,
+        )
+        .await;
         assert_eq!(code, EXIT_SERVER_ERROR);
     }
 
@@ -946,9 +933,16 @@ spec:
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         let code = cmd_logs(
-            &client, &url, "tailer", DEFAULT_NAMESPACE, "main",
-            false, Some(1), false,
-        ).await;
+            &client,
+            &url,
+            "tailer",
+            DEFAULT_NAMESPACE,
+            "main",
+            false,
+            Some(1),
+            false,
+        )
+        .await;
         assert_eq!(code, EXIT_OK);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -967,9 +961,16 @@ spec:
         // previous=true on a container that hasn't restarted may return
         // 404 or empty — we just verify the client handles it without panic
         let code = cmd_logs(
-            &client, &url, "prev-pod", DEFAULT_NAMESPACE, "main",
-            false, None, true,
-        ).await;
+            &client,
+            &url,
+            "prev-pod",
+            DEFAULT_NAMESPACE,
+            "main",
+            false,
+            None,
+            true,
+        )
+        .await;
         // Either OK (found previous log) or SERVER_ERROR (no previous log)
         assert!(code == EXIT_OK || code == EXIT_SERVER_ERROR);
 
@@ -1015,8 +1016,9 @@ spec:
     async fn test_metrics() {
         // Start a real metrics server
         let metrics = pod_runner::metrics::Metrics::new();
-        let app = axum::Router::new()
-            .route(ENDPOINT_METRICS, axum::routing::get({
+        let app = axum::Router::new().route(
+            ENDPOINT_METRICS,
+            axum::routing::get({
                 let metrics = Arc::clone(&metrics);
                 move |_: ()| {
                     let metrics = Arc::clone(&metrics);
@@ -1028,7 +1030,8 @@ spec:
                             &prometheus::TextEncoder::new(),
                             &families,
                             &mut buf,
-                        ).unwrap();
+                        )
+                        .unwrap();
                         (
                             axum::http::StatusCode::OK,
                             [("content-type", "text/plain")],
@@ -1036,7 +1039,8 @@ spec:
                         )
                     }
                 }
-            }));
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1124,8 +1128,12 @@ spec:
     #[test]
     fn test_cli_parse_create() {
         let cli = Cli::parse_from([
-            "kpr", "--prconfig", "config.yaml",
-            "create", "-f", "pod.yaml",
+            "kpr",
+            "--prconfig",
+            "config.yaml",
+            "create",
+            "-f",
+            "pod.yaml",
         ]);
         assert!(matches!(cli.command, Command::Create { deployment } if deployment == "pod.yaml"));
     }
@@ -1133,8 +1141,14 @@ spec:
     #[test]
     fn test_cli_parse_delete() {
         let cli = Cli::parse_from([
-            "kpr", "--prconfig", "config.yaml",
-            "delete", "-n", "app", "-N", "prod",
+            "kpr",
+            "--prconfig",
+            "config.yaml",
+            "delete",
+            "-n",
+            "app",
+            "-N",
+            "prod",
         ]);
         assert!(matches!(
             cli.command,
@@ -1145,8 +1159,18 @@ spec:
     #[test]
     fn test_cli_parse_logs_with_options() {
         let cli = Cli::parse_from([
-            "kpr", "--prconfig", "config.yaml",
-            "logs", "-n", "app", "-c", "worker", "--stream", "--tail", "100", "--previous",
+            "kpr",
+            "--prconfig",
+            "config.yaml",
+            "logs",
+            "-n",
+            "app",
+            "-c",
+            "worker",
+            "--stream",
+            "--tail",
+            "100",
+            "--previous",
         ]);
         assert!(matches!(
             cli.command,
@@ -1158,8 +1182,14 @@ spec:
     #[test]
     fn test_cli_parse_logs_defaults() {
         let cli = Cli::parse_from([
-            "kpr", "--prconfig", "config.yaml",
-            "logs", "-n", "app", "-c", "main",
+            "kpr",
+            "--prconfig",
+            "config.yaml",
+            "logs",
+            "-n",
+            "app",
+            "-c",
+            "main",
         ]);
         assert!(matches!(
             cli.command,
@@ -1170,51 +1200,37 @@ spec:
 
     #[test]
     fn test_cli_parse_logs_requires_container() {
-        let result = Cli::try_parse_from([
-            "kpr", "--prconfig", "config.yaml",
-            "logs", "-n", "app",
-        ]);
+        let result = Cli::try_parse_from(["kpr", "--prconfig", "config.yaml", "logs", "-n", "app"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_cli_parse_list() {
-        let cli = Cli::parse_from([
-            "kpr", "--prconfig", "config.yaml", "list",
-        ]);
+        let cli = Cli::parse_from(["kpr", "--prconfig", "config.yaml", "list"]);
         assert!(matches!(cli.command, Command::List));
     }
 
     #[test]
     fn test_cli_parse_node_conditions() {
-        let cli = Cli::parse_from([
-            "kpr", "--prconfig", "config.yaml", "node-conditions",
-        ]);
+        let cli = Cli::parse_from(["kpr", "--prconfig", "config.yaml", "node-conditions"]);
         assert!(matches!(cli.command, Command::NodeConditions));
     }
 
     #[test]
     fn test_cli_parse_node_addresses() {
-        let cli = Cli::parse_from([
-            "kpr", "--prconfig", "config.yaml", "node-addresses",
-        ]);
+        let cli = Cli::parse_from(["kpr", "--prconfig", "config.yaml", "node-addresses"]);
         assert!(matches!(cli.command, Command::NodeAddresses));
     }
 
     #[test]
     fn test_cli_parse_prconfig() {
-        let cli = Cli::parse_from([
-            "kpr", "--prconfig", "/path/to/config.yaml", "capacity",
-        ]);
+        let cli = Cli::parse_from(["kpr", "--prconfig", "/path/to/config.yaml", "capacity"]);
         assert_eq!(cli.prconfig, Some("/path/to/config.yaml".to_string()));
     }
 
     #[test]
     fn test_cli_default_namespace() {
-        let cli = Cli::parse_from([
-            "kpr", "--prconfig", "config.yaml",
-            "get", "-n", "myapp",
-        ]);
+        let cli = Cli::parse_from(["kpr", "--prconfig", "config.yaml", "get", "-n", "myapp"]);
         assert!(matches!(
             cli.command,
             Command::Get { ref name, ref namespace }
@@ -1225,8 +1241,14 @@ spec:
     #[test]
     fn test_cli_parse_status() {
         let cli = Cli::parse_from([
-            "kpr", "--prconfig", "config.yaml",
-            "status", "-n", "myapp", "-N", "staging",
+            "kpr",
+            "--prconfig",
+            "config.yaml",
+            "status",
+            "-n",
+            "myapp",
+            "-N",
+            "staging",
         ]);
         assert!(matches!(
             cli.command,
@@ -1237,17 +1259,21 @@ spec:
 
     #[test]
     fn test_cli_parse_capacity() {
-        let cli = Cli::parse_from([
-            "kpr", "--prconfig", "config.yaml", "capacity",
-        ]);
+        let cli = Cli::parse_from(["kpr", "--prconfig", "config.yaml", "capacity"]);
         assert!(matches!(cli.command, Command::Capacity));
     }
 
     #[test]
     fn test_cli_parse_get_custom_namespace() {
         let cli = Cli::parse_from([
-            "kpr", "--prconfig", "config.yaml",
-            "get", "-n", "myapp", "-N", "prod",
+            "kpr",
+            "--prconfig",
+            "config.yaml",
+            "get",
+            "-n",
+            "myapp",
+            "-N",
+            "prod",
         ]);
         assert!(matches!(
             cli.command,
@@ -1259,33 +1285,31 @@ spec:
     #[test]
     fn test_cli_parse_kubeconfig() {
         let cli = Cli::parse_from([
-            "kpr", "--kubeconfig", "/etc/kube/config",
-            "--prconfig", "config.yaml", "list",
+            "kpr",
+            "--kubeconfig",
+            "/etc/kube/config",
+            "--prconfig",
+            "config.yaml",
+            "list",
         ]);
         assert_eq!(cli.kubeconfig, Some("/etc/kube/config".to_string()));
     }
 
     #[test]
     fn test_cli_parse_metrics() {
-        let cli = Cli::parse_from([
-            "kpr", "--prconfig", "config.yaml", "metrics",
-        ]);
+        let cli = Cli::parse_from(["kpr", "--prconfig", "config.yaml", "metrics"]);
         assert!(matches!(cli.command, Command::Metrics));
     }
 
     #[test]
     fn test_cli_no_url_flag() {
-        let result = Cli::try_parse_from([
-            "kpr", "--url", "http://localhost:3000", "list",
-        ]);
+        let result = Cli::try_parse_from(["kpr", "--url", "http://localhost:3000", "list"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_cli_no_insecure_flag() {
-        let result = Cli::try_parse_from([
-            "kpr", "--insecure-skip-tls-verify", "list",
-        ]);
+        let result = Cli::try_parse_from(["kpr", "--insecure-skip-tls-verify", "list"]);
         assert!(result.is_err());
     }
 }
@@ -1338,9 +1362,7 @@ async fn main() -> ExitCode {
 
     // Dispatch command
     let code = match cli.command {
-        Command::Create { ref deployment } => {
-            cmd_create(&client, &base_url, deployment).await
-        }
+        Command::Create { ref deployment } => cmd_create(&client, &base_url, deployment).await,
         Command::Delete {
             ref name,
             ref namespace,
@@ -1363,14 +1385,7 @@ async fn main() -> ExitCode {
             previous,
         } => {
             cmd_logs(
-                &client,
-                &base_url,
-                name,
-                namespace,
-                container,
-                stream,
-                tail,
-                previous,
+                &client, &base_url, name, namespace, container, stream, tail, previous,
             )
             .await
         }

@@ -54,7 +54,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
-use tracing::{debug, debug_span, warn, Instrument};
+use tracing::{Instrument, debug, debug_span, warn};
 
 // ---------------------------------------------------------------------------
 // LogStream — identifies the source stream
@@ -507,13 +507,14 @@ impl OutputRedirector for DirectFileOutput {
                 ));
             }
             if let (Some(out), Some(err)) = (&self.stdout_path, &self.stderr_path)
-                && out == err {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "DirectFileOutput: stdout and stderr paths must differ; \
+                && out == err
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "DirectFileOutput: stdout and stderr paths must differ; \
                          use DirectFileOutput::merged() for a shared file",
-                    ));
-                }
+                ));
+            }
         }
         Ok(())
     }
@@ -630,8 +631,7 @@ impl OutputRedirector for MergedOutput {
             // *not* cancel-safe, so it must never share a `select!` with
             // another `read_line` — racing two reads would silently drop
             // partial data on the losing branch.
-            let (tx, mut rx) =
-                tokio::sync::mpsc::channel::<(LogStream, String)>(256);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<(LogStream, String)>(256);
 
             let stdout_pump = spawn_merged_pump(
                 "stdout",
@@ -640,13 +640,7 @@ impl OutputRedirector for MergedOutput {
                 tx.clone(),
                 shutdown.clone(),
             );
-            let stderr_pump = spawn_merged_pump(
-                "stderr",
-                LogStream::Stderr,
-                stderr,
-                tx,
-                shutdown,
-            );
+            let stderr_pump = spawn_merged_pump("stderr", LogStream::Stderr, stderr, tx, shutdown);
 
             while let Some((stream, line)) = rx.recv().await {
                 if let Err(e) = writer.write_line(line.as_bytes(), stream) {
@@ -762,8 +756,15 @@ impl OutputRedirector for SplitOutput {
         let shutdown_clone = shutdown.clone();
 
         tokio::spawn(async move {
-            let stdout_handle = pump_stream("stdout", LogStream::Stdout, stdout, stdout_config, shutdown);
-            let stderr_handle = pump_stream("stderr", LogStream::Stderr, stderr, stderr_config, shutdown_clone);
+            let stdout_handle =
+                pump_stream("stdout", LogStream::Stdout, stdout, stdout_config, shutdown);
+            let stderr_handle = pump_stream(
+                "stderr",
+                LogStream::Stderr,
+                stderr,
+                stderr_config,
+                shutdown_clone,
+            );
             let _ = stdout_handle.await;
             let _ = stderr_handle.await;
         })
@@ -885,9 +886,7 @@ impl ExecutorHandle {
         }
         let code = (&mut self.wait_handle)
             .await
-            .map_err(|e| io::Error::other(format!(
-                "process monitor task failed: {}", e
-            )))?;
+            .map_err(|e| io::Error::other(format!("process monitor task failed: {}", e)))?;
         self.cached_exit_code = Some(code);
         // Drain I/O pump tasks so all output is flushed before returning.
         while self.io_tasks.join_next().await.is_some() {}
@@ -901,10 +900,11 @@ impl ExecutorHandle {
             return Some(code);
         }
         if self.wait_handle.is_finished()
-            && let Some(Ok(code)) = now_or_never(&mut self.wait_handle) {
-                self.cached_exit_code = Some(code);
-                return Some(code);
-            }
+            && let Some(Ok(code)) = now_or_never(&mut self.wait_handle)
+        {
+            self.cached_exit_code = Some(code);
+            return Some(code);
+        }
         None
     }
 
@@ -927,18 +927,30 @@ impl ExecutorHandle {
         let kill_start = std::time::Instant::now();
 
         if !is_pid_alive(self.pid) {
-            debug!(pid = self.pid, elapsed_ms = kill_start.elapsed().as_millis(), "Kill: already dead");
+            debug!(
+                pid = self.pid,
+                elapsed_ms = kill_start.elapsed().as_millis(),
+                "Kill: already dead"
+            );
             return;
         }
 
         if grace_period.is_zero() {
             force_kill_group(self.pid);
-            debug!(pid = self.pid, elapsed_ms = kill_start.elapsed().as_millis(), "Kill: SIGKILL group (zero grace)");
+            debug!(
+                pid = self.pid,
+                elapsed_ms = kill_start.elapsed().as_millis(),
+                "Kill: SIGKILL group (zero grace)"
+            );
         } else {
             let pid = self.pid;
             send_sigterm_group(pid);
             let sigterm_elapsed = kill_start.elapsed();
-            debug!(pid, sigterm_ms = sigterm_elapsed.as_millis(), "Kill: SIGTERM sent to group");
+            debug!(
+                pid,
+                sigterm_ms = sigterm_elapsed.as_millis(),
+                "Kill: SIGTERM sent to group"
+            );
 
             let exit_code = tokio::select! {
                 result = &mut self.wait_handle => {
@@ -951,13 +963,15 @@ impl ExecutorHandle {
             if let Some(code) = exit_code {
                 self.cached_exit_code = Some(code);
                 debug!(
-                    pid, exit_code = code,
+                    pid,
+                    exit_code = code,
                     wait_ms = wait_elapsed.as_millis(),
                     "Kill: exited after SIGTERM",
                 );
             } else if is_pid_alive(pid) {
                 warn!(
-                    pid, grace_ms = wait_elapsed.as_millis(),
+                    pid,
+                    grace_ms = wait_elapsed.as_millis(),
                     "Kill: grace period expired, sending SIGKILL to group",
                 );
                 force_kill_group(pid);
@@ -975,7 +989,11 @@ impl ExecutorHandle {
             }
         }
 
-        debug!(pid = self.pid, total_ms = kill_start.elapsed().as_millis(), "Kill completed");
+        debug!(
+            pid = self.pid,
+            total_ms = kill_start.elapsed().as_millis(),
+            "Kill completed"
+        );
     }
 }
 
@@ -1006,11 +1024,7 @@ fn now_or_never(handle: &mut JoinHandle<i32>) -> Option<Result<i32, tokio::task:
 fn is_pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid as i32),
-            None,
-        )
-        .is_ok()
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
     }
     #[cfg(windows)]
     {
@@ -1348,24 +1362,27 @@ impl ProcessExecutor {
         });
 
         let wait_span = proc_span.clone();
-        let wait_handle = tokio::spawn(async move {
-            let status = child.wait().await;
-            let exit_code = match &status {
-                Ok(s) => s.code().unwrap_or(-1),
-                Err(_) => -1,
-            };
-            if exit_code == 0 {
-                debug!("Exited (exit_code=0)");
-            } else {
-                debug!("Exited (exit_code={})", exit_code);
+        let wait_handle = tokio::spawn(
+            async move {
+                let status = child.wait().await;
+                let exit_code = match &status {
+                    Ok(s) => s.code().unwrap_or(-1),
+                    Err(_) => -1,
+                };
+                if exit_code == 0 {
+                    debug!("Exited (exit_code=0)");
+                } else {
+                    debug!("Exited (exit_code={})", exit_code);
+                }
+                // Remove PID file on exit
+                if let Some(ref path) = pid_file {
+                    let _ = std::fs::remove_file(path);
+                    debug!("PID file removed");
+                }
+                exit_code
             }
-            // Remove PID file on exit
-            if let Some(ref path) = pid_file {
-                let _ = std::fs::remove_file(path);
-                debug!("PID file removed");
-            }
-            exit_code
-        }.instrument(wait_span));
+            .instrument(wait_span),
+        );
 
         Ok(ExecutorHandle {
             pid,
@@ -1417,7 +1434,8 @@ fn get_pid_command(pid: u32) -> Option<String> {
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout);
             // CSV format: "image_name","pid",...
-            text.split(',').next()
+            text.split(',')
+                .next()
                 .map(|s| s.trim().trim_matches('"').to_string())
                 .filter(|s| !s.is_empty() && s != "INFO:")
         } else {
@@ -1490,7 +1508,11 @@ pub fn cleanup_stale_pids(pid_dir: &Path) -> u32 {
                 .unwrap_or(false);
 
             if matches {
-                debug!(pid, program = expected_program.trim(), "Killing stale process");
+                debug!(
+                    pid,
+                    program = expected_program.trim(),
+                    "Killing stale process"
+                );
                 force_kill(pid);
                 killed += 1;
             } else {
@@ -1730,7 +1752,11 @@ mod tests {
         let code = handle.wait().await.unwrap();
         assert_eq!(code, 0);
         let content = fs::read_to_string(&out).unwrap();
-        assert!(content.contains("HOME=END"), "HOME should be empty, got: {}", content);
+        assert!(
+            content.contains("HOME=END"),
+            "HOME should be empty, got: {}",
+            content
+        );
     }
 
     // -- env var validation --------------------------------------------------
@@ -1867,11 +1893,13 @@ mod tests {
         for i in 1..=N {
             assert!(
                 content.contains(&format!("OUT_{}_tail\n", i)),
-                "missing OUT_{} (data loss?)", i
+                "missing OUT_{} (data loss?)",
+                i
             );
             assert!(
                 content.contains(&format!("ERR_{}_part1_tail\n", i)),
-                "missing ERR_{} (data loss?)", i
+                "missing ERR_{} (data loss?)",
+                i
             );
         }
     }
@@ -1926,7 +1954,10 @@ mod tests {
         // max_files=3 means: app.log, app.log.1, app.log.2
         assert!(log.exists(), "current log should exist");
         let rolled_3 = PathBuf::from(format!("{}.3", log.display()));
-        assert!(!rolled_3.exists(), "app.log.3 should not exist with max_files=3");
+        assert!(
+            !rolled_3.exists(),
+            "app.log.3 should not exist with max_files=3"
+        );
     }
 
     #[tokio::test]
@@ -1952,7 +1983,10 @@ mod tests {
         if rolled_2.exists() {
             let content_1 = fs::read_to_string(&rolled_1).unwrap();
             let content_2 = fs::read_to_string(&rolled_2).unwrap();
-            assert_ne!(content_1, content_2, ".1 and .2 should have different content");
+            assert_ne!(
+                content_1, content_2,
+                ".1 and .2 should have different content"
+            );
         }
     }
 
@@ -1978,10 +2012,26 @@ mod tests {
 
         let stdout_content = fs::read_to_string(&stdout_log).unwrap();
         let stderr_content = fs::read_to_string(&stderr_log).unwrap();
-        assert!(stdout_content.contains("out_only"), "stdout: {}", stdout_content);
-        assert!(!stdout_content.contains("err_only"), "stdout should not have stderr: {}", stdout_content);
-        assert!(stderr_content.contains("err_only"), "stderr: {}", stderr_content);
-        assert!(!stderr_content.contains("out_only"), "stderr should not have stdout: {}", stderr_content);
+        assert!(
+            stdout_content.contains("out_only"),
+            "stdout: {}",
+            stdout_content
+        );
+        assert!(
+            !stdout_content.contains("err_only"),
+            "stdout should not have stderr: {}",
+            stdout_content
+        );
+        assert!(
+            stderr_content.contains("err_only"),
+            "stderr: {}",
+            stderr_content
+        );
+        assert!(
+            !stderr_content.contains("out_only"),
+            "stderr should not have stdout: {}",
+            stderr_content
+        );
     }
 
     #[tokio::test]
@@ -2050,7 +2100,11 @@ mod tests {
         assert_eq!(handle.wait().await.unwrap(), 0);
         let copy = fs::read_to_string(&copy_log).unwrap();
         for i in 1..=5 {
-            assert!(copy.contains(&format!("line_{}", i)), "copy missing line_{}", i);
+            assert!(
+                copy.contains(&format!("line_{}", i)),
+                "copy missing line_{}",
+                i
+            );
         }
     }
 
@@ -2074,8 +2128,16 @@ mod tests {
         // Give OS a moment to flush
         tokio::time::sleep(Duration::from_millis(200)).await;
         let content = fs::read_to_string(&log).unwrap();
-        assert!(content.contains("direct_out"), "missing stdout: {}", content);
-        assert!(content.contains("direct_err"), "missing stderr: {}", content);
+        assert!(
+            content.contains("direct_out"),
+            "missing stdout: {}",
+            content
+        );
+        assert!(
+            content.contains("direct_err"),
+            "missing stderr: {}",
+            content
+        );
     }
 
     #[tokio::test]
@@ -2168,14 +2230,22 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("at least one path"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("at least one path")
+        );
     }
 
     #[tokio::test]
     async fn test_direct_file_rejects_same_path() {
         let result = ProcessExecutor::new("true")
             .die_with_parent(false)
-            .output(DirectFileOutput::new(Some("/tmp/same.log"), Some("/tmp/same.log")))
+            .output(DirectFileOutput::new(
+                Some("/tmp/same.log"),
+                Some("/tmp/same.log"),
+            ))
             .spawn(shutdown())
             .await;
 
@@ -2233,7 +2303,11 @@ mod tests {
 
         // File should have some content (was writing before shutdown)
         let content = fs::read_to_string(&log).unwrap();
-        assert!(content.contains("tick"), "expected output before shutdown: {}", content);
+        assert!(
+            content.contains("tick"),
+            "expected output before shutdown: {}",
+            content
+        );
 
         handle.kill(Duration::ZERO).await;
     }
@@ -2246,7 +2320,10 @@ mod tests {
         let (tx, rx) = watch::channel(());
 
         let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "while true; do echo out_tick; echo err_tick >&2; sleep 0.1; done"])
+            .args([
+                "-c",
+                "while true; do echo out_tick; echo err_tick >&2; sleep 0.1; done",
+            ])
             .output(SplitOutput::new(
                 FileStream::new(&out),
                 FileStream::new(&err),
@@ -2309,10 +2386,7 @@ mod tests {
             .arg("triple")
             .output(MergedOutput::new(TeeStream::new(
                 FileStream::new(&a),
-                TeeStream::new(
-                    FileStream::new(&b),
-                    FileStream::new(&c),
-                ),
+                TeeStream::new(FileStream::new(&b), FileStream::new(&c)),
             )))
             .spawn(shutdown())
             .await
@@ -2321,7 +2395,12 @@ mod tests {
         assert_eq!(handle.wait().await.unwrap(), 0);
         for (label, path) in [("a", &a), ("b", &b), ("c", &c)] {
             let content = fs::read_to_string(path).unwrap();
-            assert!(content.contains("triple"), "{} missing content: {}", label, content);
+            assert!(
+                content.contains("triple"),
+                "{} missing content: {}",
+                label,
+                content
+            );
         }
     }
 
@@ -2330,13 +2409,23 @@ mod tests {
     // ========================================================================
 
     /// Helper: open a RollingFileStream as a Box<dyn StreamWriter>.
-    fn open_rolling(path: &std::path::Path, max_size: u64, max_files: usize) -> Box<dyn StreamWriter> {
-        Box::new(RollingFileStream::new(path, max_size, max_files)).open().unwrap()
+    fn open_rolling(
+        path: &std::path::Path,
+        max_size: u64,
+        max_files: usize,
+    ) -> Box<dyn StreamWriter> {
+        Box::new(RollingFileStream::new(path, max_size, max_files))
+            .open()
+            .unwrap()
     }
 
     /// Helper: count files in a directory.
     fn count_files(dir: &std::path::Path) -> usize {
-        fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.path().is_file()).count()
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .count()
     }
 
     #[test]
@@ -2345,7 +2434,11 @@ mod tests {
         let log = dir.join("app.log");
         let mut w = open_rolling(&log, 0, 5);
         for _ in 0..100 {
-            w.write_line(b"this is a long line that would trigger rotation\n", LogStream::Stdout).unwrap();
+            w.write_line(
+                b"this is a long line that would trigger rotation\n",
+                LogStream::Stdout,
+            )
+            .unwrap();
         }
         w.flush().unwrap();
         // Only the current file should exist
@@ -2359,8 +2452,10 @@ mod tests {
         let dir = test_dir!("logs");
         let log = dir.join("app.log");
         let mut w = open_rolling(&log, 20, 1);
-        w.write_line(b"aaaaaaaaaaaaaaaaaaa\n", LogStream::Stdout).unwrap(); // triggers rotation
-        w.write_line(b"bbbbbbbbbbbbbbbbbbb\n", LogStream::Stdout).unwrap(); // triggers again
+        w.write_line(b"aaaaaaaaaaaaaaaaaaa\n", LogStream::Stdout)
+            .unwrap(); // triggers rotation
+        w.write_line(b"bbbbbbbbbbbbbbbbbbb\n", LogStream::Stdout)
+            .unwrap(); // triggers again
         w.write_line(b"final\n", LogStream::Stdout).unwrap();
         w.flush().unwrap();
         // Only current file should exist (rolled files deleted)
@@ -2404,8 +2499,16 @@ mod tests {
         let r2 = fs::read_to_string(dir.join("app.log.2")).unwrap();
         let r3 = fs::read_to_string(dir.join("app.log.3")).unwrap();
         assert!(current.contains("current"));
-        assert!(r1.contains("third"), ".1 should have most recent rolled: {}", r1);
-        assert!(r2.contains("second"), ".2 should have second most recent: {}", r2);
+        assert!(
+            r1.contains("third"),
+            ".1 should have most recent rolled: {}",
+            r1
+        );
+        assert!(
+            r2.contains("second"),
+            ".2 should have second most recent: {}",
+            r2
+        );
         assert!(r3.contains("first"), ".3 should have oldest: {}", r3);
     }
 
@@ -2424,7 +2527,10 @@ mod tests {
         assert!(log.exists());
         assert!(dir.join("app.log.1").exists());
         assert!(dir.join("app.log.2").exists());
-        assert!(!dir.join("app.log.3").exists(), ".3 should have been deleted");
+        assert!(
+            !dir.join("app.log.3").exists(),
+            ".3 should have been deleted"
+        );
         assert_eq!(count_files(&dir), 3);
     }
 
@@ -2435,7 +2541,8 @@ mod tests {
         let log = dir.join("app.log");
         let mut w = open_rolling(&log, 15, 50);
         for i in 1..=20 {
-            w.write_line(format!("line_{}\n", i).as_bytes(), LogStream::Stdout).unwrap();
+            w.write_line(format!("line_{}\n", i).as_bytes(), LogStream::Stdout)
+                .unwrap();
         }
         w.flush().unwrap();
 
@@ -2462,7 +2569,11 @@ mod tests {
         w.write_line(b"no newline", LogStream::Stdout).unwrap();
         w.flush().unwrap();
         let content = fs::read_to_string(&log).unwrap();
-        assert!(content.ends_with('\n'), "should append newline: {:?}", content);
+        assert!(
+            content.ends_with('\n'),
+            "should append newline: {:?}",
+            content
+        );
     }
 
     #[test]
@@ -2548,7 +2659,9 @@ mod tests {
     fn test_devnull_stream_discards() {
         let config: Box<dyn StreamConfig> = Box::new(DevNullStream);
         let mut writer = config.open().unwrap();
-        writer.write_line(b"discarded\n", LogStream::Stdout).unwrap();
+        writer
+            .write_line(b"discarded\n", LogStream::Stdout)
+            .unwrap();
         writer.flush().unwrap();
         // No crash, no output — that's the test
     }
@@ -2562,10 +2675,8 @@ mod tests {
         let dir = test_dir!();
         let a = dir.join("a.log");
         let b = dir.join("b.log");
-        let config: Box<dyn StreamConfig> = Box::new(TeeStream::new(
-            FileStream::new(&a),
-            FileStream::new(&b),
-        ));
+        let config: Box<dyn StreamConfig> =
+            Box::new(TeeStream::new(FileStream::new(&a), FileStream::new(&b)));
         let mut writer = config.open().unwrap();
         writer.write_line(b"line1\n", LogStream::Stdout).unwrap();
         writer.write_line(b"line2\n", LogStream::Stdout).unwrap();
@@ -2766,8 +2877,18 @@ mod tests {
     // Fork stress tests — spawn N processes, kill them, check for zombies
     // ========================================================================
 
-    async fn fork_stress(n: usize, label: &str, output_fn: impl Fn(usize) -> Box<dyn OutputRedirector>) {
-        let progress_every = if n >= 1000 { 100 } else if n >= 100 { 50 } else { 10 };
+    async fn fork_stress(
+        n: usize,
+        label: &str,
+        output_fn: impl Fn(usize) -> Box<dyn OutputRedirector>,
+    ) {
+        let progress_every = if n >= 1000 {
+            100
+        } else if n >= 100 {
+            50
+        } else {
+            10
+        };
         let mut handles: Vec<ExecutorHandle> = Vec::with_capacity(n);
 
         // --- Phase 1: Spawn N ---
@@ -2784,14 +2905,19 @@ mod tests {
                 .unwrap();
             let spawn_elapsed = t_spawn.elapsed();
             if spawn_elapsed > Duration::from_millis(100) {
-                eprintln!("[{label} n={n}]   spawn[{i}] SLOW: {}ms (pid={})", spawn_elapsed.as_millis(), h.pid());
+                eprintln!(
+                    "[{label} n={n}]   spawn[{i}] SLOW: {}ms (pid={})",
+                    spawn_elapsed.as_millis(),
+                    h.pid()
+                );
                 slow_spawns += 1;
             }
             handles.push(h);
             if (i + 1) % progress_every == 0 {
                 eprintln!(
                     "[{label} n={n}]   spawned {}/{n} (elapsed={}ms)",
-                    i + 1, t0.elapsed().as_millis(),
+                    i + 1,
+                    t0.elapsed().as_millis(),
                 );
             }
         }
@@ -2864,9 +2990,7 @@ mod tests {
             }
         }
         let kill_ms = t1.elapsed().as_millis();
-        eprintln!(
-            "[{label} n={n}]   kill complete: {kill_ms}ms, sigkills={sigkill_count}",
-        );
+        eprintln!("[{label} n={n}]   kill complete: {kill_ms}ms, sigkills={sigkill_count}",);
 
         // --- Phase 4: Wait and reap ---
         eprintln!("[{label} n={n}] === Phase 4: Waiting/reaping ===");
@@ -2879,14 +3003,16 @@ mod tests {
             if wait_elapsed > Duration::from_millis(100) {
                 eprintln!(
                     "[{label} n={n}]   wait[{i}] SLOW: {}ms (pid={})",
-                    wait_elapsed.as_millis(), h.pid(),
+                    wait_elapsed.as_millis(),
+                    h.pid(),
                 );
                 slow_waits += 1;
             }
             if (i + 1) % progress_every == 0 {
                 eprintln!(
                     "[{label} n={n}]   waited {}/{n} (elapsed={}ms)",
-                    i + 1, t2.elapsed().as_millis(),
+                    i + 1,
+                    t2.elapsed().as_millis(),
                 );
             }
         }
@@ -2905,7 +3031,9 @@ mod tests {
         eprintln!("[{label} n={n}] === Phase 5: Final checks ===");
         let mut still_alive = 0;
         for h in &mut handles {
-            if h.try_wait().is_none() { still_alive += 1; }
+            if h.try_wait().is_none() {
+                still_alive += 1;
+            }
         }
 
         eprintln!(
@@ -2919,11 +3047,13 @@ mod tests {
             alive_before >= min_alive_before,
             "{label} n={n}: only {alive_before}/{n} alive before kill (floor {min_alive_before})",
         );
-        assert_eq!(still_alive, 0, "{label} n={n}: {still_alive} processes still alive after kill");
+        assert_eq!(
+            still_alive, 0,
+            "{label} n={n}: {still_alive} processes still alive after kill"
+        );
 
         drop(handles);
     }
-
 
     // The fork_stress tests fork up to 1000 child processes each, opening
     // hundreds of file descriptors. Running multiple instances concurrently
@@ -2949,8 +3079,11 @@ mod tests {
     async fn test_fork_stress_100_file() {
         let dir = test_dir!();
         fork_stress(100, "file", move |i| {
-            Box::new(MergedOutput::new(FileStream::new(dir.join(format!("{i}.log")))))
-        }).await;
+            Box::new(MergedOutput::new(FileStream::new(
+                dir.join(format!("{i}.log")),
+            )))
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -2958,8 +3091,11 @@ mod tests {
     async fn test_fork_stress_1000_file() {
         let dir = test_dir!();
         fork_stress(1000, "file", move |i| {
-            Box::new(MergedOutput::new(FileStream::new(dir.join(format!("{i}.log")))))
-        }).await;
+            Box::new(MergedOutput::new(FileStream::new(
+                dir.join(format!("{i}.log")),
+            )))
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -2968,9 +3104,12 @@ mod tests {
         let dir = test_dir!();
         fork_stress(100, "rolling", move |i| {
             Box::new(MergedOutput::new(RollingFileStream::new(
-                dir.join(format!("{i}.log")), 1024 * 1024, 3,
+                dir.join(format!("{i}.log")),
+                1024 * 1024,
+                3,
             )))
-        }).await;
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -2979,8 +3118,11 @@ mod tests {
         let dir = test_dir!();
         fork_stress(1000, "rolling", move |i| {
             Box::new(MergedOutput::new(RollingFileStream::new(
-                dir.join(format!("{i}.log")), 1024 * 1024, 3,
+                dir.join(format!("{i}.log")),
+                1024 * 1024,
+                3,
             )))
-        }).await;
+        })
+        .await;
     }
 }

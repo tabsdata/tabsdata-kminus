@@ -34,10 +34,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use tracing::{debug, debug_span, info, info_span, warn, Instrument};
+use tracing::{Instrument, debug, debug_span, info, info_span, warn};
 
-pub use crate::pod::container_log::ContainerLogOptions;
 use crate::metrics::Metrics;
+pub use crate::pod::container_log::ContainerLogOptions;
 use crate::pod::executor::{
     PodEventKind, PodExecutor, PodHandle, PodKillHandle, PodLogHandle, PodTask,
 };
@@ -120,7 +120,11 @@ impl ExecutorProvider for DefaultExecutorProvider {
     }
 
     fn log_dir(&self, id: &PodId) -> Option<PathBuf> {
-        Some(self.pods_dir.join(id.full()).join(crate::server::config::POD_LOG_SUBDIR))
+        Some(
+            self.pods_dir
+                .join(id.full())
+                .join(crate::server::config::POD_LOG_SUBDIR),
+        )
     }
 }
 
@@ -340,7 +344,10 @@ impl PodLogic {
     pub async fn wait_for_pods(&self, timeout: Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let count = self.runtimes.read().unwrap()
+            let count = self
+                .runtimes
+                .read()
+                .unwrap()
                 .values()
                 .filter(|r| !r.is_finished())
                 .count();
@@ -349,7 +356,10 @@ impl PodLogic {
                 return;
             }
             if tokio::time::Instant::now() >= deadline {
-                warn!(remaining = count, "Timeout waiting for pod monitors, proceeding with shutdown");
+                warn!(
+                    remaining = count,
+                    "Timeout waiting for pod monitors, proceeding with shutdown"
+                );
                 return;
             }
             debug!(remaining = count, "Waiting for pod monitors to complete");
@@ -426,7 +436,8 @@ impl PodLogic {
             // Try to reap any already-finished tasks. Use try_join_next
             // so we don't block while holding the StdMutex.
             let finished = {
-                let mut guard = self.runner_task_set
+                let mut guard = self
+                    .runner_task_set
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
                 if guard.is_empty() {
@@ -438,7 +449,8 @@ impl PodLogic {
                 continue;
             }
             if tokio::time::Instant::now() >= deadline {
-                let remaining = self.runner_task_set
+                let remaining = self
+                    .runner_task_set
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .len();
@@ -501,7 +513,8 @@ impl PodLogic {
                     stale_phase = ?existing.status.phase,
                     "Evicting stale terminal pod to make room for the new incarnation"
                 );
-                self.delete_pod_inner(existing, None, std::time::Instant::now()).await?;
+                self.delete_pod_inner(existing, None, std::time::Instant::now())
+                    .await?;
             } else {
                 warn!(
                     pod = %id,
@@ -509,7 +522,8 @@ impl PodLogic {
                     live_phase = ?existing.status.phase,
                     "Live pod with same name still exists; terminating it and rejecting the new pod (retry once reaped)"
                 );
-                self.delete_pod_inner(existing, None, std::time::Instant::now()).await?;
+                self.delete_pod_inner(existing, None, std::time::Instant::now())
+                    .await?;
                 return Err(LogicError::Conflict {
                     namespace: id.namespace,
                     name: id.name,
@@ -524,7 +538,9 @@ impl PodLogic {
         // delete arrives, which it may do late, out of order, or never).
         if self.store.count_non_terminal().await >= self.config.max_pods {
             warn!(pod = %id, max = self.config.max_pods, "Capacity exceeded");
-            return Err(LogicError::CapacityExceeded { max: self.config.max_pods });
+            return Err(LogicError::CapacityExceeded {
+                max: self.config.max_pods,
+            });
         }
 
         // Store the pod in Pending. The running_spec starts equal to the
@@ -532,12 +548,14 @@ impl PodLogic {
         // once preparation succeeds.
         let original_spec = Arc::new(spec);
         let initial_status = build_initial_status(&original_spec);
-        self.store.put(
-            id.clone(),
-            Arc::clone(&original_spec),
-            Arc::clone(&original_spec),
-            initial_status,
-        ).await;
+        self.store
+            .put(
+                id.clone(),
+                Arc::clone(&original_spec),
+                Arc::clone(&original_spec),
+                initial_status,
+            )
+            .await;
         info!(pod = %id, "Pod stored in Pending; spawning preparer");
 
         // Per-pod cancel channel — fires on delete_pod or shutdown.
@@ -570,21 +588,29 @@ impl PodLogic {
         // Register Preparing runtime entry so delete_pod can find it.
         self.runtimes.write().unwrap().insert(
             id.clone(),
-            PodRuntime::Preparing { cancel_tx, deleted, task },
+            PodRuntime::Preparing {
+                cancel_tx,
+                deleted,
+                task,
+            },
         );
 
         // Metrics
         if let Some(ref m) = self.metrics {
             m.pods_created_total.inc();
-            m.pods_running.set(self.runtimes.read().unwrap().len() as i64);
-            m.pod_creation_seconds.observe(create_start.elapsed().as_secs_f64());
+            m.pods_running
+                .set(self.runtimes.read().unwrap().len() as i64);
+            m.pod_creation_seconds
+                .observe(create_start.elapsed().as_secs_f64());
         }
 
         match self.store.get(&id, SpecView::Running).await {
             Some(snap) => Ok(snap),
             None => {
                 self.store.remove(&id).await;
-                Err(LogicError::Internal("pod disappeared after put".to_string()))
+                Err(LogicError::Internal(
+                    "pod disappeared after put".to_string(),
+                ))
             }
         }
     }
@@ -602,7 +628,11 @@ impl PodLogic {
         grace_period: Option<Duration>,
     ) -> Result<(), LogicError> {
         let delete_start = std::time::Instant::now();
-        let snap = match self.store.get_by_name(namespace, name, SpecView::Running).await {
+        let snap = match self
+            .store
+            .get_by_name(namespace, name, SpecView::Running)
+            .await
+        {
             Some(snap) => snap,
             None => {
                 debug!(namespace, name, "Delete: pod not found (ok, idempotent)");
@@ -643,7 +673,8 @@ impl PodLogic {
                 self.store.as_ref(),
                 self.executor_provider.as_ref(),
                 &self.cleanup_config,
-            ).await;
+            )
+            .await;
             // Mark deleted so if the monitor is still finishing, it skips
             // its own cleanup (store entry already removed above).
             if let Some(runtime) = self.runtimes.read().unwrap().get(&snap.id) {
@@ -718,7 +749,8 @@ impl PodLogic {
 
         if let Some(ref m) = self.metrics {
             m.pods_deleted_total.inc();
-            m.pod_deletion_seconds.observe(delete_start.elapsed().as_secs_f64());
+            m.pod_deletion_seconds
+                .observe(delete_start.elapsed().as_secs_f64());
         }
 
         Ok(())
@@ -734,13 +766,16 @@ impl PodLogic {
         // Use .instrument() instead of .entered() — EnteredSpan is
         // !Send and would make this async fn's future !Send.
         async {
-            self.store.get_by_name(namespace, name, view).await.ok_or_else(|| {
-                debug!("Pod not found");
-                LogicError::NotFound {
-                    namespace: namespace.to_string(),
-                    name: name.to_string(),
-                }
-            })
+            self.store
+                .get_by_name(namespace, name, view)
+                .await
+                .ok_or_else(|| {
+                    debug!("Pod not found");
+                    LogicError::NotFound {
+                        namespace: namespace.to_string(),
+                        name: name.to_string(),
+                    }
+                })
         }
         .instrument(debug_span!("logic_get", namespace, name))
         .await
@@ -830,9 +865,9 @@ impl PodLogic {
         let snap = self.get_pod(namespace, name, SpecView::Running).await?;
 
         let runtimes = self.runtimes.read().unwrap();
-        let runtime = runtimes.get(&snap.id).ok_or_else(|| {
-            LogicError::Internal("no runtime for pod".to_string())
-        })?;
+        let runtime = runtimes
+            .get(&snap.id)
+            .ok_or_else(|| LogicError::Internal("no runtime for pod".to_string()))?;
 
         match runtime {
             PodRuntime::Preparing { .. } => Err(LogicError::Internal(
@@ -922,12 +957,16 @@ fn build_initial_status(spec: &PodSpec) -> PodStatus {
 
     // Init container statuses
     for c in &spec.spec.init_containers {
-        status.init_container_statuses.push(ContainerStatus::new_waiting(&c.name));
+        status
+            .init_container_statuses
+            .push(ContainerStatus::new_waiting(&c.name));
     }
 
     // Container statuses
     for c in &spec.spec.containers {
-        status.container_statuses.push(ContainerStatus::new_waiting(&c.name));
+        status
+            .container_statuses
+            .push(ContainerStatus::new_waiting(&c.name));
     }
 
     status
@@ -999,9 +1038,10 @@ async fn monitor_pod(
                     PodEventKind::PhaseChanged { to, .. } => {
                         debug!(phase = ?to, "Phase changed");
                         if let Some(ref m) = metrics
-                            && *to == crate::spec::constants::PodPhase::Running {
-                                m.pods_started_total.inc();
-                            }
+                            && *to == crate::spec::constants::PodPhase::Running
+                        {
+                            m.pods_started_total.inc();
+                        }
                     }
                     _ => {
                         debug!(kind = ?event.kind, phase = ?event.status.phase, "Event received");
@@ -1049,7 +1089,8 @@ async fn monitor_pod(
             store.as_ref(),
             executor_provider.as_ref(),
             &cleanup_config,
-        ).await;
+        )
+        .await;
         runtimes.write().unwrap().remove(&id);
     }
 
@@ -1289,9 +1330,15 @@ mod tests {
     fn make_logic() -> PodLogic {
         let store = Arc::new(MemoryStore::new());
         let (shutdown_tx, _) = watch::channel(());
-        PodLogic::new(LogicConfig::default(), test_cleanup_config(), store, make_provider(), ResolverSet::default(), shutdown_tx)
+        PodLogic::new(
+            LogicConfig::default(),
+            test_cleanup_config(),
+            store,
+            make_provider(),
+            ResolverSet::default(),
+            shutdown_tx,
+        )
     }
-
 
     // -- build_initial_status --
 
@@ -1384,7 +1431,10 @@ mod tests {
     #[tokio::test]
     async fn get_pod_not_found() {
         let logic = make_logic();
-        let err = logic.get_pod("default", "nope", SpecView::Running).await.unwrap_err();
+        let err = logic
+            .get_pod("default", "nope", SpecView::Running)
+            .await
+            .unwrap_err();
         assert!(matches!(err, LogicError::NotFound { .. }));
     }
 
@@ -1405,7 +1455,12 @@ mod tests {
     #[tokio::test]
     async fn list_pods_in_namespace_empty() {
         let logic = make_logic();
-        assert!(logic.list_pods_in_namespace("default", SpecView::Running).await.is_empty());
+        assert!(
+            logic
+                .list_pods_in_namespace("default", SpecView::Running)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1588,7 +1643,10 @@ mod tests {
                 }
             })
             .await;
-            result.expect(&format!("Timed out waiting for pod '{}' to terminate", name))
+            result.expect(&format!(
+                "Timed out waiting for pod '{}' to terminate",
+                name
+            ))
         }
 
         /// Wait until a pod is removed from the store, with timeout.
@@ -1603,7 +1661,10 @@ mod tests {
                 }
             })
             .await;
-            result.expect(&format!("Timed out waiting for pod '{}' to be removed", name));
+            result.expect(&format!(
+                "Timed out waiting for pod '{}' to be removed",
+                name
+            ));
         }
 
         // -- create_pod --
@@ -1612,7 +1673,10 @@ mod tests {
         async fn create_pod_returns_pending_snapshot() {
             let (logic, _, _) = make_logic_with_store();
 
-            let snap = logic.create_pod(make_pod_spec("app", "exit 0")).await.unwrap();
+            let snap = logic
+                .create_pod(make_pod_spec("app", "exit 0"))
+                .await
+                .unwrap();
             assert_eq!(snap.id.name, "app");
             assert_eq!(snap.id.namespace, "default");
             assert_eq!(snap.status.phase, PodPhase::Pending);
@@ -1627,10 +1691,19 @@ mod tests {
         #[tokio::test]
         async fn create_pod_stores_both_spec_variants() {
             let (logic, _, _) = make_logic_with_store();
-            logic.create_pod(make_pod_spec("app", "sleep 60")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("app", "sleep 60"))
+                .await
+                .unwrap();
 
-            let original = logic.get_pod("default", "app", SpecView::Original).await.unwrap();
-            let running = logic.get_pod("default", "app", SpecView::Running).await.unwrap();
+            let original = logic
+                .get_pod("default", "app", SpecView::Original)
+                .await
+                .unwrap();
+            let running = logic
+                .get_pod("default", "app", SpecView::Running)
+                .await
+                .unwrap();
 
             // Identity prepare_spec means both are equivalent
             assert_eq!(original.spec.metadata.name, "app");
@@ -1643,8 +1716,14 @@ mod tests {
             // Same (namespace, name, uid) redelivered — a resync, not a
             // second incarnation. The second create returns the current
             // snapshot without starting another run.
-            let first = logic.create_pod(make_pod_spec("app", "sleep 60")).await.unwrap();
-            let second = logic.create_pod(make_pod_spec("app", "sleep 60")).await.unwrap();
+            let first = logic
+                .create_pod(make_pod_spec("app", "sleep 60"))
+                .await
+                .unwrap();
+            let second = logic
+                .create_pod(make_pod_spec("app", "sleep 60"))
+                .await
+                .unwrap();
             assert_eq!(first.id, second.id);
             assert_eq!(store.len().await, 1);
         }
@@ -1652,7 +1731,10 @@ mod tests {
         #[tokio::test]
         async fn create_pod_same_name_new_uid_rejected_when_live() {
             let (logic, _, _) = make_logic_with_store();
-            logic.create_pod(make_pod_spec("app", "sleep 60")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("app", "sleep 60"))
+                .await
+                .unwrap();
 
             // Same name, different uid, old pod still live → reject
             // (retryable). The old pod is terminated so a later retry can
@@ -1668,7 +1750,10 @@ mod tests {
         async fn create_pod_evicts_stale_terminal_same_name() {
             let (logic, store, _) = make_logic_with_store();
             // First incarnation runs to completion but is never deleted.
-            logic.create_pod(make_pod_spec("app", "exit 0")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("app", "exit 0"))
+                .await
+                .unwrap();
             wait_for_terminal(&logic, "app").await;
             tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1682,7 +1767,10 @@ mod tests {
             assert_eq!(snap.status.phase, PodPhase::Pending);
 
             // Only the new incarnation remains under this name.
-            let got = logic.get_pod("default", "app", SpecView::Running).await.unwrap();
+            let got = logic
+                .get_pod("default", "app", SpecView::Running)
+                .await
+                .unwrap();
             assert_eq!(got.id.uid, "uid-app-2");
             assert_eq!(store.len().await, 1);
         }
@@ -1696,10 +1784,23 @@ mod tests {
                 ..Default::default()
             };
             let provider = make_provider();
-            let logic = PodLogic::new(config, test_cleanup_config(), Arc::clone(&store) as Arc<dyn PodStore>, provider, ResolverSet::default(), shutdown_tx);
+            let logic = PodLogic::new(
+                config,
+                test_cleanup_config(),
+                Arc::clone(&store) as Arc<dyn PodStore>,
+                provider,
+                ResolverSet::default(),
+                shutdown_tx,
+            );
 
-            logic.create_pod(make_pod_spec("first", "sleep 60")).await.unwrap();
-            let err = logic.create_pod(make_pod_spec("second", "sleep 60")).await.unwrap_err();
+            logic
+                .create_pod(make_pod_spec("first", "sleep 60"))
+                .await
+                .unwrap();
+            let err = logic
+                .create_pod(make_pod_spec("second", "sleep 60"))
+                .await
+                .unwrap_err();
             assert!(matches!(err, LogicError::CapacityExceeded { max: 1 }));
         }
 
@@ -1712,17 +1813,30 @@ mod tests {
                 ..Default::default()
             };
             let provider = make_provider();
-            let logic = PodLogic::new(config, test_cleanup_config(), Arc::clone(&store) as Arc<dyn PodStore>, provider, ResolverSet::default(), shutdown_tx);
+            let logic = PodLogic::new(
+                config,
+                test_cleanup_config(),
+                Arc::clone(&store) as Arc<dyn PodStore>,
+                provider,
+                ResolverSet::default(),
+                shutdown_tx,
+            );
 
             // First pod runs to completion and is never deleted, so it lingers
             // in the store in a terminal phase (as it would between completion
             // and the control plane's delete).
-            logic.create_pod(make_pod_spec("first", "exit 0")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("first", "exit 0"))
+                .await
+                .unwrap();
             wait_for_terminal(&logic, "first").await;
 
             // With max_pods=1 the old store.len() gate would reject this. A
             // terminal pod holds no resources, so the second pod is admitted.
-            let snap = logic.create_pod(make_pod_spec("second", "sleep 60")).await.unwrap();
+            let snap = logic
+                .create_pod(make_pod_spec("second", "sleep 60"))
+                .await
+                .unwrap();
             assert_eq!(snap.status.phase, PodPhase::Pending);
 
             // The terminal pod is still in the store — it was skipped by the
@@ -1734,7 +1848,10 @@ mod tests {
         #[tokio::test]
         async fn list_pod_statuses_carries_uid() {
             let (logic, _, _) = make_logic_with_store();
-            logic.create_pod(make_pod_spec("app", "sleep 60")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("app", "sleep 60"))
+                .await
+                .unwrap();
 
             // The uid must be present in the bulk status feed: the VK sync
             // loop relies on it to distinguish a stale incarnation from the
@@ -1750,18 +1867,27 @@ mod tests {
         #[tokio::test]
         async fn monitor_transitions_to_running() {
             let (logic, _, _) = make_logic_with_store();
-            logic.create_pod(make_pod_spec("app", "sleep 60")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("app", "sleep 60"))
+                .await
+                .unwrap();
 
             wait_for_phase(&logic, "app", PodPhase::Running).await;
 
-            let snap = logic.get_pod("default", "app", SpecView::Running).await.unwrap();
+            let snap = logic
+                .get_pod("default", "app", SpecView::Running)
+                .await
+                .unwrap();
             assert_eq!(snap.status.phase, PodPhase::Running);
         }
 
         #[tokio::test]
         async fn monitor_transitions_to_succeeded() {
             let (logic, _, _) = make_logic_with_store();
-            logic.create_pod(make_pod_spec("app", "exit 0")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("app", "exit 0"))
+                .await
+                .unwrap();
 
             let phase = wait_for_terminal(&logic, "app").await;
             assert_eq!(phase, PodPhase::Succeeded);
@@ -1770,7 +1896,10 @@ mod tests {
         #[tokio::test]
         async fn monitor_transitions_to_failed() {
             let (logic, _, _) = make_logic_with_store();
-            logic.create_pod(make_pod_spec("app", "exit 1")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("app", "exit 1"))
+                .await
+                .unwrap();
 
             let phase = wait_for_terminal(&logic, "app").await;
             assert_eq!(phase, PodPhase::Failed);
@@ -1779,7 +1908,10 @@ mod tests {
         #[tokio::test]
         async fn monitor_keeps_runtime_after_natural_completion() {
             let (logic, _, _) = make_logic_with_store();
-            logic.create_pod(make_pod_spec("app", "exit 0")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("app", "exit 0"))
+                .await
+                .unwrap();
             let id = PodId::new("default", "app", "uid-app");
 
             // Runtime exists while running
@@ -1799,7 +1931,10 @@ mod tests {
         #[tokio::test]
         async fn monitor_writes_finished_sentinel() {
             let (logic, _, _) = make_logic_with_store();
-            logic.create_pod(make_pod_spec("app", "exit 0")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("app", "exit 0"))
+                .await
+                .unwrap();
             let id = PodId::new("default", "app", "uid-app");
 
             wait_for_terminal(&logic, "app").await;
@@ -1807,7 +1942,10 @@ mod tests {
 
             let work_dir = logic.executor_provider.work_dir(&id);
             let sentinel = work_dir.join(FINISHED_SENTINEL);
-            assert!(sentinel.exists(), "FINISHED sentinel should be written on completion");
+            assert!(
+                sentinel.exists(),
+                "FINISHED sentinel should be written on completion"
+            );
         }
 
         // -- get_pod --
@@ -1815,10 +1953,19 @@ mod tests {
         #[tokio::test]
         async fn get_pod_both_views() {
             let (logic, _, _) = make_logic_with_store();
-            logic.create_pod(make_pod_spec("app", "sleep 60")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("app", "sleep 60"))
+                .await
+                .unwrap();
 
-            let running = logic.get_pod("default", "app", SpecView::Running).await.unwrap();
-            let original = logic.get_pod("default", "app", SpecView::Original).await.unwrap();
+            let running = logic
+                .get_pod("default", "app", SpecView::Running)
+                .await
+                .unwrap();
+            let original = logic
+                .get_pod("default", "app", SpecView::Original)
+                .await
+                .unwrap();
 
             assert_eq!(running.id, original.id);
             assert_eq!(running.status.phase, original.status.phase);
@@ -1827,7 +1974,10 @@ mod tests {
         #[tokio::test]
         async fn get_pod_status_returns_current() {
             let (logic, _, _) = make_logic_with_store();
-            logic.create_pod(make_pod_spec("app", "sleep 60")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("app", "sleep 60"))
+                .await
+                .unwrap();
 
             let status = logic.get_pod_status("default", "app").await.unwrap();
             assert_eq!(status.phase, PodPhase::Pending);
@@ -1843,9 +1993,18 @@ mod tests {
         #[tokio::test]
         async fn list_pods_multiple() {
             let (logic, _, _) = make_logic_with_store();
-            logic.create_pod(make_pod_spec("a", "sleep 60")).await.unwrap();
-            logic.create_pod(make_pod_spec("b", "sleep 60")).await.unwrap();
-            logic.create_pod(make_pod_spec("c", "sleep 60")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("a", "sleep 60"))
+                .await
+                .unwrap();
+            logic
+                .create_pod(make_pod_spec("b", "sleep 60"))
+                .await
+                .unwrap();
+            logic
+                .create_pod(make_pod_spec("c", "sleep 60"))
+                .await
+                .unwrap();
 
             assert_eq!(logic.list_pods(SpecView::Running).await.len(), 3);
             assert_eq!(logic.list_pods(SpecView::Original).await.len(), 3);
@@ -1854,13 +2013,40 @@ mod tests {
         #[tokio::test]
         async fn list_pods_in_namespace_filters() {
             let (logic, _, _) = make_logic_with_store();
-            logic.create_pod(make_pod_spec_ns("ns1", "a", "sleep 60")).await.unwrap();
-            logic.create_pod(make_pod_spec_ns("ns1", "b", "sleep 60")).await.unwrap();
-            logic.create_pod(make_pod_spec_ns("ns2", "c", "sleep 60")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec_ns("ns1", "a", "sleep 60"))
+                .await
+                .unwrap();
+            logic
+                .create_pod(make_pod_spec_ns("ns1", "b", "sleep 60"))
+                .await
+                .unwrap();
+            logic
+                .create_pod(make_pod_spec_ns("ns2", "c", "sleep 60"))
+                .await
+                .unwrap();
 
-            assert_eq!(logic.list_pods_in_namespace("ns1", SpecView::Running).await.len(), 2);
-            assert_eq!(logic.list_pods_in_namespace("ns2", SpecView::Running).await.len(), 1);
-            assert_eq!(logic.list_pods_in_namespace("ns3", SpecView::Running).await.len(), 0);
+            assert_eq!(
+                logic
+                    .list_pods_in_namespace("ns1", SpecView::Running)
+                    .await
+                    .len(),
+                2
+            );
+            assert_eq!(
+                logic
+                    .list_pods_in_namespace("ns2", SpecView::Running)
+                    .await
+                    .len(),
+                1
+            );
+            assert_eq!(
+                logic
+                    .list_pods_in_namespace("ns3", SpecView::Running)
+                    .await
+                    .len(),
+                0
+            );
         }
 
         // -- delete_pod --
@@ -1874,24 +2060,38 @@ mod tests {
         #[tokio::test]
         async fn delete_terminal_pod_removes_from_store() {
             let (logic, store, _) = make_logic_with_store();
-            logic.create_pod(make_pod_spec("app", "exit 0")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("app", "exit 0"))
+                .await
+                .unwrap();
 
             wait_for_terminal(&logic, "app").await;
             assert_eq!(store.len().await, 1);
 
             logic.delete_pod("default", "app", None).await.unwrap();
             assert_eq!(store.len().await, 0);
-            assert!(logic.get_pod("default", "app", SpecView::Running).await.is_err());
+            assert!(
+                logic
+                    .get_pod("default", "app", SpecView::Running)
+                    .await
+                    .is_err()
+            );
         }
 
         #[tokio::test]
         async fn delete_running_pod_kills_and_removes() {
             let (logic, store, _) = make_logic_with_store();
-            logic.create_pod(make_pod_spec("app", "sleep 60")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("app", "sleep 60"))
+                .await
+                .unwrap();
 
             wait_for_phase(&logic, "app", PodPhase::Running).await;
 
-            logic.delete_pod("default", "app", Some(Duration::from_secs(1))).await.unwrap();
+            logic
+                .delete_pod("default", "app", Some(Duration::from_secs(1)))
+                .await
+                .unwrap();
 
             // Pod is removed from store after completion
             wait_for_removal(&store, "app").await;
@@ -1907,8 +2107,18 @@ mod tests {
                 ..Default::default()
             };
             let provider = make_provider();
-            let logic = PodLogic::new(config, test_cleanup_config(), Arc::clone(&store) as Arc<dyn PodStore>, provider, ResolverSet::default(), shutdown_tx);
-            logic.create_pod(make_pod_spec("app", "sleep 60")).await.unwrap();
+            let logic = PodLogic::new(
+                config,
+                test_cleanup_config(),
+                Arc::clone(&store) as Arc<dyn PodStore>,
+                provider,
+                ResolverSet::default(),
+                shutdown_tx,
+            );
+            logic
+                .create_pod(make_pod_spec("app", "sleep 60"))
+                .await
+                .unwrap();
 
             wait_for_phase(&logic, "app", PodPhase::Running).await;
 
@@ -1984,23 +2194,38 @@ mod tests {
         #[tokio::test]
         async fn delete_idempotent_disruption() {
             let (logic, _, _) = make_logic_with_store();
-            logic.create_pod(make_pod_spec("app", "sleep 60")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("app", "sleep 60"))
+                .await
+                .unwrap();
 
             wait_for_phase(&logic, "app", PodPhase::Running).await;
 
             // First delete marks disruption
-            logic.delete_pod("default", "app", Some(Duration::from_secs(1))).await.unwrap();
-            let snap = logic.get_pod("default", "app", SpecView::Running).await.unwrap();
+            logic
+                .delete_pod("default", "app", Some(Duration::from_secs(1)))
+                .await
+                .unwrap();
+            let snap = logic
+                .get_pod("default", "app", SpecView::Running)
+                .await
+                .unwrap();
             assert!(snap.status.is_condition_true(CONDITION_DISRUPTION_TARGET));
 
             // Second delete is a no-op (no error, no change)
-            logic.delete_pod("default", "app", Some(Duration::from_secs(1))).await.unwrap();
+            logic
+                .delete_pod("default", "app", Some(Duration::from_secs(1)))
+                .await
+                .unwrap();
         }
 
         #[tokio::test]
         async fn delete_already_removed_is_ok() {
             let (logic, _, _) = make_logic_with_store();
-            logic.create_pod(make_pod_spec("app", "exit 0")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("app", "exit 0"))
+                .await
+                .unwrap();
 
             wait_for_terminal(&logic, "app").await;
 
@@ -2017,9 +2242,18 @@ mod tests {
             let (logic, store, _) = make_logic_with_store();
 
             // Create three pods: fast exit, slow, failing
-            logic.create_pod(make_pod_spec("fast", "exit 0")).await.unwrap();
-            logic.create_pod(make_pod_spec("slow", "sleep 60")).await.unwrap();
-            logic.create_pod(make_pod_spec("fail", "exit 1")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("fast", "exit 0"))
+                .await
+                .unwrap();
+            logic
+                .create_pod(make_pod_spec("slow", "sleep 60"))
+                .await
+                .unwrap();
+            logic
+                .create_pod(make_pod_spec("fail", "exit 1"))
+                .await
+                .unwrap();
 
             assert_eq!(store.len().await, 3);
 
@@ -2034,7 +2268,10 @@ mod tests {
             wait_for_phase(&logic, "slow", PodPhase::Running).await;
 
             // Kill slow — deleted pods are removed automatically
-            logic.delete_pod("default", "slow", Some(Duration::from_secs(1))).await.unwrap();
+            logic
+                .delete_pod("default", "slow", Some(Duration::from_secs(1)))
+                .await
+                .unwrap();
             wait_for_removal(&store, "slow").await;
 
             // Clean up terminal pods (natural completions stay in store)
@@ -2049,8 +2286,14 @@ mod tests {
         #[tokio::test]
         async fn shutdown_terminates_running_pods() {
             let (logic, _, shutdown_tx) = make_logic_with_store();
-            logic.create_pod(make_pod_spec("a", "sleep 60")).await.unwrap();
-            logic.create_pod(make_pod_spec("b", "sleep 60")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("a", "sleep 60"))
+                .await
+                .unwrap();
+            logic
+                .create_pod(make_pod_spec("b", "sleep 60"))
+                .await
+                .unwrap();
 
             wait_for_phase(&logic, "a", PodPhase::Running).await;
             wait_for_phase(&logic, "b", PodPhase::Running).await;
@@ -2066,7 +2309,10 @@ mod tests {
         #[tokio::test]
         async fn stream_logs_after_completion() {
             let (logic, _, _) = make_logic_with_store();
-            logic.create_pod(make_pod_spec("logger", "echo hello-world")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("logger", "echo hello-world"))
+                .await
+                .unwrap();
 
             wait_for_terminal(&logic, "logger").await;
 
@@ -2076,7 +2322,9 @@ mod tests {
                     "logger",
                     Some("main"),
                     ContainerLogOptions::default(),
-                ).await.unwrap();
+                )
+                .await
+                .unwrap();
 
             let mut output = String::new();
             while let Some(Ok(chunk)) = rx.recv().await {
@@ -2090,7 +2338,10 @@ mod tests {
             let (logic, _, _) = make_logic_with_store();
             // Print 10 lines
             logic
-                .create_pod(make_pod_spec("tailer", "for i in 1 2 3 4 5 6 7 8 9 10; do echo line-$i; done"))
+                .create_pod(make_pod_spec(
+                    "tailer",
+                    "for i in 1 2 3 4 5 6 7 8 9 10; do echo line-$i; done",
+                ))
                 .await
                 .unwrap();
 
@@ -2105,7 +2356,9 @@ mod tests {
                         tail_lines: Some(3),
                         ..Default::default()
                     },
-                ).await.unwrap();
+                )
+                .await
+                .unwrap();
 
             let mut output = String::new();
             while let Some(Ok(chunk)) = rx.recv().await {
@@ -2140,7 +2393,9 @@ mod tests {
                         follow: true,
                         ..Default::default()
                     },
-                ).await.unwrap();
+                )
+                .await
+                .unwrap();
 
             // Collect all output — should complete when pod terminates
             let result = tokio::time::timeout(Duration::from_secs(10), async {
@@ -2160,7 +2415,9 @@ mod tests {
         async fn stream_logs_pod_not_found() {
             let (logic, _, _) = make_logic_with_store();
             let err = logic
-                .stream_container_logs("default", "nope", None, ContainerLogOptions::default()).await.unwrap_err();
+                .stream_container_logs("default", "nope", None, ContainerLogOptions::default())
+                .await
+                .unwrap_err();
             assert!(matches!(err, LogicError::NotFound { .. }));
         }
 
@@ -2317,7 +2574,10 @@ mod tests {
             // Give the preparer a moment to enter its first wait.
             tokio::time::sleep(Duration::from_millis(100)).await;
 
-            logic.delete_pod("default", "waiter", Some(Duration::from_secs(1))).await.unwrap();
+            logic
+                .delete_pod("default", "waiter", Some(Duration::from_secs(1)))
+                .await
+                .unwrap();
             wait_for_removal(&store, "waiter").await;
             assert_eq!(store.len().await, 0);
         }
@@ -2352,12 +2612,20 @@ mod tests {
                 ResolverSet::default(),
                 shutdown_tx.clone(),
             )
-            .register_task(Arc::new(Counter { started: Arc::clone(&started) }));
+            .register_task(Arc::new(Counter {
+                started: Arc::clone(&started),
+            }));
 
             // Two pods on the same PodLogic — both should pick up the
             // registered task.
-            logic.create_pod(make_pod_spec("a", "exit 0")).await.unwrap();
-            logic.create_pod(make_pod_spec("b", "exit 0")).await.unwrap();
+            logic
+                .create_pod(make_pod_spec("a", "exit 0"))
+                .await
+                .unwrap();
+            logic
+                .create_pod(make_pod_spec("b", "exit 0"))
+                .await
+                .unwrap();
             wait_for_terminal(&logic, "a").await;
             wait_for_terminal(&logic, "b").await;
 
@@ -2407,12 +2675,7 @@ mod tests {
             // rather than panic.
             tokio::time::sleep(Duration::from_millis(50)).await;
             let err = logic
-                .stream_container_logs(
-                    "default",
-                    "prep",
-                    None,
-                    ContainerLogOptions::default(),
-                )
+                .stream_container_logs("default", "prep", None, ContainerLogOptions::default())
                 .await
                 .unwrap_err();
             match err {
@@ -2424,7 +2687,10 @@ mod tests {
 
             // Clean up so the test runtime doesn't hang on the spawned
             // preparer task.
-            logic.delete_pod("default", "prep", Some(Duration::from_secs(1))).await.unwrap();
+            logic
+                .delete_pod("default", "prep", Some(Duration::from_secs(1)))
+                .await
+                .unwrap();
         }
 
         // -- runner tasks ---------------------------------------------------
@@ -2533,9 +2799,15 @@ mod tests {
                 ResolverSet::default(),
                 shutdown_tx.clone(),
             )
-            .register_runner_task(Arc::new(RunnerCounter { spawn_count: Arc::clone(&count) }))
-            .register_runner_task(Arc::new(RunnerCounter { spawn_count: Arc::clone(&count) }))
-            .register_runner_task(Arc::new(RunnerCounter { spawn_count: Arc::clone(&count) }));
+            .register_runner_task(Arc::new(RunnerCounter {
+                spawn_count: Arc::clone(&count),
+            }))
+            .register_runner_task(Arc::new(RunnerCounter {
+                spawn_count: Arc::clone(&count),
+            }))
+            .register_runner_task(Arc::new(RunnerCounter {
+                spawn_count: Arc::clone(&count),
+            }));
 
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert_eq!(count.load(Ordering::SeqCst), 3);
@@ -2558,7 +2830,9 @@ mod tests {
                 ResolverSet::default(),
                 shutdown_tx.clone(),
             )
-            .register_runner_task(Arc::new(RunnerHang { aborted: Arc::clone(&aborted) }));
+            .register_runner_task(Arc::new(RunnerHang {
+                aborted: Arc::clone(&aborted),
+            }));
 
             tokio::time::sleep(Duration::from_millis(50)).await;
             let _ = shutdown_tx.send(());
@@ -2567,17 +2841,25 @@ mod tests {
             // gives up after the timeout. The task should still be
             // running afterwards.
             let start = std::time::Instant::now();
-            logic.wait_for_runner_tasks(Duration::from_millis(200)).await;
+            logic
+                .wait_for_runner_tasks(Duration::from_millis(200))
+                .await;
             assert!(
                 start.elapsed() >= Duration::from_millis(150),
                 "wait should have honored the timeout",
             );
-            assert!(!aborted.load(Ordering::SeqCst), "task should still be running after timeout");
+            assert!(
+                !aborted.load(Ordering::SeqCst),
+                "task should still be running after timeout"
+            );
 
             // Drop logic — JoinSet drop aborts the task.
             drop(logic);
             tokio::time::sleep(Duration::from_millis(100)).await;
-            assert!(aborted.load(Ordering::SeqCst), "task should be aborted on PodLogic drop");
+            assert!(
+                aborted.load(Ordering::SeqCst),
+                "task should be aborted on PodLogic drop"
+            );
         }
 
         #[tokio::test]
@@ -2594,7 +2876,9 @@ mod tests {
                 ResolverSet::default(),
                 shutdown_tx,
             )
-            .register_runner_task(Arc::new(RunnerHang { aborted: Arc::clone(&aborted) }));
+            .register_runner_task(Arc::new(RunnerHang {
+                aborted: Arc::clone(&aborted),
+            }));
 
             tokio::time::sleep(Duration::from_millis(50)).await;
             assert!(!aborted.load(Ordering::SeqCst));

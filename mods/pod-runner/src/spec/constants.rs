@@ -6,8 +6,7 @@ use serde::{Deserialize, Serialize};
 // Pod phases
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PodPhase {
     #[default]
     Pending,
@@ -15,7 +14,6 @@ pub enum PodPhase {
     Succeeded,
     Failed,
 }
-
 
 impl PodPhase {
     pub fn is_terminal(&self) -> bool {
@@ -102,15 +100,13 @@ pub const STATE_KEY_TERMINATED: &str = "terminated";
 // Restart policies
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum RestartPolicy {
     #[default]
     Never,
     OnFailure,
     Always,
 }
-
 
 // ---------------------------------------------------------------------------
 // Probe types

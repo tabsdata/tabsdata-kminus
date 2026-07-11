@@ -139,10 +139,11 @@ impl FileStore {
 
     fn write_json<T: serde::Serialize>(&self, path: &Path, value: &T) {
         if let Some(parent) = path.parent()
-            && let Err(e) = fs::create_dir_all(parent) {
-                warn!(error = %e, path = ?path, "Failed to create directory");
-                return;
-            }
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            warn!(error = %e, path = ?path, "Failed to create directory");
+            return;
+        }
         match serde_json::to_string_pretty(value) {
             Ok(json) => {
                 if let Err(e) = fs::write(path, json) {
@@ -250,16 +251,10 @@ impl PodStore for FileStore {
             return;
         }
 
-        self.write_json(
-            &store.join("original-spec.json"),
-            original_spec.as_ref(),
-        );
+        self.write_json(&store.join("original-spec.json"), original_spec.as_ref());
 
         if self.config.write_running_spec {
-            self.write_json(
-                &store.join("running-spec.json"),
-                running_spec.as_ref(),
-            );
+            self.write_json(&store.join("running-spec.json"), running_spec.as_ref());
         }
 
         self.write_status(&id, &status);
@@ -276,7 +271,12 @@ impl PodStore for FileStore {
         self.read_snapshot(id, view)
     }
 
-    async fn get_by_name(&self, namespace: &str, name: &str, view: SpecView) -> Option<PodSnapshot> {
+    async fn get_by_name(
+        &self,
+        namespace: &str,
+        name: &str,
+        view: SpecView,
+    ) -> Option<PodSnapshot> {
         let prefix = format!("{}_{}_", namespace, name);
         let entries = match fs::read_dir(&self.pods_dir) {
             Ok(rd) => rd,
@@ -320,9 +320,10 @@ impl PodStore for FileStore {
         // work/ and log/ that cleanup/purge manage separately.
         let store = self.store_dir(id);
         if store.exists()
-            && let Err(e) = fs::remove_dir_all(&store) {
-                warn!(error = %e, "Failed to remove pod store directory");
-            }
+            && let Err(e) = fs::remove_dir_all(&store)
+        {
+            warn!(error = %e, "Failed to remove pod store directory");
+        }
         snap
     }
 
@@ -402,7 +403,14 @@ mod tests {
         let running = make_running_spec("default", "app", "uid-1");
         let id = PodId::from_spec(&original);
 
-        store.put(id.clone(), original, running, make_status(PodPhase::Pending)).await;
+        store
+            .put(
+                id.clone(),
+                original,
+                running,
+                make_status(PodPhase::Pending),
+            )
+            .await;
 
         // Running view returns running spec
         let snap = store.get(&id, SpecView::Running).await.unwrap();
@@ -426,7 +434,14 @@ mod tests {
         let running = make_running_spec("default", "app", "uid-1");
         let id = PodId::from_spec(&original);
 
-        store.put(id.clone(), original, running, make_status(PodPhase::Pending)).await;
+        store
+            .put(
+                id.clone(),
+                original,
+                running,
+                make_status(PodPhase::Pending),
+            )
+            .await;
 
         // Running view falls back to original when running-spec.json absent
         let snap = store.get(&id, SpecView::Running).await.unwrap();
@@ -443,16 +458,20 @@ mod tests {
         let spec = make_spec("default", "app", "uid-1");
         let id = PodId::from_spec(&spec);
 
-        store.put(
-            id.clone(),
-            Arc::clone(&spec),
-            spec,
-            make_status(PodPhase::Pending),
-        ).await;
+        store
+            .put(
+                id.clone(),
+                Arc::clone(&spec),
+                spec,
+                make_status(PodPhase::Pending),
+            )
+            .await;
 
         // Small delay so the timestamp differs
         std::thread::sleep(std::time::Duration::from_millis(5));
-        store.update_status(&id, make_status(PodPhase::Running)).await;
+        store
+            .update_status(&id, make_status(PodPhase::Running))
+            .await;
 
         let snap = store.get(&id, SpecView::Running).await.unwrap();
         assert_eq!(snap.status.phase, PodPhase::Running);
@@ -470,7 +489,9 @@ mod tests {
     async fn update_status_nonexistent_is_noop() {
         let store = make_store("update-noop");
         let id = PodId::new("default", "nope", "uid");
-        store.update_status(&id, make_status(PodPhase::Running)).await;
+        store
+            .update_status(&id, make_status(PodPhase::Running))
+            .await;
         assert!(store.get(&id, SpecView::Running).await.is_none());
     }
 
@@ -480,17 +501,35 @@ mod tests {
         let spec = make_spec("prod", "web", "uid-3");
         let running = make_running_spec("prod", "web", "uid-3");
         let id = PodId::from_spec(&spec);
-        store.put(id, spec, running, make_status(PodPhase::Running)).await;
+        store
+            .put(id, spec, running, make_status(PodPhase::Running))
+            .await;
 
-        let snap = store.get_by_name("prod", "web", SpecView::Running).await.unwrap();
+        let snap = store
+            .get_by_name("prod", "web", SpecView::Running)
+            .await
+            .unwrap();
         assert_eq!(snap.id.uid, "uid-3");
         assert_eq!(snap.spec.metadata.uid, "uid-3_running");
 
-        let snap = store.get_by_name("prod", "web", SpecView::Original).await.unwrap();
+        let snap = store
+            .get_by_name("prod", "web", SpecView::Original)
+            .await
+            .unwrap();
         assert_eq!(snap.spec.metadata.uid, "uid-3");
 
-        assert!(store.get_by_name("prod", "nope", SpecView::Running).await.is_none());
-        assert!(store.get_by_name("staging", "web", SpecView::Running).await.is_none());
+        assert!(
+            store
+                .get_by_name("prod", "nope", SpecView::Running)
+                .await
+                .is_none()
+        );
+        assert!(
+            store
+                .get_by_name("staging", "web", SpecView::Running)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -503,7 +542,9 @@ mod tests {
             let running =
                 make_running_spec("default", &format!("pod-{}", i), &format!("uid-{}", i));
             let id = PodId::from_spec(&original);
-            store.put(id, original, running, make_status(PodPhase::Pending)).await;
+            store
+                .put(id, original, running, make_status(PodPhase::Pending))
+                .await;
         }
 
         assert_eq!(store.len().await, 3);
@@ -511,42 +552,68 @@ mod tests {
 
         let pods = store.list(SpecView::Running).await;
         assert_eq!(pods.len(), 3);
-        assert!(pods
-            .iter()
-            .all(|s| s.spec.metadata.uid.ends_with("_running")));
+        assert!(
+            pods.iter()
+                .all(|s| s.spec.metadata.uid.ends_with("_running"))
+        );
 
         let pods = store.list(SpecView::Original).await;
         assert_eq!(pods.len(), 3);
-        assert!(pods
-            .iter()
-            .all(|s| !s.spec.metadata.uid.ends_with("_running")));
+        assert!(
+            pods.iter()
+                .all(|s| !s.spec.metadata.uid.ends_with("_running"))
+        );
     }
 
     #[tokio::test]
     async fn list_in_namespace() {
         let store = make_store("list-ns");
-        store.put(
-            PodId::new("ns1", "a", "1"),
-            make_spec("ns1", "a", "1"),
-            make_running_spec("ns1", "a", "1"),
-            make_status(PodPhase::Running),
-        ).await;
-        store.put(
-            PodId::new("ns1", "b", "2"),
-            make_spec("ns1", "b", "2"),
-            make_running_spec("ns1", "b", "2"),
-            make_status(PodPhase::Running),
-        ).await;
-        store.put(
-            PodId::new("ns2", "c", "3"),
-            make_spec("ns2", "c", "3"),
-            make_running_spec("ns2", "c", "3"),
-            make_status(PodPhase::Running),
-        ).await;
+        store
+            .put(
+                PodId::new("ns1", "a", "1"),
+                make_spec("ns1", "a", "1"),
+                make_running_spec("ns1", "a", "1"),
+                make_status(PodPhase::Running),
+            )
+            .await;
+        store
+            .put(
+                PodId::new("ns1", "b", "2"),
+                make_spec("ns1", "b", "2"),
+                make_running_spec("ns1", "b", "2"),
+                make_status(PodPhase::Running),
+            )
+            .await;
+        store
+            .put(
+                PodId::new("ns2", "c", "3"),
+                make_spec("ns2", "c", "3"),
+                make_running_spec("ns2", "c", "3"),
+                make_status(PodPhase::Running),
+            )
+            .await;
 
-        assert_eq!(store.list_in_namespace("ns1", SpecView::Running).await.len(), 2);
-        assert_eq!(store.list_in_namespace("ns2", SpecView::Running).await.len(), 1);
-        assert_eq!(store.list_in_namespace("ns3", SpecView::Running).await.len(), 0);
+        assert_eq!(
+            store
+                .list_in_namespace("ns1", SpecView::Running)
+                .await
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .list_in_namespace("ns2", SpecView::Running)
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_in_namespace("ns3", SpecView::Running)
+                .await
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -554,12 +621,14 @@ mod tests {
         let store = make_store("remove");
         let spec = make_spec("default", "app", "uid-1");
         let id = PodId::from_spec(&spec);
-        store.put(
-            id.clone(),
-            Arc::clone(&spec),
-            spec,
-            make_status(PodPhase::Pending),
-        ).await;
+        store
+            .put(
+                id.clone(),
+                Arc::clone(&spec),
+                spec,
+                make_status(PodPhase::Pending),
+            )
+            .await;
 
         assert!(store.contains(&id).await);
         let snap = store.remove(&id).await.unwrap();
@@ -582,12 +651,14 @@ mod tests {
         let spec = make_spec("default", "app", "uid-1");
         let id = PodId::from_spec(&spec);
 
-        store.put(
-            id.clone(),
-            Arc::clone(&spec),
-            spec,
-            make_status(PodPhase::Pending),
-        ).await;
+        store
+            .put(
+                id.clone(),
+                Arc::clone(&spec),
+                spec,
+                make_status(PodPhase::Pending),
+            )
+            .await;
 
         for phase in [PodPhase::Running, PodPhase::Succeeded] {
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -612,15 +683,24 @@ mod tests {
         let running = make_running_spec("default", "app", "uid-1");
         let id = PodId::from_spec(&original);
 
-        store.put(
-            id.clone(),
-            Arc::clone(&original),
-            Arc::clone(&running),
-            make_status(PodPhase::Pending),
-        ).await;
+        store
+            .put(
+                id.clone(),
+                Arc::clone(&original),
+                Arc::clone(&running),
+                make_status(PodPhase::Pending),
+            )
+            .await;
 
         std::thread::sleep(std::time::Duration::from_millis(5));
-        store.put(id.clone(), original, running, make_status(PodPhase::Running)).await;
+        store
+            .put(
+                id.clone(),
+                original,
+                running,
+                make_status(PodPhase::Running),
+            )
+            .await;
 
         let snap = store.get(&id, SpecView::Running).await.unwrap();
         assert_eq!(snap.status.phase, PodPhase::Running);

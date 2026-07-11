@@ -176,8 +176,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Toy error type for tests. `retryable=true` simulates "resource not
     /// found yet"; `retryable=false` simulates a non-retryable failure

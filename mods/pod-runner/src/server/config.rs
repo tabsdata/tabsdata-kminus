@@ -99,7 +99,6 @@ fn parse_port_from_url(url: &str) -> u16 {
 /// current directory (`./run/...`).
 pub struct PRConfig {
     // -- server --
-
     /// Address to bind the HTTP server to.
     pub bind_address: String,
 
@@ -111,7 +110,6 @@ pub struct PRConfig {
     pub kubeconfig: String,
 
     // -- node identity --
-
     /// Virtual node name reported to K8s.
     pub nodename: String,
 
@@ -119,12 +117,10 @@ pub struct PRConfig {
     pub namespace: String,
 
     // -- TLS --
-
     /// Server TLS configuration (always mTLS).
     pub tls: ServerTlsConfig,
 
     // -- directories --
-
     /// Run directory: `<workdir>/run/`. Rotated on startup.
     pub run_dir: PathBuf,
 
@@ -139,7 +135,6 @@ pub struct PRConfig {
     pub pid_dir: PathBuf,
 
     // -- pod limits --
-
     /// Default grace period (seconds) for pod deletion.
     pub default_grace_period_secs: u64,
 
@@ -152,7 +147,6 @@ pub struct PRConfig {
     pub container_restart_backoff_base_secs: u64,
 
     // -- node capacity --
-
     /// CPU capacity reported to K8s.
     pub capacity_cpu: u32,
 
@@ -163,7 +157,6 @@ pub struct PRConfig {
     pub capacity_pods: u32,
 
     // -- executor --
-
     /// Whether to propagate the parent process environment to containers.
     pub propagate_env: bool,
 
@@ -171,20 +164,17 @@ pub struct PRConfig {
     pub die_with_parent: bool,
 
     // -- store --
-
     /// Whether to persist the running (prepared) spec to disk.
     /// Set to `false` if it may contain resolved secrets.
     pub write_running_spec: bool,
 
     // -- images --
-
     /// Root directory for resolving relative container `image` paths.
     /// Absolute `image` paths are used as-is. Empty means the container
     /// `image` field is used verbatim.
     pub images_dir: PathBuf,
 
     // -- resolvers --
-
     /// Secret resolver configuration.
     pub secret_resolver: ResolverConfig,
 
@@ -195,7 +185,6 @@ pub struct PRConfig {
     pub node_env_resolver: ResolverConfig,
 
     // -- cleanup --
-
     /// Keep work dir when a pod is deleted (default: false).
     pub keep_deleted_pod_dir: bool,
 
@@ -213,7 +202,6 @@ pub struct PRConfig {
     pub dir_size_scan_interval_secs: u64,
 
     // -- metrics --
-
     /// Metrics endpoint URL (HTTP only, e.g. `http://127.0.0.1:3001`).
     /// Empty string disables the metrics server.
     pub metrics_url: String,

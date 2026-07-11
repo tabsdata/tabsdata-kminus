@@ -90,12 +90,13 @@ pub fn resolve_volumes(
         let mut mounts = Vec::new();
 
         for vm in &c.volume_mounts {
-            let vol = volume_map.get(vm.name.as_str()).ok_or_else(|| {
-                PrepareError::UnknownVolume {
-                    container: c.name.clone(),
-                    volume: vm.name.clone(),
-                }
-            })?;
+            let vol =
+                volume_map
+                    .get(vm.name.as_str())
+                    .ok_or_else(|| PrepareError::UnknownVolume {
+                        container: c.name.clone(),
+                        volume: vm.name.clone(),
+                    })?;
 
             let vol_dir = match materialized.get(vm.name.as_str()) {
                 Some(dir) => dir.clone(),
@@ -594,7 +595,10 @@ mod tests {
             "hello"
         );
 
-        assert_eq!(result.containers["app"][0].host_path, host_dir.to_string_lossy());
+        assert_eq!(
+            result.containers["app"][0].host_path,
+            host_dir.to_string_lossy()
+        );
         assert_eq!(
             result.containers["app"][0].volume_path,
             vol_dir.to_string_lossy()
@@ -646,7 +650,9 @@ mod tests {
         );
 
         let err = resolve_volumes(&pod, &ResolvedK8sValues::default(), &base).unwrap_err();
-        assert!(matches!(err, PrepareError::UnknownVolume { ref volume, .. } if volume == "missing"));
+        assert!(
+            matches!(err, PrepareError::UnknownVolume { ref volume, .. } if volume == "missing")
+        );
     }
 
     #[test]
@@ -674,7 +680,9 @@ mod tests {
         );
 
         let err = resolve_volumes(&pod, &ResolvedK8sValues::default(), &base).unwrap_err();
-        assert!(matches!(err, PrepareError::MountPathConflict { ref volume, .. } if volume == "data"));
+        assert!(
+            matches!(err, PrepareError::MountPathConflict { ref volume, .. } if volume == "data")
+        );
     }
 
     #[test]
@@ -891,7 +899,9 @@ mod tests {
         }]);
         assert_eq!(plan.files.len(), 1);
         assert_eq!(
-            plan.files.get("apiserver/apiserver.yaml").map(String::as_str),
+            plan.files
+                .get("apiserver/apiserver.yaml")
+                .map(String::as_str),
             Some("A")
         );
     }
@@ -900,13 +910,30 @@ mod tests {
     fn plan_projection_last_source_wins_on_collision() {
         let d1 = data(&[("k", "first")]);
         let d2 = data(&[("k", "second")]);
-        let i1 = vec![KeyToPath { key: "k".into(), path: "shared.yaml".into() }];
-        let i2 = vec![KeyToPath { key: "k".into(), path: "shared.yaml".into() }];
+        let i1 = vec![KeyToPath {
+            key: "k".into(),
+            path: "shared.yaml".into(),
+        }];
+        let i2 = vec![KeyToPath {
+            key: "k".into(),
+            path: "shared.yaml".into(),
+        }];
         let plan = plan_projection(&[
-            CmSource { name: "cm1", items: &i1, data: &d1 },
-            CmSource { name: "cm2", items: &i2, data: &d2 },
+            CmSource {
+                name: "cm1",
+                items: &i1,
+                data: &d1,
+            },
+            CmSource {
+                name: "cm2",
+                items: &i2,
+                data: &d2,
+            },
         ]);
-        assert_eq!(plan.files.get("shared.yaml").map(String::as_str), Some("second"));
+        assert_eq!(
+            plan.files.get("shared.yaml").map(String::as_str),
+            Some("second")
+        );
         assert_eq!(plan.collisions.len(), 1);
         assert_eq!(plan.collisions[0].path, "shared.yaml");
         assert_eq!(plan.collisions[0].previous, "cm1/k");
@@ -917,15 +944,32 @@ mod tests {
     fn plan_projection_missing_key_and_unsafe_path() {
         let d = data(&[("present", "v")]);
         let items = vec![
-            KeyToPath { key: "absent".into(), path: "a.yaml".into() },
-            KeyToPath { key: "present".into(), path: "../escape.yaml".into() },
+            KeyToPath {
+                key: "absent".into(),
+                path: "a.yaml".into(),
+            },
+            KeyToPath {
+                key: "present".into(),
+                path: "../escape.yaml".into(),
+            },
         ];
-        let plan = plan_projection(&[CmSource { name: "cm", items: &items, data: &d }]);
+        let plan = plan_projection(&[CmSource {
+            name: "cm",
+            items: &items,
+            data: &d,
+        }]);
         assert!(plan.files.is_empty());
-        assert_eq!(plan.missing_keys, vec![("cm".to_string(), "absent".to_string())]);
+        assert_eq!(
+            plan.missing_keys,
+            vec![("cm".to_string(), "absent".to_string())]
+        );
         assert_eq!(
             plan.unsafe_paths,
-            vec![("cm".to_string(), "present".to_string(), "../escape.yaml".to_string())]
+            vec![(
+                "cm".to_string(),
+                "present".to_string(),
+                "../escape.yaml".to_string()
+            )]
         );
     }
 
@@ -959,19 +1003,29 @@ mod tests {
             &mount_path,
             vec![
                 VolumeProjection {
-                    config_map: Some(cm("cm-a", vec![("apiserver.yaml", "apiserver/apiserver.yaml")])),
+                    config_map: Some(cm(
+                        "cm-a",
+                        vec![("apiserver.yaml", "apiserver/apiserver.yaml")],
+                    )),
                     ..Default::default()
                 },
                 VolumeProjection {
-                    config_map: Some(cm("cm-b", vec![("apiserver.log.yaml", "apiserver/apiserver.log.yaml")])),
+                    config_map: Some(cm(
+                        "cm-b",
+                        vec![("apiserver.log.yaml", "apiserver/apiserver.log.yaml")],
+                    )),
                     ..Default::default()
                 },
             ],
         );
 
         let mut resolved = ResolvedK8sValues::default();
-        resolved.config_map_volumes.insert("cm-a".to_string(), data(&[("apiserver.yaml", "A")]));
-        resolved.config_map_volumes.insert("cm-b".to_string(), data(&[("apiserver.log.yaml", "B")]));
+        resolved
+            .config_map_volumes
+            .insert("cm-a".to_string(), data(&[("apiserver.yaml", "A")]));
+        resolved
+            .config_map_volumes
+            .insert("cm-b".to_string(), data(&[("apiserver.log.yaml", "B")]));
 
         let result = resolve_volumes(&pod, &resolved, &base).unwrap();
         assert!(mount_path.is_symlink());
@@ -979,8 +1033,14 @@ mod tests {
             fs::read_link(&mount_path).unwrap(),
             base.join(VOLUMES_DIR).join("cfg")
         );
-        assert_eq!(fs::read_to_string(mount_path.join("apiserver/apiserver.yaml")).unwrap(), "A");
-        assert_eq!(fs::read_to_string(mount_path.join("apiserver/apiserver.log.yaml")).unwrap(), "B");
+        assert_eq!(
+            fs::read_to_string(mount_path.join("apiserver/apiserver.yaml")).unwrap(),
+            "A"
+        );
+        assert_eq!(
+            fs::read_to_string(mount_path.join("apiserver/apiserver.log.yaml")).unwrap(),
+            "B"
+        );
         assert!(result.containers["app"][0].read_only);
     }
 
@@ -991,17 +1051,30 @@ mod tests {
         let pod = projected_pod(
             &mount_path,
             vec![
-                VolumeProjection { config_map: Some(cm("cm-a", vec![("v", "shared.yaml")])), ..Default::default() },
-                VolumeProjection { config_map: Some(cm("cm-b", vec![("v", "shared.yaml")])), ..Default::default() },
+                VolumeProjection {
+                    config_map: Some(cm("cm-a", vec![("v", "shared.yaml")])),
+                    ..Default::default()
+                },
+                VolumeProjection {
+                    config_map: Some(cm("cm-b", vec![("v", "shared.yaml")])),
+                    ..Default::default()
+                },
             ],
         );
         let mut resolved = ResolvedK8sValues::default();
-        resolved.config_map_volumes.insert("cm-a".to_string(), data(&[("v", "from-a")]));
-        resolved.config_map_volumes.insert("cm-b".to_string(), data(&[("v", "from-b")]));
+        resolved
+            .config_map_volumes
+            .insert("cm-a".to_string(), data(&[("v", "from-a")]));
+        resolved
+            .config_map_volumes
+            .insert("cm-b".to_string(), data(&[("v", "from-b")]));
 
         resolve_volumes(&pod, &resolved, &base).unwrap();
         // Last source (cm-b) wins; pod-runner logs a warning (see materialize_plan).
-        assert_eq!(fs::read_to_string(mount_path.join("shared.yaml")).unwrap(), "from-b");
+        assert_eq!(
+            fs::read_to_string(mount_path.join("shared.yaml")).unwrap(),
+            "from-b"
+        );
     }
 
     #[test]
@@ -1041,12 +1114,16 @@ mod tests {
             }],
         );
         let mut resolved = ResolvedK8sValues::default();
-        resolved
-            .config_map_volumes
-            .insert("app-config".to_string(), data(&[("a.conf", "AA"), ("b.conf", "BB")]));
+        resolved.config_map_volumes.insert(
+            "app-config".to_string(),
+            data(&[("a.conf", "AA"), ("b.conf", "BB")]),
+        );
 
         resolve_volumes(&pod, &resolved, &base).unwrap();
-        assert_eq!(fs::read_to_string(mount_path.join("nested/a.conf")).unwrap(), "AA");
+        assert_eq!(
+            fs::read_to_string(mount_path.join("nested/a.conf")).unwrap(),
+            "AA"
+        );
         // b.conf was not selected by items.
         assert!(!mount_path.join("b.conf").exists());
     }

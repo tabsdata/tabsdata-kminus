@@ -43,8 +43,7 @@ client:
 metricsUrl: "{metrics_url}"
 "#
     );
-    fs::write(&path, &content)
-        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+    fs::write(&path, &content).map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -58,10 +57,7 @@ mod tests {
 
     #[test]
     fn write_vk_prconfig_creates_file() {
-        let tmp = std::env::temp_dir().join(format!(
-            "pr-vk-test-{}",
-            std::process::id(),
-        ));
+        let tmp = std::env::temp_dir().join(format!("pr-vk-test-{}", std::process::id(),));
         std::fs::create_dir_all(&tmp).unwrap();
 
         write_vk_prconfig(

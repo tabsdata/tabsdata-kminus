@@ -56,8 +56,16 @@ fn parse_url(url: &str) -> Result<ParsedUrl, String> {
 
 /// Map a pair of YAML cert fields (path, base64 data) into a [`CertSource`].
 fn map_cert_source(path: &str, data: &str) -> CertSource {
-    let path = if path.is_empty() { None } else { Some(path.to_string()) };
-    let data = if data.is_empty() { None } else { Some(data.to_string()) };
+    let path = if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    };
+    let data = if data.is_empty() {
+        None
+    } else {
+        Some(data.to_string())
+    };
     CertSource { path, data }
 }
 
@@ -77,10 +85,7 @@ fn map_cert_source(path: &str, data: &str) -> CertSource {
 /// 8. Returns the final `PRConfig`
 pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
     // 1. Resolve configdir
-    let configdir = cli
-        .configdir
-        .as_deref()
-        .unwrap_or(DEFAULT_CONFIGDIR);
+    let configdir = cli.configdir.as_deref().unwrap_or(DEFAULT_CONFIGDIR);
     let configdir = std::fs::canonicalize(configdir)
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(configdir));
 
@@ -88,7 +93,9 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
     let prconfig_path = configdir.join(PRCONFIG_FILENAME);
     if !prconfig_path.is_file() {
         let port = cli.port.unwrap_or(DEFAULT_PORT);
-        let metrics_port = cli.metrics_port.unwrap_or(crate::metrics::DEFAULT_METRICS_PORT);
+        let metrics_port = cli
+            .metrics_port
+            .unwrap_or(crate::metrics::DEFAULT_METRICS_PORT);
         info!(configdir = %configdir.display(), port, metrics_port, "Generating config files");
         pki::generate_and_write_configs(&configdir, DEFAULT_ADDRESS, port, metrics_port)?;
     }
@@ -116,18 +123,12 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
         .unwrap_or_default();
 
     // 6. Resolve workdir: CLI → default
-    let workdir = cli
-        .workdir
-        .as_deref()
-        .unwrap_or(DEFAULT_WORKDIR);
+    let workdir = cli.workdir.as_deref().unwrap_or(DEFAULT_WORKDIR);
     let workdir = std::fs::canonicalize(workdir)
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(workdir));
 
     // 7. Resolve logdir: CLI → default
-    let log_dir = cli
-        .logdir
-        .as_deref()
-        .unwrap_or(DEFAULT_LOGDIR);
+    let log_dir = cli.logdir.as_deref().unwrap_or(DEFAULT_LOGDIR);
     let log_dir = std::fs::canonicalize(log_dir)
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(log_dir));
 
@@ -183,9 +184,7 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
         if p.is_absolute() {
             p
         } else {
-            std::env::current_dir()
-                .map(|cwd| cwd.join(&p))
-                .unwrap_or(p)
+            std::env::current_dir().map(|cwd| cwd.join(&p)).unwrap_or(p)
         }
     };
 
@@ -268,7 +267,9 @@ fn rotate_run_dir(run_dir: &std::path::Path) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn map_resolver(yaml: &super::yaml_config::YamlResolverConfig) -> crate::pod::resolver::ResolverConfig {
+fn map_resolver(
+    yaml: &super::yaml_config::YamlResolverConfig,
+) -> crate::pod::resolver::ResolverConfig {
     crate::pod::resolver::ResolverConfig {
         resolver_type: yaml.resolver_type.clone(),
         configs: yaml.configs.clone(),
@@ -282,8 +283,7 @@ fn regenerate_vk_prconfig(
     sys: &super::yaml_config::YamlSysConfig,
     tls: &ServerTlsConfig,
 ) -> Result<(), String> {
-    let ca_b64 = cert_source_to_b64(&tls.client_ca)
-        .unwrap_or_default();
+    let ca_b64 = cert_source_to_b64(&tls.client_ca).unwrap_or_default();
 
     // Preserve existing client certs from the vk-prconfig if present
     let vk_path = configdir.join(VK_PRCONFIG_FILENAME);
@@ -387,10 +387,7 @@ mod tests {
 
     #[test]
     fn resolve_config_auto_generates_pki() {
-        let tmp = std::env::temp_dir().join(format!(
-            "pr-resolve-test-{}",
-            std::process::id(),
-        ));
+        let tmp = std::env::temp_dir().join(format!("pr-resolve-test-{}", std::process::id(),));
         let configdir = tmp.join("config");
         let workdir = tmp.join("work");
         let logdir = tmp.join("log");
@@ -409,9 +406,15 @@ mod tests {
 
         let config = resolve_config(&cli).unwrap();
 
-        assert!(config.tls_enabled(), "TLS should be enabled with auto-gen certs");
+        assert!(
+            config.tls_enabled(),
+            "TLS should be enabled with auto-gen certs"
+        );
         assert!(config.tls_configured(), "mTLS should be fully configured");
-        assert_eq!(config.bind_address, format!("{DEFAULT_ADDRESS}:{DEFAULT_PORT}"));
+        assert_eq!(
+            config.bind_address,
+            format!("{DEFAULT_ADDRESS}:{DEFAULT_PORT}")
+        );
         assert_eq!(config.nodename, DEFAULT_NODENAME);
         assert_eq!(config.namespace, DEFAULT_NAMESPACE);
 
@@ -458,7 +461,11 @@ maxPods: 42
 propagateEnv: false
 keepDeletedPodDir: true
 "#;
-        std::fs::write(configdir.join(crate::config::template::PRSYSCONFIG_FILENAME), syscfg).unwrap();
+        std::fs::write(
+            configdir.join(crate::config::template::PRSYSCONFIG_FILENAME),
+            syscfg,
+        )
+        .unwrap();
 
         let cli = CliArgs {
             kubeconfig: Some("/my/kubeconfig".into()),
@@ -572,7 +579,10 @@ keepDeletedPodDir: true
         };
 
         let c = resolve_config(&cli).unwrap();
-        assert_eq!(c.images_dir, std::path::PathBuf::from("/var/lib/kminus/images"));
+        assert_eq!(
+            c.images_dir,
+            std::path::PathBuf::from("/var/lib/kminus/images")
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -701,7 +711,11 @@ capacity:
   memoryGB: 256
   pods: 500
 "#;
-        std::fs::write(configdir.join(crate::config::template::PRSYSCONFIG_FILENAME), syscfg).unwrap();
+        std::fs::write(
+            configdir.join(crate::config::template::PRSYSCONFIG_FILENAME),
+            syscfg,
+        )
+        .unwrap();
 
         let cli = CliArgs {
             kubeconfig: None,

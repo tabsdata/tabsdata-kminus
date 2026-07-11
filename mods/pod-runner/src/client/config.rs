@@ -216,10 +216,8 @@ metricsUrl: "http://localhost:3001"
 
     #[test]
     fn from_file_reads_yaml() {
-        let tmp = std::env::temp_dir().join(format!(
-            "vkprconfig-test-{}.yaml",
-            std::process::id(),
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("vkprconfig-test-{}.yaml", std::process::id(),));
         std::fs::write(&tmp, b"url: \"http://test:3000\"\n").unwrap();
 
         let config = VKPRConfig::from_file(&tmp).unwrap();
@@ -227,5 +225,4 @@ metricsUrl: "http://localhost:3001"
 
         let _ = std::fs::remove_file(&tmp);
     }
-
 }

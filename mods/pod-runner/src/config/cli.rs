@@ -100,13 +100,20 @@ mod tests {
     fn parse_all_args() {
         let args = CliArgs::try_parse_from([
             "prog",
-            "--kubeconfig", "/etc/kube/config",
-            "--configdir", "/etc/pr",
-            "--workdir", "/var/pr",
-            "--logdir", "/var/log/pr",
-            "--imagesdir", "/var/lib/kminus/images",
-            "--port", "9000",
-            "--metrics-port", "9001",
+            "--kubeconfig",
+            "/etc/kube/config",
+            "--configdir",
+            "/etc/pr",
+            "--workdir",
+            "/var/pr",
+            "--logdir",
+            "/var/log/pr",
+            "--imagesdir",
+            "/var/lib/kminus/images",
+            "--port",
+            "9000",
+            "--metrics-port",
+            "9001",
         ])
         .unwrap();
         assert_eq!(args.kubeconfig.as_deref(), Some("/etc/kube/config"));

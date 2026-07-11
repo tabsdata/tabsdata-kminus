@@ -35,8 +35,8 @@ use tracing::debug;
 use crate::pod::executor::ContainerRole;
 use crate::spec::constants::*;
 use crate::spec::status::{
-    ContainerStateRunning, ContainerStateTerminated, ContainerStateWaiting,
-    ContainerStatus, PodCondition, PodStatus,
+    ContainerStateRunning, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus,
+    PodCondition, PodStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -293,11 +293,7 @@ impl ContainerLifecycle {
     ///
     /// Returns [`TransitionError`] if the container is not currently in
     /// the `Running` state.
-    pub fn on_exited(
-        &mut self,
-        exit_code: i32,
-        finished_at: &str,
-    ) -> Result<(), TransitionError> {
+    pub fn on_exited(&mut self, exit_code: i32, finished_at: &str) -> Result<(), TransitionError> {
         match &self.state {
             ContainerState::Running { started_at } => {
                 let reason = TerminatedReason::from_exit_code(exit_code);
@@ -336,12 +332,7 @@ impl ContainerLifecycle {
     /// Returns `Ok(threshold_reached)` — `true` iff the new consecutive
     /// count is equal to (or greater than, for successive re-observations)
     /// the provided threshold in the current direction.
-    pub fn on_probe_result(
-        &mut self,
-        kind: ProbeKind,
-        success: bool,
-        threshold: u32,
-    ) -> bool {
+    pub fn on_probe_result(&mut self, kind: ProbeKind, success: bool, threshold: u32) -> bool {
         // Ensure probe is registered
         self.add_probe(kind);
 
@@ -399,12 +390,24 @@ impl ContainerLifecycle {
 
     // -- accessors ---------------------------------------------------------
 
-    pub fn name(&self) -> &str { &self.name }
-    pub fn role(&self) -> ContainerRole { self.role }
-    pub fn state(&self) -> &ContainerState { &self.state }
-    pub fn is_ready(&self) -> bool { self.ready }
-    pub fn is_started(&self) -> bool { self.started }
-    pub fn restart_count(&self) -> u32 { self.restart_count }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn role(&self) -> ContainerRole {
+        self.role
+    }
+    pub fn state(&self) -> &ContainerState {
+        &self.state
+    }
+    pub fn is_ready(&self) -> bool {
+        self.ready
+    }
+    pub fn is_started(&self) -> bool {
+        self.started
+    }
+    pub fn restart_count(&self) -> u32 {
+        self.restart_count
+    }
 
     pub fn is_running(&self) -> bool {
         matches!(self.state, ContainerState::Running { .. })
@@ -558,10 +561,7 @@ impl PodLifecycle {
 
     // -- transitions -------------------------------------------------------
 
-    fn require_non_terminal(
-        &self,
-        target: &str,
-    ) -> Result<(), TransitionError> {
+    fn require_non_terminal(&self, target: &str) -> Result<(), TransitionError> {
         if self.phase.is_terminal() {
             return Err(TransitionError {
                 machine: MACHINE_POD,
@@ -602,11 +602,7 @@ impl PodLifecycle {
     }
 
     /// Set the `Initialized` condition to False.
-    pub fn mark_not_initialized(
-        &mut self,
-        reason: &str,
-        now: &str,
-    ) -> Result<(), TransitionError> {
+    pub fn mark_not_initialized(&mut self, reason: &str, now: &str) -> Result<(), TransitionError> {
         self.require_non_terminal(POD_TARGET_NOT_INITIALIZED)?;
         debug!(reason, "Pod condition: Initialized=False");
         self.set_condition(
@@ -689,10 +685,7 @@ impl PodLifecycle {
     /// current state of main containers. A container counts as "ready" if
     /// `ready == true` OR it is terminated.
     pub fn update_readiness(&mut self, now: &str) {
-        let all_ready = self
-            .containers
-            .iter()
-            .all(|c| c.ready || c.is_terminated());
+        let all_ready = self.containers.iter().all(|c| c.ready || c.is_terminated());
         if all_ready {
             self.set_condition(
                 PodConditionKey::ContainersReady,
@@ -701,13 +694,7 @@ impl PodLifecycle {
                 "",
                 now,
             );
-            self.set_condition(
-                PodConditionKey::Ready,
-                true,
-                REASON_POD_READY,
-                "",
-                now,
-            );
+            self.set_condition(PodConditionKey::Ready, true, REASON_POD_READY, "", now);
         } else {
             self.set_condition(
                 PodConditionKey::ContainersReady,
@@ -795,16 +782,30 @@ impl PodLifecycle {
         }
     }
 
-    pub fn containers(&self) -> &[ContainerLifecycle] { &self.containers }
-    pub fn init_containers(&self) -> &[ContainerLifecycle] { &self.init_containers }
+    pub fn containers(&self) -> &[ContainerLifecycle] {
+        &self.containers
+    }
+    pub fn init_containers(&self) -> &[ContainerLifecycle] {
+        &self.init_containers
+    }
 
     // -- accessors ---------------------------------------------------------
 
-    pub fn phase(&self) -> PodPhase { self.phase }
-    pub fn message(&self) -> &str { &self.message }
-    pub fn start_time(&self) -> &str { &self.start_time }
-    pub fn last_transition_time(&self) -> &str { &self.last_transition_time }
-    pub fn is_terminal(&self) -> bool { self.phase.is_terminal() }
+    pub fn phase(&self) -> PodPhase {
+        self.phase
+    }
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+    pub fn start_time(&self) -> &str {
+        &self.start_time
+    }
+    pub fn last_transition_time(&self) -> &str {
+        &self.last_transition_time
+    }
+    pub fn is_terminal(&self) -> bool {
+        self.phase.is_terminal()
+    }
 
     pub fn condition(&self, key: PodConditionKey) -> Option<&ConditionState> {
         self.conditions.get(&key)
@@ -841,8 +842,12 @@ impl PodLifecycle {
             if let Some(cond) = self.conditions.get(&key) {
                 status.conditions.push(PodCondition {
                     condition_type: key.as_str().to_string(),
-                    status: if cond.status { CONDITION_TRUE } else { CONDITION_FALSE }
-                        .to_string(),
+                    status: if cond.status {
+                        CONDITION_TRUE
+                    } else {
+                        CONDITION_FALSE
+                    }
+                    .to_string(),
                     last_transition_time: cond.last_transition_time.clone(),
                     reason: cond.reason.clone(),
                     message: cond.message.clone(),
@@ -873,11 +878,7 @@ mod tests {
     }
 
     fn pod_simple() -> PodLifecycle {
-        PodLifecycle::new(
-            vec![],
-            vec![("app".to_string(), ContainerRole::Main)],
-            TS,
-        )
+        PodLifecycle::new(vec![], vec![("app".to_string(), ContainerRole::Main)], TS)
     }
 
     // -- ContainerLifecycle transitions ------------------------------------
@@ -936,7 +937,12 @@ mod tests {
         c.on_started("T1").unwrap();
         c.on_exited(3, "T2").unwrap();
         match c.state() {
-            ContainerState::Terminated { started_at, finished_at, exit_code, reason } => {
+            ContainerState::Terminated {
+                started_at,
+                finished_at,
+                exit_code,
+                reason,
+            } => {
                 assert_eq!(started_at, "T1");
                 assert_eq!(finished_at, "T2");
                 assert_eq!(*exit_code, 3);
@@ -1117,17 +1123,17 @@ mod tests {
         // a running but not ready, b still waiting
         p.container_mut("a").unwrap().on_started(TS).unwrap();
         p.update_readiness(TS2);
-        assert!(!p.condition(PodConditionKey::ContainersReady).unwrap().status);
+        assert!(
+            !p.condition(PodConditionKey::ContainersReady)
+                .unwrap()
+                .status
+        );
         assert!(!p.condition(PodConditionKey::Ready).unwrap().status);
     }
 
     #[test]
     fn update_readiness_all_ready_running_marks_ready() {
-        let mut p = PodLifecycle::new(
-            vec![],
-            vec![("a".to_string(), ContainerRole::Main)],
-            TS,
-        );
+        let mut p = PodLifecycle::new(vec![], vec![("a".to_string(), ContainerRole::Main)], TS);
         p.container_mut("a").unwrap().on_started(TS).unwrap();
         p.container_mut("a").unwrap().set_ready(true);
         p.update_readiness(TS2);
@@ -1190,11 +1196,11 @@ mod tests {
         assert_eq!(ps.container_statuses[0].name, "a");
         assert_eq!(ps.init_container_statuses[0].name, "i");
         // Scheduled condition present
-        assert!(ps
-            .conditions
-            .iter()
-            .any(|c| c.condition_type == CONDITION_POD_SCHEDULED
-                && c.status == CONDITION_TRUE));
+        assert!(
+            ps.conditions
+                .iter()
+                .any(|c| c.condition_type == CONDITION_POD_SCHEDULED && c.status == CONDITION_TRUE)
+        );
     }
 
     #[test]
@@ -1224,11 +1230,17 @@ mod tests {
         p.start_running(TS2).unwrap();
         p.mark_disruption_target(TS2);
         let ps = p.to_pod_status();
-        assert!(ps.conditions.iter().any(|c| c.condition_type
-            == CONDITION_DISRUPTION_TARGET
-            && c.status == CONDITION_TRUE));
-        assert!(ps.conditions.iter().any(|c| c.condition_type == CONDITION_READY
-            && c.status == CONDITION_FALSE));
+        assert!(
+            ps.conditions
+                .iter()
+                .any(|c| c.condition_type == CONDITION_DISRUPTION_TARGET
+                    && c.status == CONDITION_TRUE)
+        );
+        assert!(
+            ps.conditions
+                .iter()
+                .any(|c| c.condition_type == CONDITION_READY && c.status == CONDITION_FALSE)
+        );
     }
 
     #[test]

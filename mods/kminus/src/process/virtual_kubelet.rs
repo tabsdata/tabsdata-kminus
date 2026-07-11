@@ -2,9 +2,10 @@
 
 //! Virtual-kubelet subprocess: startup, readiness, status gathering.
 
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
@@ -16,9 +17,15 @@ use crate::system::proc::resolve_binary;
 /// Binary name for the virtual-kubelet subprocess.
 pub const BIN: &str = "virtual-kubelet";
 
-/// Spawn the virtual-kubelet. The VK has no clean readiness signal,
-/// so we wait for its pids dir to appear under `<workdir>/data/` and
-/// then warm up for a few seconds.
+/// How long to wait for the kubelet API port to start accepting connections.
+const PORT_READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Interval between readiness checks.
+const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Per-attempt TCP connect timeout for the kubelet port probe.
+const PORT_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Spawn the virtual-kubelet, then wait until its kubelet API port is
+/// accepting connections (the process is up and serving) before returning.
 pub fn start(
     workdir: &Path,
     configdir: &Path,
@@ -64,9 +71,52 @@ pub fn start(
     if !wait_for_file(&vk_pids_dir, Duration::from_secs(15)) {
         warn!("{} may not have fully started, continuing...", BIN);
     }
-    std::thread::sleep(Duration::from_secs(5));
+    wait_until_ready(port_vk, vk.id());
     info!(pid = vk.id(), "{} started", BIN);
     vk
+}
+
+/// Poll until the virtual-kubelet's kubelet API port accepts a TCP
+/// connection — i.e. the process is up and serving — or the timeout elapses.
+/// Replaces a fixed warm-up sleep, so startup returns as soon as the VK is
+/// serving rather than after a worst-case delay.
+fn wait_until_ready(port_vk: &str, pid: u32) {
+    let start = Instant::now();
+    let deadline = start + PORT_READY_TIMEOUT;
+    loop {
+        if kubelet_port_open(port_vk) {
+            info!(
+                pid,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "{} kubelet port ready",
+                BIN
+            );
+            return;
+        }
+        if Instant::now() >= deadline {
+            warn!(
+                pid,
+                "{} kubelet port {} not accepting connections after {}s; continuing",
+                BIN,
+                port_vk,
+                PORT_READY_TIMEOUT.as_secs()
+            );
+            return;
+        }
+        std::thread::sleep(READY_POLL_INTERVAL);
+    }
+}
+
+/// Whether the kubelet API port accepts a TCP connection on loopback.
+fn kubelet_port_open(port_vk: &str) -> bool {
+    let Ok(port) = port_vk.parse::<u16>() else {
+        return false;
+    };
+    TcpStream::connect_timeout(
+        &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        PORT_CONNECT_TIMEOUT,
+    )
+    .is_ok()
 }
 
 /// The virtual-kubelet's pids directory under `<workdir>/data/<BIN>/pids`.

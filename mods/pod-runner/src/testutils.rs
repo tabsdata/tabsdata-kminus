@@ -33,9 +33,8 @@ use chrono::Utc;
 
 /// Session-wide timestamp, set once per test run. All test directories
 /// created during the same `cargo test` invocation share this timestamp.
-pub static SESSION_TS: LazyLock<String> = LazyLock::new(|| {
-    Utc::now().format("%Y%m%dT%H%M%S%.3f").to_string()
-});
+pub static SESSION_TS: LazyLock<String> =
+    LazyLock::new(|| Utc::now().format("%Y%m%dT%H%M%S%.3f").to_string());
 
 // ---------------------------------------------------------------------------
 // test_dir! macro
@@ -90,9 +89,7 @@ macro_rules! test_dir {
         };
         $crate::testutils::make_test_dir(without_crate)
     }};
-    ($subdir:expr) => {{
-        $crate::testutils::subdir(&test_dir!(), $subdir)
-    }};
+    ($subdir:expr) => {{ $crate::testutils::subdir(&test_dir!(), $subdir) }};
 }
 
 pub(crate) use test_dir;
@@ -182,7 +179,9 @@ mod tests {
         let suffix = &name["secret-".len()..];
         assert_eq!(suffix.len(), 26, "suffix: {}", suffix);
         assert!(
-            suffix.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            suffix
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
             "suffix not lowercase base32: {}",
             suffix,
         );
