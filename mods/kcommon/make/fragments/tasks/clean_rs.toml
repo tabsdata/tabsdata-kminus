@@ -6,7 +6,7 @@
 plugin = "td-task-tracker"
 category = "01 - Clean"
 description = "Task 'clean' for kcommon project"
-cwd = "${KM_ROOT}/mods/kcommon"
+cwd = "${KM_ROOT}"
 script_runner = "@duckscript"
 script = '''
     !include_files ./make/libraries/log.ds

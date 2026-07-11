@@ -6,13 +6,13 @@
 plugin = "td-task-tracker"
 category = "03 - Build"
 description = "Task 'build' for kcommon project"
-cwd = "${KM_ROOT}/mods/kcommon"
+cwd = "${KM_ROOT}"
 script_runner = "@duckscript"
 script = '''
     !include_files ./make/libraries/log.ds
 
-    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} build %{td-rust-quiet} --locked %{td-target-token} %{td-target} --profile ${td-profile} --workspace --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML} --all-features --lib"
-    exec --fail-on-error ${td-cargo} %{td-toolchain-token}%{td-toolchain} build %{td-rust-quiet} --locked %{td-target-token} %{td-target} --profile ${td-profile} --workspace --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML} --all-features --lib
+    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} build %{td-rust-quiet} --locked %{td-target-token} %{td-target} --profile ${td-profile} --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML} --all-features --lib"
+    exec --fail-on-error ${td-cargo} %{td-toolchain-token}%{td-toolchain} build %{td-rust-quiet} --locked %{td-target-token} %{td-target} --profile ${td-profile} --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML} --all-features --lib
 
     td_check_build_folder = set ${td-profile}
     is_dev = eq ${td_check_build_folder} "dev"
