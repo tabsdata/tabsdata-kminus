@@ -13,10 +13,21 @@ script = '''
 
     km_root = get_env KM_ROOT
     profile = get_env profile
+    td-target = get_env td-target
 
-    build_folder = set ${profile}
-    if eq ${profile} "dev"
+    if is_empty ${profile}
         build_folder = set "debug"
+    else
+        is_dev = eq ${profile} "dev"
+        if ${is_dev}
+            build_folder = set "debug"
+        else
+            build_folder = set ${profile}
+        end
+    end
+
+    if not is_empty ${td-target}
+        build_folder = set ${td-target}/${build_folder}
     end
 
     dist_folder = concat ${km_root} "/target/dist"
