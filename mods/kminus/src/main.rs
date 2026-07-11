@@ -8,6 +8,9 @@
 //! waits for each to be ready, then stays in the foreground handling
 //! signals. On shutdown (SIGTERM / SIGINT / Ctrl+C) it stops children
 //! in reverse order: virtual-kubelet → pod-runner → control-plane.
+//! `km stop` terminates a running instance from another terminal by
+//! signalling the foreground `km start` process. `km status` reports
+//! which components are alive. `km restart` stops then starts.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -26,7 +29,7 @@ use config::{KM_SYSCONFIG_FILE, KmSysConfig};
 use process::{control_plane, pod_runner, virtual_kubelet};
 use system::file::{CONFIG_DIR, LOG_DIR};
 use system::pid::{
-    BIN_KM, cleanup_stale_pids, kill_descendants, pids_dir, read_pid, remove_pid,
+    BIN_KM, cleanup_stale_pids, is_alive, kill_descendants, pids_dir, read_pid, remove_pid,
     terminate_process, write_pid,
 };
 use system::port::check_port;
@@ -52,6 +55,12 @@ enum Command {
     Create(CreateArgs),
     /// Start a previously created kminus instance from `--workdir`.
     Start(StartArgs),
+    /// Stop a running kminus instance in `--workdir`.
+    Stop(StopArgs),
+    /// Report the status of a kminus instance in `--workdir`.
+    Status(StatusArgs),
+    /// Restart a kminus instance in `--workdir`: stop then start.
+    Restart(StartArgs),
 }
 
 /// Create-time arguments. Writes `kmsysconfig.yaml` and exits.
@@ -101,6 +110,22 @@ struct StartArgs {
     /// `prsysconfig.yaml`, then to `./images`.
     #[arg(long)]
     imagesdir: Option<String>,
+}
+
+/// Stop-time arguments. Terminates a running instance.
+#[derive(Args, Debug)]
+struct StopArgs {
+    /// Working directory of the running instance.
+    #[arg(long)]
+    workdir: String,
+}
+
+/// Status-time arguments. Reports which components are alive.
+#[derive(Args, Debug)]
+struct StatusArgs {
+    /// Working directory of the instance.
+    #[arg(long)]
+    workdir: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +201,27 @@ impl Paths {
 
         let pids = pids_dir(&workdir, BIN_KM);
 
+        Ok(Self {
+            workdir,
+            configdir,
+            logdir,
+            pids,
+        })
+    }
+
+    /// Resolve paths for stop/status of an existing instance. Only the
+    /// workdir and pids directory are meaningful here; configdir/logdir
+    /// are set to their defaults but not required to exist.
+    fn for_existing(workdir: &str) -> Result<Self, String> {
+        let workdir = PathBuf::from(workdir);
+        if !workdir.exists() {
+            return Err(format!("Folder '{}' does not exist.", workdir.display()));
+        }
+        let workdir = fs::canonicalize(&workdir)
+            .map_err(|e| format!("Cannot resolve folder '{}': {e}", workdir.display()))?;
+        let configdir = workdir.join(CONFIG_DIR);
+        let logdir = workdir.join(LOG_DIR);
+        let pids = pids_dir(&workdir, BIN_KM);
         Ok(Self {
             workdir,
             configdir,
@@ -517,6 +563,21 @@ fn command_start(args: StartArgs) {
         std::process::exit(1);
     });
 
+    // Refuse to start over a live instance. `cleanup_stale_pids` (below)
+    // would otherwise silently kill the running km and take over, which
+    // reads as a no-op to the user. Report status and exit instead.
+    if read_pid(&paths.pids, BIN_KM).is_some_and(is_alive) {
+        println!();
+        println!("Tabsdata K- (K minus) is already running");
+        println!("  workdir          {}", paths.workdir.display());
+        println!();
+        print_instance_status(&paths);
+        println!();
+        println!("To stop it:    km stop --workdir {}", args.workdir);
+        println!("To restart it: km restart --workdir {}", args.workdir);
+        std::process::exit(1);
+    }
+
     let mut sys_cfg = KmSysConfig::load(&paths.configdir).unwrap_or_else(|e| {
         eprintln!(
             "ERROR: '{}' is not a kminus instance: {e}",
@@ -654,6 +715,134 @@ fn command_start(args: StartArgs) {
     }
 }
 
+/// Grace period km's own signal-driven teardown may need before `stop`
+/// escalates to killing the stack directly. Sized to cover the
+/// pod-runner drain (see [`POD_RUNNER_SHUTDOWN_GRACE`]) plus overhead for
+/// the other components and process bookkeeping.
+const STOP_WAIT: Duration = Duration::from_secs(120);
+
+/// Stop a running kminus instance in `args.workdir`.
+///
+/// The running `km start` process owns orderly teardown via its
+/// signal-driven shutdown thread, so the clean path is simply to signal
+/// it and wait for it to exit: it stops virtual-kubelet → pod-runner →
+/// control-plane in order (draining pods) and removes the PID files. If
+/// that process is not alive (crashed, or never fully started) we fall
+/// back to tearing the stack down directly from the recorded PID files,
+/// which also reaps any orphaned children.
+fn command_stop(args: StopArgs) {
+    let paths = Paths::for_existing(&args.workdir).unwrap_or_else(|e| {
+        eprintln!("ERROR: {e}");
+        std::process::exit(1);
+    });
+
+    let km_pid = read_pid(&paths.pids, BIN_KM);
+    match km_pid {
+        Some(pid) if is_alive(pid) => {
+            println!("Stopping Tabsdata K- (K minus) [km pid={pid}]...");
+            // Signal the foreground `km start` and let its own shutdown
+            // thread drive the orderly teardown, then wait for it to exit.
+            terminate_process(pid, STOP_WAIT);
+            if is_alive(pid) {
+                eprintln!(
+                    "ERROR: km (pid={pid}) did not stop within {}s; forcing teardown.",
+                    STOP_WAIT.as_secs()
+                );
+            }
+            // km's own shutdown thread removes the PID files on a clean
+            // exit, but sweep any it left behind (e.g. it was SIGKILLed
+            // mid-teardown or crashed) so a later `status` reads clean.
+            shutdown_from_pids(&paths);
+            println!("Stopped.");
+        }
+        _ => {
+            // No live km orchestrator. Either it is not running, or it
+            // died leaving children behind. Clean up directly.
+            let stale: Vec<&str> = [virtual_kubelet::BIN, pod_runner::BIN, control_plane::BIN]
+                .into_iter()
+                .filter(|name| read_pid(&paths.pids, name).is_some_and(is_alive))
+                .collect();
+
+            if stale.is_empty() {
+                println!("Tabsdata K- (K minus) is not running.");
+                // Best-effort cleanup of any leftover PID files/dirs.
+                shutdown_from_pids(&paths);
+                return;
+            }
+            println!(
+                "km orchestrator not running; tearing down orphaned components: {}",
+                stale.join(", ")
+            );
+            shutdown_from_pids(&paths);
+            println!("Stopped.");
+        }
+    }
+}
+
+/// One line of status output for a component.
+fn print_component_status(pids: &Path, name: &str) {
+    match read_pid(pids, name) {
+        Some(pid) if is_alive(pid) => println!("  {:<16} running   pid={}", name, pid),
+        Some(pid) => println!("  {:<16} DEAD      pid={} (stale PID file)", name, pid),
+        None => println!("  {:<16} stopped", name),
+    }
+}
+
+/// Render the per-component status block (km, control-plane + children,
+/// pod-runner, virtual-kubelet) for the instance at `paths`. Returns
+/// whether the km orchestrator itself is alive. Shared by `km status`
+/// and the "already running" guard in `km start`.
+fn print_instance_status(paths: &Paths) -> bool {
+    let km_running = read_pid(&paths.pids, BIN_KM).is_some_and(is_alive);
+
+    print_component_status(&paths.pids, BIN_KM);
+    print_component_status(&paths.pids, control_plane::BIN);
+    for (name, pid) in control_plane::read_children(&paths.workdir) {
+        let alive = pid.parse::<u32>().map(is_alive).unwrap_or(false);
+        let state = if alive { "running" } else { "DEAD   " };
+        println!("    {:<14} {}   pid={}", name, state, pid);
+    }
+    print_component_status(&paths.pids, pod_runner::BIN);
+    print_component_status(&paths.pids, virtual_kubelet::BIN);
+
+    km_running
+}
+
+/// Report the status of the kminus instance in `args.workdir`.
+///
+/// Exit code reflects overall state: 0 if the km orchestrator is running,
+/// 3 if it is stopped — mirroring LSB `status` conventions so callers can
+/// script on it.
+fn command_status(args: StatusArgs) {
+    let paths = Paths::for_existing(&args.workdir).unwrap_or_else(|e| {
+        eprintln!("ERROR: {e}");
+        std::process::exit(1);
+    });
+
+    println!();
+    println!("Tabsdata K- (K minus) status");
+    println!("  workdir          {}", paths.workdir.display());
+    println!();
+    let km_running = print_instance_status(&paths);
+    println!();
+
+    if km_running {
+        println!("Overall: running");
+    } else {
+        println!("Overall: stopped");
+        std::process::exit(3);
+    }
+}
+
+/// Restart the kminus instance: stop it (if running), then start it.
+fn command_restart(args: StartArgs) {
+    command_stop(StopArgs {
+        workdir: args.workdir.clone(),
+    });
+    println!();
+    command_start(args);
+}
+
 /// Install the SIGINT/SIGTERM (Ctrl+C/Ctrl+Break) handlers, signal that
 /// they are armed via `armed`, then resolve when a signal arrives. On
 /// Windows, listen for both Ctrl+C and Ctrl+Break — `tdkserver stop`
@@ -692,6 +881,9 @@ fn main() {
     match cli.command {
         Command::Create(args) => command_create(args),
         Command::Start(args) => command_start(args),
+        Command::Stop(args) => command_stop(args),
+        Command::Status(args) => command_status(args),
+        Command::Restart(args) => command_restart(args),
     }
 }
 
@@ -829,6 +1021,37 @@ mod tests {
         .unwrap();
         assert_eq!(paths.configdir, cdir.canonicalize().unwrap());
         assert_eq!(paths.logdir, ldir.canonicalize().unwrap());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- Paths::for_existing ------------------------------------------------
+
+    #[test]
+    fn for_existing_errors_when_workdir_missing() {
+        let dir = tempdir();
+        let workdir = dir.join("does-not-exist");
+        let result = Paths::for_existing(&workdir.to_string_lossy());
+        assert!(result.is_err());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn for_existing_resolves_workdir_and_pids() {
+        let dir = tempdir();
+        let workdir = dir.join("wd");
+        fs::create_dir_all(&workdir).unwrap();
+        let paths = Paths::for_existing(&workdir.to_string_lossy()).unwrap();
+        assert_eq!(paths.workdir, workdir.canonicalize().unwrap());
+        assert!(
+            paths.pids.ends_with(
+                PathBuf::from(system::pid::DATA_DIR)
+                    .join(BIN_KM)
+                    .join(system::pid::PIDS_DIR)
+            )
+        );
+        // configdir/logdir default under workdir but need not exist.
+        assert_eq!(paths.configdir, paths.workdir.join(CONFIG_DIR));
+        assert_eq!(paths.logdir, paths.workdir.join(LOG_DIR));
         fs::remove_dir_all(&dir).ok();
     }
 }
