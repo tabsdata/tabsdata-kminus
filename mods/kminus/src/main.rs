@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use file_rotate::{ContentLimit, FileRotate, compression::Compression, suffix::AppendCount};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod config;
 mod process;
@@ -36,6 +36,39 @@ use system::port::check_port;
 
 /// Filename of km's own log file under `<logdir>/`.
 const KM_LOG_FILE: &str = "km.log";
+
+/// Development-only env var honored by the control-plane subprocess: when set
+/// to "true", the admin token written to `kubeconfig.yaml` is derived
+/// deterministically from the current username instead of being random. km
+/// inherits its environment to the control-plane, so setting it before
+/// `km start` is enough; km reads it here only to warn — on both `km create`
+/// and every `km start`/`km restart` — that the fixed dev token is in use.
+const FIXED_AUTH_TOKEN_ENV: &str = "TD_DEV_FIXED_AUTH_TOKEN";
+
+/// Whether the [`FIXED_AUTH_TOKEN_ENV`] dev override is enabled.
+fn fixed_auth_token_enabled() -> bool {
+    env_flag_enabled(std::env::var(FIXED_AUTH_TOKEN_ENV).ok().as_deref())
+}
+
+/// Whether an env-var value denotes an enabled boolean flag: present and
+/// equal to "true" (case-insensitive). Pure so it is testable without
+/// mutating process-global environment state.
+fn env_flag_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
+/// Print a prominent warning (stdout + log) that the development fixed-token
+/// override is active, so the fixed, non-secret `admin` credential in
+/// `kubeconfig.yaml` is never mistaken for a secure default.
+fn warn_fixed_auth_token() {
+    println!(
+        "  WARNING: {FIXED_AUTH_TOKEN_ENV}=true — the 'admin' token in kubeconfig.yaml is a fixed,"
+    );
+    println!("           non-secret value derived from your username. For development only.");
+    warn!(
+        "{FIXED_AUTH_TOKEN_ENV}=true: 'admin' token in kubeconfig.yaml is a fixed dev value derived from the username"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -536,6 +569,10 @@ fn command_create(args: CreateArgs) {
     println!();
     println!("Tabsdata K- (K minus) instance created");
     println!();
+    if fixed_auth_token_enabled() {
+        warn_fixed_auth_token();
+        println!();
+    }
     println!("  workdir    {}", paths.workdir.display());
     println!("  configdir  {}", paths.configdir.display());
     println!();
@@ -614,6 +651,11 @@ fn command_start(args: StartArgs) {
         println!("Tabsdata K- (K minus) starting");
     }
     println!();
+
+    if fixed_auth_token_enabled() {
+        warn_fixed_auth_token();
+        println!();
+    }
 
     info!(
         workdir = %paths.workdir.display(),
@@ -904,6 +946,20 @@ mod tests {
         let dir = env::temp_dir().join(format!("km-main-{}-{}", std::process::id(), n));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // -- env_flag_enabled --------------------------------------------------
+
+    #[test]
+    fn env_flag_enabled_only_for_true() {
+        assert!(env_flag_enabled(Some("true")));
+        assert!(env_flag_enabled(Some("TRUE")));
+        assert!(env_flag_enabled(Some("True")));
+        assert!(!env_flag_enabled(Some("false")));
+        assert!(!env_flag_enabled(Some("1")));
+        assert!(!env_flag_enabled(Some("yes")));
+        assert!(!env_flag_enabled(Some("")));
+        assert!(!env_flag_enabled(None));
     }
 
     // -- clear_regenerated_configs -----------------------------------------

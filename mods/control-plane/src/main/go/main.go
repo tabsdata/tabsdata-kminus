@@ -7,15 +7,19 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/csv"
 	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
+	mathrand "math/rand"
 	"net"
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -78,6 +82,13 @@ func loadOrCreateCPSysConfig(configDir string) (cpSysConfig, error) {
 // Pure CSV — the apiserver's parser does not support comment lines.
 const tokensFile = "tokens.csv"
 
+// fixedAuthTokenEnv, when set to "true", is a DEVELOPMENT-ONLY override that
+// makes the admin token deterministic — derived from the current OS username
+// instead of random. It yields a stable, predictable admin credential in
+// kubeconfig.yaml across fresh instances and machines (handy for scripting
+// and tests) at the cost of secrecy. Never enable it for a real deployment.
+const fixedAuthTokenEnv = "TD_DEV_FIXED_AUTH_TOKEN"
+
 // Authenticated identities provisioned in tokens.csv.
 const (
 	adminUserName = "admin"
@@ -96,11 +107,62 @@ var tokenUsers = []struct {
 	{kcmUserName, "system:masters"},
 }
 
+func currentUsername() string {
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		return u.Username
+	}
+	for _, key := range []string{"USER", "USERNAME"} {
+		if v := os.Getenv(key); v != "" {
+			return v
+		}
+	}
+	return "unknown"
+}
+
+// creates a fixed token from the given seed.
+func seededToken(seed string) string {
+	sum := sha256.Sum256([]byte(seed))
+	rng := mathrand.New(mathrand.NewSource(int64(binary.BigEndian.Uint64(sum[:8]))))
+	raw := make([]byte, 32)
+	rng.Read(raw)
+	return hex.EncodeToString(raw)
+}
+
+func fixedAdminToken() string {
+	if !strings.EqualFold(os.Getenv(fixedAuthTokenEnv), "true") {
+		return ""
+	}
+	return seededToken(currentUsername())
+}
+
+// writeTokensFile writes tokens.csv from the token map, one record per
+// provisioned user: token,user,uid,"group1,group2". The apiserver reads this
+// as its --token-auth-file, so it must always match the kubeconfigs.
+func writeTokensFile(path string, tokens map[string]string) error {
+	var lines []string
+	for _, u := range tokenUsers {
+		lines = append(lines, fmt.Sprintf("%s,%s,%s,%q", tokens[u.name], u.name, u.name, u.groups))
+	}
+	content := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
+}
+
 // loadOrCreateTokens reads tokens.csv or creates it with fresh random
 // tokens. Returns a map of user name -> token. File format (one record
 // per user): token,user,uid,"group1,group2".
+//
+// When the TD_DEV_FIXED_AUTH_TOKEN dev override is enabled, the admin token is
+// forced to a deterministic value derived from the current OS username. This
+// applies on every startup — including over an existing tokens.csv, which is
+// rewritten so the apiserver's --token-auth-file stays in sync with the admin
+// kubeconfig — while the other users keep their existing (random) tokens.
 func loadOrCreateTokens(configDir string) (map[string]string, error) {
 	path := filepath.Join(configDir, tokensFile)
+	fixedAdmin := fixedAdminToken()
+
 	if _, err := os.Stat(path); err == nil {
 		file, err := os.Open(path)
 		if err != nil {
@@ -124,23 +186,29 @@ func loadOrCreateTokens(configDir string) (map[string]string, error) {
 				return nil, fmt.Errorf("%s: no token for user %q (delete the file to regenerate it)", path, u.name)
 			}
 		}
+		if fixedAdmin != "" && tokens[adminUserName] != fixedAdmin {
+			tokens[adminUserName] = fixedAdmin
+			if err := writeTokensFile(path, tokens); err != nil {
+				return nil, err
+			}
+		}
 		return tokens, nil
 	}
 
 	tokens := make(map[string]string)
-	var lines []string
 	for _, u := range tokenUsers {
+		if u.name == adminUserName && fixedAdmin != "" {
+			tokens[u.name] = fixedAdmin
+			continue
+		}
 		raw := make([]byte, 32)
 		if _, err := rand.Read(raw); err != nil {
 			return nil, fmt.Errorf("generate token: %w", err)
 		}
-		token := hex.EncodeToString(raw)
-		tokens[u.name] = token
-		lines = append(lines, fmt.Sprintf("%s,%s,%s,%q", token, u.name, u.name, u.groups))
+		tokens[u.name] = hex.EncodeToString(raw)
 	}
-	content := strings.Join(lines, "\n") + "\n"
-	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
-		return nil, fmt.Errorf("write %s: %w", path, err)
+	if err := writeTokensFile(path, tokens); err != nil {
+		return nil, err
 	}
 	return tokens, nil
 }
