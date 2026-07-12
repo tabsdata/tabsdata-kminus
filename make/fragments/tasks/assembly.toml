@@ -36,12 +36,18 @@ script = '''
     end
     mkdir ${dist_folder}
 
+    native_binaries = array
+
     go_modules = array control-plane virtual-kubelet
     for go_module in ${go_modules}
         src = concat ${km_root} "/mods/" ${go_module} "/target/" ${go_module}
         if is_file ${src}
             dst = concat ${dist_folder} "/" ${go_module}
             cp ${src} ${dst}
+            info "🔎 Native check: added Go binary '${dst}'"
+            array_push ${native_binaries} ${dst}
+        else
+            info "🔎 Native check: Go binary not found (skipped): '${src}'"
         end
     end
 
@@ -56,6 +62,10 @@ script = '''
         if is_file ${src}
             dst = concat ${dist_folder} "/" ${rs_binary}
             cp ${src} ${dst}
+            info "🔎 Native check: added Rust binary '${dst}'"
+            array_push ${native_binaries} ${dst}
+        else
+            info "🔎 Native check: Rust binary not found (skipped): '${src}'"
         end
         rs_index = calc ${rs_index} + 1
     end
@@ -78,6 +88,15 @@ script = '''
                 end
             end
         end
+    end
+
+    native_count = array_length ${native_binaries}
+    if greater_than ${native_count} 0
+        native_files = array_join ${native_binaries} " "
+        info "🔎 Native check: running check on ${native_count} binaries"
+        exec --fail-on-error python ${CHECK_NATIVE_LIBS_SCRIPT} files %{native_files}
+    else
+        info "🔎 Native check: no km binaries collected; skipping check"
     end
 
     info "🧩 Distribution folder: ${dist_folder}"

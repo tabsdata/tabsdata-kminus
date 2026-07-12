@@ -27,6 +27,17 @@ script = '''
         debug "🎯 Building Go for host target"
     end
 
+    build_os = os_family
+    building_darwin = eq ${go_os} "darwin"
+    building_host_mac = eq ${build_os} "mac"
+    if is_empty ${go_os}
+        building_darwin = set ${building_host_mac}
+    end
+    if ${building_darwin}
+        set_env CGO_CFLAGS "-Wno-gnu-folding-constant"
+        debug "🍎 Suppressing clang GNU-folding warning for cgo (go-m1cpu on darwin)"
+    end
+
     source_folder = set "${KM_ROOT}/mods/virtual-kubelet/src/main/go"
     target_folder = set "${KM_ROOT}/mods/virtual-kubelet/target"
     output_file = concat ${target_folder} "/virtual-kubelet" ${binary_extension}
