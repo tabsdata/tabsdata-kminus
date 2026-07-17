@@ -24,6 +24,6 @@ script = '''
     if not ${td_target_empty}
         td_check_build_folder = concat ${td_target_value} "/" ${td_check_build_folder}
     end
-    td_check_target_folder = concat ${PROJECT_RS_POD_RUNNER_CARGO_FOLDER} "target/" ${td_check_build_folder}
+    td_check_target_folder = concat ${PROJECT_RS_POD_RUNNER_FOLDER} "/target/" ${td_check_build_folder}
     exec --fail-on-error python ${CHECK_NATIVE_LIBS_SCRIPT} cargo ${PROJECT_RS_POD_RUNNER_CARGO_TOML} ${td_check_target_folder}
 '''
