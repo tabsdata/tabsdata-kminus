@@ -4,13 +4,18 @@
 //!
 //! Lookup chain (first hit wins):
 //!   1. Same folder as the running km executable.
-//!   2. `<sys.prefix>/<LIBEXEC_DIR>/<TABSDATA_DIR>/<name>` (Python wheel
+//!   2. `<km-venv>/<LIBEXEC_DIR>/<TABSDATA_DIR>/<name>`, where `<km-venv>` is
+//!      the parent of the km executable's folder (`<venv>/Scripts` on Windows,
+//!      `<venv>/bin` on POSIX). Independent of any `python` on `PATH`, so it
+//!      resolves against the venv that actually owns km — not whatever
+//!      interpreter PATH happens to point at (e.g. a hosted-tool Python on CI).
+//!   3. `<sys.prefix>/<LIBEXEC_DIR>/<TABSDATA_DIR>/<name>` (Python wheel
 //!      off-PATH install).
-//!   3. `<sys.prefix>/<scripts>/<name>` (Python wheel on-PATH —
+//!   4. `<sys.prefix>/<scripts>/<name>` (Python wheel on-PATH —
 //!      `bin` on POSIX, `Scripts` on Windows).
-//!   4. The system `PATH`.
+//!   5. The system `PATH`.
 //!
-//! Steps 2 and 3 require a working `python` (or `python3`) on `PATH`;
+//! Steps 3 and 4 require a working `python` (or `python3`) on `PATH`;
 //! if Python is unavailable, those steps are silently skipped. If
 //! nothing matches, the bare name is returned so the caller surfaces a
 //! clear spawn-time error rather than a silent miss here.
@@ -43,17 +48,21 @@ const SCRIPTS: &str = "scripts";
 pub fn resolve_binary(name: &str) -> PathBuf {
     let exe_name = with_exe_extension(name);
 
-    let sibling = resolve_bin_dir().join(&exe_name);
+    let sibling_dir = resolve_bin_dir();
+    let sibling = sibling_dir.join(&exe_name);
     if sibling.is_file() {
         return sibling;
     }
 
+    if let Some(venv_root) = sibling_dir.parent() {
+        let self_libexec = venv_root.join(LIBEXEC_DIR).join(TABSDATA_DIR).join(&exe_name);
+        if self_libexec.is_file() {
+            return self_libexec;
+        }
+    }
+
     if let Some(info) = python_prefix_info() {
-        let libexec = info
-            .prefix
-            .join(LIBEXEC_DIR)
-            .join(TABSDATA_DIR)
-            .join(&exe_name);
+        let libexec = info.prefix.join(LIBEXEC_DIR).join(TABSDATA_DIR).join(&exe_name);
         if libexec.is_file() {
             return libexec;
         }
@@ -119,7 +128,7 @@ fn query_python_prefix_info() -> Option<PythonPrefixInfo> {
 
 fn run_python(cmd: &str) -> Option<PythonPrefixInfo> {
     let query = format!(
-        "import sys, os, sysconfig; \
+        "import os, sys, sysconfig; \
          print(sys.prefix); \
          print(os.path.basename(sysconfig.get_path('{SCRIPTS}')))"
     );
