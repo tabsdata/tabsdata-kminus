@@ -50,6 +50,21 @@ const KM_LOG_FILE: &str = "km.log";
 const FIXED_AUTH_TOKEN_ENV: &str = "TD_DEV_FIXED_AUTH_TOKEN";
 
 /// Whether the [`FIXED_AUTH_TOKEN_ENV`] dev override is enabled.
+/// `dunce::canonicalize` with an input→output trace. Returns the `Result`
+/// unchanged so callers keep their own fallback/error handling.
+fn canon_log(label: &str, path: &Path) -> std::io::Result<PathBuf> {
+    let result = dunce::canonicalize(path);
+    info!(
+        dunce = "canonicalize",
+        site = label,
+        input = %path.display(),
+        ok = result.is_ok(),
+        output = %result.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+        "canon_log",
+    );
+    result
+}
+
 fn fixed_auth_token_enabled() -> bool {
     env_flag_enabled(std::env::var(FIXED_AUTH_TOKEN_ENV).ok().as_deref())
 }
@@ -193,14 +208,14 @@ impl Paths {
         }
         fs::create_dir_all(&workdir)
             .map_err(|e| format!("Cannot create folder '{}': {e}", workdir.display()))?;
-        let workdir = dunce::canonicalize(&workdir).unwrap_or(workdir);
+        let workdir = canon_log("create.workdir", &workdir).unwrap_or(workdir);
 
         let configdir = configdir
             .map(PathBuf::from)
             .unwrap_or_else(|| workdir.join(CONFIG_DIR));
         fs::create_dir_all(&configdir)
             .map_err(|e| format!("Cannot create config folder '{}': {e}", configdir.display()))?;
-        let configdir = dunce::canonicalize(&configdir).unwrap_or(configdir);
+        let configdir = canon_log("create.configdir", &configdir).unwrap_or(configdir);
 
         // logdir is a runtime concern; record the default but don't create it here.
         let logdir = workdir.join(LOG_DIR);
@@ -226,20 +241,20 @@ impl Paths {
         if !workdir.exists() {
             return Err(format!("Folder '{}' does not exist.", workdir.display()));
         }
-        let workdir = dunce::canonicalize(&workdir)
+        let workdir = canon_log("start.workdir", &workdir)
             .map_err(|e| format!("Cannot resolve folder '{}': {e}", workdir.display()))?;
 
         let configdir = configdir
             .map(PathBuf::from)
             .unwrap_or_else(|| workdir.join(CONFIG_DIR));
         fs::create_dir_all(&configdir).ok();
-        let configdir = dunce::canonicalize(&configdir).unwrap_or(configdir);
+        let configdir = canon_log("start.configdir", &configdir).unwrap_or(configdir);
 
         let logdir = logdir
             .map(PathBuf::from)
             .unwrap_or_else(|| workdir.join(LOG_DIR));
         fs::create_dir_all(&logdir).ok();
-        let logdir = dunce::canonicalize(&logdir).unwrap_or(logdir);
+        let logdir = canon_log("start.logdir", &logdir).unwrap_or(logdir);
 
         let pids = pids_dir(&workdir, BIN_KM);
 
@@ -259,7 +274,7 @@ impl Paths {
         if !workdir.exists() {
             return Err(format!("Folder '{}' does not exist.", workdir.display()));
         }
-        let workdir = dunce::canonicalize(&workdir)
+        let workdir = canon_log("existing.workdir", &workdir)
             .map_err(|e| format!("Cannot resolve folder '{}': {e}", workdir.display()))?;
         let configdir = workdir.join(CONFIG_DIR);
         let logdir = workdir.join(LOG_DIR);

@@ -1278,14 +1278,7 @@ impl ProcessExecutor {
         let (stdout_stdio, stderr_stdio) = redirector.setup()?;
         let setup_us = t_setup.elapsed().as_micros();
 
-        // Strip any Windows `\\?\` verbatim prefix from the program path:
-        // CreateProcess rejects it (os error 123). No-op on other platforms and
-        // for a bare program name (no prefix to strip).
-        let program = dunce::simplified(Path::new(&self.program)).to_path_buf();
-        eprintln!(
-            "[pod-runner spawn] program={:?} args={:?} work_dir={:?}",
-            program, self.args, self.work_dir
-        );
+        let program = normalize_spawn_path(Path::new(&self.program));
         let mut cmd = Command::new(&program);
         cmd.args(&self.args);
 
@@ -1297,9 +1290,7 @@ impl ProcessExecutor {
         }
 
         if let Some(ref dir) = self.work_dir {
-            // Strip any Windows `\\?\` verbatim prefix: CreateProcess rejects it
-            // as a working directory (os error 123). No-op on other platforms.
-            cmd.current_dir(dunce::simplified(dir));
+            cmd.current_dir(normalize_spawn_path(dir));
         }
 
         cmd.stdout(stdout_stdio);
@@ -1330,7 +1321,16 @@ impl ProcessExecutor {
         cmd.kill_on_drop(self.die_with_parent);
 
         let t_fork = std::time::Instant::now();
-        let mut child = cmd.spawn()?;
+        let mut child = cmd.spawn().map_err(|e| {
+            warn!(
+                program = %program.display(),
+                args = ?self.args,
+                work_dir = ?self.work_dir,
+                error = %e,
+                "Failed to spawn process",
+            );
+            e
+        })?;
         let fork_us = t_fork.elapsed().as_micros();
         let pid = child.id().unwrap_or(0);
 
@@ -1401,6 +1401,43 @@ impl ProcessExecutor {
             io_tasks,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Spawn path normalization
+// ---------------------------------------------------------------------------
+
+/// Normalize a path for use as a `CreateProcess` program or working directory.
+///
+/// On Windows a path that mixes `\` (from a native container root) with `/`
+/// (from a pod spec's forward-slash command/path) is rejected with os error
+/// 123, and the `/` also prevents `dunce::simplified` from stripping a `\\?\`
+/// verbatim prefix. Converting `/` to `\` first makes the path simplifiable and
+/// acceptable to `CreateProcess`. No-op on other platforms.
+#[cfg(windows)]
+fn normalize_spawn_path(path: &Path) -> PathBuf {
+    let native: PathBuf = path.to_string_lossy().replace('/', "\\").into();
+    let out = dunce::simplified(&native).to_path_buf();
+    debug!(
+        dunce = "simplified",
+        input = %path.display(),
+        native = %native.display(),
+        output = %out.display(),
+        "normalize_spawn_path",
+    );
+    out
+}
+
+#[cfg(not(windows))]
+fn normalize_spawn_path(path: &Path) -> PathBuf {
+    let out = dunce::simplified(path).to_path_buf();
+    debug!(
+        dunce = "simplified",
+        input = %path.display(),
+        output = %out.display(),
+        "normalize_spawn_path",
+    );
+    out
 }
 
 // ---------------------------------------------------------------------------

@@ -3,10 +3,29 @@
 //! Configuration resolution — merges CLI args, environment variables,
 //! and YAML config into the final [`PRConfig`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use tracing::info;
+
+/// `dunce::canonicalize` with an input→output trace and a fallback of
+/// `current_dir()/<path>` when canonicalization fails (e.g. path missing).
+fn canonicalize_logged(label: &str, path: &Path) -> PathBuf {
+    let result = dunce::canonicalize(path);
+    let out = match &result {
+        Ok(p) => p.clone(),
+        Err(_) => std::env::current_dir().unwrap_or_default().join(path),
+    };
+    info!(
+        dunce = "canonicalize",
+        site = label,
+        input = %path.display(),
+        ok = result.is_ok(),
+        output = %out.display(),
+        "canonicalize_logged",
+    );
+    out
+}
 
 use super::cli::{CliArgs, DEFAULT_CONFIGDIR, DEFAULT_IMAGESDIR, DEFAULT_LOGDIR, DEFAULT_WORKDIR};
 use super::pki;
@@ -86,8 +105,7 @@ fn map_cert_source(path: &str, data: &str) -> CertSource {
 pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
     // 1. Resolve configdir
     let configdir = cli.configdir.as_deref().unwrap_or(DEFAULT_CONFIGDIR);
-    let configdir = std::fs::canonicalize(configdir)
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(configdir));
+    let configdir = canonicalize_logged("configdir", Path::new(configdir));
 
     // 2. Load or generate prconfig.yaml + prsysconfig.yaml
     let prconfig_path = configdir.join(PRCONFIG_FILENAME);
@@ -124,13 +142,11 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
 
     // 6. Resolve workdir: CLI → default
     let workdir = cli.workdir.as_deref().unwrap_or(DEFAULT_WORKDIR);
-    let workdir = std::fs::canonicalize(workdir)
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(workdir));
+    let workdir = canonicalize_logged("workdir", Path::new(workdir));
 
     // 7. Resolve logdir: CLI → default
     let log_dir = cli.logdir.as_deref().unwrap_or(DEFAULT_LOGDIR);
-    let log_dir = std::fs::canonicalize(log_dir)
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(log_dir));
+    let log_dir = canonicalize_logged("logdir", Path::new(log_dir));
 
     // 8. Rotate and create data/run/ directory structure
     let data_dir = workdir.join("data");
