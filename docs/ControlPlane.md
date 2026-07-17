@@ -28,11 +28,19 @@ Kubernetes cluster:
 - Tracks all process PIDs for clean shutdown.
 
 The kube-controller-manager runs with a limited set of controllers
-(`--controllers=job,cronjob,ttl-after-finished,garbagecollector`):
-job and cronjob lifecycle, deletion of finished jobs via
-`ttlSecondsAfterFinished`, and cascading deletion of dependents via
-`ownerReferences`. Leader election is disabled since this is a
-single-node setup.
+(`--controllers=job,cronjob,ttl-after-finished,garbagecollector,deployment,replicaset`):
+job and cronjob lifecycle, `Deployment` → `ReplicaSet` → `Pod` expansion,
+deletion of finished jobs via `ttlSecondsAfterFinished`, and cascading
+deletion of dependents via `ownerReferences`. Leader election is disabled
+since this is a single-node setup.
+
+There is **no scheduler** and the virtual-kubelet node carries a
+`virtual-kubelet.io/provider:NoSchedule` taint, so workload pod templates
+must pin themselves to the node with `spec.nodeName` (which bypasses
+scheduling) and tolerate that taint. This applies to bare Pods as well as
+the pod templates inside `Job`, `CronJob`, and `Deployment` objects. See
+[`examples/deployment.yaml`](../examples/deployment.yaml) for a complete
+Deployment manifest.
 
 ## Services Started
 

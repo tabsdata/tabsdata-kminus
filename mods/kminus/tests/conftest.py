@@ -169,3 +169,10 @@ def batch_client(km):
     from kubernetes import client, config as k8s_config
     k8s_config.load_kube_config(config_file=km.kubeconfig)
     return client.BatchV1Api()
+
+
+@pytest.fixture(scope="session")
+def apps_client(km):
+    from kubernetes import client, config as k8s_config
+    k8s_config.load_kube_config(config_file=km.kubeconfig)
+    return client.AppsV1Api()

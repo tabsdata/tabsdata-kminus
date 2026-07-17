@@ -615,7 +615,7 @@ func main() {
 	kcmCmd := exec.CommandContext(ctx, kcmPath,
 		"--kubeconfig", kcmConfigPath,
 		"--leader-elect=false",
-		"--controllers=job,cronjob,ttl-after-finished,garbagecollector",
+		"--controllers=job,cronjob,ttl-after-finished,garbagecollector,deployment,replicaset",
 		fmt.Sprintf("--concurrent-job-syncs=%d", cpSys.ConcurrentJobSyncs),
 		fmt.Sprintf("--kube-api-qps=%d", cpSys.KubeAPIQPS),
 		fmt.Sprintf("--kube-api-burst=%d", cpSys.KubeAPIBurst),

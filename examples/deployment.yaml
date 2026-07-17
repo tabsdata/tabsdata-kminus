@@ -1,0 +1,51 @@
+# Example: a Deployment on Tabsdata K- (kminus).
+#
+# kminus runs no scheduler, and its single virtual-kubelet node carries a
+# `virtual-kubelet.io/provider:NoSchedule` taint. So — unlike on a normal
+# cluster — the pod template MUST:
+#
+#   1. pin itself to the node with `spec.nodeName` (this bypasses scheduling
+#      entirely, so the virtual-kubelet's pod informer, which watches
+#      `spec.nodeName == <node>`, picks the pod up), and
+#   2. tolerate the node's `virtual-kubelet.io/provider:NoSchedule` taint.
+#
+# The kube-controller-manager runs the `deployment` + `replicaset`
+# controllers, so this Deployment expands to a ReplicaSet and Pods normally.
+#
+# Apply with:
+#   export KUBECONFIG=<workdir>/config/kubeconfig.yaml
+#   kubectl apply -f examples/deployment.yaml
+#   kubectl rollout status deployment/hello
+#   kubectl get pods -l app=hello
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hello
+  template:
+    metadata:
+      labels:
+        app: hello
+    spec:
+      # (1) Pin to the kminus node — there is no scheduler to place the pod.
+      #     Must match the configured node name (default: tdknode).
+      nodeName: tdknode
+      # (2) Tolerate the virtual-kubelet node taint.
+      tolerations:
+        - key: virtual-kubelet.io/provider
+          operator: Exists
+          effect: NoSchedule
+      # restartPolicy is omitted: Deployments require `Always` (the default).
+      containers:
+        - name: app
+          # The pod-runner treats `image` as a local path (directory or
+          # .tgz). Use /dev/null when the container just runs a system
+          # command via `command`/`args`. See docs/PodRunnerUserGuide.md.
+          image: /dev/null
+          command: ["sh", "-c"]
+          args: ["while true; do echo hello; sleep 10; done"]

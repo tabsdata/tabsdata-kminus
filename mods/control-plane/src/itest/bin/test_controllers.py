@@ -147,6 +147,88 @@ class TestTTLAfterFinished:
         assert job.metadata.deletion_timestamp is None
 
 
+class TestDeploymentController:
+    """The deployment + replicaset controllers expand a Deployment.
+
+    As with Jobs, there is no kubelet in the control-plane-only
+    environment, so the created pods never run (they stay Pending); this
+    test only verifies that the controllers are registered and perform the
+    `Deployment` -> `ReplicaSet` -> `Pod` expansion.
+    """
+
+    def _make_deployment(self, name, replicas=2):
+        from kubernetes.client import (
+            V1Container,
+            V1Deployment,
+            V1DeploymentSpec,
+            V1LabelSelector,
+            V1ObjectMeta,
+            V1PodSpec,
+            V1PodTemplateSpec,
+        )
+
+        labels = {"app": name}
+        return V1Deployment(
+            metadata=V1ObjectMeta(name=name, namespace="default"),
+            spec=V1DeploymentSpec(
+                replicas=replicas,
+                selector=V1LabelSelector(match_labels=labels),
+                template=V1PodTemplateSpec(
+                    metadata=V1ObjectMeta(labels=labels),
+                    spec=V1PodSpec(
+                        restart_policy="Always",
+                        containers=[
+                            V1Container(name="main", image="busybox", command=["true"])
+                        ],
+                    ),
+                ),
+            ),
+        )
+
+    def test_deployment_expands_to_replicaset_and_pods(self, control_plane):
+        """Creating a Deployment yields a ReplicaSet (owned by the
+        Deployment) and Pods (owned by the ReplicaSet)."""
+        from kubernetes import client
+
+        core, _ = _load_clients(control_plane.kubeconfig)
+        apps = client.AppsV1Api()
+
+        name = "expand-deploy"
+        apps.create_namespaced_deployment(
+            namespace="default", body=self._make_deployment(name, replicas=2)
+        )
+
+        # deployment controller -> a ReplicaSet owned by the Deployment.
+        def replicaset_created():
+            rs = apps.list_namespaced_replica_set(
+                namespace="default", label_selector=f"app={name}"
+            )
+            return rs.items[0] if rs.items else None
+
+        rs = _wait_for(
+            replicaset_created, message=f"replicaset of deployment {name}"
+        )
+        rs_owners = [o.kind for o in (rs.metadata.owner_references or [])]
+        assert "Deployment" in rs_owners
+
+        # replicaset controller -> Pods owned by the ReplicaSet.
+        def pods_created():
+            pods = core.list_namespaced_pod(
+                namespace="default", label_selector=f"app={name}"
+            )
+            return pods.items if len(pods.items) >= 2 else None
+
+        pods = _wait_for(pods_created, message=f"pods of deployment {name}")
+        assert len(pods) == 2
+        for pod in pods:
+            pod_owners = [o.kind for o in (pod.metadata.owner_references or [])]
+            assert "ReplicaSet" in pod_owners
+
+        apps.delete_namespaced_deployment(
+            name=name, namespace="default", propagation_policy="Background"
+        )
+
+
 class TestGarbageCollector:
     """The garbage-collector controller cascade-deletes dependents."""
 
