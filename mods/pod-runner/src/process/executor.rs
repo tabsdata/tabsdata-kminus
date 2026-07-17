@@ -1278,7 +1278,15 @@ impl ProcessExecutor {
         let (stdout_stdio, stderr_stdio) = redirector.setup()?;
         let setup_us = t_setup.elapsed().as_micros();
 
-        let mut cmd = Command::new(&self.program);
+        // Strip any Windows `\\?\` verbatim prefix from the program path:
+        // CreateProcess rejects it (os error 123). No-op on other platforms and
+        // for a bare program name (no prefix to strip).
+        let program = dunce::simplified(Path::new(&self.program)).to_path_buf();
+        eprintln!(
+            "[pod-runner spawn] program={:?} args={:?} work_dir={:?}",
+            program, self.args, self.work_dir
+        );
+        let mut cmd = Command::new(&program);
         cmd.args(&self.args);
 
         if !self.propagate_env {
@@ -1289,7 +1297,9 @@ impl ProcessExecutor {
         }
 
         if let Some(ref dir) = self.work_dir {
-            cmd.current_dir(dir);
+            // Strip any Windows `\\?\` verbatim prefix: CreateProcess rejects it
+            // as a working directory (os error 123). No-op on other platforms.
+            cmd.current_dir(dunce::simplified(dir));
         }
 
         cmd.stdout(stdout_stdio);

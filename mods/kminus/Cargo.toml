@@ -58,6 +58,7 @@ ignored = ["openssl"]
 [dependencies]
 
 clap = { version = "4.6.0", features = ["derive"] }
+dunce = { version = "1.0.5" }
 file-rotate = { version = "0.7" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = { version = "0.9.34" }

@@ -193,14 +193,14 @@ impl Paths {
         }
         fs::create_dir_all(&workdir)
             .map_err(|e| format!("Cannot create folder '{}': {e}", workdir.display()))?;
-        let workdir = fs::canonicalize(&workdir).unwrap_or(workdir);
+        let workdir = dunce::canonicalize(&workdir).unwrap_or(workdir);
 
         let configdir = configdir
             .map(PathBuf::from)
             .unwrap_or_else(|| workdir.join(CONFIG_DIR));
         fs::create_dir_all(&configdir)
             .map_err(|e| format!("Cannot create config folder '{}': {e}", configdir.display()))?;
-        let configdir = configdir.canonicalize().unwrap_or(configdir);
+        let configdir = dunce::canonicalize(&configdir).unwrap_or(configdir);
 
         // logdir is a runtime concern; record the default but don't create it here.
         let logdir = workdir.join(LOG_DIR);
@@ -226,20 +226,20 @@ impl Paths {
         if !workdir.exists() {
             return Err(format!("Folder '{}' does not exist.", workdir.display()));
         }
-        let workdir = fs::canonicalize(&workdir)
+        let workdir = dunce::canonicalize(&workdir)
             .map_err(|e| format!("Cannot resolve folder '{}': {e}", workdir.display()))?;
 
         let configdir = configdir
             .map(PathBuf::from)
             .unwrap_or_else(|| workdir.join(CONFIG_DIR));
         fs::create_dir_all(&configdir).ok();
-        let configdir = configdir.canonicalize().unwrap_or(configdir);
+        let configdir = dunce::canonicalize(&configdir).unwrap_or(configdir);
 
         let logdir = logdir
             .map(PathBuf::from)
             .unwrap_or_else(|| workdir.join(LOG_DIR));
         fs::create_dir_all(&logdir).ok();
-        let logdir = logdir.canonicalize().unwrap_or(logdir);
+        let logdir = dunce::canonicalize(&logdir).unwrap_or(logdir);
 
         let pids = pids_dir(&workdir, BIN_KM);
 
@@ -259,7 +259,7 @@ impl Paths {
         if !workdir.exists() {
             return Err(format!("Folder '{}' does not exist.", workdir.display()));
         }
-        let workdir = fs::canonicalize(&workdir)
+        let workdir = dunce::canonicalize(&workdir)
             .map_err(|e| format!("Cannot resolve folder '{}': {e}", workdir.display()))?;
         let configdir = workdir.join(CONFIG_DIR);
         let logdir = workdir.join(LOG_DIR);
