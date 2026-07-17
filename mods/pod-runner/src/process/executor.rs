@@ -1417,27 +1417,16 @@ impl ProcessExecutor {
 #[cfg(windows)]
 fn normalize_spawn_path(path: &Path) -> PathBuf {
     let native: PathBuf = path.to_string_lossy().replace('/', "\\").into();
-    let out = dunce::simplified(&native).to_path_buf();
-    debug!(
-        dunce = "simplified",
-        input = %path.display(),
-        native = %native.display(),
-        output = %out.display(),
-        "normalize_spawn_path",
-    );
-    out
+    let resolved = dunce::simplified(&native).to_path_buf();
+    debug!(input = %path.display(), output = %resolved.display(), "Normalized spawn path.");
+    resolved
 }
 
 #[cfg(not(windows))]
 fn normalize_spawn_path(path: &Path) -> PathBuf {
-    let out = dunce::simplified(path).to_path_buf();
-    debug!(
-        dunce = "simplified",
-        input = %path.display(),
-        output = %out.display(),
-        "normalize_spawn_path",
-    );
-    out
+    let resolved = dunce::simplified(path).to_path_buf();
+    debug!(input = %path.display(), output = %resolved.display(), "Normalized spawn path.");
+    resolved
 }
 
 // ---------------------------------------------------------------------------

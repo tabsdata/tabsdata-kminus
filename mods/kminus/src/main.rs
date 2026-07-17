@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use file_rotate::{ContentLimit, FileRotate, compression::Compression, suffix::AppendCount};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::filter::LevelFilter;
 
 mod config;
@@ -49,22 +49,15 @@ const KM_LOG_FILE: &str = "km.log";
 /// and every `km start`/`km restart` — that the fixed dev token is in use.
 const FIXED_AUTH_TOKEN_ENV: &str = "TD_DEV_FIXED_AUTH_TOKEN";
 
-/// Whether the [`FIXED_AUTH_TOKEN_ENV`] dev override is enabled.
-/// `dunce::canonicalize` with an input→output trace. Returns the `Result`
-/// unchanged so callers keep their own fallback/error handling.
-fn canon_log(label: &str, path: &Path) -> std::io::Result<PathBuf> {
+fn canonicalize(label: &str, path: &Path) -> std::io::Result<PathBuf> {
     let result = dunce::canonicalize(path);
-    info!(
-        dunce = "canonicalize",
-        site = label,
-        input = %path.display(),
-        ok = result.is_ok(),
-        output = %result.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
-        "canon_log",
-    );
+    if let Ok(resolved) = &result {
+        debug!(site = label, input = %path.display(), output = %resolved.display(), "Canonicalized path.");
+    }
     result
 }
 
+/// Whether the [`FIXED_AUTH_TOKEN_ENV`] dev override is enabled.
 fn fixed_auth_token_enabled() -> bool {
     env_flag_enabled(std::env::var(FIXED_AUTH_TOKEN_ENV).ok().as_deref())
 }
@@ -208,14 +201,14 @@ impl Paths {
         }
         fs::create_dir_all(&workdir)
             .map_err(|e| format!("Cannot create folder '{}': {e}", workdir.display()))?;
-        let workdir = canon_log("create.workdir", &workdir).unwrap_or(workdir);
+        let workdir = canonicalize("create.workdir", &workdir).unwrap_or(workdir);
 
         let configdir = configdir
             .map(PathBuf::from)
             .unwrap_or_else(|| workdir.join(CONFIG_DIR));
         fs::create_dir_all(&configdir)
             .map_err(|e| format!("Cannot create config folder '{}': {e}", configdir.display()))?;
-        let configdir = canon_log("create.configdir", &configdir).unwrap_or(configdir);
+        let configdir = canonicalize("create.configdir", &configdir).unwrap_or(configdir);
 
         // logdir is a runtime concern; record the default but don't create it here.
         let logdir = workdir.join(LOG_DIR);
@@ -241,20 +234,20 @@ impl Paths {
         if !workdir.exists() {
             return Err(format!("Folder '{}' does not exist.", workdir.display()));
         }
-        let workdir = canon_log("start.workdir", &workdir)
+        let workdir = canonicalize("start.workdir", &workdir)
             .map_err(|e| format!("Cannot resolve folder '{}': {e}", workdir.display()))?;
 
         let configdir = configdir
             .map(PathBuf::from)
             .unwrap_or_else(|| workdir.join(CONFIG_DIR));
         fs::create_dir_all(&configdir).ok();
-        let configdir = canon_log("start.configdir", &configdir).unwrap_or(configdir);
+        let configdir = canonicalize("start.configdir", &configdir).unwrap_or(configdir);
 
         let logdir = logdir
             .map(PathBuf::from)
             .unwrap_or_else(|| workdir.join(LOG_DIR));
         fs::create_dir_all(&logdir).ok();
-        let logdir = canon_log("start.logdir", &logdir).unwrap_or(logdir);
+        let logdir = canonicalize("start.logdir", &logdir).unwrap_or(logdir);
 
         let pids = pids_dir(&workdir, BIN_KM);
 
@@ -274,7 +267,7 @@ impl Paths {
         if !workdir.exists() {
             return Err(format!("Folder '{}' does not exist.", workdir.display()));
         }
-        let workdir = canon_log("existing.workdir", &workdir)
+        let workdir = canonicalize("existing.workdir", &workdir)
             .map_err(|e| format!("Cannot resolve folder '{}': {e}", workdir.display()))?;
         let configdir = workdir.join(CONFIG_DIR);
         let logdir = workdir.join(LOG_DIR);

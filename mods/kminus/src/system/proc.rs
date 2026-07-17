@@ -55,14 +55,21 @@ pub fn resolve_binary(name: &str) -> PathBuf {
     }
 
     if let Some(venv_root) = sibling_dir.parent() {
-        let self_libexec = venv_root.join(LIBEXEC_DIR).join(TABSDATA_DIR).join(&exe_name);
+        let self_libexec = venv_root
+            .join(LIBEXEC_DIR)
+            .join(TABSDATA_DIR)
+            .join(&exe_name);
         if self_libexec.is_file() {
             return self_libexec;
         }
     }
 
     if let Some(info) = python_prefix_info() {
-        let libexec = info.prefix.join(LIBEXEC_DIR).join(TABSDATA_DIR).join(&exe_name);
+        let libexec = info
+            .prefix
+            .join(LIBEXEC_DIR)
+            .join(TABSDATA_DIR)
+            .join(&exe_name);
         if libexec.is_file() {
             return libexec;
         }
