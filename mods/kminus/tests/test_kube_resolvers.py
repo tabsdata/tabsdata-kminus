@@ -123,6 +123,55 @@ class TestSecretEnvResolution:
                 name=secret_name, namespace="default",
             )
 
+    def test_secret_env_from_preserves_empty_value(self, km, k8s_client, batch_client):
+        """Regression: an envFrom secret key with an EMPTY value must reach
+        the container as a set-but-empty env var, not be dropped.
+
+        Mirrors the live `dump-conn-secret` report (a password-less conn
+        secret whose empty key went missing). `${VAR+SET}` expands to "SET"
+        iff VAR is set — including set-but-empty — and to "" if VAR is unset,
+        so a dropped key fails the check and the Job fails.
+        """
+        from kubernetes.client import (
+            V1Secret, V1ObjectMeta, V1EnvFromSource, V1SecretEnvSource,
+        )
+
+        secret_name = _unique_name("sec-empty")
+        k8s_client.create_namespaced_secret(
+            namespace="default",
+            body=V1Secret(
+                metadata=V1ObjectMeta(name=secret_name),
+                string_data={"USER": "admin", "EMPTY_PASS": ""},
+            ),
+        )
+
+        try:
+            job_name = _unique_name("sec-empty-job")
+            check = (
+                '[ "$USER" = "admin" ] && '
+                '[ "${EMPTY_PASS+SET}" = "SET" ] && '
+                '[ -z "$EMPTY_PASS" ]'
+            )
+            job = _job_body(
+                job_name,
+                check,
+                env_from=[V1EnvFromSource(
+                    secret_ref=V1SecretEnvSource(name=secret_name),
+                )],
+            )
+            batch_client.create_namespaced_job(namespace="default", body=job)
+            try:
+                _wait_for_job(batch_client, job_name)
+            finally:
+                batch_client.delete_namespaced_job(
+                    name=job_name, namespace="default",
+                    propagation_policy="Background",
+                )
+        finally:
+            k8s_client.delete_namespaced_secret(
+                name=secret_name, namespace="default",
+            )
+
     def test_secret_via_env_from(self, km, k8s_client, batch_client):
         from kubernetes.client import (
             V1Secret, V1ObjectMeta, V1EnvFromSource, V1SecretEnvSource,

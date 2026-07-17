@@ -136,6 +136,13 @@ impl SecretResolver for FileSecretResolver {
 }
 
 /// Extract and merge `data` (base64) and `stringData` (plain) fields.
+///
+/// A key whose value is YAML `null` (`KEY:` with nothing after it) is
+/// treated as an empty value and preserved as `key -> ""`. This keeps
+/// parity with [`KubeSecretResolver`], where `k8s_openapi::ByteString`
+/// decodes a null/empty value to empty bytes: an empty secret value is
+/// valid and must survive as a set-but-empty env var rather than being
+/// silently dropped.
 fn extract_secret_data(
     doc: &serde_json::Value,
     name: &str,
@@ -144,7 +151,9 @@ fn extract_secret_data(
 
     if let Some(data) = doc.get("data").and_then(|d| d.as_object()) {
         for (key, val) in data {
-            if let Some(b64) = val.as_str() {
+            if val.is_null() {
+                values.insert(key.clone(), String::new());
+            } else if let Some(b64) = val.as_str() {
                 use base64::Engine;
                 let decoded = base64::engine::general_purpose::STANDARD
                     .decode(b64)
@@ -167,7 +176,9 @@ fn extract_secret_data(
 
     if let Some(string_data) = doc.get("stringData").and_then(|d| d.as_object()) {
         for (key, val) in string_data {
-            if let Some(s) = val.as_str() {
+            if val.is_null() {
+                values.insert(key.clone(), String::new());
+            } else if let Some(s) = val.as_str() {
                 values.insert(key.clone(), s.to_string());
             }
         }
@@ -227,25 +238,38 @@ impl KubeSecretResolver {
                 }
             };
 
-            let mut values = HashMap::new();
-            if let Some(data) = secret.data {
-                for (key, val) in data {
-                    let s = String::from_utf8(val.0).map_err(|e| {
-                        SecretResolverError::other(
-                            name,
-                            format!("UTF-8 decode for '{}': {}", key, e),
-                        )
-                    })?;
-                    values.insert(key, s);
-                }
-            }
-            if let Some(string_data) = secret.string_data {
-                values.extend(string_data);
-            }
-            result.insert(name.clone(), values);
+            result.insert(name.clone(), secret_to_values(name, secret)?);
         }
         Ok(result)
     }
+}
+
+/// Flatten a fetched [`Secret`]'s `data` (raw bytes) and `stringData`
+/// (plain strings) into a `{key: value}` map.
+///
+/// Every stored key is preserved, including empty-valued ones: an empty
+/// `data` value round-trips through `k8s_openapi::ByteString` as empty
+/// bytes and becomes `key -> ""`, and `stringData` empties are kept as-is.
+/// An empty secret value is valid (e.g. a password-less DB user) and must
+/// survive as a set-but-empty env var, not be dropped. `stringData`
+/// overrides `data` on key collision (matching the API server on write).
+fn secret_to_values(
+    name: &str,
+    secret: k8s_openapi::api::core::v1::Secret,
+) -> Result<HashMap<String, String>, SecretResolverError> {
+    let mut values = HashMap::new();
+    if let Some(data) = secret.data {
+        for (key, val) in data {
+            let s = String::from_utf8(val.0).map_err(|e| {
+                SecretResolverError::other(name, format!("UTF-8 decode for '{}': {}", key, e))
+            })?;
+            values.insert(key, s);
+        }
+    }
+    if let Some(string_data) = secret.string_data {
+        values.extend(string_data);
+    }
+    Ok(values)
 }
 
 #[async_trait]
@@ -276,6 +300,7 @@ impl SecretResolver for KubeSecretResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::fs;
 
     fn setup_secret_dir(name: &str) -> PathBuf {
@@ -480,5 +505,85 @@ mod tests {
         let other = SecretResolverError::other("s", "boom");
         assert!(!other.is_not_found());
         assert_eq!(other.kind, SecretResolverErrorKind::Other);
+    }
+
+    // -- empty-value preservation (kube path) --------------------------------
+    //
+    // Regression coverage for the "empty secret value dropped from a
+    // worker's env" report: an empty `data` value must survive as
+    // `key -> ""` (a set-but-empty env var), never be absent. These drive
+    // the exact JSON the API server returns for such a secret through the
+    // same `Secret` deserialize + `secret_to_values` path the kube resolver
+    // uses, so no live cluster is needed.
+
+    #[test]
+    fn kube_empty_data_value_is_preserved() {
+        // API server returns base64 for `data`; an empty value is the empty
+        // base64 string. Mirrors `stringData: {FOO_PASSWORD: ""}`.
+        let secret: k8s_openapi::api::core::v1::Secret = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": "td-empty-probe", "namespace": "default"},
+            "type": "Opaque",
+            "data": {"FOO_USER": "c29tZXVzZXI=", "FOO_PASSWORD": ""},
+        }))
+        .unwrap();
+
+        let values = secret_to_values("td-empty-probe", secret).unwrap();
+        assert_eq!(values.get("FOO_USER").map(String::as_str), Some("someuser"));
+        // Present with an empty value — NOT dropped.
+        assert_eq!(values.get("FOO_PASSWORD").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn kube_null_data_value_decodes_to_empty() {
+        // A null `data` value round-trips through ByteString to empty bytes.
+        let secret: k8s_openapi::api::core::v1::Secret = serde_json::from_value(json!({
+            "metadata": {"name": "s", "namespace": "default"},
+            "data": {"FOO_PASSWORD": null},
+        }))
+        .unwrap();
+
+        let values = secret_to_values("s", secret).unwrap();
+        assert_eq!(values.get("FOO_PASSWORD").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn kube_empty_string_data_value_is_preserved() {
+        let secret: k8s_openapi::api::core::v1::Secret = serde_json::from_value(json!({
+            "metadata": {"name": "s", "namespace": "default"},
+            "stringData": {"USER": "admin", "PASSWORD": ""},
+        }))
+        .unwrap();
+
+        let values = secret_to_values("s", secret).unwrap();
+        assert_eq!(values.get("USER").map(String::as_str), Some("admin"));
+        assert_eq!(values.get("PASSWORD").map(String::as_str), Some(""));
+    }
+
+    // -- empty-value preservation (file path) --------------------------------
+
+    #[tokio::test]
+    async fn file_resolver_preserves_empty_values() {
+        let dir = setup_secret_dir("empty-values");
+        // Empty base64 `data`, empty-string `stringData`, and a bare
+        // `null` (`KEY:` with no value) all represent an empty secret value.
+        fs::write(
+            dir.join("creds.yaml"),
+            "data:\n  D_EMPTY: \"\"\nstringData:\n  S_EMPTY: \"\"\n  S_NULL:\n",
+        )
+        .unwrap();
+
+        let resolver = FileSecretResolver::new(dir).unwrap();
+        let (_tx, mut rx) = cancel_channel();
+        let result = resolver
+            .secrets("default", &["creds".to_string()], None, &mut rx)
+            .await
+            .unwrap();
+        let creds = &result["creds"];
+        // All three keys are present with an empty value — none dropped.
+        assert_eq!(creds.get("D_EMPTY").map(String::as_str), Some(""));
+        assert_eq!(creds.get("S_EMPTY").map(String::as_str), Some(""));
+        assert_eq!(creds.get("S_NULL").map(String::as_str), Some(""));
     }
 }

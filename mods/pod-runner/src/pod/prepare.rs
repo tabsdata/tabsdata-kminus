@@ -1260,6 +1260,30 @@ mod tests {
     }
 
     #[test]
+    fn empty_env_from_value_survives_as_set_but_empty() {
+        // Regression: an empty envFrom-derived value must become a final
+        // EnvVar with `value: Some("")` (delivered as a set-but-empty env
+        // var), not be dropped. See EMPTY_SECRET_ENVFROM_BUG.md.
+        let mut spec = make_pod(
+            vec![Container {
+                name: "app".to_string(),
+                ..Default::default()
+            }],
+            vec![],
+        );
+        let resolved = resolved_for("app", vec![("USER", "admin"), ("PASSWORD", "")]);
+
+        apply_envs_and_substitute(&mut spec, &resolved);
+
+        let password = spec.spec.containers[0]
+            .env
+            .iter()
+            .find(|e| e.name == "PASSWORD")
+            .expect("PASSWORD env var must be present");
+        assert_eq!(password.value.as_deref(), Some(""));
+    }
+
+    #[test]
     fn k8s_order_resolves_only_earlier_env_entries() {
         // Per K8s expansion semantics, B=$(A) declared BEFORE A=val
         // must leave B as the literal "$(A)".

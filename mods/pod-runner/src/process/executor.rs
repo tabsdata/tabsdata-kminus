@@ -1759,6 +1759,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_empty_value_env_var_is_set_not_unset() {
+        // Mirrors the EMPTY_SECRET_ENVFROM_BUG.md probe (set-vs-unset), but
+        // via the POSIX `${VAR+SET}` builtin so no PATH lookup is needed.
+        // An empty-valued env var must reach the child as *set-but-empty*.
+        let dir = test_dir!();
+        let out = dir.join("out.log");
+
+        let mut handle = ProcessExecutor::new("sh")
+            .args(["-c", "echo \"R=${EMPTY_VAR+SET}=${EMPTY_VAR}END\""])
+            .env("EMPTY_VAR", "")
+            .propagate_env(false)
+            .output(MergedOutput::new(FileStream::new(&out)))
+            .spawn(shutdown())
+            .await
+            .unwrap();
+
+        let code = handle.wait().await.unwrap();
+        assert_eq!(code, 0);
+        let content = fs::read_to_string(&out).unwrap();
+        // "R=SET=END" => the var is present (SET) and empty. A dropped var
+        // would print "R==END".
+        assert!(
+            content.contains("R=SET=END"),
+            "empty-valued env var must be delivered as set-but-empty, got: {}",
+            content
+        );
+    }
+
     // -- env var validation --------------------------------------------------
 
     #[tokio::test]

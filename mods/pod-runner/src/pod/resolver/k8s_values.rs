@@ -198,6 +198,19 @@ pub async fn resolve_k8s_values(
                 {
                     env.insert(ev.name.clone(), val.clone());
                 }
+            } else {
+                // Neither `value` nor `valueFrom`: per K8s semantics an
+                // `EnvVar` with only a name is a valid variable whose value
+                // defaults to "" (set-but-empty), not an entry to drop.
+                //
+                // This is the shape the virtual-kubelet delivers for an
+                // empty-valued secret key: it expands `envFrom` into explicit
+                // `env` entries, and because k8s's Go `EnvVar.Value` is
+                // `json:"value,omitempty"`, an empty value is omitted on the
+                // wire and arrives here as `value: None`. Dropping it made a
+                // password-less connection secret's key go missing from the
+                // worker env.
+                env.insert(ev.name.clone(), String::new());
             }
         }
 
@@ -417,6 +430,78 @@ mod tests {
         assert_eq!(app.env["PASS"], "secret");
         assert!(app.secret_keys.contains("USER"));
         assert!(app.secret_keys.contains("PASS"));
+    }
+
+    #[tokio::test]
+    async fn env_from_secret_ref_preserves_empty_value() {
+        // Regression: an empty-valued secret key delivered via envFrom must
+        // survive as a set-but-empty env var (e.g. a password-less user),
+        // not be dropped. See EMPTY_SECRET_ENVFROM_BUG.md.
+        let dir = setup_dir("env-from-sec-empty");
+        fs::write(
+            dir.join("creds.yaml"),
+            "stringData:\n  USER: admin\n  PASSWORD: \"\"\n",
+        )
+        .unwrap();
+
+        let pod = make_pod_with_envs(vec![Container {
+            name: "app".to_string(),
+            env_from: vec![EnvFromSource {
+                secret_ref: Some(ObjectRef {
+                    name: "creds".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }]);
+
+        let resolvers = ResolverSet {
+            secret_resolver: Some(Box::new(FileSecretResolver::new(dir).unwrap())),
+            ..Default::default()
+        };
+
+        let result = resolve_no_wait(&pod, "default", &resolvers).await.unwrap();
+        let app = &result.containers["app"];
+        assert_eq!(app.env.get("USER").map(String::as_str), Some("admin"));
+        // Present with an empty value — the reported failure mode.
+        assert_eq!(app.env.get("PASSWORD").map(String::as_str), Some(""));
+        assert!(app.secret_keys.contains("PASSWORD"));
+    }
+
+    #[tokio::test]
+    async fn value_less_env_entry_resolves_to_empty() {
+        // Regression (the real "empty secret value dropped" bug): the
+        // virtual-kubelet expands `envFrom` into explicit `env` entries and,
+        // because k8s's Go `EnvVar.Value` is `json:"value,omitempty"`, an
+        // empty value is omitted on the wire and arrives as an entry with
+        // neither `value` nor `valueFrom`. Per K8s semantics that is a valid
+        // set-but-empty variable, not one to drop.
+        let pod = make_pod_with_envs(vec![Container {
+            name: "app".to_string(),
+            env: vec![
+                EnvVar {
+                    name: "USER".to_string(),
+                    value: Some("admin".to_string()),
+                    value_from: None,
+                },
+                EnvVar {
+                    // value AND value_from both absent (the omitempty shape).
+                    name: "PASSWORD".to_string(),
+                    value: None,
+                    value_from: None,
+                },
+            ],
+            ..Default::default()
+        }]);
+
+        let result = resolve_no_wait(&pod, "default", &ResolverSet::default())
+            .await
+            .unwrap();
+        let app = &result.containers["app"];
+        assert_eq!(app.env.get("USER").map(String::as_str), Some("admin"));
+        // Present with an empty value — NOT dropped.
+        assert_eq!(app.env.get("PASSWORD").map(String::as_str), Some(""));
     }
 
     #[tokio::test]
