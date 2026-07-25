@@ -182,7 +182,7 @@ impl Default for YamlSysConfig {
             nodename: DEFAULT_NODENAME.to_string(),
             namespace: DEFAULT_NAMESPACE.to_string(),
             capacity: YamlCapacityConfig::default(),
-            max_pods: 100,
+            max_pods: 250,
             default_grace_period_secs: 30,
             max_restart_count: 5,
             restart_backoff_base_secs: 10,

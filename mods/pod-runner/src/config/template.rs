@@ -77,7 +77,7 @@ podArchiveTtlDays: 7
 capacity:
   cpu: 100
   memoryGB: 100
-  pods: 100
+  pods: 250
 
 # ---------------------------------------------------------------------------
 # Metrics
@@ -123,7 +123,7 @@ mod tests {
         let c = YamlSysConfig::from_str(PRSYSCONFIG_TEMPLATE).unwrap();
         assert_eq!(c.nodename, DEFAULT_NODENAME);
         assert_eq!(c.namespace, DEFAULT_NAMESPACE);
-        assert_eq!(c.capacity.pods, 100);
+        assert_eq!(c.capacity.pods, 250);
         assert!(c.propagate_env);
         assert!(c.die_with_parent);
         assert!(c.keep_failed_pod_dir);
