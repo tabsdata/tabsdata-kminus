@@ -1,3 +1,6 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
 # Minimal pod: one container with command and args.
 apiVersion: v1
 kind: Pod

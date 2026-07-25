@@ -1,3 +1,6 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
 # Example: a Deployment on Tabsdata K- (kminus).
 #
 # kminus runs no scheduler, and its single virtual-kubelet node carries a

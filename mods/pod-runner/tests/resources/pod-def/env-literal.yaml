@@ -1,3 +1,6 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
 # Pod with literal environment variables.
 apiVersion: v1
 kind: Pod

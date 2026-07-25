@@ -1,3 +1,6 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
 # Pod with a sidecar (init container with restartPolicy: Always).
 # The sidecar runs alongside the main container and is terminated
 # after the main container exits.

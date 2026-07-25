@@ -1,3 +1,6 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
 # Pod with hostPath and emptyDir volume mounts.
 # The hostPath directory and emptyDir are set up at test time.
 # Mount paths must be under /mounts (PR constraint).

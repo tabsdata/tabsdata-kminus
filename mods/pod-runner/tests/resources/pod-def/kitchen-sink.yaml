@@ -1,3 +1,6 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
 # Kitchen-sink pod exercising multiple features at once:
 # init container, sidecar, main containers, literal env vars,
 # volume mounts (hostPath + emptyDir), and exec probes.

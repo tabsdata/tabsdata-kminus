@@ -1,3 +1,6 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
 # Pod with exec-based liveness and readiness probes.
 # Uses exec probes since they work with process-based execution
 # (no real network stack for httpGet/tcpSocket in tests).

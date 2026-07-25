@@ -1,3 +1,6 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
 # Pod that references configmaps via env valueFrom.configMapKeyRef
 # and via envFrom.configMapRef (bulk loading).
 # Requires a ConfigMapResolver to be configured at create time.

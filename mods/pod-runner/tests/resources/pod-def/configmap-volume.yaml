@@ -1,3 +1,6 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
 # Pod that mounts a configmap as a volume.
 # Each key in the configmap becomes a file in the mount directory
 # (filename = key, contents = value).

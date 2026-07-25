@@ -1,3 +1,6 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
 # Pod with multiple main containers running concurrently.
 apiVersion: v1
 kind: Pod

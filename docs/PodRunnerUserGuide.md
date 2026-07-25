@@ -2,10 +2,6 @@
   Copyright 2026 Tabsdata Inc.
 -->
 
-  <!--
-  Copyright 2026 Tabs Data Inc.
-  -->
-
 # Pod Runner -- User Guide
 
 ## Quick Start

@@ -1,3 +1,6 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
 # Pod that exercises KM_CONTAINER_ROOT auto-injection and chained K8s-style
 # $(VAR) substitution.
 #
