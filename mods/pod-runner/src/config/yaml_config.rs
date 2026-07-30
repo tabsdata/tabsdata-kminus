@@ -358,7 +358,7 @@ server:
         let c = YamlSysConfig::default();
         assert_eq!(c.nodename, DEFAULT_NODENAME);
         assert_eq!(c.namespace, DEFAULT_NAMESPACE);
-        assert_eq!(c.max_pods, 100);
+        assert_eq!(c.max_pods, 250);
         assert!(c.propagate_env);
         assert!(c.die_with_parent);
         assert!(c.keep_failed_pod_dir);
