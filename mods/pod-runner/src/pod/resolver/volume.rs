@@ -168,7 +168,7 @@ fn materialize_volume(
             items: &cm.items,
             data,
         }]);
-        materialize_plan(&vol_dir, &vol.name, &plan)?;
+        materialize_plan(&vol_dir, &vol.name, &plan, cm.default_mode)?;
     } else if let Some(ref proj) = vol.projected {
         // Gather configMap sources in declared order. Unsupported
         // source types (secret, downwardAPI, serviceAccountToken) are
@@ -197,7 +197,7 @@ fn materialize_volume(
             }
         }
         let plan = plan_projection(&sources);
-        materialize_plan(&vol_dir, &vol.name, &plan)?;
+        materialize_plan(&vol_dir, &vol.name, &plan, proj.default_mode)?;
     } else if let Some(ref hp) = vol.host_path {
         let host = &hp.path;
         if !Path::new(host).is_dir() {
@@ -387,6 +387,7 @@ fn materialize_plan(
     vol_dir: &Path,
     volume_name: &str,
     plan: &ProjectionPlan,
+    default_mode: Option<u32>,
 ) -> Result<(), PrepareError> {
     fs::create_dir_all(vol_dir).map_err(|source| PrepareError::Io {
         context: format!(
@@ -428,7 +429,33 @@ fn materialize_plan(
             context: format!("Failed to write volume file '{}'", file_path.display()),
             source,
         })?;
+        apply_default_mode(&file_path, default_mode)?;
     }
+    Ok(())
+}
+
+/// Apply a volume's `defaultMode` to a just-written file. Kubernetes expresses
+/// the mode as Unix permission bits, so on Windows there is nothing to apply.
+#[cfg(unix)]
+fn apply_default_mode(file_path: &Path, default_mode: Option<u32>) -> Result<(), PrepareError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(mode) = default_mode else {
+        return Ok(());
+    };
+    fs::set_permissions(file_path, fs::Permissions::from_mode(mode)).map_err(|source| {
+        PrepareError::Io {
+            context: format!(
+                "Failed to set mode {mode:04o} on volume file '{}'",
+                file_path.display()
+            ),
+            source,
+        }
+    })
+}
+
+#[cfg(windows)]
+fn apply_default_mode(_file_path: &Path, _default_mode: Option<u32>) -> Result<(), PrepareError> {
     Ok(())
 }
 
@@ -807,6 +834,93 @@ mod tests {
         assert!(result.containers["app"][0].read_only);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn config_map_volume_default_mode_is_applied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = setup_dir("cm-vol-mode");
+        let mount_path = base.join("mount");
+
+        let pod = make_pod(
+            vec![Container {
+                name: "app".to_string(),
+                volume_mounts: vec![VolumeMount {
+                    name: "assets".to_string(),
+                    mount_path: mount_path.to_string_lossy().to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            vec![Volume {
+                name: "assets".to_string(),
+                config_map: Some(ConfigMapVolume {
+                    name: "app-assets".to_string(),
+                    default_mode: Some(0o755),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        );
+
+        let mut resolved = ResolvedK8sValues::default();
+        resolved.config_map_volumes.insert(
+            "app-assets".to_string(),
+            [("build.sh".to_string(), "#!/usr/bin/env bash\n".to_string())]
+                .into_iter()
+                .collect(),
+        );
+
+        resolve_volumes(&pod, &resolved, &base).unwrap();
+
+        let script = base.join(VOLUMES_DIR).join("assets").join("build.sh");
+        let mode = fs::metadata(&script).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_map_volume_without_default_mode_keeps_os_default() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = setup_dir("cm-vol-no-mode");
+        let mount_path = base.join("mount");
+
+        let pod = make_pod(
+            vec![Container {
+                name: "app".to_string(),
+                volume_mounts: vec![VolumeMount {
+                    name: "assets".to_string(),
+                    mount_path: mount_path.to_string_lossy().to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            vec![Volume {
+                name: "assets".to_string(),
+                config_map: Some(ConfigMapVolume {
+                    name: "app-assets".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        );
+
+        let mut resolved = ResolvedK8sValues::default();
+        resolved.config_map_volumes.insert(
+            "app-assets".to_string(),
+            [("plain.txt".to_string(), "text".to_string())]
+                .into_iter()
+                .collect(),
+        );
+
+        resolve_volumes(&pod, &resolved, &base).unwrap();
+
+        let file = base.join(VOLUMES_DIR).join("assets").join("plain.txt");
+        let mode = fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0);
+    }
+
     #[test]
     fn config_map_volume_missing_data_errors() {
         let base = setup_dir("cm-vol-missing");
@@ -862,6 +976,7 @@ mod tests {
                     path: p.to_string(),
                 })
                 .collect(),
+            ..Default::default()
         }
     }
 
@@ -989,7 +1104,10 @@ mod tests {
             }],
             vec![Volume {
                 name: "cfg".to_string(),
-                projected: Some(ProjectedVolume { sources }),
+                projected: Some(ProjectedVolume {
+                    sources,
+                    ..Default::default()
+                }),
                 ..Default::default()
             }],
         )

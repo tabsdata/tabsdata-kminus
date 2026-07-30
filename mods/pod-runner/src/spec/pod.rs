@@ -172,6 +172,9 @@ pub struct ConfigMapVolume {
     /// projected at a file named after the key. When set, only the listed
     /// keys are projected, each at its `path` (relative to the mount).
     pub items: Vec<KeyToPath>,
+    /// Unix permission bits applied to every projected file. Ignored on
+    /// Windows, which has no execute bit.
+    pub default_mode: Option<u32>,
 }
 
 /// One source within a `projected` volume. Only `configMap` sources are
@@ -194,6 +197,9 @@ pub struct VolumeProjection {
 #[serde(rename_all = "camelCase", default)]
 pub struct ProjectedVolume {
     pub sources: Vec<VolumeProjection>,
+    /// Unix permission bits applied to every projected file. Ignored on
+    /// Windows, which has no execute bit.
+    pub default_mode: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
