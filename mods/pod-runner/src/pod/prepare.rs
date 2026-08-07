@@ -137,6 +137,18 @@ impl PrepareError {
             _ => false,
         }
     }
+
+    /// True when the error originates from a cancelled resolver poll
+    /// (delete or shutdown fired while waiting for a resource).
+    pub fn is_cancelled(&self) -> bool {
+        use crate::pod::resolver::config_map::ConfigMapResolverErrorKind;
+        use crate::pod::resolver::secret::SecretResolverErrorKind;
+        match self {
+            Self::SecretResolution(e) => e.kind == SecretResolverErrorKind::Cancelled,
+            Self::ConfigMapResolution(e) => e.kind == ConfigMapResolverErrorKind::Cancelled,
+            _ => false,
+        }
+    }
 }
 
 /// Environment variable injected into every container with the container's

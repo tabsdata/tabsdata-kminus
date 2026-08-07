@@ -342,7 +342,21 @@ impl PodLogic {
     /// — those have `_monitor.is_finished()` and don't block shutdown.
     /// Times out after `timeout` to avoid hanging on stuck pods.
     pub async fn wait_for_pods(&self, timeout: Duration) {
+        // Preparer cancel channels are otherwise only fired by
+        // delete_pod. Fire them for every pod still preparing so a
+        // pod stuck waiting for a missing resource (infinite
+        // resolver backoff) cannot hold shutdown until the timeout.
+        {
+            let runtimes = self.runtimes.read().unwrap();
+            for runtime in runtimes.values() {
+                if let PodRuntime::Preparing { cancel_tx, .. } = runtime {
+                    let _ = cancel_tx.send(());
+                }
+            }
+        }
+
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut last_logged = 0;
         loop {
             let count = self
                 .runtimes
@@ -362,7 +376,10 @@ impl PodLogic {
                 );
                 return;
             }
-            debug!(remaining = count, "Waiting for pod monitors to complete");
+            if count != last_logged {
+                info!(remaining = count, "Waiting for pod monitors to complete");
+                last_logged = count;
+            }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -1180,6 +1197,13 @@ async fn prepare_and_run(
     let prepared = match prepare_result {
         Ok(p) => p,
         Err(err) => {
+            // A cancelled poll with `deleted` unset means shutdown
+            // fired the cancel (wait_for_pods) — exit without
+            // marking the pod Failed.
+            if err.is_cancelled() {
+                info!(pod = %id, "Preparation aborted by shutdown");
+                return;
+            }
             // Classify and surface as Failed in the store.
             let reason = if err.is_timeout() {
                 warn!(pod = %id, error = %err, "Pod preparation timed out");
@@ -2532,6 +2556,31 @@ mod tests {
             assert_eq!(
                 init_cond.message, REASON_DEADLINE_EXCEEDED,
                 "Initialized condition should carry the DeadlineExceeded reason",
+            );
+        }
+
+        #[tokio::test]
+        async fn shutdown_cancels_stuck_preparer() {
+            let secret_dir = temp_dir("shutdown-cancels-preparer");
+            let (logic, _, shutdown_tx) = make_logic_with_secret_dir(secret_dir);
+
+            // No activeDeadlineSeconds — the resolver backoff would
+            // otherwise retry forever waiting for the missing secret.
+            let pod = pod_with_secret_ref("stuck", "missing-secret", None);
+            logic.create_pod(pod).await.unwrap();
+
+            // Let the preparer enter the resolver poll loop.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Shutdown: wait_for_pods fires the preparer cancels, so
+            // it must return well before its own timeout.
+            let _ = shutdown_tx.send(());
+            let start = std::time::Instant::now();
+            logic.wait_for_pods(Duration::from_secs(10)).await;
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "wait_for_pods should return promptly once the preparer is cancelled, took {:?}",
+                start.elapsed(),
             );
         }
 
