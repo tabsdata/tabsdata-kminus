@@ -52,13 +52,13 @@ async fn purge_loop(
     store: Arc<dyn PodStore>,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
-    info!("Purge daemon started");
+    debug!("Purge daemon started");
 
     // Initial delay
     tokio::select! {
         _ = tokio::time::sleep(INITIAL_DELAY) => {},
         _ = shutdown_rx.changed() => {
-            info!("Shutdown before first scan");
+            debug!("Shutdown before first scan");
             return;
         }
     }
@@ -69,7 +69,7 @@ async fn purge_loop(
 
         // If shutdown was signalled during scan, exit
         if shutdown_rx.has_changed().unwrap_or(true) {
-            info!("Shutdown signal received, purge daemon exiting");
+            debug!("Shutdown signal received, purge daemon exiting");
             return;
         }
 
@@ -87,7 +87,7 @@ async fn purge_loop(
         tokio::select! {
             _ = tokio::time::sleep(sleep_duration) => {},
             _ = shutdown_rx.changed() => {
-                info!("Shutdown signal received, purge daemon exiting");
+                debug!("Shutdown signal received, purge daemon exiting");
                 return;
             }
         }

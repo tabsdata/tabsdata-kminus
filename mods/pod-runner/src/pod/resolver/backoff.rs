@@ -19,7 +19,7 @@
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 // ---------------------------------------------------------------------------
 // Schedule
@@ -111,7 +111,7 @@ where
             biased;
             _ = cancel.changed() => {
                 let elapsed = start.elapsed();
-                warn!(op = op_name, ?elapsed, "Poll cancelled");
+                debug!(op = op_name, ?elapsed, "Poll cancelled");
                 return Err(PollError::Cancelled { elapsed });
             }
             r = op() => r,
@@ -146,7 +146,7 @@ where
                     None => base_delay,
                 };
 
-                info!(
+                warn!(
                     op = op_name,
                     attempt = attempt + 1,
                     next_retry_secs = sleep_dur.as_secs_f64(),
@@ -158,7 +158,7 @@ where
                     biased;
                     _ = cancel.changed() => {
                         let elapsed = start.elapsed();
-                        warn!(op = op_name, ?elapsed, "Poll cancelled during backoff");
+                        debug!(op = op_name, ?elapsed, "Poll cancelled during backoff");
                         return Err(PollError::Cancelled { elapsed });
                     }
                     _ = tokio::time::sleep(sleep_dur) => {}

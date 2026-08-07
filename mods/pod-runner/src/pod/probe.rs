@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinSet;
-use tracing::{Instrument, debug, info, info_span, warn};
+use tracing::{Instrument, debug, info_span, warn};
 
 use crate::pod::container_log::ProbeLogStream;
 use crate::pod::executor::{PodEvent, PodEventKind, PodState};
@@ -350,7 +350,7 @@ async fn run_container_probes(
             match probe_type.as_str() {
                 PROBE_STARTUP => {
                     if success && threshold_reached {
-                        info!("Startup probe passed");
+                        debug!("Startup probe passed");
                         tracker.startup_passed = true;
                         for t in trackers.iter_mut() {
                             t.startup_passed = true;
@@ -384,7 +384,7 @@ async fn run_container_probes(
                             }
                         };
                         if changed {
-                            info!("Readiness probe passed — container ready");
+                            debug!("Readiness probe passed — container ready");
                             let _ = action_tx.try_send(ProbeAction::ReadinessChanged {
                                 container: container_name.to_string(),
                                 ready: true,

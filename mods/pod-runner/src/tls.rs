@@ -13,7 +13,7 @@
 use std::path::Path;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tracing::debug;
+use tracing::trace;
 
 // ---------------------------------------------------------------------------
 // TlsError
@@ -218,7 +218,7 @@ pub fn load_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, TlsError> 
     if certs.is_empty() {
         return Err(TlsError::EmptyCerts);
     }
-    debug!(count = certs.len(), "Loaded certificates");
+    trace!(count = certs.len(), "Loaded certificates");
     Ok(certs)
 }
 

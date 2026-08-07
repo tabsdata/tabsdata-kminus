@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use tracing::{Instrument, debug, debug_span, info, info_span, warn};
+use tracing::{Instrument, debug, info, info_span, trace, trace_span, warn};
 
 use crate::metrics::Metrics;
 pub use crate::pod::container_log::ContainerLogOptions;
@@ -573,7 +573,12 @@ impl PodLogic {
                 initial_status,
             )
             .await;
-        info!(pod = %id, "Pod stored in Pending; spawning preparer");
+        {
+            // Tightly scoped: EnteredSpan is !Send, so it must not be
+            // held across an await.
+            let _span = info_span!("pod", pod = %id).entered();
+            info!("Pod accepted");
+        }
 
         // Per-pod cancel channel — fires on delete_pod or shutdown.
         let (cancel_tx, cancel_rx) = watch::channel(());
@@ -661,7 +666,7 @@ impl PodLogic {
         // than an .entered() guard — EnteredSpan is !Send, so holding
         // one across an .await makes the whole future !Send and would
         // prevent the axum handler from using this function.
-        let span = info_span!("logic_delete", pod = %snap.id);
+        let span = info_span!("pod", pod = %snap.id);
         self.delete_pod_inner(snap, grace_period, delete_start)
             .instrument(span)
             .await
@@ -680,11 +685,13 @@ impl PodLogic {
             .or_else(|| snap.spec.termination_grace_period())
             .unwrap_or(self.config.default_grace_period);
 
+        info!(phase = ?snap.status.phase, "Pod deleted");
+
         // Terminal — run cleanup and remove runtime.
         // The monitor task has already processed the Completed event and
         // written the FINISHED sentinel by the time we reach here.
         if snap.status.phase.is_terminal() {
-            info!(phase = ?snap.status.phase, "Cleaning up terminal pod");
+            debug!(phase = ?snap.status.phase, "Cleaning up terminal pod");
             cleanup::cleanup_pod(
                 &snap.id,
                 self.store.as_ref(),
@@ -737,7 +744,7 @@ impl PodLogic {
 
         match action {
             Action::CancelPreparer(tx) => {
-                info!("Cancelling pod preparer");
+                debug!("Cancelling pod preparer");
                 let _ = tx.send(());
                 // The preparer task observes `deleted` after its
                 // prepare_pod call returns and exits without spawning the
@@ -747,7 +754,7 @@ impl PodLogic {
                 return Ok(());
             }
             Action::KillRunning(kh) => {
-                info!(grace_period = ?grace, "Killing pod");
+                debug!(grace_period = ?grace, "Killing pod");
                 kh.kill(grace);
                 // Mark disruption target on the LIVE lifecycle + status
                 // so the next emitted event carries it forward.
@@ -787,14 +794,14 @@ impl PodLogic {
                 .get_by_name(namespace, name, view)
                 .await
                 .ok_or_else(|| {
-                    debug!("Pod not found");
+                    trace!("Pod not found");
                     LogicError::NotFound {
                         namespace: namespace.to_string(),
                         name: name.to_string(),
                     }
                 })
         }
-        .instrument(debug_span!("logic_get", namespace, name))
+        .instrument(trace_span!("logic_get", namespace, name))
         .await
     }
 
@@ -809,7 +816,7 @@ impl PodLogic {
                 .await
                 .map(|snap| snap.status)
         }
-        .instrument(debug_span!("logic_get_status", namespace, name))
+        .instrument(trace_span!("logic_get_status", namespace, name))
         .await
     }
 
@@ -817,10 +824,10 @@ impl PodLogic {
     pub async fn list_pods(&self, view: SpecView) -> Vec<PodSnapshot> {
         async {
             let pods = self.store.list(view).await;
-            debug!(count = pods.len(), "Listed pods");
+            trace!(count = pods.len(), "Listed pods");
             pods
         }
-        .instrument(debug_span!("logic_list"))
+        .instrument(trace_span!("logic_list"))
         .await
     }
 
@@ -831,7 +838,7 @@ impl PodLogic {
     pub async fn list_pod_statuses(&self) -> Vec<crate::spec::api::PodStatusEntry> {
         async {
             let pods = self.store.list(SpecView::Running).await;
-            debug!(count = pods.len(), "Listed pod statuses");
+            trace!(count = pods.len(), "Listed pod statuses");
             pods.into_iter()
                 .map(|snap| crate::spec::api::PodStatusEntry {
                     namespace: snap.id.namespace,
@@ -845,7 +852,7 @@ impl PodLogic {
                 })
                 .collect()
         }
-        .instrument(debug_span!("logic_list_statuses"))
+        .instrument(trace_span!("logic_list_statuses"))
         .await
     }
 
@@ -857,10 +864,10 @@ impl PodLogic {
     ) -> Vec<PodSnapshot> {
         async {
             let pods = self.store.list_in_namespace(namespace, view).await;
-            debug!(count = pods.len(), "Listed pods in namespace");
+            trace!(count = pods.len(), "Listed pods in namespace");
             pods
         }
-        .instrument(debug_span!("logic_list_ns", namespace))
+        .instrument(trace_span!("logic_list_ns", namespace))
         .await
     }
 
@@ -1013,7 +1020,7 @@ async fn monitor_pod(
         let event = tokio::select! {
             result = handle.wait() => result,
             _ = shutdown.changed() => {
-                info!("Shutdown signal received in monitor, waiting for pod to finish");
+                debug!("Shutdown signal received in monitor, waiting for pod to finish");
                 // Don't break — let the orchestrator finish. It already
                 // received the shutdown signal and will kill containers.
                 // Just continue the event loop to process final events.
@@ -1024,27 +1031,47 @@ async fn monitor_pod(
             Ok(event) => {
                 match &event.kind {
                     PodEventKind::ContainerStarted { name, role } => {
-                        info!(container = name.as_str(), role = %role, "Container started");
+                        debug!(container = name.as_str(), role = %role, "Container started");
                         if let Some(ref m) = metrics {
                             m.containers_started_total.inc();
                             m.containers_running.inc();
                         }
                     }
                     PodEventKind::ContainerSucceeded { name } => {
-                        info!(container = name.as_str(), "Container succeeded");
+                        debug!(container = name.as_str(), "Container succeeded");
                         if let Some(ref m) = metrics {
                             m.containers_running.dec();
                         }
                     }
                     PodEventKind::ContainerFailed { name, exit_code } => {
-                        info!(container = name.as_str(), exit_code, "Container failed");
+                        // Sidecars are killed when the pod completes, so
+                        // a nonzero exit is their normal termination.
+                        let is_sidecar = handle
+                            .pod()
+                            .spec
+                            .init_containers
+                            .iter()
+                            .any(|c| c.name == *name && c.is_sidecar());
+                        if is_sidecar {
+                            debug!(container = name.as_str(), exit_code, "Sidecar terminated");
+                        } else {
+                            warn!(container = name.as_str(), exit_code, "Container failed");
+                        }
                         if let Some(ref m) = metrics {
                             m.containers_failed_total.inc();
                             m.containers_running.dec();
                         }
                     }
                     PodEventKind::Completed { phase } => {
-                        info!(phase = ?phase, "Pod completed");
+                        if *phase == crate::spec::constants::PodPhase::Failed {
+                            warn!(
+                                phase = ?phase,
+                                reason = %event.status.message,
+                                "Pod completed",
+                            );
+                        } else {
+                            info!(phase = ?phase, "Pod completed");
+                        }
                         if let Some(ref m) = metrics {
                             if *phase == crate::spec::constants::PodPhase::Failed {
                                 m.pods_failed_total.inc();
@@ -1053,7 +1080,11 @@ async fn monitor_pod(
                         }
                     }
                     PodEventKind::PhaseChanged { to, .. } => {
-                        debug!(phase = ?to, "Phase changed");
+                        if *to == crate::spec::constants::PodPhase::Running {
+                            info!(phase = ?to, "Pod running");
+                        } else {
+                            debug!(phase = ?to, "Phase changed");
+                        }
                         if let Some(ref m) = metrics
                             && *to == crate::spec::constants::PodPhase::Running
                         {
@@ -1100,7 +1131,7 @@ async fn monitor_pod(
     // Natural completions keep everything so logs can still be read
     // until delete_pod is called.
     if deleted.load(Ordering::Relaxed) {
-        info!("Cleaning up deleted pod");
+        debug!("Cleaning up deleted pod");
         cleanup::cleanup_pod(
             &id,
             store.as_ref(),
@@ -1171,7 +1202,6 @@ async fn prepare_and_run(
         .map(Duration::from_secs);
 
     debug!(
-        pod = %id,
         timeout_secs = ?timeout.map(|d| d.as_secs()),
         "Starting pod preparation",
     );
@@ -1190,7 +1220,7 @@ async fn prepare_and_run(
     // If delete_pod fired the cancel while we were preparing, exit
     // silently — the delete path has already cleaned store + runtimes.
     if deleted.load(Ordering::Relaxed) {
-        info!(pod = %id, "Preparation aborted by deletion");
+        debug!("Preparation aborted by deletion");
         return;
     }
 
@@ -1201,15 +1231,15 @@ async fn prepare_and_run(
             // fired the cancel (wait_for_pods) — exit without
             // marking the pod Failed.
             if err.is_cancelled() {
-                info!(pod = %id, "Preparation aborted by shutdown");
+                info!("Preparation aborted by shutdown");
                 return;
             }
             // Classify and surface as Failed in the store.
             let reason = if err.is_timeout() {
-                warn!(pod = %id, error = %err, "Pod preparation timed out");
+                warn!(error = %err, "Pod preparation timed out");
                 REASON_DEADLINE_EXCEEDED
             } else {
-                warn!(pod = %id, error = %err, "Pod preparation failed");
+                warn!(error = %err, "Pod preparation failed");
                 REASON_POD_PREPARATION_FAILED
             };
             let status = build_failed_prep_status(reason, &err.to_string());
@@ -1242,7 +1272,7 @@ async fn prepare_and_run(
     let handle = match executor.spawn(exec_shutdown).await {
         Ok(h) => h,
         Err(e) => {
-            warn!(pod = %id, error = %e, "Executor spawn failed");
+            warn!(error = %e, "Executor spawn failed");
             let status = build_failed_prep_status(
                 REASON_POD_PREPARATION_FAILED,
                 &format!("executor spawn failed: {}", e),
@@ -1258,7 +1288,9 @@ async fn prepare_and_run(
     let kill_handle = handle.kill_handle();
     let log_handle = handle.log_handle();
 
-    let monitor_span = info_span!("monitor", pod = %id);
+    // Root span: the monitor outlives preparation — don't nest
+    // the pod's runtime logs under the prepare{...} span.
+    let monitor_span = info_span!(parent: None, "pod", pod = %id);
     let monitor_shutdown = shutdown_tx.subscribe();
     let monitor = tokio::spawn(
         monitor_pod(
@@ -1289,7 +1321,7 @@ async fn prepare_and_run(
         },
     );
 
-    info!(pod = %id, "Pod prepared and executor spawned");
+    debug!("Pod prepared and executor spawned");
 }
 
 // ---------------------------------------------------------------------------

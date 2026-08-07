@@ -77,7 +77,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use tracing::{Instrument, debug, debug_span, info, info_span, warn};
+use tracing::{Instrument, debug, debug_span, info_span, trace, warn};
 
 use crate::pod::container_log::{ContainerLogStream, read_only_mount_warning};
 use crate::pod::lifecycle::PodLifecycle;
@@ -736,9 +736,12 @@ impl PodExecutor {
 
         let log_dir = config.log_dir().cloned();
 
+        // Root span: the executor outlives the preparer task that
+        // spawns it, so don't inherit the prepare{...} span context.
         let pod_span = info_span!(
+            parent: None,
             "pod",
-            pod = format!("{}/{}", pod.metadata.namespace, pod.metadata.name).as_str(),
+            pod = format!("{}_{}", pod.metadata.name, pod.metadata.uid).as_str(),
         );
 
         // Clones for the task-lifecycle wrapper. The original
@@ -767,7 +770,7 @@ impl PodExecutor {
                     };
                     // Inherit the orchestrator's pod span so events
                     // emitted inside `task.run` carry pod context
-                    // (`pod = <ns>/<name>`) automatically.
+                    // (`pod = <name>`) automatically.
                     task_set.spawn(async move { task.run(ctx).await }.in_current_span());
                 }
 
@@ -949,7 +952,7 @@ fn read_only_mount_warnings(container: &Container) -> Vec<String> {
 
 /// Emit a pod event. Best-effort: if the receiver is full or dropped, lost.
 fn emit(event_tx: &mpsc::Sender<PodEvent>, kind: PodEventKind, status: &PodStatus) {
-    debug!(kind = ?kind, phase = ?status.phase, "Emitting event");
+    trace!(kind = ?kind, phase = ?status.phase, "Emitting event");
     if let Err(e) = event_tx.try_send(PodEvent {
         kind,
         status: status.clone(),
@@ -992,7 +995,6 @@ async fn transition_phase(
     let snapshot = st.status();
     drop(st); // release before emitting
 
-    info!("Phase transition: {} -> {}", old, new_phase);
     emit(
         event_tx,
         PodEventKind::PhaseChanged {
@@ -1177,7 +1179,7 @@ async fn run_orchestrator(
 ) {
     let pod_start = Instant::now();
 
-    info!(
+    debug!(
         init_containers = pod.spec.init_containers.len(),
         containers = pod.spec.containers.len(),
         "Orchestrator starting",
@@ -1209,7 +1211,7 @@ async fn run_orchestrator(
         warn!("Init containers failed: {}", e);
         kill_all_in_state(&state, config.shutdown_grace_period).await;
         fail_pod(&state, &event_tx, &format!("Init failed: {}", e)).await;
-        info!(
+        debug!(
             init_ms,
             total_ms = pod_start.elapsed().as_millis(),
             "Pod timing (failed in init)"
@@ -1219,7 +1221,7 @@ async fn run_orchestrator(
     if shutdown.has_changed().unwrap_or(true) || *kill_watch.borrow() {
         kill_all_in_state(&state, config.shutdown_grace_period).await;
         fail_pod(&state, &event_tx, "Shutdown/kill during init").await;
-        info!(
+        debug!(
             init_ms,
             total_ms = pod_start.elapsed().as_millis(),
             "Pod timing (killed in init)"
@@ -1238,7 +1240,7 @@ async fn run_orchestrator(
     if pod.spec.containers.is_empty() {
         terminate_sidecars(&pod, &state, &event_tx).await;
         succeed_pod(&state, &event_tx, "No containers to run").await;
-        info!(
+        debug!(
             init_ms,
             total_ms = pod_start.elapsed().as_millis(),
             "Pod timing (no containers)"
@@ -1250,7 +1252,7 @@ async fn run_orchestrator(
         warn!("Failed to start main containers: {}", e);
         kill_all_in_state(&state, config.shutdown_grace_period).await;
         fail_pod(&state, &event_tx, &format!("Container start failed: {}", e)).await;
-        info!(
+        debug!(
             init_ms,
             total_ms = pod_start.elapsed().as_millis(),
             "Pod timing (start failed)"
@@ -1271,7 +1273,7 @@ async fn run_orchestrator(
     let sidecar_term_ms = phase_start.elapsed().as_millis();
 
     let total_ms = pod_start.elapsed().as_millis();
-    info!(
+    debug!(
         init_ms,
         main_ms,
         sidecar_term_ms,
@@ -1288,7 +1290,6 @@ async fn run_orchestrator(
 }
 
 async fn fail_pod(state: &Mutex<PodState>, event_tx: &mpsc::Sender<PodEvent>, message: &str) {
-    warn!("Pod failed: {}", message);
     let (old, snapshot) = {
         let mut st = state.lock().await;
         let old = st.lifecycle.phase();
@@ -1298,7 +1299,6 @@ async fn fail_pod(state: &Mutex<PodState>, event_tx: &mpsc::Sender<PodEvent>, me
         (old, st.status())
     };
     if old != PodPhase::Failed {
-        info!("Phase transition: {} -> {}", old, PodPhase::Failed);
         emit(
             event_tx,
             PodEventKind::PhaseChanged {
@@ -1318,7 +1318,6 @@ async fn fail_pod(state: &Mutex<PodState>, event_tx: &mpsc::Sender<PodEvent>, me
 }
 
 async fn succeed_pod(state: &Mutex<PodState>, event_tx: &mpsc::Sender<PodEvent>, message: &str) {
-    info!("Pod succeeded: {}", message);
     let (old, snapshot) = {
         let mut st = state.lock().await;
         let old = st.lifecycle.phase();
@@ -1331,7 +1330,6 @@ async fn succeed_pod(state: &Mutex<PodState>, event_tx: &mpsc::Sender<PodEvent>,
         (old, st.status())
     };
     if old != PodPhase::Succeeded {
-        info!("Phase transition: {} -> {}", old, PodPhase::Succeeded);
         emit(
             event_tx,
             PodEventKind::PhaseChanged {
@@ -1360,7 +1358,7 @@ async fn kill_all_in_state(state: &Mutex<PodState>, grace_period: Duration) {
         st.handles.keys().cloned().collect()
     };
     if !names.is_empty() {
-        warn!(containers = ?names, "Killing {} container(s)", names.len());
+        debug!(containers = ?names, "Killing {} container(s)", names.len());
     }
     for name in &names {
         kill_container(name, state, grace_period).await;
@@ -1391,7 +1389,7 @@ async fn run_init_containers(
     }
 
     let total = pod.spec.init_containers.len();
-    info!("Running {} init container(s)", total);
+    debug!("Running {} init container(s)", total);
 
     for (idx, container) in pod.spec.init_containers.iter().enumerate() {
         if shutdown.has_changed().unwrap_or(true) || *kill_watch.borrow() {
@@ -1399,7 +1397,7 @@ async fn run_init_containers(
         }
 
         if container.is_sidecar() {
-            info!(
+            debug!(
                 container = container.name.as_str(),
                 step = idx + 1,
                 total,
@@ -1416,7 +1414,7 @@ async fn run_init_containers(
             )
             .await?;
         } else {
-            info!(
+            debug!(
                 container = container.name.as_str(),
                 step = idx + 1,
                 total,
@@ -1479,7 +1477,7 @@ async fn start_main_containers(
     event_tx: &mpsc::Sender<PodEvent>,
     shutdown: &watch::Receiver<()>,
 ) -> io::Result<()> {
-    info!("Starting {} main container(s)", pod.spec.containers.len());
+    debug!("Starting {} main container(s)", pod.spec.containers.len());
 
     for container in &pod.spec.containers {
         spawn_container(
@@ -1611,7 +1609,7 @@ async fn monitor_main_containers(
                     result = handle.wait() => result.unwrap_or(-1),
                     Ok(()) = kill_signal.changed() => {
                         let grace = kill_signal.borrow().unwrap_or(Duration::from_secs(5));
-                        warn!("Kill signal received, killing process");
+                        debug!("Kill signal received, killing process");
                         handle.kill(grace).await;
                         handle.wait().await.unwrap_or(-1)
                     }
@@ -1706,7 +1704,7 @@ async fn monitor_main_containers(
             grace = kill_rx.recv(), if kill_channel_open => {
                 match grace {
                     Some(grace_period) => {
-                        warn!("Kill request received — broadcasting to monitor tasks");
+                        debug!("Kill request received — broadcasting to monitor tasks");
                         let _ = kill_signal_tx.send(Some(grace_period));
                         kill_all_in_state(state, grace_period).await;
                     }
@@ -1718,7 +1716,7 @@ async fn monitor_main_containers(
             }
             // Shutdown
             _ = shutdown.changed() => {
-                warn!("Shutdown during container monitoring — killing all");
+                debug!("Shutdown during container monitoring — killing all");
                 // Broadcast the kill to the per-container monitor tasks, which
                 // own the live handles: each runs `handle.kill(grace)` (SIGTERM,
                 // then SIGKILL after the pod's termination grace) and lets the
@@ -1780,11 +1778,11 @@ async fn terminate_sidecars(
         return;
     }
 
-    info!(sidecars = ?sidecar_names, "Terminating {} sidecar(s)", sidecar_names.len());
+    debug!(sidecars = ?sidecar_names, "Terminating {} sidecar(s)", sidecar_names.len());
 
     // Send SIGTERM to all sidecars — they start shutting down concurrently.
     for name in &sidecar_names {
-        info!(container = name.as_str(), "Sending SIGTERM to sidecar");
+        debug!(container = name.as_str(), "Sending SIGTERM to sidecar");
         sigterm_container(name, state).await;
     }
 

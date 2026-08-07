@@ -15,7 +15,7 @@ use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, info, warn};
+use tracing::{info, trace, warn};
 
 use super::config::PRConfig;
 use crate::tls::{TlsError, load_certs, load_private_key};
@@ -123,7 +123,7 @@ pub async fn axum_serve_tls(
                     let tls_stream = match acceptor.accept(stream).await {
                         Ok(s) => s,
                         Err(e) => {
-                            debug!(peer = %addr, error = %e, "TLS handshake failed");
+                            trace!(peer = %addr, error = %e, "TLS handshake failed");
                             return;
                         }
                     };
@@ -143,11 +143,11 @@ pub async fn axum_serve_tls(
                     tokio::select! {
                         result = &mut conn => {
                             if let Err(e) = result {
-                                debug!(peer = %addr, error = %e, "Connection error");
+                                trace!(peer = %addr, error = %e, "Connection error");
                             }
                         }
                         _ = conn_shutdown.changed() => {
-                            debug!(peer = %addr, "Shutdown, closing connection");
+                            trace!(peer = %addr, "Shutdown, closing connection");
                         }
                     }
                 });

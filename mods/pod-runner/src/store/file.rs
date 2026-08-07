@@ -54,7 +54,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::{debug_span, info, warn};
+use tracing::{debug, debug_span, warn};
 
 use crate::spec::pod::PodSpec;
 use crate::spec::status::PodStatus;
@@ -113,7 +113,7 @@ impl FileStore {
         if let Err(e) = fs::create_dir_all(&pods_dir) {
             warn!(error = %e, dir = ?pods_dir, "Failed to create pods directory");
         }
-        info!(dir = ?pods_dir, "File store initialized");
+        debug!(dir = ?pods_dir, "File store initialized");
         Self { pods_dir, config }
     }
 

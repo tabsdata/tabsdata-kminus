@@ -90,7 +90,7 @@ impl PodId {
         }
     }
 
-    /// `namespace/name` format for logging and display.
+    /// `namespace/name` format for namespace-qualified display.
     pub fn short(&self) -> String {
         format!("{}/{}", self.namespace, self.name)
     }
@@ -123,9 +123,15 @@ impl PodId {
     }
 }
 
+// Logging format: the k8s pod identity, `name_uid`. The uid
+// distinguishes incarnations of a reused pod name, and the pair is the
+// trailing two segments of the `full()` pod directory name, so log
+// lines correlate directly with on-disk pod dirs. Namespace is omitted
+// — pod-runner logs are already per-node and namespace adds no
+// disambiguation.
 impl std::fmt::Display for PodId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.namespace, self.name)
+        write!(f, "{}_{}", self.name, self.uid)
     }
 }
 
@@ -481,7 +487,7 @@ mod tests {
     #[test]
     fn test_pod_id_display() {
         let id = PodId::new("prod", "web", "uid-1");
-        assert_eq!(id.to_string(), "prod/web");
+        assert_eq!(id.to_string(), "web_uid-1");
         assert_eq!(id.short(), "prod/web");
         assert_eq!(id.full(), "prod_web_uid-1");
         assert_eq!(id.lookup_key(), "prod_web");

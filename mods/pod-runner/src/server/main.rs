@@ -5,8 +5,7 @@ use std::sync::Arc;
 use clap::Parser;
 use file_rotate::{ContentLimit, FileRotate, compression::Compression, suffix::AppendCount};
 use tokio::sync::watch;
-use tracing::info;
-use tracing_subscriber::filter::LevelFilter;
+use tracing::{info, warn};
 
 use pod_runner::config::cli::CliArgs;
 use pod_runner::config::resolve::resolve_config;
@@ -56,10 +55,7 @@ async fn main() {
     let writer = std::sync::Mutex::new(writer);
 
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::default()
-                .add_directive(LevelFilter::from(cli.loglevel).into()),
-        )
+        .with_env_filter(cli.loglevel.env_filter())
         .with_writer(writer)
         .with_ansi(false)
         .init();
@@ -78,7 +74,7 @@ async fn main() {
     // Kill any orphaned processes from a previous run
     let stale_killed = pod_runner::process::executor::cleanup_stale_pids(&pr_config.pid_dir);
     if stale_killed > 0 {
-        info!(stale_killed, "Killed stale processes from previous run");
+        warn!(stale_killed, "Killed stale processes from previous run");
     }
 
     // Create metrics

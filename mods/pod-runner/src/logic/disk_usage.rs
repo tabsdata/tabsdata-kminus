@@ -16,13 +16,14 @@
 //!   initial / periodic / final pattern against the pod-runner's
 //!   working directory.
 //!
-//! Each scan emits a structured tracing event at `INFO` with two
-//! fields — `mb` (allocated size as MiB with three decimals) and
-//! `blocks` (in 512-byte units per
-//! [`crate::utils::dir_size::BLOCK_BYTES`]) — and a distinct
-//! message per scan kind (`initial`, periodic, `final`). The scan
-//! also writes `_size` (JSON: `{"bytes":N,"blocks":M}`) at the
-//! directory it was called on.
+//! Each scan emits a structured tracing event with two fields —
+//! `mb` (allocated size as MiB with three decimals) and `blocks`
+//! (in 512-byte units per [`crate::utils::dir_size::BLOCK_BYTES`])
+//! — and a distinct message per scan kind (`initial`, periodic,
+//! `final`). Runner-wide scans log at `INFO` (one line per
+//! interval); per-pod scans log at `DEBUG` (they multiply with pod
+//! count). The scan also writes `_size` (JSON:
+//! `{"bytes":N,"blocks":M}`) at the directory it was called on.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -30,7 +31,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::watch;
 use tokio::time::{self, MissedTickBehavior};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::{RunnerTask, RunnerTaskContext};
 use crate::pod::executor::{PodTask, PodTaskContext};
@@ -54,6 +55,8 @@ fn mib(bytes: u64) -> String {
 /// Per-scan-kind log messages. Pod and runner tasks differ only in
 /// what they print; the loop logic itself is shared.
 struct ScanLabels {
+    /// Log successful scans at INFO instead of DEBUG.
+    info_level: bool,
     initial_ok: &'static str,
     initial_err: &'static str,
     periodic_ok: &'static str,
@@ -63,6 +66,7 @@ struct ScanLabels {
 }
 
 const POD_LABELS: ScanLabels = ScanLabels {
+    info_level: false,
     initial_ok: "Pod initial disk utilization",
     initial_err: "Pod initial disk usage scan failed",
     periodic_ok: "Pod disk utilization",
@@ -72,6 +76,7 @@ const POD_LABELS: ScanLabels = ScanLabels {
 };
 
 const RUNNER_LABELS: ScanLabels = ScanLabels {
+    info_level: true,
     initial_ok: "Pod-runner initial total disk utilization",
     initial_err: "Pod-runner initial disk usage scan failed",
     periodic_ok: "Pod-runner total disk utilization",
@@ -84,11 +89,13 @@ const RUNNER_LABELS: ScanLabels = ScanLabels {
 async fn one_scan(
     work_dir: &std::path::Path,
     cancel: &mut watch::Receiver<()>,
+    info_level: bool,
     ok_msg: &'static str,
     err_msg: &'static str,
 ) {
     match scan_dir(work_dir, cancel).await {
-        Ok(s) => info!(mb = %mib(s.bytes), blocks = s.blocks, "{}", ok_msg),
+        Ok(s) if info_level => info!(mb = %mib(s.bytes), blocks = s.blocks, "{}", ok_msg),
+        Ok(s) => debug!(mb = %mib(s.bytes), blocks = s.blocks, "{}", ok_msg),
         Err(e) => warn!(error = %e, "{}", err_msg),
     }
 }
@@ -118,6 +125,7 @@ async fn run_scan_loop(
         one_scan(
             &work_dir,
             &mut cancel,
+            labels.info_level,
             labels.initial_ok,
             labels.initial_err,
         )
@@ -146,7 +154,7 @@ async fn run_scan_loop(
             _ = runner_shutdown.changed() => break,
             _ = ticker.tick() => {
                 let mut cancel = runner_shutdown.clone();
-                one_scan(&work_dir, &mut cancel, labels.periodic_ok, labels.periodic_err).await;
+                one_scan(&work_dir, &mut cancel, labels.info_level, labels.periodic_ok, labels.periodic_err).await;
             }
         }
     }
@@ -157,6 +165,7 @@ async fn run_scan_loop(
     one_scan(
         &work_dir,
         &mut never_fires,
+        labels.info_level,
         labels.final_ok,
         labels.final_err,
     )
@@ -198,7 +207,7 @@ impl Default for DiskSizePodTask {
 #[async_trait]
 impl PodTask for DiskSizePodTask {
     async fn run(&self, ctx: PodTaskContext) {
-        // Pod context (`pod=<ns>/<name>`) is supplied by the
+        // Pod context (`pod=<name>`) is supplied by the
         // orchestrator's pod span which wraps this task — no need to
         // attach it as an event field.
         run_scan_loop(

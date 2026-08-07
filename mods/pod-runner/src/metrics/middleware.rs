@@ -8,6 +8,7 @@ use std::time::Instant;
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
+use tracing::trace;
 
 use super::Metrics;
 
@@ -27,6 +28,14 @@ pub async fn track_request_duration(
 
     let status = response.status().as_u16().to_string();
     let elapsed = start.elapsed().as_secs_f64();
+
+    trace!(
+        %method,
+        %path,
+        %status,
+        elapsed_ms = (elapsed * 1000.0) as u64,
+        "HTTP request"
+    );
 
     metrics
         .http_request_duration
