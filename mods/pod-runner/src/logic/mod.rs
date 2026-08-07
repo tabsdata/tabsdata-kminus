@@ -2198,9 +2198,10 @@ mod tests {
         async fn reap_ttl_annotation_defers_reaping_a_succeeded_pod() {
             let (logic, _, _) = make_logic_with_store();
             let mut spec = make_pod_spec("app", "exit 0");
-            spec.metadata
-                .annotations
-                .insert(ANN_POD_REAP_TTL_ON_SUCCESS.to_string(), "1h".to_string());
+            spec.metadata.annotations.insert(
+                ANN_POD_DATA_REAP_TTL_ON_POD_SUCCESS.to_string(),
+                "1h".to_string(),
+            );
             logic.create_pod(spec).await.unwrap();
             let id = PodId::new("default", "app", "uid-app");
 
@@ -2221,7 +2222,7 @@ mod tests {
             let (logic, _, _) = make_logic_with_store();
             let mut spec = make_pod_spec("app", "exit 0");
             spec.metadata.annotations.insert(
-                ANN_POD_REAP_TTL_ON_SUCCESS.to_string(),
+                ANN_POD_DATA_REAP_TTL_ON_POD_SUCCESS.to_string(),
                 TTL_NEVER.to_string(),
             );
             logic.create_pod(spec).await.unwrap();
@@ -2258,11 +2259,11 @@ mod tests {
             let ttls = ttl::read_cleanup_ttls(&pod_dir).expect("cleanup TTLs readable");
             assert_eq!(
                 ttls.reap_ttl_on_success.raw,
-                DEFAULT_POD_REAP_TTL_ON_SUCCESS
+                DEFAULT_POD_DATA_REAP_TTL_ON_POD_SUCCESS
             );
             assert_eq!(
-                ttls.delete_ttl_on_error.raw,
-                DEFAULT_POD_DELETE_TTL_ON_ERROR
+                ttls.delete_ttl_on_failure.raw,
+                DEFAULT_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE
             );
             assert_eq!(ttls.reap_ttl_on_success.source, ttl::TtlSource::Config);
             assert!(!ttls.written_at.is_empty());
@@ -2272,9 +2273,10 @@ mod tests {
         async fn cleanup_ttls_file_records_annotation_override() {
             let (logic, _, _) = make_logic_with_store();
             let mut spec = make_pod_spec("app", "exit 0");
-            spec.metadata
-                .annotations
-                .insert(ANN_POD_REAP_TTL_ON_ERROR.to_string(), "45m".to_string());
+            spec.metadata.annotations.insert(
+                ANN_POD_DATA_REAP_TTL_ON_POD_FAILURE.to_string(),
+                "45m".to_string(),
+            );
             logic.create_pod(spec).await.unwrap();
             let id = PodId::new("default", "app", "uid-app");
 
@@ -2282,12 +2284,12 @@ mod tests {
             assert!(wait_for_presence(&pod_dir.join(CLEANUP_TTLS_FILE)).await);
 
             let ttls = ttl::read_cleanup_ttls(&pod_dir).expect("cleanup TTLs readable");
-            assert_eq!(ttls.reap_ttl_on_error.raw, "45m");
-            assert_eq!(ttls.reap_ttl_on_error.secs, Some(2700));
-            assert_eq!(ttls.reap_ttl_on_error.source, ttl::TtlSource::Annotation);
+            assert_eq!(ttls.reap_ttl_on_failure.raw, "45m");
+            assert_eq!(ttls.reap_ttl_on_failure.secs, Some(2700));
+            assert_eq!(ttls.reap_ttl_on_failure.source, ttl::TtlSource::Annotation);
             // Only the annotated value is overridden.
             assert_eq!(ttls.reap_ttl_on_success.source, ttl::TtlSource::Config);
-            assert_eq!(ttls.delete_ttl_on_error.source, ttl::TtlSource::Config);
+            assert_eq!(ttls.delete_ttl_on_failure.source, ttl::TtlSource::Config);
         }
 
         // -- finalization: every terminal path stamps the pod dir --
@@ -3012,9 +3014,10 @@ mod tests {
             let (logic, provider, _tx) = make_logic_with_file_store(secret_dir);
 
             let mut spec = make_pod_spec("app", "exit 0");
-            spec.metadata
-                .annotations
-                .insert(ANN_POD_DELETE_TTL_ON_SUCCESS.to_string(), "0s".to_string());
+            spec.metadata.annotations.insert(
+                ANN_POD_DIR_DELETE_TTL_POD_SUCCESS_ON_POD_DELETE.to_string(),
+                "0s".to_string(),
+            );
             logic.create_pod(spec).await.unwrap();
             let id = PodId::new("default", "app", "uid-app");
             assert_eq!(wait_for_terminal(&logic, "app").await, PodPhase::Succeeded);

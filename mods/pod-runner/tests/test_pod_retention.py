@@ -86,7 +86,7 @@ class TestReaping:
 
     def test_reap_ttl_annotation_defers_reaping(self, pod_runner, mtls_client):
         name, ns, uid = submit_annotated(
-            mtls_client, pod_runner, {"prPodReapTtlOnSuccess": "1h"}
+            mtls_client, pod_runner, {"prPodDataReapTtlOnPodSuccess": "1h"}
         )
         wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Succeeded"})
 
@@ -100,7 +100,7 @@ class TestReaping:
 
     def test_never_reap_ttl_keeps_data_dirs(self, pod_runner, mtls_client):
         name, ns, uid = submit_annotated(
-            mtls_client, pod_runner, {"prPodReapTtlOnSuccess": TTL_NEVER}
+            mtls_client, pod_runner, {"prPodDataReapTtlOnPodSuccess": TTL_NEVER}
         )
         wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Succeeded"})
 
@@ -114,7 +114,7 @@ class TestReaping:
         self, pod_runner, mtls_client
     ):
         name, ns, uid = submit_annotated(
-            mtls_client, pod_runner, {"prPodDeleteTtlOnError": "90m"}
+            mtls_client, pod_runner, {"prPodDirDeleteTtlPodFailureOnPodDelete": "90m"}
         )
         wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Succeeded"})
 
@@ -123,7 +123,7 @@ class TestReaping:
         with open(os.path.join(d, CLEANUP_TTLS_FILE)) as f:
             ttls = json.load(f)
 
-        assert ttls["deleteTtlOnError"] == {
+        assert ttls["deleteTtlOnFailure"] == {
             "raw": "90m", "secs": 5400, "source": "annotation",
         }
         assert ttls["reapTtlOnSuccess"]["source"] == "config"
@@ -166,7 +166,7 @@ class TestDeleteDeadline:
         self, pod_runner, mtls_client
     ):
         name, ns, uid = submit_annotated(
-            mtls_client, pod_runner, {"prPodDeleteTtlOnSuccess": "0s"}
+            mtls_client, pod_runner, {"prPodDirDeleteTtlPodSuccessOnPodDelete": "0s"}
         )
         wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Succeeded"})
         d = pod_dir(pod_runner, ns, name, uid)
@@ -182,7 +182,7 @@ class TestDeleteDeadline:
 
     def test_never_delete_ttl_keeps_the_dir(self, pod_runner, mtls_client):
         name, ns, uid = submit_annotated(
-            mtls_client, pod_runner, {"prPodDeleteTtlOnSuccess": TTL_NEVER}
+            mtls_client, pod_runner, {"prPodDirDeleteTtlPodSuccessOnPodDelete": TTL_NEVER}
         )
         wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Succeeded"})
         d = pod_dir(pod_runner, ns, name, uid)

@@ -386,7 +386,7 @@ mod tests {
         let c = PRConfig::default();
         assert_eq!(c.ttls, TtlConfig::default());
         assert_eq!(c.ttls.reap_on_success.raw(), "0s");
-        assert_eq!(c.ttls.delete_on_error.raw(), "24h");
+        assert_eq!(c.ttls.delete_on_failure.raw(), "24h");
     }
 
     #[test]
@@ -394,7 +394,7 @@ mod tests {
         use crate::logic::ttl::TtlSpec;
         let pr = PRConfig {
             ttls: TtlConfig {
-                reap_on_error: TtlSpec::parse("30m").unwrap(),
+                reap_on_failure: TtlSpec::parse("30m").unwrap(),
                 ..TtlConfig::default()
             },
             pods_dir: PathBuf::from("/custom/pods"),
@@ -402,7 +402,7 @@ mod tests {
         };
 
         let cc = CleanupConfig::from(&pr);
-        assert_eq!(cc.ttls.reap_on_error.raw(), "30m");
+        assert_eq!(cc.ttls.reap_on_failure.raw(), "30m");
         assert_eq!(cc.pods_dir, PathBuf::from("/custom/pods"));
     }
 }

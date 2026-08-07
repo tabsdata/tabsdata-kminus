@@ -11,7 +11,7 @@
 //!   **removed from the pod runner**, because until then the runner still
 //!   answers queries about it.
 //!
-//! Each clock has a TTL per outcome (success/error), so four values in
+//! Each clock has a TTL per outcome (success/failure), so four values in
 //! total. Every value is configured at the pod runner level and can be
 //! overridden per pod with an annotation.
 //!
@@ -36,10 +36,12 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::spec::constants::{
-    ANN_POD_DELETE_TTL_ON_ERROR, ANN_POD_DELETE_TTL_ON_SUCCESS, ANN_POD_REAP_TTL_ON_ERROR,
-    ANN_POD_REAP_TTL_ON_SUCCESS, CLEANUP_TTLS_FILE, DEFAULT_POD_DELETE_TTL_ON_ERROR,
-    DEFAULT_POD_DELETE_TTL_ON_SUCCESS, DEFAULT_POD_REAP_TTL_ON_ERROR,
-    DEFAULT_POD_REAP_TTL_ON_SUCCESS, TTL_NEVER,
+    ANN_POD_DATA_REAP_TTL_ON_POD_FAILURE, ANN_POD_DATA_REAP_TTL_ON_POD_SUCCESS,
+    ANN_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE,
+    ANN_POD_DIR_DELETE_TTL_POD_SUCCESS_ON_POD_DELETE, CLEANUP_TTLS_FILE,
+    DEFAULT_POD_DATA_REAP_TTL_ON_POD_FAILURE, DEFAULT_POD_DATA_REAP_TTL_ON_POD_SUCCESS,
+    DEFAULT_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE,
+    DEFAULT_POD_DIR_DELETE_TTL_POD_SUCCESS_ON_POD_DELETE, TTL_NEVER,
 };
 
 /// Seconds in a minute — TTL unit `m`.
@@ -173,21 +175,23 @@ pub struct TtlConfig {
     /// Data dirs of a succeeded pod, from completion.
     pub reap_on_success: TtlSpec,
     /// Data dirs of a failed pod, from completion.
-    pub reap_on_error: TtlSpec,
+    pub reap_on_failure: TtlSpec,
     /// Pod dir of a succeeded pod, from removal from the runner.
     pub delete_on_success: TtlSpec,
     /// Pod dir of a failed pod, from removal from the runner.
-    pub delete_on_error: TtlSpec,
+    pub delete_on_failure: TtlSpec,
 }
 
 impl Default for TtlConfig {
     fn default() -> Self {
         // The defaults are constants in this crate, so they parse.
         Self {
-            reap_on_success: TtlSpec::parse(DEFAULT_POD_REAP_TTL_ON_SUCCESS).unwrap(),
-            reap_on_error: TtlSpec::parse(DEFAULT_POD_REAP_TTL_ON_ERROR).unwrap(),
-            delete_on_success: TtlSpec::parse(DEFAULT_POD_DELETE_TTL_ON_SUCCESS).unwrap(),
-            delete_on_error: TtlSpec::parse(DEFAULT_POD_DELETE_TTL_ON_ERROR).unwrap(),
+            reap_on_success: TtlSpec::parse(DEFAULT_POD_DATA_REAP_TTL_ON_POD_SUCCESS).unwrap(),
+            reap_on_failure: TtlSpec::parse(DEFAULT_POD_DATA_REAP_TTL_ON_POD_FAILURE).unwrap(),
+            delete_on_success: TtlSpec::parse(DEFAULT_POD_DIR_DELETE_TTL_POD_SUCCESS_ON_POD_DELETE)
+                .unwrap(),
+            delete_on_failure: TtlSpec::parse(DEFAULT_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE)
+                .unwrap(),
         }
     }
 }
@@ -237,11 +241,11 @@ pub struct CleanupTtls {
     /// Data dirs of a succeeded pod, from completion.
     pub reap_ttl_on_success: TtlSetting,
     /// Data dirs of a failed pod, from completion.
-    pub reap_ttl_on_error: TtlSetting,
+    pub reap_ttl_on_failure: TtlSetting,
     /// Pod dir of a succeeded pod, from removal from the runner.
     pub delete_ttl_on_success: TtlSetting,
     /// Pod dir of a failed pod, from removal from the runner.
-    pub delete_ttl_on_error: TtlSetting,
+    pub delete_ttl_on_failure: TtlSetting,
 }
 
 impl CleanupTtls {
@@ -250,7 +254,7 @@ impl CleanupTtls {
         if succeeded {
             self.reap_ttl_on_success.ttl()
         } else {
-            self.reap_ttl_on_error.ttl()
+            self.reap_ttl_on_failure.ttl()
         }
     }
 
@@ -259,7 +263,7 @@ impl CleanupTtls {
         if succeeded {
             self.delete_ttl_on_success.ttl()
         } else {
-            self.delete_ttl_on_error.ttl()
+            self.delete_ttl_on_failure.ttl()
         }
     }
 }
@@ -277,22 +281,22 @@ pub fn resolve_cleanup_ttls(
         reap_ttl_on_success: resolve_one(
             &config.reap_on_success,
             annotations,
-            ANN_POD_REAP_TTL_ON_SUCCESS,
+            ANN_POD_DATA_REAP_TTL_ON_POD_SUCCESS,
         ),
-        reap_ttl_on_error: resolve_one(
-            &config.reap_on_error,
+        reap_ttl_on_failure: resolve_one(
+            &config.reap_on_failure,
             annotations,
-            ANN_POD_REAP_TTL_ON_ERROR,
+            ANN_POD_DATA_REAP_TTL_ON_POD_FAILURE,
         ),
         delete_ttl_on_success: resolve_one(
             &config.delete_on_success,
             annotations,
-            ANN_POD_DELETE_TTL_ON_SUCCESS,
+            ANN_POD_DIR_DELETE_TTL_POD_SUCCESS_ON_POD_DELETE,
         ),
-        delete_ttl_on_error: resolve_one(
-            &config.delete_on_error,
+        delete_ttl_on_failure: resolve_one(
+            &config.delete_on_failure,
             annotations,
-            ANN_POD_DELETE_TTL_ON_ERROR,
+            ANN_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE,
         ),
     }
 }
@@ -513,9 +517,9 @@ mod tests {
     fn config_defaults_match_the_documented_values() {
         let c = TtlConfig::default();
         assert_eq!(c.reap_on_success.raw(), "0s");
-        assert_eq!(c.reap_on_error.raw(), "1h");
+        assert_eq!(c.reap_on_failure.raw(), "1h");
         assert_eq!(c.delete_on_success.raw(), "1h");
-        assert_eq!(c.delete_on_error.raw(), "24h");
+        assert_eq!(c.delete_on_failure.raw(), "24h");
     }
 
     // -- resolve_cleanup_ttls --
@@ -526,48 +530,48 @@ mod tests {
         assert_eq!(ttls.written_at, "now");
         for s in [
             &ttls.reap_ttl_on_success,
-            &ttls.reap_ttl_on_error,
+            &ttls.reap_ttl_on_failure,
             &ttls.delete_ttl_on_success,
-            &ttls.delete_ttl_on_error,
+            &ttls.delete_ttl_on_failure,
         ] {
             assert_eq!(s.source, TtlSource::Config);
         }
         assert_eq!(ttls.reap_ttl_on_success.secs, Some(0));
-        assert_eq!(ttls.delete_ttl_on_error.secs, Some(86_400));
+        assert_eq!(ttls.delete_ttl_on_failure.secs, Some(86_400));
     }
 
     #[test]
     fn resolve_reap_on_success_annotation() {
         let ttls = resolve_cleanup_ttls(
             &TtlConfig::default(),
-            &ann(&[(ANN_POD_REAP_TTL_ON_SUCCESS, "5m")]),
+            &ann(&[(ANN_POD_DATA_REAP_TTL_ON_POD_SUCCESS, "5m")]),
             "now",
         );
         assert_eq!(ttls.reap_ttl_on_success.raw, "5m");
         assert_eq!(ttls.reap_ttl_on_success.secs, Some(300));
         assert_eq!(ttls.reap_ttl_on_success.source, TtlSource::Annotation);
         // The other three are untouched.
-        assert_eq!(ttls.reap_ttl_on_error.source, TtlSource::Config);
+        assert_eq!(ttls.reap_ttl_on_failure.source, TtlSource::Config);
         assert_eq!(ttls.delete_ttl_on_success.source, TtlSource::Config);
-        assert_eq!(ttls.delete_ttl_on_error.source, TtlSource::Config);
+        assert_eq!(ttls.delete_ttl_on_failure.source, TtlSource::Config);
     }
 
     #[test]
-    fn resolve_reap_on_error_annotation() {
+    fn resolve_reap_on_failure_annotation() {
         let ttls = resolve_cleanup_ttls(
             &TtlConfig::default(),
-            &ann(&[(ANN_POD_REAP_TTL_ON_ERROR, "2h")]),
+            &ann(&[(ANN_POD_DATA_REAP_TTL_ON_POD_FAILURE, "2h")]),
             "now",
         );
-        assert_eq!(ttls.reap_ttl_on_error.secs, Some(7200));
-        assert_eq!(ttls.reap_ttl_on_error.source, TtlSource::Annotation);
+        assert_eq!(ttls.reap_ttl_on_failure.secs, Some(7200));
+        assert_eq!(ttls.reap_ttl_on_failure.source, TtlSource::Annotation);
     }
 
     #[test]
     fn resolve_delete_on_success_annotation() {
         let ttls = resolve_cleanup_ttls(
             &TtlConfig::default(),
-            &ann(&[(ANN_POD_DELETE_TTL_ON_SUCCESS, "0s")]),
+            &ann(&[(ANN_POD_DIR_DELETE_TTL_POD_SUCCESS_ON_POD_DELETE, "0s")]),
             "now",
         );
         assert_eq!(ttls.delete_ttl_on_success.secs, Some(0));
@@ -575,27 +579,27 @@ mod tests {
     }
 
     #[test]
-    fn resolve_delete_on_error_annotation() {
+    fn resolve_delete_on_failure_annotation() {
         let ttls = resolve_cleanup_ttls(
             &TtlConfig::default(),
-            &ann(&[(ANN_POD_DELETE_TTL_ON_ERROR, TTL_NEVER)]),
+            &ann(&[(ANN_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE, TTL_NEVER)]),
             "now",
         );
-        assert_eq!(ttls.delete_ttl_on_error.raw, TTL_NEVER);
-        assert_eq!(ttls.delete_ttl_on_error.secs, None);
-        assert_eq!(ttls.delete_ttl_on_error.ttl(), Ttl::Never);
-        assert_eq!(ttls.delete_ttl_on_error.source, TtlSource::Annotation);
+        assert_eq!(ttls.delete_ttl_on_failure.raw, TTL_NEVER);
+        assert_eq!(ttls.delete_ttl_on_failure.secs, None);
+        assert_eq!(ttls.delete_ttl_on_failure.ttl(), Ttl::Never);
+        assert_eq!(ttls.delete_ttl_on_failure.source, TtlSource::Annotation);
     }
 
     #[test]
     fn resolve_ignores_invalid_annotation() {
         let ttls = resolve_cleanup_ttls(
             &TtlConfig::default(),
-            &ann(&[(ANN_POD_REAP_TTL_ON_ERROR, "1d")]),
+            &ann(&[(ANN_POD_DATA_REAP_TTL_ON_POD_FAILURE, "1d")]),
             "now",
         );
-        assert_eq!(ttls.reap_ttl_on_error.raw, "1h", "fell back to config");
-        assert_eq!(ttls.reap_ttl_on_error.source, TtlSource::Config);
+        assert_eq!(ttls.reap_ttl_on_failure.raw, "1h", "fell back to config");
+        assert_eq!(ttls.reap_ttl_on_failure.source, TtlSource::Config);
     }
 
     #[test]
@@ -626,7 +630,7 @@ mod tests {
         let dir = tmp("round-trip");
         let ttls = resolve_cleanup_ttls(
             &TtlConfig::default(),
-            &ann(&[(ANN_POD_REAP_TTL_ON_ERROR, "15m")]),
+            &ann(&[(ANN_POD_DATA_REAP_TTL_ON_POD_FAILURE, "15m")]),
             "2026-08-04T09:00:00+00:00",
         );
 
@@ -670,7 +674,7 @@ mod tests {
         let json = serde_json::to_string(&ttls).unwrap();
         assert!(json.contains("\"writtenAt\""), "{}", json);
         assert!(json.contains("\"reapTtlOnSuccess\""), "{}", json);
-        assert!(json.contains("\"deleteTtlOnError\""), "{}", json);
+        assert!(json.contains("\"deleteTtlOnFailure\""), "{}", json);
         assert!(json.contains("\"source\":\"config\""), "{}", json);
     }
 
@@ -678,7 +682,7 @@ mod tests {
     fn never_serializes_as_null_secs() {
         let ttls = resolve_cleanup_ttls(
             &TtlConfig::default(),
-            &ann(&[(ANN_POD_DELETE_TTL_ON_ERROR, TTL_NEVER)]),
+            &ann(&[(ANN_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE, TTL_NEVER)]),
             "now",
         );
         let json = serde_json::to_string(&ttls).unwrap();

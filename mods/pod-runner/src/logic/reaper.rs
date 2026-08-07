@@ -78,7 +78,7 @@ impl Default for CleanupConfig {
 // ---------------------------------------------------------------------------
 
 /// Which terminal outcome a pod reached — the half of the retention policy
-/// that picks between the `OnSuccess` and `OnError` TTLs.
+/// that picks between the `PodSuccess` and `PodFailure` TTLs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     /// The pod succeeded.
@@ -619,7 +619,8 @@ mod tests {
     use super::*;
     use crate::logic::ttl::{TtlSource, TtlSpec};
     use crate::spec::constants::{
-        ANN_POD_DELETE_TTL_ON_ERROR, ANN_POD_REAP_TTL_ON_ERROR, CLEANUP_TTLS_FILE,
+        ANN_POD_DATA_REAP_TTL_ON_POD_FAILURE, ANN_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE,
+        CLEANUP_TTLS_FILE,
     };
     use std::collections::HashMap;
     use std::time::Duration;
@@ -801,7 +802,7 @@ mod tests {
     #[test]
     fn finalize_honors_the_pods_own_annotated_ttl() {
         let dir = tmp("finalize-annotated");
-        plant_ttls(&dir, &[(ANN_POD_REAP_TTL_ON_ERROR, "15m")]);
+        plant_ttls(&dir, &[(ANN_POD_DATA_REAP_TTL_ON_POD_FAILURE, "15m")]);
 
         finalize_pod(&dir, Outcome::Failed, &TtlConfig::default(), at(T0));
 
@@ -816,7 +817,7 @@ mod tests {
     #[test]
     fn finalize_writes_never_for_a_never_ttl() {
         let dir = tmp("finalize-never");
-        plant_ttls(&dir, &[(ANN_POD_REAP_TTL_ON_ERROR, TTL_NEVER)]);
+        plant_ttls(&dir, &[(ANN_POD_DATA_REAP_TTL_ON_POD_FAILURE, TTL_NEVER)]);
 
         finalize_pod(&dir, Outcome::Failed, &TtlConfig::default(), at(T0));
 
@@ -854,7 +855,7 @@ mod tests {
         let dir = tmp("finalize-no-ttls");
         // No plant_ttls: simulate a pod whose TTL file never got written.
         let fallback = TtlConfig {
-            reap_on_error: TtlSpec::parse("5m").unwrap(),
+            reap_on_failure: TtlSpec::parse("5m").unwrap(),
             ..TtlConfig::default()
         };
 
@@ -869,7 +870,7 @@ mod tests {
             "the fallback policy is written out so the dir carries one",
         );
         let ttls = read_cleanup_ttls(&dir).unwrap();
-        assert_eq!(ttls.reap_ttl_on_error.source, TtlSource::Config);
+        assert_eq!(ttls.reap_ttl_on_failure.source, TtlSource::Config);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -952,7 +953,10 @@ mod tests {
     #[test]
     fn eviction_writes_never_for_a_never_ttl() {
         let dir = tmp("evict-never");
-        plant_ttls(&dir, &[(ANN_POD_DELETE_TTL_ON_ERROR, TTL_NEVER)]);
+        plant_ttls(
+            &dir,
+            &[(ANN_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE, TTL_NEVER)],
+        );
         finalize_pod(&dir, Outcome::Failed, &TtlConfig::default(), at(T0));
 
         mark_pod_evicted(&dir, &TtlConfig::default(), at(T0));
@@ -1131,7 +1135,7 @@ mod tests {
     #[test]
     fn never_reap_ttl_is_never_reaped() {
         let dir = tmp("reap-never");
-        plant_pod_dir(&dir, &[(ANN_POD_REAP_TTL_ON_ERROR, TTL_NEVER)]);
+        plant_pod_dir(&dir, &[(ANN_POD_DATA_REAP_TTL_ON_POD_FAILURE, TTL_NEVER)]);
         finalize_pod(&dir, Outcome::Failed, &TtlConfig::default(), at(T0));
 
         let result = reap_pod_dir(&dir, at("2099-01-01T00:00:00+00:00"));
@@ -1209,7 +1213,10 @@ mod tests {
     #[test]
     fn never_delete_ttl_keeps_the_dir_forever() {
         let dir = tmp("delete-never");
-        plant_pod_dir(&dir, &[(ANN_POD_DELETE_TTL_ON_ERROR, TTL_NEVER)]);
+        plant_pod_dir(
+            &dir,
+            &[(ANN_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE, TTL_NEVER)],
+        );
         finalize_pod(&dir, Outcome::Failed, &TtlConfig::default(), at(T0));
         mark_pod_evicted(&dir, &TtlConfig::default(), at(T0));
 
@@ -1306,7 +1313,10 @@ mod tests {
         let root = tmp("rotate-never");
         let pods = root.join("run.0").join("pods");
         let pod_dir = pods.join("default_keep_uid-1");
-        plant_pod_dir(&pod_dir, &[(ANN_POD_REAP_TTL_ON_ERROR, TTL_NEVER)]);
+        plant_pod_dir(
+            &pod_dir,
+            &[(ANN_POD_DATA_REAP_TTL_ON_POD_FAILURE, TTL_NEVER)],
+        );
         finalize_pod(&pod_dir, Outcome::Failed, &TtlConfig::default(), at(T0));
 
         assert_eq!(reap_rotated_pod_dirs(&pods, at(T0)), 0);

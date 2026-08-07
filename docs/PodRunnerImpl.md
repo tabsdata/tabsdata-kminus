@@ -167,10 +167,10 @@ propagateEnv: true                    # Inherit parent process environment
 dieWithParent: true                   # Kill child processes when pod runner exits (Unix)
 writeSecretsToContainerShellScript: false
 
-podReapTtlOnSuccess: "0s"             # Data dirs of a succeeded pod, from completion
-podReapTtlOnError: "1h"               # Data dirs of a failed pod, from completion
-podDeleteTtlOnSuccess: "1h"           # Pod dir of a succeeded pod, from removal from the runner
-podDeleteTtlOnError: "24h"            # Pod dir of a failed pod, from removal from the runner
+podDataReapTtlOnPodSuccess: "0s"                 # Data dirs of a succeeded pod, from completion
+podDataReapTtlOnPodFailure: "1h"                 # Data dirs of a failed pod, from completion
+podDirDeleteTtlPodSuccessOnPodDelete: "1h"       # Pod dir of a succeeded pod, from removal from the runner
+podDirDeleteTtlPodFailureOnPodDelete: "24h"      # Pod dir of a failed pod, from removal from the runner
 
 metricsUrl: "http://127.0.0.1:3001"
 
@@ -509,20 +509,21 @@ Two independent clocks govern a finished pod's on-disk footprint:
 
 Each clock has a TTL per outcome, so four settings in total:
 
-| Setting                 | Default | Governs                                        |
-|-------------------------|---------|------------------------------------------------|
-| `podReapTtlOnSuccess`   | `0s`    | `work/` + `volumes/` of a succeeded pod        |
-| `podReapTtlOnError`     | `1h`    | `work/` + `volumes/` of a failed pod           |
-| `podDeleteTtlOnSuccess` | `1h`    | pod dir of a succeeded pod                     |
-| `podDeleteTtlOnError`   | `24h`   | pod dir of a failed pod                        |
+| Setting                                | Default | Governs                                 |
+|----------------------------------------|---------|-----------------------------------------|
+| `podDataReapTtlOnPodSuccess`           | `0s`    | `work/` + `volumes/` of a succeeded pod |
+| `podDataReapTtlOnPodFailure`           | `1h`    | `work/` + `volumes/` of a failed pod    |
+| `podDirDeleteTtlPodSuccessOnPodDelete` | `1h`    | pod dir of a succeeded pod              |
+| `podDirDeleteTtlPodFailureOnPodDelete` | `24h`   | pod dir of a failed pod                 |
 
 A value is `<number><unit>` with unit `s`, `m` or `h`, or `never` to keep the files indefinitely.
 There is no `d` unit -- `24h` says the same thing without a second spelling. An invalid value in
 `prsysconfig.yaml` fails startup rather than silently falling back.
 
-Each can be overridden per pod with the matching annotation: `prPodReapTtlOnSuccess`,
-`prPodReapTtlOnError`, `prPodDeleteTtlOnSuccess`, `prPodDeleteTtlOnError`. An annotation that
-doesn't parse is ignored with a warning and the configured value is used.
+Each can be overridden per pod with the matching annotation: `prPodDataReapTtlOnPodSuccess`,
+`prPodDataReapTtlOnPodFailure`, `prPodDirDeleteTtlPodSuccessOnPodDelete`,
+`prPodDirDeleteTtlPodFailureOnPodDelete`. An annotation that doesn't parse is ignored with a
+warning and the configured value is used.
 
 ### How it works on disk
 

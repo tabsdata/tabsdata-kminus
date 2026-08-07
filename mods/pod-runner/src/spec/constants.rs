@@ -143,17 +143,19 @@ pub const REASON_KUBELET_NO_DISK_PRESSURE: &str = "KubeletHasNoDiskPressure";
 // Pod runner annotation keys
 // ---------------------------------------------------------------------------
 
-/// Annotation to override `pod_reap_ttl_on_success` per pod.
-pub const ANN_POD_REAP_TTL_ON_SUCCESS: &str = "prPodReapTtlOnSuccess";
+/// Annotation to override `pod_data_reap_ttl_on_pod_success` per pod.
+pub const ANN_POD_DATA_REAP_TTL_ON_POD_SUCCESS: &str = "prPodDataReapTtlOnPodSuccess";
 
-/// Annotation to override `pod_reap_ttl_on_error` per pod.
-pub const ANN_POD_REAP_TTL_ON_ERROR: &str = "prPodReapTtlOnError";
+/// Annotation to override `pod_data_reap_ttl_on_pod_failure` per pod.
+pub const ANN_POD_DATA_REAP_TTL_ON_POD_FAILURE: &str = "prPodDataReapTtlOnPodFailure";
 
-/// Annotation to override `pod_delete_ttl_on_success` per pod.
-pub const ANN_POD_DELETE_TTL_ON_SUCCESS: &str = "prPodDeleteTtlOnSuccess";
+/// Annotation to override `pod_dir_delete_ttl_pod_success_on_pod_delete` per pod.
+pub const ANN_POD_DIR_DELETE_TTL_POD_SUCCESS_ON_POD_DELETE: &str =
+    "prPodDirDeleteTtlPodSuccessOnPodDelete";
 
-/// Annotation to override `pod_delete_ttl_on_error` per pod.
-pub const ANN_POD_DELETE_TTL_ON_ERROR: &str = "prPodDeleteTtlOnError";
+/// Annotation to override `pod_dir_delete_ttl_pod_failure_on_pod_delete` per pod.
+pub const ANN_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE: &str =
+    "prPodDirDeleteTtlPodFailureOnPodDelete";
 
 // ---------------------------------------------------------------------------
 // Cleanup TTL defaults
@@ -164,16 +166,16 @@ pub const ANN_POD_DELETE_TTL_ON_ERROR: &str = "prPodDeleteTtlOnError";
 // moment the pod is removed from the pod runner.
 
 /// Default TTL before a succeeded pod's data dirs are reaped.
-pub const DEFAULT_POD_REAP_TTL_ON_SUCCESS: &str = "0s";
+pub const DEFAULT_POD_DATA_REAP_TTL_ON_POD_SUCCESS: &str = "0s";
 
 /// Default TTL before a failed pod's data dirs are reaped.
-pub const DEFAULT_POD_REAP_TTL_ON_ERROR: &str = "1h";
+pub const DEFAULT_POD_DATA_REAP_TTL_ON_POD_FAILURE: &str = "1h";
 
 /// Default TTL before a succeeded pod's dir is deleted.
-pub const DEFAULT_POD_DELETE_TTL_ON_SUCCESS: &str = "1h";
+pub const DEFAULT_POD_DIR_DELETE_TTL_POD_SUCCESS_ON_POD_DELETE: &str = "1h";
 
 /// Default TTL before a failed pod's dir is deleted.
-pub const DEFAULT_POD_DELETE_TTL_ON_ERROR: &str = "24h";
+pub const DEFAULT_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE: &str = "24h";
 
 /// TTL value meaning "no deadline" — nothing is ever reaped or deleted.
 pub const TTL_NEVER: &str = "never";

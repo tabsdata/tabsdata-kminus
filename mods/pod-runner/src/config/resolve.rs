@@ -212,10 +212,22 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
     // 12. Parse cleanup TTLs — a bad value fails the load rather than
     // silently falling back, since retention is not a setting to guess at.
     let ttls = TtlConfig {
-        reap_on_success: parse_ttl("podReapTtlOnSuccess", &sys.pod_reap_ttl_on_success)?,
-        reap_on_error: parse_ttl("podReapTtlOnError", &sys.pod_reap_ttl_on_error)?,
-        delete_on_success: parse_ttl("podDeleteTtlOnSuccess", &sys.pod_delete_ttl_on_success)?,
-        delete_on_error: parse_ttl("podDeleteTtlOnError", &sys.pod_delete_ttl_on_error)?,
+        reap_on_success: parse_ttl(
+            "podDataReapTtlOnPodSuccess",
+            &sys.pod_data_reap_ttl_on_pod_success,
+        )?,
+        reap_on_failure: parse_ttl(
+            "podDataReapTtlOnPodFailure",
+            &sys.pod_data_reap_ttl_on_pod_failure,
+        )?,
+        delete_on_success: parse_ttl(
+            "podDirDeleteTtlPodSuccessOnPodDelete",
+            &sys.pod_dir_delete_ttl_pod_success_on_pod_delete,
+        )?,
+        delete_on_failure: parse_ttl(
+            "podDirDeleteTtlPodFailureOnPodDelete",
+            &sys.pod_dir_delete_ttl_pod_failure_on_pod_delete,
+        )?,
     };
 
     // 13. Build PRConfig
@@ -492,7 +504,7 @@ nodename: "custom-node"
 namespace: "staging"
 maxPods: 42
 propagateEnv: false
-podReapTtlOnSuccess: "5m"
+podDataReapTtlOnPodSuccess: "5m"
 "#;
         std::fs::write(
             configdir.join(crate::config::template::PRSYSCONFIG_FILENAME),
@@ -740,10 +752,10 @@ restartBackoffBaseSecs: 20
 propagateEnv: false
 dieWithParent: false
 writeSecretsToContainerShellScript: true
-podReapTtlOnSuccess: "30s"
-podReapTtlOnError: "90m"
-podDeleteTtlOnSuccess: "2h"
-podDeleteTtlOnError: "never"
+podDataReapTtlOnPodSuccess: "30s"
+podDataReapTtlOnPodFailure: "90m"
+podDirDeleteTtlPodSuccessOnPodDelete: "2h"
+podDirDeleteTtlPodFailureOnPodDelete: "never"
 capacity:
   cpu: 64
   memoryGB: 256
@@ -781,9 +793,12 @@ capacity:
         assert!(!c.die_with_parent);
         assert!(c.write_running_spec);
         assert_eq!(c.ttls.reap_on_success.ttl().secs(), Some(30));
-        assert_eq!(c.ttls.reap_on_error.ttl().secs(), Some(5400));
+        assert_eq!(c.ttls.reap_on_failure.ttl().secs(), Some(5400));
         assert_eq!(c.ttls.delete_on_success.ttl().secs(), Some(7200));
-        assert_eq!(c.ttls.delete_on_error.ttl(), crate::logic::ttl::Ttl::Never);
+        assert_eq!(
+            c.ttls.delete_on_failure.ttl(),
+            crate::logic::ttl::Ttl::Never
+        );
         assert_eq!(c.capacity_cpu, 64);
         assert_eq!(c.capacity_memory_gb, 256);
         assert_eq!(c.capacity_pods, 500);
@@ -909,21 +924,25 @@ server:
 
     #[test]
     fn resolve_config_rejects_a_misspelled_setting() {
-        let err = expect_syscfg_error("typo", "podReapTtlOnSucess: \"5m\"\n");
-        assert!(err.contains("podReapTtlOnSucess"), "{err}");
+        let err = expect_syscfg_error("typo", "podDataReapTtlOnPodSucess: \"5m\"\n");
+        assert!(err.contains("podDataReapTtlOnPodSucess"), "{err}");
     }
 
     #[test]
     fn resolve_config_rejects_invalid_cleanup_ttl() {
         // `1d` is not accepted — 24h is the only way to say a day.
-        let err = expect_syscfg_error("ttl-bad", "podDeleteTtlOnError: \"1d\"\n");
-        assert!(err.contains("podDeleteTtlOnError"), "{}", err);
+        let err = expect_syscfg_error("ttl-bad", "podDirDeleteTtlPodFailureOnPodDelete: \"1d\"\n");
+        assert!(
+            err.contains("podDirDeleteTtlPodFailureOnPodDelete"),
+            "{}",
+            err
+        );
         assert!(err.contains("1d"), "{}", err);
     }
 
     #[test]
     fn resolve_config_rejects_unitless_cleanup_ttl() {
-        let err = expect_syscfg_error("ttl-unitless", "podReapTtlOnSuccess: \"0\"\n");
-        assert!(err.contains("podReapTtlOnSuccess"), "{}", err);
+        let err = expect_syscfg_error("ttl-unitless", "podDataReapTtlOnPodSuccess: \"0\"\n");
+        assert!(err.contains("podDataReapTtlOnPodSuccess"), "{}", err);
     }
 }

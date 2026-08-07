@@ -18,8 +18,9 @@ use serde::Deserialize;
 
 use crate::server::config::*;
 use crate::spec::constants::{
-    DEFAULT_POD_DELETE_TTL_ON_ERROR, DEFAULT_POD_DELETE_TTL_ON_SUCCESS,
-    DEFAULT_POD_REAP_TTL_ON_ERROR, DEFAULT_POD_REAP_TTL_ON_SUCCESS,
+    DEFAULT_POD_DATA_REAP_TTL_ON_POD_FAILURE, DEFAULT_POD_DATA_REAP_TTL_ON_POD_SUCCESS,
+    DEFAULT_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE,
+    DEFAULT_POD_DIR_DELETE_TTL_POD_SUCCESS_ON_POD_DELETE,
 };
 
 // ---------------------------------------------------------------------------
@@ -109,24 +110,24 @@ impl YamlPRConfig {
 const REMOVED_SYSCONFIG_KEYS: &[(&str, &str)] = &[
     (
         "keepDeletedPodDir",
-        "use podDeleteTtlOnSuccess / podDeleteTtlOnError",
+        "use podDirDeleteTtlPodSuccessOnPodDelete / podDirDeleteTtlPodFailureOnPodDelete",
     ),
     (
         "keepFailedPodDir",
-        "use podDeleteTtlOnError (\"never\" keeps a failed pod dir indefinitely)",
+        "use podDirDeleteTtlPodFailureOnPodDelete (\"never\" keeps a failed pod dir indefinitely)",
     ),
     (
         "keepSucceededPodDataDirs",
-        "use podReapTtlOnSuccess (\"never\" keeps the data dirs indefinitely)",
+        "use podDataReapTtlOnPodSuccess (\"never\" keeps the data dirs indefinitely)",
     ),
     (
         "deletedPodDirTtlHours",
-        "use podDeleteTtlOnSuccess / podDeleteTtlOnError",
+        "use podDirDeleteTtlPodSuccessOnPodDelete / podDirDeleteTtlPodFailureOnPodDelete",
     ),
     (
         "podArchiveTtlDays",
-        "pod archives no longer exist; logs and specs live in the pod dir \
-         until podDeleteTtlOnSuccess / podDeleteTtlOnError",
+        "pod archives no longer exist; logs and specs live in the pod dir until \
+         podDirDeleteTtlPodSuccessOnPodDelete / podDirDeleteTtlPodFailureOnPodDelete",
     ),
 ];
 
@@ -187,23 +188,23 @@ pub struct YamlSysConfig {
     // -- cleanup --
     /// TTL before a succeeded pod's data dirs (`work/`, `volumes/`) are
     /// reaped, counted from pod completion. `<number>[s|m|h]` or `never`.
-    #[serde(alias = "podReapTtlOnSuccess")]
-    pub pod_reap_ttl_on_success: String,
+    #[serde(alias = "podDataReapTtlOnPodSuccess")]
+    pub pod_data_reap_ttl_on_pod_success: String,
 
     /// TTL before a failed pod's data dirs are reaped, counted from pod
     /// completion. `<number>[s|m|h]` or `never`.
-    #[serde(alias = "podReapTtlOnError")]
-    pub pod_reap_ttl_on_error: String,
+    #[serde(alias = "podDataReapTtlOnPodFailure")]
+    pub pod_data_reap_ttl_on_pod_failure: String,
 
     /// TTL before a succeeded pod's dir is deleted, counted from the pod's
     /// removal from the pod runner. `<number>[s|m|h]` or `never`.
-    #[serde(alias = "podDeleteTtlOnSuccess")]
-    pub pod_delete_ttl_on_success: String,
+    #[serde(alias = "podDirDeleteTtlPodSuccessOnPodDelete")]
+    pub pod_dir_delete_ttl_pod_success_on_pod_delete: String,
 
     /// TTL before a failed pod's dir is deleted, counted from the pod's
     /// removal from the pod runner. `<number>[s|m|h]` or `never`.
-    #[serde(alias = "podDeleteTtlOnError")]
-    pub pod_delete_ttl_on_error: String,
+    #[serde(alias = "podDirDeleteTtlPodFailureOnPodDelete")]
+    pub pod_dir_delete_ttl_pod_failure_on_pod_delete: String,
 
     /// Cadence between disk-usage scans for both per-pod and pod-runner
     /// trackers (seconds).
@@ -246,10 +247,12 @@ impl Default for YamlSysConfig {
             die_with_parent: true,
             write_secrets_to_container_shell_script: false,
             images_dir: String::new(),
-            pod_reap_ttl_on_success: DEFAULT_POD_REAP_TTL_ON_SUCCESS.to_string(),
-            pod_reap_ttl_on_error: DEFAULT_POD_REAP_TTL_ON_ERROR.to_string(),
-            pod_delete_ttl_on_success: DEFAULT_POD_DELETE_TTL_ON_SUCCESS.to_string(),
-            pod_delete_ttl_on_error: DEFAULT_POD_DELETE_TTL_ON_ERROR.to_string(),
+            pod_data_reap_ttl_on_pod_success: DEFAULT_POD_DATA_REAP_TTL_ON_POD_SUCCESS.to_string(),
+            pod_data_reap_ttl_on_pod_failure: DEFAULT_POD_DATA_REAP_TTL_ON_POD_FAILURE.to_string(),
+            pod_dir_delete_ttl_pod_success_on_pod_delete:
+                DEFAULT_POD_DIR_DELETE_TTL_POD_SUCCESS_ON_POD_DELETE.to_string(),
+            pod_dir_delete_ttl_pod_failure_on_pod_delete:
+                DEFAULT_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE.to_string(),
             dir_size_scan_interval_secs: 60,
             metrics_url: crate::metrics::DEFAULT_METRICS_URL.to_string(),
             secret_resolver: YamlResolverConfig {
@@ -469,8 +472,14 @@ server:
         assert_eq!(c.max_pods, 250);
         assert!(c.propagate_env);
         assert!(c.die_with_parent);
-        assert_eq!(c.pod_reap_ttl_on_success, DEFAULT_POD_REAP_TTL_ON_SUCCESS);
-        assert_eq!(c.pod_delete_ttl_on_error, DEFAULT_POD_DELETE_TTL_ON_ERROR);
+        assert_eq!(
+            c.pod_data_reap_ttl_on_pod_success,
+            DEFAULT_POD_DATA_REAP_TTL_ON_POD_SUCCESS
+        );
+        assert_eq!(
+            c.pod_dir_delete_ttl_pod_failure_on_pod_delete,
+            DEFAULT_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE
+        );
     }
 
     #[test]
@@ -480,8 +489,8 @@ nodename: "my-node"
 namespace: "prod"
 maxPods: 50
 propagateEnv: false
-podReapTtlOnError: "30m"
-podDeleteTtlOnError: "48h"
+podDataReapTtlOnPodFailure: "30m"
+podDirDeleteTtlPodFailureOnPodDelete: "48h"
 capacity:
   cpu: 200
   memoryGB: 64
@@ -495,17 +504,17 @@ secretResolver:
         assert_eq!(c.namespace, "prod");
         assert_eq!(c.max_pods, 50);
         assert!(!c.propagate_env);
-        assert_eq!(c.pod_reap_ttl_on_error, "30m");
-        assert_eq!(c.pod_delete_ttl_on_error, "48h");
+        assert_eq!(c.pod_data_reap_ttl_on_pod_failure, "30m");
+        assert_eq!(c.pod_dir_delete_ttl_pod_failure_on_pod_delete, "48h");
         assert_eq!(c.capacity.cpu, 200);
         assert_eq!(c.secret_resolver.resolver_type, "kube");
     }
 
     #[test]
     fn syscfg_parse_never_ttl() {
-        let yaml = "podDeleteTtlOnError: \"never\"\n";
+        let yaml = "podDirDeleteTtlPodFailureOnPodDelete: \"never\"\n";
         let c = YamlSysConfig::from_str(yaml).unwrap();
-        assert_eq!(c.pod_delete_ttl_on_error, "never");
+        assert_eq!(c.pod_dir_delete_ttl_pod_failure_on_pod_delete, "never");
     }
 
     // -- removed settings --
@@ -549,7 +558,10 @@ podArchiveTtlDays: 7
             .validate_known_keys()
             .unwrap_err();
         assert!(err.contains("keepFailedPodDir"), "{err}");
-        assert!(err.contains("podDeleteTtlOnError"), "{err}");
+        assert!(
+            err.contains("podDirDeleteTtlPodFailureOnPodDelete"),
+            "{err}"
+        );
         assert!(err.contains("never"), "{err}");
     }
 
@@ -561,17 +573,20 @@ podArchiveTtlDays: 7
             .unwrap()
             .validate_known_keys()
             .unwrap_err();
-        assert!(err.contains("podDeleteTtlOnError"), "{err}");
+        assert!(
+            err.contains("podDirDeleteTtlPodFailureOnPodDelete"),
+            "{err}"
+        );
     }
 
     #[test]
     fn syscfg_rejects_an_unknown_key() {
         // A typo in a key name must not look like it took effect.
-        let err = YamlSysConfig::from_str("podReapTtlOnSucess: \"5m\"\n")
+        let err = YamlSysConfig::from_str("podDataReapTtlOnPodSucess: \"5m\"\n")
             .unwrap()
             .validate_known_keys()
             .unwrap_err();
-        assert!(err.contains("podReapTtlOnSucess"), "{err}");
+        assert!(err.contains("podDataReapTtlOnPodSucess"), "{err}");
         assert!(err.contains("not a known setting"), "{err}");
     }
 
@@ -594,7 +609,7 @@ podArchiveTtlDays: 7
     #[test]
     fn syscfg_clean_config_validates() {
         let c = YamlSysConfig::from_str(
-            "nodename: \"n\"\npodReapTtlOnError: \"5m\"\ncapacity:\n  cpu: 4\n",
+            "nodename: \"n\"\npodDataReapTtlOnPodFailure: \"5m\"\ncapacity:\n  cpu: 4\n",
         )
         .unwrap();
         assert!(c.validate_known_keys().is_ok());
