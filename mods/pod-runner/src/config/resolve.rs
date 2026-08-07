@@ -20,7 +20,18 @@ use super::pki;
 use super::template::{PRCONFIG_FILENAME, VK_PRCONFIG_FILENAME};
 use super::vk_config;
 use super::yaml_config::YamlPRConfig;
+use crate::logic::ttl::{TtlConfig, TtlSpec};
 use crate::server::config::*;
+
+// ---------------------------------------------------------------------------
+// Cleanup TTL parsing
+// ---------------------------------------------------------------------------
+
+/// Parse a configured cleanup TTL, naming the key in the error so the
+/// operator knows which line of `prsysconfig.yaml` to fix.
+fn parse_ttl(key: &str, value: &str) -> Result<TtlSpec, String> {
+    TtlSpec::parse(value).map_err(|e| format!("{}: {}", key, e))
+}
 
 // ---------------------------------------------------------------------------
 // URL parsing
@@ -109,9 +120,15 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
     yaml.validate()?;
 
     // 3. Load prsysconfig.yaml (system settings, persistent)
+    // The file is never regenerated, so one written by an older build can
+    // still carry settings this one dropped. Fail rather than silently
+    // ignoring a retention choice the operator made deliberately.
     let syscfg_path = configdir.join(crate::config::template::PRSYSCONFIG_FILENAME);
     let sys = if syscfg_path.is_file() {
-        super::yaml_config::YamlSysConfig::from_file(&syscfg_path)?
+        let sys = super::yaml_config::YamlSysConfig::from_file(&syscfg_path)?;
+        sys.validate_known_keys()
+            .map_err(|e| format!("{}: {}", syscfg_path.display(), e))?;
+        sys
     } else {
         super::yaml_config::YamlSysConfig::default()
     };
@@ -192,7 +209,16 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
         }
     };
 
-    // 12. Build PRConfig
+    // 12. Parse cleanup TTLs — a bad value fails the load rather than
+    // silently falling back, since retention is not a setting to guess at.
+    let ttls = TtlConfig {
+        reap_on_success: parse_ttl("podReapTtlOnSuccess", &sys.pod_reap_ttl_on_success)?,
+        reap_on_error: parse_ttl("podReapTtlOnError", &sys.pod_reap_ttl_on_error)?,
+        delete_on_success: parse_ttl("podDeleteTtlOnSuccess", &sys.pod_delete_ttl_on_success)?,
+        delete_on_error: parse_ttl("podDeleteTtlOnError", &sys.pod_delete_ttl_on_error)?,
+    };
+
+    // 13. Build PRConfig
     Ok(PRConfig {
         bind_address,
         node_address: parsed.host,
@@ -226,10 +252,7 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
         config_map_resolver: map_resolver(&sys.config_map_resolver),
         node_env_resolver: map_resolver(&sys.node_envs_resolver),
 
-        keep_deleted_pod_dir: sys.keep_deleted_pod_dir,
-        keep_failed_pod_dir: sys.keep_failed_pod_dir,
-        deleted_pod_dir_ttl_hours: sys.deleted_pod_dir_ttl_hours,
-        pod_archive_ttl_days: sys.pod_archive_ttl_days,
+        ttls,
         dir_size_scan_interval_secs: sys.dir_size_scan_interval_secs,
 
         metrics_url: sys.metrics_url.clone(),
@@ -264,7 +287,12 @@ fn rotate_run_dir(run_dir: &std::path::Path) {
         }
     }
     // Rename run/ → run.0/
-    let _ = fs::rename(run_dir, parent.join("run.0"));
+    let rotated = parent.join("run.0");
+    let _ = fs::rename(run_dir, &rotated);
+
+    // Every pod in the rotated run belonged to the previous incarnation of
+    // the runner, so its data dirs are dead weight from this moment on.
+    crate::logic::reaper::reap_rotated_pod_dirs(&rotated.join(PODS_SUBDIR), chrono::Utc::now());
 }
 
 // ---------------------------------------------------------------------------
@@ -464,7 +492,7 @@ nodename: "custom-node"
 namespace: "staging"
 maxPods: 42
 propagateEnv: false
-keepDeletedPodDir: true
+podReapTtlOnSuccess: "5m"
 "#;
         std::fs::write(
             configdir.join(crate::config::template::PRSYSCONFIG_FILENAME),
@@ -497,7 +525,7 @@ keepDeletedPodDir: true
         // This YAML doesn't set capacity.pods, so it defaults to 100.
         assert_eq!(config.capacity_pods, 100);
         assert!(!config.propagate_env);
-        assert!(config.keep_deleted_pod_dir);
+        assert_eq!(config.ttls.reap_on_success.raw(), "5m");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -712,10 +740,10 @@ restartBackoffBaseSecs: 20
 propagateEnv: false
 dieWithParent: false
 writeSecretsToContainerShellScript: true
-keepDeletedPodDir: true
-keepFailedPodDir: false
-deletedPodDirTtlHours: 72
-podArchiveTtlDays: 30
+podReapTtlOnSuccess: "30s"
+podReapTtlOnError: "90m"
+podDeleteTtlOnSuccess: "2h"
+podDeleteTtlOnError: "never"
 capacity:
   cpu: 64
   memoryGB: 256
@@ -752,14 +780,150 @@ capacity:
         assert!(!c.propagate_env);
         assert!(!c.die_with_parent);
         assert!(c.write_running_spec);
-        assert!(c.keep_deleted_pod_dir);
-        assert!(!c.keep_failed_pod_dir);
-        assert_eq!(c.deleted_pod_dir_ttl_hours, 72);
-        assert_eq!(c.pod_archive_ttl_days, 30);
+        assert_eq!(c.ttls.reap_on_success.ttl().secs(), Some(30));
+        assert_eq!(c.ttls.reap_on_error.ttl().secs(), Some(5400));
+        assert_eq!(c.ttls.delete_on_success.ttl().secs(), Some(7200));
+        assert_eq!(c.ttls.delete_on_error.ttl(), crate::logic::ttl::Ttl::Never);
         assert_eq!(c.capacity_cpu, 64);
         assert_eq!(c.capacity_memory_gb, 256);
         assert_eq!(c.capacity_pods, 500);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Resolve a config from a `prsysconfig.yaml` body, with everything
+    /// else defaulted.
+    fn resolve_with_syscfg(label: &str, syscfg: &str) -> Result<PRConfig, String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let tmp = std::env::temp_dir().join(format!(
+            "pr-resolve-{}-{}-{}",
+            label,
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed),
+        ));
+        let configdir = tmp.join("config");
+        std::fs::create_dir_all(&configdir).unwrap();
+        std::fs::write(
+            configdir.join(PRCONFIG_FILENAME),
+            r#"
+url: "https://127.0.0.1:9090"
+server:
+  tls:
+    certificate-data: "Y2VydA=="
+    certificate-key-data: "a2V5"
+    certificate-authority-data: "Y2E="
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            configdir.join(crate::config::template::PRSYSCONFIG_FILENAME),
+            syscfg,
+        )
+        .unwrap();
+
+        let cli = CliArgs {
+            kubeconfig: None,
+            configdir: Some(configdir.to_string_lossy().into()),
+            workdir: Some(tmp.join("work").to_string_lossy().into()),
+            logdir: Some(tmp.join("log").to_string_lossy().into()),
+            imagesdir: None,
+            port: None,
+            metrics_port: None,
+            logmaxsizemb: 100,
+            logmaxfiles: 3,
+            loglevel: crate::config::loglevel::LogLevel::Debug,
+        };
+
+        let result = resolve_config(&cli);
+        let _ = std::fs::remove_dir_all(&tmp);
+        result
+    }
+
+    #[test]
+    fn resolve_config_defaults_cleanup_ttls_when_absent() {
+        let c = resolve_with_syscfg("ttl-default", "nodename: \"n\"\n").unwrap();
+        assert_eq!(c.ttls, crate::logic::ttl::TtlConfig::default());
+    }
+
+    #[test]
+    fn rotation_reaps_the_previous_runs_pod_dirs() {
+        use crate::server::config::POD_LOG_SUBDIR;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let tmp = std::env::temp_dir().join(format!(
+            "pr-rotate-reap-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed),
+        ));
+        let run_dir = tmp.join(RUN_DIR);
+
+        // A pod dir in the live run, as the previous incarnation left it.
+        let pod_dir = run_dir.join(PODS_SUBDIR).join("default_app_uid-1");
+        std::fs::create_dir_all(pod_dir.join(POD_WORK_SUBDIR).join("main")).unwrap();
+        std::fs::create_dir_all(pod_dir.join(POD_LOG_SUBDIR).join("main")).unwrap();
+
+        rotate_run_dir(&run_dir);
+
+        let rotated = tmp
+            .join("run.0")
+            .join(PODS_SUBDIR)
+            .join("default_app_uid-1");
+        assert!(rotated.exists(), "the pod dir moved with the run");
+        assert!(
+            !rotated.join(POD_WORK_SUBDIR).exists(),
+            "work/ of a previous run is dead weight and is reaped at rotation",
+        );
+        assert!(
+            rotated.join(POD_LOG_SUBDIR).exists(),
+            "logs survive so a crashed run stays diagnosable",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `PRConfig` holds TLS key material and deliberately has no `Debug`,
+    /// so error-path tests can't use `unwrap_err`.
+    fn expect_syscfg_error(label: &str, syscfg: &str) -> String {
+        match resolve_with_syscfg(label, syscfg) {
+            Err(e) => e,
+            Ok(_) => panic!("expected config resolution to fail"),
+        }
+    }
+
+    #[test]
+    fn resolve_config_rejects_a_legacy_cleanup_config() {
+        // prsysconfig.yaml is persistent, so an instance created by a
+        // pre-reaper build still has these. Starting up and silently
+        // ignoring them would change retention behind the operator's back.
+        let err = expect_syscfg_error(
+            "legacy",
+            "keepFailedPodDir: true\ndeletedPodDirTtlHours: 24\npodArchiveTtlDays: 7\n",
+        );
+        assert!(err.contains("keepFailedPodDir"), "{err}");
+        assert!(err.contains("deletedPodDirTtlHours"), "{err}");
+        assert!(err.contains("podArchiveTtlDays"), "{err}");
+        // The error names the file so the operator knows what to edit.
+        assert!(err.contains("prsysconfig.yaml"), "{err}");
+    }
+
+    #[test]
+    fn resolve_config_rejects_a_misspelled_setting() {
+        let err = expect_syscfg_error("typo", "podReapTtlOnSucess: \"5m\"\n");
+        assert!(err.contains("podReapTtlOnSucess"), "{err}");
+    }
+
+    #[test]
+    fn resolve_config_rejects_invalid_cleanup_ttl() {
+        // `1d` is not accepted — 24h is the only way to say a day.
+        let err = expect_syscfg_error("ttl-bad", "podDeleteTtlOnError: \"1d\"\n");
+        assert!(err.contains("podDeleteTtlOnError"), "{}", err);
+        assert!(err.contains("1d"), "{}", err);
+    }
+
+    #[test]
+    fn resolve_config_rejects_unitless_cleanup_ttl() {
+        let err = expect_syscfg_error("ttl-unitless", "podReapTtlOnSuccess: \"0\"\n");
+        assert!(err.contains("podReapTtlOnSuccess"), "{}", err);
     }
 }

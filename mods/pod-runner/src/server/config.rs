@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::logic::ttl::TtlConfig;
 use crate::logic::{CapacityConfig, CleanupConfig, DefaultExecutorProvider, LogicConfig};
 use crate::pod::resolver::ResolverConfig;
 use crate::store::file::FileStoreConfig;
@@ -185,17 +186,9 @@ pub struct PRConfig {
     pub node_env_resolver: ResolverConfig,
 
     // -- cleanup --
-    /// Keep work dir when a pod is deleted (default: false).
-    pub keep_deleted_pod_dir: bool,
-
-    /// Keep work dir if the pod failed (default: true).
-    pub keep_failed_pod_dir: bool,
-
-    /// TTL in hours for kept work dirs before purge (default: 24).
-    pub deleted_pod_dir_ttl_hours: u64,
-
-    /// TTL in days for archive tgz files before purge (default: 7).
-    pub pod_archive_ttl_days: u64,
+    /// Cleanup TTLs governing when a finished pod's data dirs are reaped
+    /// and when its pod dir is deleted, parsed from config.
+    pub ttls: TtlConfig,
 
     /// Cadence between disk-usage scans for the per-pod and pod-runner
     /// disk-usage trackers (seconds, default: 60).
@@ -244,10 +237,7 @@ impl Default for PRConfig {
             config_map_resolver: ResolverConfig::default(),
             node_env_resolver: ResolverConfig::default(),
 
-            keep_deleted_pod_dir: false,
-            keep_failed_pod_dir: true,
-            deleted_pod_dir_ttl_hours: 24,
-            pod_archive_ttl_days: 7,
+            ttls: TtlConfig::default(),
             dir_size_scan_interval_secs: 60,
 
             metrics_url: crate::metrics::DEFAULT_METRICS_URL.to_string(),
@@ -310,10 +300,7 @@ impl From<&PRConfig> for DefaultExecutorProvider {
 impl From<&PRConfig> for CleanupConfig {
     fn from(c: &PRConfig) -> Self {
         Self {
-            keep_deleted_pod_dir: c.keep_deleted_pod_dir,
-            keep_failed_pod_dir: c.keep_failed_pod_dir,
-            deleted_pod_dir_ttl_hours: c.deleted_pod_dir_ttl_hours,
-            pod_archive_ttl_days: c.pod_archive_ttl_days,
+            ttls: c.ttls.clone(),
             pods_dir: c.pods_dir.clone(),
         }
     }
@@ -395,28 +382,27 @@ mod tests {
     // -- cleanup --
 
     #[test]
-    fn prconfig_default_cleanup_fields() {
+    fn prconfig_default_cleanup_ttls() {
         let c = PRConfig::default();
-        assert!(!c.keep_deleted_pod_dir);
-        assert!(c.keep_failed_pod_dir);
-        assert_eq!(c.deleted_pod_dir_ttl_hours, 24);
-        assert_eq!(c.pod_archive_ttl_days, 7);
+        assert_eq!(c.ttls, TtlConfig::default());
+        assert_eq!(c.ttls.reap_on_success.raw(), "0s");
+        assert_eq!(c.ttls.delete_on_error.raw(), "24h");
     }
 
     #[test]
     fn cleanup_config_from_prconfig() {
-        let mut pr = PRConfig::default();
-        pr.keep_deleted_pod_dir = true;
-        pr.keep_failed_pod_dir = false;
-        pr.deleted_pod_dir_ttl_hours = 48;
-        pr.pod_archive_ttl_days = 14;
-        pr.pods_dir = PathBuf::from("/custom/pods");
+        use crate::logic::ttl::TtlSpec;
+        let pr = PRConfig {
+            ttls: TtlConfig {
+                reap_on_error: TtlSpec::parse("30m").unwrap(),
+                ..TtlConfig::default()
+            },
+            pods_dir: PathBuf::from("/custom/pods"),
+            ..PRConfig::default()
+        };
 
         let cc = CleanupConfig::from(&pr);
-        assert!(cc.keep_deleted_pod_dir);
-        assert!(!cc.keep_failed_pod_dir);
-        assert_eq!(cc.deleted_pod_dir_ttl_hours, 48);
-        assert_eq!(cc.pod_archive_ttl_days, 14);
+        assert_eq!(cc.ttls.reap_on_error.raw(), "30m");
         assert_eq!(cc.pods_dir, PathBuf::from("/custom/pods"));
     }
 }

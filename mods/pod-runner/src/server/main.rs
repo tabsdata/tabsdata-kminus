@@ -26,7 +26,17 @@ async fn main() {
     // the log directory. Logging is initialised below once we've
     // decided where to write.
     let cli = CliArgs::parse();
-    let pr_config = resolve_config(&cli).expect("Failed to resolve configuration");
+    // A bad config is the operator's problem, not a crash: report it on
+    // stderr and exit. Panicking would render the message through `Debug`,
+    // which escapes the newlines that make a multi-line complaint readable,
+    // and would bury it under a backtrace note.
+    let pr_config = match resolve_config(&cli) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("pod-runner: configuration error: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Set up tracing to a size-rotated log file under
     // <logdir>/pod-runner.log, matching control-plane
@@ -100,12 +110,9 @@ async fn main() {
 
     let (shutdown_tx, _) = watch::channel(());
     let cleanup_config = CleanupConfig::from(&pr_config);
-    // Shared with the purge daemon so it can evict store entries for
-    // finished pods whose delete never arrived (same store instance).
-    let purge_store = Arc::clone(&store);
     let logic = PodLogic::new(
         &pr_config,
-        cleanup_config.clone(),
+        cleanup_config,
         store,
         provider,
         resolvers,
@@ -119,13 +126,6 @@ async fn main() {
     .register_runner_task(Arc::new(DiskSizeRunnerTask::with_interval(
         std::time::Duration::from_secs(pr_config.dir_size_scan_interval_secs),
     )));
-
-    // Spawn purge daemon for expired work dirs and archives
-    let _purge = pod_runner::logic::purge::spawn_purge_daemon(
-        cleanup_config,
-        purge_store,
-        shutdown_tx.subscribe(),
-    );
 
     // Spawn metrics server
     let metrics_port = pr_config.metrics_port();
@@ -161,7 +161,8 @@ async fn main() {
     pod_runner::server::tls::axum_serve_tls(listener, app, server_config, shutdown).await;
 
     // Wait for all running pods to finish cleanup before exiting.
-    // Timeout is 2x the grace period to allow for SIGTERM + SIGKILL + archive.
+    // Timeout is 2x the grace period to allow for SIGTERM + SIGKILL + the
+    // monitor's post-completion work.
     let wait_timeout = std::time::Duration::from_secs(grace_secs * 2 + 10);
     state.logic.wait_for_pods(wait_timeout).await;
     info!("Server stopped");

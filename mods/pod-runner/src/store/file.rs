@@ -317,7 +317,7 @@ impl PodStore for FileStore {
         let _span = debug_span!("file_store", pod = %id).entered();
         let snap = self.read_snapshot(id, SpecView::Running);
         // Remove only the store/ subdir — the pod dir may contain
-        // work/ and log/ that cleanup/purge manage separately.
+        // work/ and log/ that the reaper manages separately.
         let store = self.store_dir(id);
         if store.exists()
             && let Err(e) = fs::remove_dir_all(&store)
@@ -325,6 +325,14 @@ impl PodStore for FileStore {
             warn!(error = %e, "Failed to remove pod store directory");
         }
         snap
+    }
+
+    /// Reads the snapshot back but leaves `store/` on disk: the specs and
+    /// statuses are the pod's troubleshooting record, and the reaper's
+    /// delete deadline decides when they go.
+    async fn evict(&self, id: &PodId) -> Option<PodSnapshot> {
+        let _span = debug_span!("file_store", pod = %id).entered();
+        self.read_snapshot(id, SpecView::Running)
     }
 
     async fn len(&self) -> usize {
@@ -636,6 +644,40 @@ mod tests {
         assert!(!store.contains(&id).await);
         assert!(!store.store_dir(&id).exists());
         assert_eq!(store.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn evict_keeps_the_directory() {
+        let store = make_store("evict");
+        let spec = make_spec("default", "app", "uid-1");
+        let id = PodId::from_spec(&spec);
+        store
+            .put(
+                id.clone(),
+                Arc::clone(&spec),
+                spec,
+                make_status(PodPhase::Failed),
+            )
+            .await;
+
+        let snap = store.evict(&id).await.unwrap();
+        assert_eq!(snap.id.name, "app");
+        assert!(
+            store.store_dir(&id).exists(),
+            "the specs and statuses are the pod's record — evicting a pod \
+             from the API must not destroy them",
+        );
+        assert!(
+            store.store_dir(&id).join("original-spec.json").exists(),
+            "the spec survives",
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_nonexistent() {
+        let store = make_store("evict-missing");
+        let id = PodId::new("default", "ghost", "uid-x");
+        assert!(store.evict(&id).await.is_none());
     }
 
     #[tokio::test]

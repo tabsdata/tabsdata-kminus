@@ -215,9 +215,23 @@ pub trait PodStore: Send + Sync {
     /// List pods in a specific namespace.
     async fn list_in_namespace(&self, namespace: &str, view: SpecView) -> Vec<PodSnapshot>;
 
-    /// Remove a pod from the store. Returns the snapshot (with the
-    /// running spec) if it existed.
+    /// Remove a pod from the store, discarding any durable record of it.
+    /// Returns the snapshot (with the running spec) if it existed.
+    ///
+    /// Use this only when the pod's on-disk dir is going away too. To drop
+    /// a pod from the API while keeping its record for troubleshooting, use
+    /// [`evict`](Self::evict).
     async fn remove(&self, id: &PodId) -> Option<PodSnapshot>;
+
+    /// Drop a pod from the store index while leaving its durable record in
+    /// place. Returns the snapshot (with the running spec) if it existed.
+    ///
+    /// This is what pod deletion uses. The specs and statuses on disk are
+    /// the only record of why a pod ended the way it did — for a pod that
+    /// failed before any container started, they are the *whole* record —
+    /// and their lifetime belongs to the reaper's delete deadline, not to
+    /// the API. Stores with no durable record (memory) evict by removing.
+    async fn evict(&self, id: &PodId) -> Option<PodSnapshot>;
 
     /// Number of pods in the store.
     async fn len(&self) -> usize;

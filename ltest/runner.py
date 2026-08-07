@@ -379,8 +379,11 @@ class PodRunnerClient:
                 'restartBackoffBaseSecs: 2\ncleanUpForceKillWaitSecs: 10\n'
                 'propagateEnv: true\ndieWithParent: true\n'
                 'writeSecretsToContainerShellScript: false\n'
-                'keepDeletedPodDir: false\nkeepFailedPodDir: false\n'
-                'deletedPodDirTtlHours: 1\npodArchiveTtlDays: 0\n'
+                # Reclaim aggressively: a load run creates thousands of pod
+                # dirs, and their logs are only interesting until the run's
+                # metrics are collected.
+                'podReapTtlOnSuccess: "0s"\npodReapTtlOnError: "0s"\n'
+                'podDeleteTtlOnSuccess: "1h"\npodDeleteTtlOnError: "1h"\n'
                 f'capacity:\n  cpu: 100\n  memoryGB: 100\n  pods: {self._max_pods}\n'
                 'metricsUrl: ""\n'
                 'secretResolver:\n  type: "none"\n  configs: {}\n'

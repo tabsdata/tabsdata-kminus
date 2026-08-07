@@ -89,6 +89,12 @@ impl PodStore for MultiplexStore {
         snap
     }
 
+    async fn evict(&self, id: &PodId) -> Option<PodSnapshot> {
+        let snap = self.primary.evict(id).await;
+        self.secondary.evict(id).await;
+        snap
+    }
+
     async fn len(&self) -> usize {
         self.primary.len().await
     }
@@ -232,6 +238,27 @@ mod tests {
 
         let snap = mpx.remove(&id).await.unwrap();
         assert_eq!(snap.id.name, "app");
+        assert!(!primary.contains(&id).await);
+        assert!(!secondary.contains(&id).await);
+    }
+
+    #[tokio::test]
+    async fn evict_evicts_from_both() {
+        let (mpx, primary, secondary) = make_stores();
+        let id = PodId::new("default", "app", "uid-1");
+
+        mpx.put(
+            id.clone(),
+            make_spec("default", "app", "uid-1"),
+            make_running_spec("default", "app", "uid-1"),
+            make_status(PodPhase::Pending),
+        )
+        .await;
+
+        let snap = mpx.evict(&id).await.unwrap();
+        assert_eq!(snap.id.name, "app");
+        // Both backing stores here are in-memory, so neither has a durable
+        // record to keep; with a FileStore secondary the dir would survive.
         assert!(!primary.contains(&id).await);
         assert!(!secondary.contains(&id).await);
     }

@@ -20,9 +20,9 @@
 //!   immediately.
 //! - **Get / List**: thin wrappers over the store.
 
-pub mod cleanup;
 pub mod disk_usage;
-pub mod purge;
+pub mod reaper;
+pub mod ttl;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -49,7 +49,7 @@ use crate::spec::pod::PodSpec;
 use crate::spec::status::{ContainerStatus, PodStatus};
 use crate::store::{PodId, PodSnapshot, PodStore, SpecView};
 
-pub use cleanup::CleanupConfig;
+pub use reaper::CleanupConfig;
 
 // ---------------------------------------------------------------------------
 // Executor provider
@@ -297,6 +297,9 @@ pub struct PodLogic {
     runtimes: Arc<RwLock<HashMap<PodId, PodRuntime>>>,
     metrics: Option<Arc<Metrics>>,
     shutdown_tx: watch::Sender<()>,
+    /// Subscribed at construction so reap timers can be cancelled by
+    /// shutdown regardless of when they are scheduled.
+    shutdown_rx: watch::Receiver<()>,
     /// Tasks registered via [`PodLogic::register_task`]. A snapshot of
     /// this Vec is passed to every pod executor at spawn time.
     tasks: Arc<Vec<Arc<dyn PodTask>>>,
@@ -327,6 +330,10 @@ impl PodLogic {
             resolvers: Arc::new(resolvers),
             runtimes: Arc::new(RwLock::new(HashMap::new())),
             metrics: None,
+            // Subscribed here rather than on demand: a receiver created
+            // after shutdown is signalled cannot observe it, and reap
+            // timers must be cancellable whenever they are scheduled.
+            shutdown_rx: shutdown_tx.subscribe(),
             shutdown_tx,
             tasks: Arc::new(Vec::new()),
             runner_work_dir: PathBuf::new(),
@@ -337,7 +344,7 @@ impl PodLogic {
     /// Wait for all running pod monitor tasks to complete.
     ///
     /// Call after sending the shutdown signal. Polls until every active
-    /// monitor has finished (cleanup, sentinels, archive). Naturally
+    /// monitor has finished (markers, deadlines, inline reap). Naturally
     /// completed pods keep their runtime entry so logs stay accessible
     /// — those have `_monitor.is_finished()` and don't block shutdown.
     /// Times out after `timeout` to avoid hanging on stuck pods.
@@ -687,20 +694,19 @@ impl PodLogic {
 
         info!(phase = ?snap.status.phase, "Pod deleted");
 
-        // Terminal — run cleanup and remove runtime.
-        // The monitor task has already processed the Completed event and
-        // written the FINISHED sentinel by the time we reach here.
+        // Terminal — the pod leaves the runner, which starts its delete
+        // clock. The monitor has already stamped the outcome and the reap
+        // deadline by the time we get here.
+        //
+        // The pod dir is left for the reaper: `log/` and `store/` are the
+        // record of what this pod did, and deleting them the moment the
+        // control plane stops asking about the pod is what made a failure
+        // unexplainable. `evict` drops the index entry but keeps the record.
         if snap.status.phase.is_terminal() {
-            debug!(phase = ?snap.status.phase, "Cleaning up terminal pod");
-            cleanup::cleanup_pod(
-                &snap.id,
-                self.store.as_ref(),
-                self.executor_provider.as_ref(),
-                &self.cleanup_config,
-            )
-            .await;
+            debug!(phase = ?snap.status.phase, "Evicting terminal pod");
+            self.evict_pod(&snap.id).await;
             // Mark deleted so if the monitor is still finishing, it skips
-            // its own cleanup (store entry already removed above).
+            // its own eviction (store entry already dropped above).
             if let Some(runtime) = self.runtimes.read().unwrap().get(&snap.id) {
                 runtime.deleted().store(true, Ordering::Relaxed);
             }
@@ -748,8 +754,27 @@ impl PodLogic {
                 let _ = tx.send(());
                 // The preparer task observes `deleted` after its
                 // prepare_pod call returns and exits without spawning the
-                // executor. The store entry is removed below.
-                self.store.remove(&snap.id).await;
+                // executor, so nothing else will ever finalize this dir.
+                // A pod deleted mid-preparation is usually one that was
+                // stuck there, and its partially resolved volumes are the
+                // evidence — so it is retained on the error TTLs rather
+                // than left unmarked, which no reaper would ever look at.
+                let pod_dir = self.executor_provider.work_dir(&snap.id);
+                let now = chrono::Utc::now();
+                let reap_on = reaper::finalize_pod(
+                    &pod_dir,
+                    reaper::Outcome::Failed,
+                    &self.cleanup_config.ttls,
+                    now,
+                );
+                reaper::schedule_deadline(
+                    &pod_dir,
+                    reaper::ScheduledReap::DataDirs,
+                    reap_on,
+                    now,
+                    &self.shutdown_rx,
+                );
+                self.evict_pod(&snap.id).await;
                 self.runtimes.write().unwrap().remove(&snap.id);
                 return Ok(());
             }
@@ -778,6 +803,28 @@ impl PodLogic {
         }
 
         Ok(())
+    }
+
+    /// Drop a pod from the runner: start its delete clock, drop the store
+    /// index entry, and apply any deadline that is already due.
+    ///
+    /// The delete clock runs from here rather than from completion because
+    /// until this point the runner still answers queries about the pod, so
+    /// its dir is live data.
+    async fn evict_pod(&self, id: &PodId) {
+        let pod_dir = self.executor_provider.work_dir(id);
+        let now = chrono::Utc::now();
+        let delete_on = reaper::mark_pod_evicted(&pod_dir, &self.cleanup_config.ttls, now);
+        self.store.evict(id).await;
+        // A zero TTL acts here; anything later waits out its own deadline.
+        reaper::reap_pod_dir(&pod_dir, now);
+        reaper::schedule_deadline(
+            &pod_dir,
+            reaper::ScheduledReap::PodDir,
+            delete_on,
+            now,
+            &self.shutdown_rx,
+        );
     }
 
     /// Get a pod by namespace and name.
@@ -1016,6 +1063,14 @@ async fn monitor_pod(
     deleted: Arc<AtomicBool>,
     mut shutdown: watch::Receiver<()>,
 ) {
+    // The outcome the pod completed with, taken from the Completed event
+    // rather than the store so it can't be disturbed by a concurrent delete.
+    let mut final_outcome: Option<reaper::Outcome> = None;
+
+    // Cloned at entry, before the loop below can observe a shutdown: a
+    // receiver that has already seen it would leave reap timers uncancellable.
+    let reap_shutdown = shutdown.clone();
+
     loop {
         let event = tokio::select! {
             result = handle.wait() => result,
@@ -1095,7 +1150,13 @@ async fn monitor_pod(
                         debug!(kind = ?event.kind, phase = ?event.status.phase, "Event received");
                     }
                 }
-                let completed = matches!(event.kind, PodEventKind::Completed { .. });
+                let completed = match event.kind {
+                    PodEventKind::Completed { phase } => {
+                        final_outcome = reaper::Outcome::from_phase(phase);
+                        true
+                    }
+                    _ => false,
+                };
                 store.update_status(&id, event.status).await;
                 if completed {
                     // Let the orchestrator's post-completion cleanup run
@@ -1117,28 +1178,45 @@ async fn monitor_pod(
         }
     }
 
-    // Write FINISHED sentinel for all completed pods. This marks the
-    // work dir for the purge daemon regardless of keep policy.
+    // Stamp the outcome and start the reap clock, then act on it — a reap
+    // TTL of 0s reclaims the data dirs here rather than waiting for a scan.
+    // This runs after the orchestrator's post-completion tasks (the
+    // disk-usage final scan among them) so the reported size still reflects
+    // what the pod used.
+    //
+    // A pod whose event stream died without a Completed event never reached
+    // a terminal phase, so it gets no marker — the run rotation deals with
+    // those.
     let work_dir = executor_provider.work_dir(&id);
-    if work_dir.exists() {
-        let sentinel = work_dir.join(FINISHED_SENTINEL);
-        if let Err(e) = std::fs::write(&sentinel, chrono::Utc::now().to_rfc3339()) {
-            warn!(error = %e, "Failed to write FINISHED sentinel");
-        }
+    if let Some(outcome) = final_outcome {
+        let now = chrono::Utc::now();
+        let reap_on = reaper::finalize_pod(&work_dir, outcome, &cleanup_config.ttls, now);
+        reaper::reap_pod_dir(&work_dir, now);
+        reaper::schedule_deadline(
+            &work_dir,
+            reaper::ScheduledReap::DataDirs,
+            reap_on,
+            now,
+            &reap_shutdown,
+        );
     }
 
-    // If the pod was marked for deletion, perform full cleanup.
-    // Natural completions keep everything so logs can still be read
-    // until delete_pod is called.
+    // If the pod was deleted while it ran, it has already left the runner,
+    // so its delete clock starts now. A natural completion keeps everything
+    // until the control plane deletes the pod.
     if deleted.load(Ordering::Relaxed) {
-        debug!("Cleaning up deleted pod");
-        cleanup::cleanup_pod(
-            &id,
-            store.as_ref(),
-            executor_provider.as_ref(),
-            &cleanup_config,
-        )
-        .await;
+        debug!("Evicting deleted pod");
+        let now = chrono::Utc::now();
+        let delete_on = reaper::mark_pod_evicted(&work_dir, &cleanup_config.ttls, now);
+        store.evict(&id).await;
+        reaper::reap_pod_dir(&work_dir, now);
+        reaper::schedule_deadline(
+            &work_dir,
+            reaper::ScheduledReap::PodDir,
+            delete_on,
+            now,
+            &reap_shutdown,
+        );
         runtimes.write().unwrap().remove(&id);
     }
 
@@ -1206,6 +1284,23 @@ async fn prepare_and_run(
         "Starting pod preparation",
     );
 
+    // For the failure paths below, which finalize the pod dir and so need a
+    // reap timer. Subscribed now, well before any shutdown.
+    let reap_shutdown = shutdown_tx.subscribe();
+
+    // Record the pod's cleanup TTLs before anything else can fail: a pod
+    // that dies in preparation still needs a retention policy, and writing
+    // it here means the pod dir carries its own — unaffected by a later
+    // config edit or a runner restart.
+    let ttls = ttl::resolve_cleanup_ttls(
+        &cleanup_config.ttls,
+        &original_spec.metadata.annotations,
+        &chrono::Utc::now().to_rfc3339(),
+    );
+    if let Err(e) = ttl::write_cleanup_ttls(&pod_work_dir, &ttls) {
+        warn!(pod = %id, error = %e, "Failed to write cleanup TTLs");
+    }
+
     let prepare_result = prepare_pod(
         &original_spec,
         &pod_work_dir,
@@ -1244,6 +1339,24 @@ async fn prepare_and_run(
             };
             let status = build_failed_prep_status(reason, &err.to_string());
             store.update_status(&id, status).await;
+            // A pod that dies here never ran a container, so its dir holds
+            // only the partially resolved volumes — which is exactly what
+            // says where preparation stopped. Finalize it like any other
+            // failure so it is retained and reaped on the error TTLs.
+            let now = chrono::Utc::now();
+            let reap_on = reaper::finalize_pod(
+                &pod_work_dir,
+                reaper::Outcome::Failed,
+                &cleanup_config.ttls,
+                now,
+            );
+            reaper::schedule_deadline(
+                &pod_work_dir,
+                reaper::ScheduledReap::DataDirs,
+                reap_on,
+                now,
+                &reap_shutdown,
+            );
             if let Some(ref m) = metrics {
                 m.pods_failed_total.inc();
             }
@@ -1278,6 +1391,20 @@ async fn prepare_and_run(
                 &format!("executor spawn failed: {}", e),
             );
             store.update_status(&id, status).await;
+            let now = chrono::Utc::now();
+            let reap_on = reaper::finalize_pod(
+                &pod_work_dir,
+                reaper::Outcome::Failed,
+                &cleanup_config.ttls,
+                now,
+            );
+            reaper::schedule_deadline(
+                &pod_work_dir,
+                reaper::ScheduledReap::DataDirs,
+                reap_on,
+                now,
+                &reap_shutdown,
+            );
             if let Some(ref m) = metrics {
                 m.pods_failed_total.inc();
             }
@@ -1611,6 +1738,7 @@ mod tests {
 
     mod async_tests {
         use super::*;
+        use crate::server::config::POD_WORK_SUBDIR;
         use crate::testutils::shell_cmd;
 
         fn make_pod_spec(name: &str, cmd: &str) -> PodSpec {
@@ -1984,8 +2112,38 @@ mod tests {
             assert!(!logic.runtimes.read().unwrap().contains_key(&id));
         }
 
+        // -- monitor: data dir reaping --
+
+        /// Wait until `path` disappears, with timeout. Returns whether it did.
+        async fn wait_for_absence(path: &std::path::Path) -> bool {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if !path.exists() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .is_ok()
+        }
+
+        /// Wait until `path` appears, with timeout. Returns whether it did.
+        async fn wait_for_presence(path: &std::path::Path) -> bool {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if path.exists() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .is_ok()
+        }
+
         #[tokio::test]
-        async fn monitor_writes_finished_sentinel() {
+        async fn monitor_reaps_data_dirs_of_succeeded_pod() {
             let (logic, _, _) = make_logic_with_store();
             logic
                 .create_pod(make_pod_spec("app", "exit 0"))
@@ -1993,15 +2151,241 @@ mod tests {
                 .unwrap();
             let id = PodId::new("default", "app", "uid-app");
 
-            wait_for_terminal(&logic, "app").await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(wait_for_terminal(&logic, "app").await, PodPhase::Succeeded);
 
-            let work_dir = logic.executor_provider.work_dir(&id);
-            let sentinel = work_dir.join(FINISHED_SENTINEL);
+            // Default reap-on-success is 0s, and the inline pass runs after
+            // the orchestrator's post-completion tasks, so poll instead of
+            // assuming it lands immediately.
+            let pod_dir = logic.executor_provider.work_dir(&id);
             assert!(
-                sentinel.exists(),
-                "FINISHED sentinel should be written on completion"
+                wait_for_absence(&pod_dir.join(POD_WORK_SUBDIR)).await,
+                "work/ should be reaped as soon as the pod succeeds",
             );
+            assert!(pod_dir.join(REAPED_MARKER).exists(), "the reap is recorded",);
+            assert!(
+                logic.executor_provider.log_dir(&id).unwrap().exists(),
+                "container logs survive the reap — they are the record",
+            );
+            assert!(
+                pod_dir.join(SUCCEEDED_MARKER).exists(),
+                "the rest of the pod dir survives the reap",
+            );
+        }
+
+        #[tokio::test]
+        async fn monitor_keeps_data_dirs_of_failed_pod() {
+            let (logic, _, _) = make_logic_with_store();
+            logic
+                .create_pod(make_pod_spec("app", "exit 1"))
+                .await
+                .unwrap();
+            let id = PodId::new("default", "app", "uid-app");
+
+            assert_eq!(wait_for_terminal(&logic, "app").await, PodPhase::Failed);
+
+            // The marker is written immediately before the inline reap pass —
+            // once it is there, a reap would already have happened.
+            let pod_dir = logic.executor_provider.work_dir(&id);
+            assert!(wait_for_presence(&pod_dir.join(FAILED_MARKER)).await);
+            assert!(
+                pod_dir.join(POD_WORK_SUBDIR).exists(),
+                "the default 1h reap-on-error keeps work/ for debugging",
+            );
+            assert!(!pod_dir.join(REAPED_MARKER).exists());
+        }
+
+        #[tokio::test]
+        async fn reap_ttl_annotation_defers_reaping_a_succeeded_pod() {
+            let (logic, _, _) = make_logic_with_store();
+            let mut spec = make_pod_spec("app", "exit 0");
+            spec.metadata
+                .annotations
+                .insert(ANN_POD_REAP_TTL_ON_SUCCESS.to_string(), "1h".to_string());
+            logic.create_pod(spec).await.unwrap();
+            let id = PodId::new("default", "app", "uid-app");
+
+            assert_eq!(wait_for_terminal(&logic, "app").await, PodPhase::Succeeded);
+
+            let pod_dir = logic.executor_provider.work_dir(&id);
+            assert!(wait_for_presence(&pod_dir.join(SUCCEEDED_MARKER)).await);
+            assert!(
+                pod_dir.join(POD_WORK_SUBDIR).exists(),
+                "the annotation defers the reap by an hour",
+            );
+            let reap_on = reaper::read_deadline(&pod_dir, REAP_ON_FILE).expect("reap deadline");
+            assert!(!reap_on.is_due(chrono::Utc::now()), "{reap_on:?}");
+        }
+
+        #[tokio::test]
+        async fn never_reap_ttl_keeps_data_dirs_indefinitely() {
+            let (logic, _, _) = make_logic_with_store();
+            let mut spec = make_pod_spec("app", "exit 0");
+            spec.metadata.annotations.insert(
+                ANN_POD_REAP_TTL_ON_SUCCESS.to_string(),
+                TTL_NEVER.to_string(),
+            );
+            logic.create_pod(spec).await.unwrap();
+            let id = PodId::new("default", "app", "uid-app");
+
+            assert_eq!(wait_for_terminal(&logic, "app").await, PodPhase::Succeeded);
+
+            let pod_dir = logic.executor_provider.work_dir(&id);
+            assert!(wait_for_presence(&pod_dir.join(SUCCEEDED_MARKER)).await);
+            assert_eq!(
+                reaper::read_deadline(&pod_dir, REAP_ON_FILE),
+                Some(reaper::Deadline::Never),
+            );
+            assert!(pod_dir.join(POD_WORK_SUBDIR).exists(), "never means never");
+        }
+
+        // -- cleanup TTLs --
+
+        #[tokio::test]
+        async fn cleanup_ttls_file_written_at_pod_start() {
+            let (logic, _, _) = make_logic_with_store();
+            logic
+                .create_pod(make_pod_spec("app", "sleep 60"))
+                .await
+                .unwrap();
+            let id = PodId::new("default", "app", "uid-app");
+
+            // Written before the pod is prepared, so it is there while the
+            // pod still runs — a pod that dies in preparation has a policy
+            // too.
+            let pod_dir = logic.executor_provider.work_dir(&id);
+            assert!(wait_for_presence(&pod_dir.join(CLEANUP_TTLS_FILE)).await);
+
+            let ttls = ttl::read_cleanup_ttls(&pod_dir).expect("cleanup TTLs readable");
+            assert_eq!(
+                ttls.reap_ttl_on_success.raw,
+                DEFAULT_POD_REAP_TTL_ON_SUCCESS
+            );
+            assert_eq!(
+                ttls.delete_ttl_on_error.raw,
+                DEFAULT_POD_DELETE_TTL_ON_ERROR
+            );
+            assert_eq!(ttls.reap_ttl_on_success.source, ttl::TtlSource::Config);
+            assert!(!ttls.written_at.is_empty());
+        }
+
+        #[tokio::test]
+        async fn cleanup_ttls_file_records_annotation_override() {
+            let (logic, _, _) = make_logic_with_store();
+            let mut spec = make_pod_spec("app", "exit 0");
+            spec.metadata
+                .annotations
+                .insert(ANN_POD_REAP_TTL_ON_ERROR.to_string(), "45m".to_string());
+            logic.create_pod(spec).await.unwrap();
+            let id = PodId::new("default", "app", "uid-app");
+
+            let pod_dir = logic.executor_provider.work_dir(&id);
+            assert!(wait_for_presence(&pod_dir.join(CLEANUP_TTLS_FILE)).await);
+
+            let ttls = ttl::read_cleanup_ttls(&pod_dir).expect("cleanup TTLs readable");
+            assert_eq!(ttls.reap_ttl_on_error.raw, "45m");
+            assert_eq!(ttls.reap_ttl_on_error.secs, Some(2700));
+            assert_eq!(ttls.reap_ttl_on_error.source, ttl::TtlSource::Annotation);
+            // Only the annotated value is overridden.
+            assert_eq!(ttls.reap_ttl_on_success.source, ttl::TtlSource::Config);
+            assert_eq!(ttls.delete_ttl_on_error.source, ttl::TtlSource::Config);
+        }
+
+        // -- finalization: every terminal path stamps the pod dir --
+
+        #[tokio::test]
+        async fn succeeded_pod_is_finalized_as_succeeded() {
+            let (logic, _, _) = make_logic_with_store();
+            logic
+                .create_pod(make_pod_spec("app", "exit 0"))
+                .await
+                .unwrap();
+            let id = PodId::new("default", "app", "uid-app");
+            assert_eq!(wait_for_terminal(&logic, "app").await, PodPhase::Succeeded);
+
+            let pod_dir = logic.executor_provider.work_dir(&id);
+            assert!(wait_for_presence(&pod_dir.join(SUCCEEDED_MARKER)).await);
+            assert!(!pod_dir.join(FAILED_MARKER).exists());
+            // Default reap-on-success is 0s, so the inline pass reaps at
+            // completion and consumes the deadline it just wrote.
+            assert!(wait_for_presence(&pod_dir.join(REAPED_MARKER)).await);
+            assert_eq!(
+                reaper::read_deadline(&pod_dir, REAP_ON_FILE),
+                None,
+                "a reaped deadline is consumed",
+            );
+            assert!(
+                !pod_dir.join(DELETE_ON_FILE).exists(),
+                "the delete clock starts when the pod leaves the runner",
+            );
+        }
+
+        #[tokio::test]
+        async fn failed_pod_is_finalized_as_failed() {
+            let (logic, _, _) = make_logic_with_store();
+            logic
+                .create_pod(make_pod_spec("app", "exit 1"))
+                .await
+                .unwrap();
+            let id = PodId::new("default", "app", "uid-app");
+            assert_eq!(wait_for_terminal(&logic, "app").await, PodPhase::Failed);
+
+            let pod_dir = logic.executor_provider.work_dir(&id);
+            assert!(wait_for_presence(&pod_dir.join(FAILED_MARKER)).await);
+            assert!(!pod_dir.join(SUCCEEDED_MARKER).exists());
+            // Default reap-on-error is 1h out.
+            let reap_on = reaper::read_deadline(&pod_dir, REAP_ON_FILE).expect("reap deadline");
+            assert!(!reap_on.is_due(chrono::Utc::now()), "{reap_on:?}");
+        }
+
+        #[tokio::test]
+        async fn pod_that_fails_preparation_is_finalized() {
+            let secret_dir = temp_dir("finalize-prep-failure");
+            let (logic, _, _) = make_logic_with_secret_dir(secret_dir);
+
+            // Never-appearing secret with a 1s deadline: the pod fails
+            // before any container runs, so nothing ever creates log/.
+            logic
+                .create_pod(pod_with_secret_ref("never", "missing-secret", Some(1)))
+                .await
+                .unwrap();
+            let id = PodId::new("default", "never", "uid-never");
+            assert_eq!(wait_for_terminal(&logic, "never").await, PodPhase::Failed);
+
+            let pod_dir = logic.executor_provider.work_dir(&id);
+            assert!(
+                wait_for_presence(&pod_dir.join(FAILED_MARKER)).await,
+                "a pod that dies in preparation still gets a retention policy",
+            );
+            assert!(reaper::read_deadline(&pod_dir, REAP_ON_FILE).is_some());
+            assert!(
+                !pod_dir.join(crate::server::config::POD_LOG_SUBDIR).exists(),
+                "no container ran, so there is no log dir — the store is the record",
+            );
+        }
+
+        #[tokio::test]
+        async fn pod_deleted_while_preparing_is_finalized() {
+            let secret_dir = temp_dir("finalize-delete-preparing");
+            let (logic, _, _) = make_logic_with_secret_dir(secret_dir);
+
+            // No deadline: the preparer waits on the missing secret until
+            // the delete cancels it.
+            logic
+                .create_pod(pod_with_secret_ref("stuck", "missing-secret", None))
+                .await
+                .unwrap();
+            let id = PodId::new("default", "stuck", "uid-stuck");
+            let pod_dir = logic.executor_provider.work_dir(&id);
+            // Wait until the preparer is actually running before deleting.
+            assert!(wait_for_presence(&pod_dir.join(CLEANUP_TTLS_FILE)).await);
+
+            logic.delete_pod("default", "stuck", None).await.unwrap();
+
+            assert!(
+                wait_for_presence(&pod_dir.join(FAILED_MARKER)).await,
+                "a dir left unmarked would never be looked at by the reaper",
+            );
+            assert!(reaper::read_deadline(&pod_dir, REAP_ON_FILE).is_some());
         }
 
         // -- get_pod --
@@ -2493,6 +2877,156 @@ mod tests {
             let _ = std::fs::remove_dir_all(&d);
             std::fs::create_dir_all(&d).unwrap();
             d
+        }
+
+        /// Build a logic whose store writes specs and statuses into each
+        /// pod dir, as the server does. Returns the provider too so tests
+        /// can look at what survives on disk.
+        fn make_logic_with_file_store(
+            secret_dir: std::path::PathBuf,
+        ) -> (PodLogic, Arc<DefaultExecutorProvider>, watch::Sender<()>) {
+            use crate::store::file::{FileStore, FileStoreConfig};
+            use crate::store::multiplex::MultiplexStore;
+
+            let provider = make_provider();
+            let file_store = FileStore::new(FileStoreConfig {
+                root_dir: provider.pods_dir.clone(),
+                write_running_spec: false,
+            });
+            let store: Arc<dyn PodStore> = Arc::new(MultiplexStore::new(
+                Arc::new(MemoryStore::new()),
+                Arc::new(file_store),
+            ));
+            let (shutdown_tx, _) = watch::channel(());
+            let resolvers = ResolverSet {
+                secret_resolver: Some(Box::new(FileSecretResolver::new(secret_dir).unwrap())),
+                ..Default::default()
+            };
+            let logic = PodLogic::new(
+                LogicConfig::default(),
+                test_cleanup_config(),
+                store,
+                Arc::clone(&provider) as Arc<dyn ExecutorProvider>,
+                resolvers,
+                shutdown_tx.clone(),
+            );
+            (logic, provider, shutdown_tx)
+        }
+
+        /// The status snapshots the file store wrote for a pod.
+        fn status_files(pod_dir: &std::path::Path) -> Vec<String> {
+            let status_dir = pod_dir
+                .join(crate::server::config::POD_STORE_SUBDIR)
+                .join("status");
+            let Ok(entries) = std::fs::read_dir(&status_dir) else {
+                return Vec::new();
+            };
+            entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn deleting_a_prep_failed_pod_keeps_the_reason_on_disk() {
+            let secret_dir = temp_dir("keep-reason");
+            let (logic, provider, _tx) = make_logic_with_file_store(secret_dir);
+
+            // Fails in preparation, so no container ever runs and there is
+            // no log dir: store/ is the entire record of why.
+            logic
+                .create_pod(pod_with_secret_ref("never", "missing-secret", Some(1)))
+                .await
+                .unwrap();
+            let id = PodId::new("default", "never", "uid-never");
+            assert_eq!(wait_for_terminal(&logic, "never").await, PodPhase::Failed);
+
+            let pod_dir = provider.work_dir(&id);
+            assert!(wait_for_presence(&pod_dir.join(FAILED_MARKER)).await);
+
+            // The control plane deletes the pod, as it does for every
+            // terminal pod. That must not take the reason with it.
+            logic.delete_pod("default", "never", None).await.unwrap();
+
+            assert!(
+                logic.get_pod_status("default", "never").await.is_err(),
+                "the pod is gone from the API",
+            );
+            let statuses = status_files(&pod_dir);
+            assert!(
+                !statuses.is_empty(),
+                "status snapshots must survive the delete",
+            );
+            assert!(
+                statuses.iter().any(|s| s.contains("timed out")),
+                "the failure reason must survive the delete, got: {statuses:?}",
+            );
+            assert!(
+                pod_dir
+                    .join(crate::server::config::POD_STORE_SUBDIR)
+                    .join("original-spec.json")
+                    .exists(),
+                "the spec must survive the delete",
+            );
+        }
+
+        #[tokio::test]
+        async fn deleting_a_succeeded_pod_keeps_its_logs_until_the_delete_deadline() {
+            let secret_dir = temp_dir("keep-logs");
+            let (logic, provider, _tx) = make_logic_with_file_store(secret_dir);
+
+            logic
+                .create_pod(make_pod_spec("app", "echo hello"))
+                .await
+                .unwrap();
+            let id = PodId::new("default", "app", "uid-app");
+            assert_eq!(wait_for_terminal(&logic, "app").await, PodPhase::Succeeded);
+            let pod_dir = provider.work_dir(&id);
+            assert!(wait_for_presence(&pod_dir.join(SUCCEEDED_MARKER)).await);
+
+            logic.delete_pod("default", "app", None).await.unwrap();
+
+            // Default delete-on-success is 1h out, so the record stays.
+            assert!(pod_dir.exists(), "the pod dir outlives the delete");
+            assert!(
+                provider.log_dir(&id).unwrap().exists(),
+                "container logs outlive the delete",
+            );
+            assert!(
+                pod_dir
+                    .join(crate::server::config::POD_STORE_SUBDIR)
+                    .join("original-spec.json")
+                    .exists(),
+            );
+            let delete_on =
+                reaper::read_deadline(&pod_dir, DELETE_ON_FILE).expect("delete deadline");
+            assert!(
+                !delete_on.is_due(chrono::Utc::now()),
+                "the delete clock starts at eviction: {delete_on:?}",
+            );
+        }
+
+        #[tokio::test]
+        async fn zero_delete_ttl_removes_the_pod_dir_at_eviction() {
+            let secret_dir = temp_dir("delete-now");
+            let (logic, provider, _tx) = make_logic_with_file_store(secret_dir);
+
+            let mut spec = make_pod_spec("app", "exit 0");
+            spec.metadata
+                .annotations
+                .insert(ANN_POD_DELETE_TTL_ON_SUCCESS.to_string(), "0s".to_string());
+            logic.create_pod(spec).await.unwrap();
+            let id = PodId::new("default", "app", "uid-app");
+            assert_eq!(wait_for_terminal(&logic, "app").await, PodPhase::Succeeded);
+            let pod_dir = provider.work_dir(&id);
+            assert!(wait_for_presence(&pod_dir.join(SUCCEEDED_MARKER)).await);
+
+            logic.delete_pod("default", "app", None).await.unwrap();
+
+            assert!(
+                !pod_dir.exists(),
+                "a 0s delete TTL is applied inline, not on the next scan",
+            );
         }
 
         /// Build a logic with a file-backed SecretResolver rooted at

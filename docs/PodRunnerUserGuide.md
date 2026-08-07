@@ -563,10 +563,6 @@ kpr node-addresses
 # Health checks
 kpr status-check
 kpr probes-check
-
-# Maintenance
-kpr archive              # Archive completed pods
-kpr purge                # Remove expired archives
 ```
 
 ---
@@ -664,11 +660,35 @@ Check container logs:
 kubectl logs <name> -c <container>
 ```
 
-Failed pod directories are kept by default (`keepFailedPodDir: true`) for debugging. Inspect the working directory
-directly:
+A failed pod keeps its working directory for an hour, and its logs and specs for a day. Inspect them directly:
 
 ```bash
 ls run/pods/<namespace>_<name>_<uid>/
+```
+
+Two clocks govern how long that lasts. The **reap** deadline (`podReapTtlOnError`, default `1h`) covers `work/` and
+`volumes/` — the bulk of the disk — and runs from the moment the pod finished. The **delete** deadline
+(`podDeleteTtlOnError`, default `24h`) covers the whole dir including `log/` and `store/`, and runs from when the
+pod was removed from the pod runner. `_reap_on` and `_delete_on` in the pod dir hold the exact instants, so you can
+always see how long you have.
+
+To hold onto a pod for longer, raise either value in `prsysconfig.yaml` or annotate the pod:
+
+```yaml
+metadata:
+  annotations:
+    prPodReapTtlOnError: "never"      # keep work/ and volumes/ indefinitely
+    prPodDeleteTtlOnError: "72h"      # keep logs and specs for three days
+```
+
+A pod that **succeeds** is reaped immediately (`podReapTtlOnSuccess`, default `0s`) and its dir deleted an hour
+after the control plane removes it. Set `prPodReapTtlOnSuccess` to inspect what a successful run left behind.
+
+If a pod failed before any container started — a missing hostPath volume, an unresolvable configmap — there are no
+container logs to read, because nothing ever ran. The reason is in the status snapshots:
+
+```bash
+cat run/pods/<namespace>_<name>_<uid>/store/status/*.json | grep message
 ```
 
 ### Connection Refused

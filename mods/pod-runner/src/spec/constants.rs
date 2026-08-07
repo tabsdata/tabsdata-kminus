@@ -143,15 +143,65 @@ pub const REASON_KUBELET_NO_DISK_PRESSURE: &str = "KubeletHasNoDiskPressure";
 // Pod runner annotation keys
 // ---------------------------------------------------------------------------
 
-/// Annotation to override `keep_deleted_pod_dir` per pod ("true"/"false").
-pub const ANN_KEEP_DELETED_POD_DIR: &str = "prKeepDeletedPodDir";
+/// Annotation to override `pod_reap_ttl_on_success` per pod.
+pub const ANN_POD_REAP_TTL_ON_SUCCESS: &str = "prPodReapTtlOnSuccess";
 
-/// Annotation to override `keep_failed_pod_dir` per pod ("true"/"false").
-pub const ANN_KEEP_FAILED_POD_DIR: &str = "prKeepFailedPodDir";
+/// Annotation to override `pod_reap_ttl_on_error` per pod.
+pub const ANN_POD_REAP_TTL_ON_ERROR: &str = "prPodReapTtlOnError";
+
+/// Annotation to override `pod_delete_ttl_on_success` per pod.
+pub const ANN_POD_DELETE_TTL_ON_SUCCESS: &str = "prPodDeleteTtlOnSuccess";
+
+/// Annotation to override `pod_delete_ttl_on_error` per pod.
+pub const ANN_POD_DELETE_TTL_ON_ERROR: &str = "prPodDeleteTtlOnError";
 
 // ---------------------------------------------------------------------------
-// Sentinel files
+// Cleanup TTL defaults
+// ---------------------------------------------------------------------------
+//
+// A TTL is `<number><unit>` with unit `s`, `m` or `h`, or the literal
+// `never`. Reap TTLs run from pod completion; delete TTLs run from the
+// moment the pod is removed from the pod runner.
+
+/// Default TTL before a succeeded pod's data dirs are reaped.
+pub const DEFAULT_POD_REAP_TTL_ON_SUCCESS: &str = "0s";
+
+/// Default TTL before a failed pod's data dirs are reaped.
+pub const DEFAULT_POD_REAP_TTL_ON_ERROR: &str = "1h";
+
+/// Default TTL before a succeeded pod's dir is deleted.
+pub const DEFAULT_POD_DELETE_TTL_ON_SUCCESS: &str = "1h";
+
+/// Default TTL before a failed pod's dir is deleted.
+pub const DEFAULT_POD_DELETE_TTL_ON_ERROR: &str = "24h";
+
+/// TTL value meaning "no deadline" — nothing is ever reaped or deleted.
+pub const TTL_NEVER: &str = "never";
+
+// ---------------------------------------------------------------------------
+// Pod dir marker and deadline files
 // ---------------------------------------------------------------------------
 
-/// Written to the pod work dir when the pod reaches a terminal phase.
-pub const FINISHED_SENTINEL: &str = "FINISHED";
+/// Per-pod file holding the resolved cleanup TTLs, written at pod start.
+pub const CLEANUP_TTLS_FILE: &str = "_cleanup_ttls.json";
+
+/// Marker written to the pod dir when the pod completes successfully.
+/// Content is the RFC3339 completion time — the reap clock origin.
+pub const SUCCEEDED_MARKER: &str = "_succeeded";
+
+/// Marker written to the pod dir when the pod completes with a failure.
+/// Content is the RFC3339 completion time — the reap clock origin.
+pub const FAILED_MARKER: &str = "_failed";
+
+/// Deadline file for reaping the pod's data dirs (`work/`, `volumes/`).
+/// Content is an RFC3339 instant or [`TTL_NEVER`].
+pub const REAP_ON_FILE: &str = "_reap_on";
+
+/// Deadline file for deleting the whole pod dir. Written when the pod is
+/// removed from the pod runner. Content is an RFC3339 instant or
+/// [`TTL_NEVER`]; absence means the pod has not been removed yet.
+pub const DELETE_ON_FILE: &str = "_delete_on";
+
+/// Marker written once the pod's data dirs have been reaped. Content is
+/// the RFC3339 time of the reap.
+pub const REAPED_MARKER: &str = "_reaped";

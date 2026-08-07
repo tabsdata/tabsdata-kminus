@@ -17,6 +17,10 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::server::config::*;
+use crate::spec::constants::{
+    DEFAULT_POD_DELETE_TTL_ON_ERROR, DEFAULT_POD_DELETE_TTL_ON_SUCCESS,
+    DEFAULT_POD_REAP_TTL_ON_ERROR, DEFAULT_POD_REAP_TTL_ON_SUCCESS,
+};
 
 // ---------------------------------------------------------------------------
 // prconfig.yaml — endpoint and TLS (regenerated on every start)
@@ -96,6 +100,43 @@ impl YamlPRConfig {
 // prsysconfig.yaml — system settings (persistent, user-editable)
 // ---------------------------------------------------------------------------
 
+/// Settings that no longer exist, paired with what to use instead.
+///
+/// `prsysconfig.yaml` is persistent and never regenerated, so an instance
+/// created by an older build keeps writing these. Unknown keys deserialize
+/// silently, which would mean a retention setting an operator deliberately
+/// chose stops applying with no signal — hence the hard failure at startup.
+const REMOVED_SYSCONFIG_KEYS: &[(&str, &str)] = &[
+    (
+        "keepDeletedPodDir",
+        "use podDeleteTtlOnSuccess / podDeleteTtlOnError",
+    ),
+    (
+        "keepFailedPodDir",
+        "use podDeleteTtlOnError (\"never\" keeps a failed pod dir indefinitely)",
+    ),
+    (
+        "keepSucceededPodDataDirs",
+        "use podReapTtlOnSuccess (\"never\" keeps the data dirs indefinitely)",
+    ),
+    (
+        "deletedPodDirTtlHours",
+        "use podDeleteTtlOnSuccess / podDeleteTtlOnError",
+    ),
+    (
+        "podArchiveTtlDays",
+        "pod archives no longer exist; logs and specs live in the pod dir \
+         until podDeleteTtlOnSuccess / podDeleteTtlOnError",
+    ),
+];
+
+/// Compare config keys ignoring case and `_`, so `keepFailedPodDir` and
+/// `keep_failed_pod_dir` are recognized as the same setting.
+fn same_key(a: &str, b: &str) -> bool {
+    let normalize = |s: &str| s.replace('_', "").to_lowercase();
+    normalize(a) == normalize(b)
+}
+
 /// Deserialized `prsysconfig.yaml`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -144,17 +185,25 @@ pub struct YamlSysConfig {
     pub images_dir: String,
 
     // -- cleanup --
-    #[serde(alias = "keepDeletedPodDir")]
-    pub keep_deleted_pod_dir: bool,
+    /// TTL before a succeeded pod's data dirs (`work/`, `volumes/`) are
+    /// reaped, counted from pod completion. `<number>[s|m|h]` or `never`.
+    #[serde(alias = "podReapTtlOnSuccess")]
+    pub pod_reap_ttl_on_success: String,
 
-    #[serde(alias = "keepFailedPodDir")]
-    pub keep_failed_pod_dir: bool,
+    /// TTL before a failed pod's data dirs are reaped, counted from pod
+    /// completion. `<number>[s|m|h]` or `never`.
+    #[serde(alias = "podReapTtlOnError")]
+    pub pod_reap_ttl_on_error: String,
 
-    #[serde(alias = "deletedPodDirTtlHours")]
-    pub deleted_pod_dir_ttl_hours: u64,
+    /// TTL before a succeeded pod's dir is deleted, counted from the pod's
+    /// removal from the pod runner. `<number>[s|m|h]` or `never`.
+    #[serde(alias = "podDeleteTtlOnSuccess")]
+    pub pod_delete_ttl_on_success: String,
 
-    #[serde(alias = "podArchiveTtlDays")]
-    pub pod_archive_ttl_days: u64,
+    /// TTL before a failed pod's dir is deleted, counted from the pod's
+    /// removal from the pod runner. `<number>[s|m|h]` or `never`.
+    #[serde(alias = "podDeleteTtlOnError")]
+    pub pod_delete_ttl_on_error: String,
 
     /// Cadence between disk-usage scans for both per-pod and pod-runner
     /// trackers (seconds).
@@ -174,6 +223,12 @@ pub struct YamlSysConfig {
 
     #[serde(alias = "nodeEnvsResolver")]
     pub node_envs_resolver: YamlResolverConfig,
+
+    /// Keys in the file that this build doesn't recognize. Collected so
+    /// startup can warn about settings that silently stopped applying —
+    /// see [`REMOVED_SYSCONFIG_KEYS`].
+    #[serde(flatten)]
+    pub unrecognized: HashMap<String, serde_yaml_ng::Value>,
 }
 
 impl Default for YamlSysConfig {
@@ -191,10 +246,10 @@ impl Default for YamlSysConfig {
             die_with_parent: true,
             write_secrets_to_container_shell_script: false,
             images_dir: String::new(),
-            keep_deleted_pod_dir: false,
-            keep_failed_pod_dir: true,
-            deleted_pod_dir_ttl_hours: 24,
-            pod_archive_ttl_days: 7,
+            pod_reap_ttl_on_success: DEFAULT_POD_REAP_TTL_ON_SUCCESS.to_string(),
+            pod_reap_ttl_on_error: DEFAULT_POD_REAP_TTL_ON_ERROR.to_string(),
+            pod_delete_ttl_on_success: DEFAULT_POD_DELETE_TTL_ON_SUCCESS.to_string(),
+            pod_delete_ttl_on_error: DEFAULT_POD_DELETE_TTL_ON_ERROR.to_string(),
             dir_size_scan_interval_secs: 60,
             metrics_url: crate::metrics::DEFAULT_METRICS_URL.to_string(),
             secret_resolver: YamlResolverConfig {
@@ -209,6 +264,7 @@ impl Default for YamlSysConfig {
                 resolver_type: "none".into(),
                 ..Default::default()
             },
+            unrecognized: HashMap::new(),
         }
     }
 }
@@ -222,6 +278,58 @@ impl YamlSysConfig {
 
     pub fn from_str(yaml: &str) -> Result<Self, String> {
         serde_yaml_ng::from_str(yaml).map_err(|e| format!("Failed to parse prsysconfig YAML: {e}"))
+    }
+
+    /// The removed settings this file still carries, each with what to use
+    /// instead. Empty for an up-to-date file.
+    pub fn removed_keys(&self) -> Vec<(&str, &str)> {
+        self.unrecognized
+            .keys()
+            .filter_map(|present| {
+                REMOVED_SYSCONFIG_KEYS
+                    .iter()
+                    .find(|(removed, _)| same_key(present, removed))
+                    .copied()
+            })
+            .collect()
+    }
+
+    /// Reject any setting this build doesn't accept, naming a replacement
+    /// for the ones that were removed.
+    ///
+    /// A setting that silently stops applying is worse than a failed start:
+    /// retention chosen deliberately would quietly become something else,
+    /// and a typo in a key name would look like it took effect. Config
+    /// resolution runs before logging exists, so a warning here would go
+    /// nowhere anyway — this has to be an error to be seen at all.
+    pub fn validate_known_keys(&self) -> Result<(), String> {
+        if self.unrecognized.is_empty() {
+            return Ok(());
+        }
+
+        // HashMap iteration order is arbitrary; sort so the message reads
+        // the same way on every run.
+        let mut offenders: Vec<(&String, &str)> = self
+            .unrecognized
+            .keys()
+            .map(|key| {
+                let advice = REMOVED_SYSCONFIG_KEYS
+                    .iter()
+                    .find(|(removed, _)| same_key(key, removed))
+                    .map(|(_, advice)| *advice)
+                    .unwrap_or("not a known setting");
+                (key, advice)
+            })
+            .collect();
+        offenders.sort();
+
+        let detail = offenders
+            .iter()
+            .map(|(key, advice)| format!("\n  {key}: {advice}"))
+            .collect::<String>();
+        Err(format!(
+            "unsupported settings — remove or replace them:{detail}",
+        ))
     }
 }
 
@@ -361,7 +469,8 @@ server:
         assert_eq!(c.max_pods, 250);
         assert!(c.propagate_env);
         assert!(c.die_with_parent);
-        assert!(c.keep_failed_pod_dir);
+        assert_eq!(c.pod_reap_ttl_on_success, DEFAULT_POD_REAP_TTL_ON_SUCCESS);
+        assert_eq!(c.pod_delete_ttl_on_error, DEFAULT_POD_DELETE_TTL_ON_ERROR);
     }
 
     #[test]
@@ -371,8 +480,8 @@ nodename: "my-node"
 namespace: "prod"
 maxPods: 50
 propagateEnv: false
-keepDeletedPodDir: true
-deletedPodDirTtlHours: 48
+podReapTtlOnError: "30m"
+podDeleteTtlOnError: "48h"
 capacity:
   cpu: 200
   memoryGB: 64
@@ -386,10 +495,130 @@ secretResolver:
         assert_eq!(c.namespace, "prod");
         assert_eq!(c.max_pods, 50);
         assert!(!c.propagate_env);
-        assert!(c.keep_deleted_pod_dir);
-        assert_eq!(c.deleted_pod_dir_ttl_hours, 48);
+        assert_eq!(c.pod_reap_ttl_on_error, "30m");
+        assert_eq!(c.pod_delete_ttl_on_error, "48h");
         assert_eq!(c.capacity.cpu, 200);
         assert_eq!(c.secret_resolver.resolver_type, "kube");
+    }
+
+    #[test]
+    fn syscfg_parse_never_ttl() {
+        let yaml = "podDeleteTtlOnError: \"never\"\n";
+        let c = YamlSysConfig::from_str(yaml).unwrap();
+        assert_eq!(c.pod_delete_ttl_on_error, "never");
+    }
+
+    // -- removed settings --
+
+    /// The cleanup block a pre-reaper build wrote into every
+    /// `prsysconfig.yaml`. The file is persistent, so upgraded instances
+    /// still have it.
+    const LEGACY_CLEANUP_BLOCK: &str = r#"
+nodename: "old-node"
+keepDeletedPodDir: false
+keepFailedPodDir: true
+keepSucceededPodDataDirs: false
+deletedPodDirTtlHours: 24
+podArchiveTtlDays: 7
+"#;
+
+    #[test]
+    fn syscfg_parses_legacy_cleanup_keys_then_rejects_them() {
+        // Deserialization succeeds — the keys land in `unrecognized` — and
+        // validation is what refuses them, so the error can name each one.
+        let c = YamlSysConfig::from_str(LEGACY_CLEANUP_BLOCK).unwrap();
+        assert_eq!(c.nodename, "old-node");
+        assert_eq!(c.unrecognized.len(), 5);
+
+        let err = c.validate_known_keys().unwrap_err();
+        for key in [
+            "keepDeletedPodDir",
+            "keepFailedPodDir",
+            "keepSucceededPodDataDirs",
+            "deletedPodDirTtlHours",
+            "podArchiveTtlDays",
+        ] {
+            assert!(err.contains(key), "{key} not named in error: {err}");
+        }
+    }
+
+    #[test]
+    fn syscfg_rejection_names_the_replacement() {
+        let err = YamlSysConfig::from_str("keepFailedPodDir: true\n")
+            .unwrap()
+            .validate_known_keys()
+            .unwrap_err();
+        assert!(err.contains("keepFailedPodDir"), "{err}");
+        assert!(err.contains("podDeleteTtlOnError"), "{err}");
+        assert!(err.contains("never"), "{err}");
+    }
+
+    #[test]
+    fn syscfg_rejection_matches_snake_case_spelling() {
+        // Both spellings were accepted for every other setting, so both
+        // have to be recognized on the way out.
+        let err = YamlSysConfig::from_str("keep_failed_pod_dir: true\n")
+            .unwrap()
+            .validate_known_keys()
+            .unwrap_err();
+        assert!(err.contains("podDeleteTtlOnError"), "{err}");
+    }
+
+    #[test]
+    fn syscfg_rejects_an_unknown_key() {
+        // A typo in a key name must not look like it took effect.
+        let err = YamlSysConfig::from_str("podReapTtlOnSucess: \"5m\"\n")
+            .unwrap()
+            .validate_known_keys()
+            .unwrap_err();
+        assert!(err.contains("podReapTtlOnSucess"), "{err}");
+        assert!(err.contains("not a known setting"), "{err}");
+    }
+
+    #[test]
+    fn syscfg_rejection_lists_keys_in_a_stable_order() {
+        let err = YamlSysConfig::from_str(LEGACY_CLEANUP_BLOCK)
+            .unwrap()
+            .validate_known_keys()
+            .unwrap_err();
+        let listed: Vec<&str> = err
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.trim().split(':').next())
+            .collect();
+        let mut sorted = listed.clone();
+        sorted.sort();
+        assert_eq!(listed, sorted, "{err}");
+    }
+
+    #[test]
+    fn syscfg_clean_config_validates() {
+        let c = YamlSysConfig::from_str(
+            "nodename: \"n\"\npodReapTtlOnError: \"5m\"\ncapacity:\n  cpu: 4\n",
+        )
+        .unwrap();
+        assert!(c.validate_known_keys().is_ok());
+        assert!(
+            c.unrecognized.is_empty(),
+            "recognized settings must not land in `unrecognized`: {:?}",
+            c.unrecognized.keys().collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn syscfg_template_validates() {
+        // The generated template must not trip its own validation.
+        let c = YamlSysConfig::from_str(crate::config::template::PRSYSCONFIG_TEMPLATE).unwrap();
+        assert!(
+            c.validate_known_keys().is_ok(),
+            "template rejected: {:?}",
+            c.validate_known_keys(),
+        );
+    }
+
+    #[test]
+    fn syscfg_defaults_validate() {
+        assert!(YamlSysConfig::default().validate_known_keys().is_ok());
     }
 
     #[test]

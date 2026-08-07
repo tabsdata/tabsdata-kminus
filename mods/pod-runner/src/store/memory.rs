@@ -132,6 +132,12 @@ impl PodStore for MemoryStore {
         pods.remove(id).map(|e| e.snapshot(SpecView::Running))
     }
 
+    /// Identical to [`remove`](Self::remove): there is no durable record in
+    /// memory to preserve.
+    async fn evict(&self, id: &PodId) -> Option<PodSnapshot> {
+        self.remove(id).await
+    }
+
     async fn len(&self) -> usize {
         let pods = self.pods.read().unwrap();
         pods.len()
