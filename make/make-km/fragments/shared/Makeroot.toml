@@ -1,0 +1,13 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[env]
+PROJECT_TABSDATA_KM_ROOT_FOLDER = { value = "${PROJECT_ROOT_FOLDER}/../tabsdata-km", normalize = true }
+
+PROJECT_GO_KM_CONTROL_PLANE_FOLDER = { value = "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/mods/control-plane/src/main/go", normalize = true }
+PROJECT_GO_KM_VIRTUAL_KUBELET_FOLDER = { value = "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/mods/virtual-kubelet/src/main/go", normalize = true }
+
+PROJECT_RS_KM_KCOMMON_FOLDER = { value = "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/mods/kcommon", normalize = true }
+PROJECT_RS_KM_KMINUS_FOLDER = { value = "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/mods/kminus", normalize = true }
+PROJECT_RS_KM_POD_RUNNER_FOLDER = { value = "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/mods/pod-runner", normalize = true }

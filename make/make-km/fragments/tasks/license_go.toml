@@ -1,0 +1,31 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__license_check_go]
+plugin = "td-task-tracker"
+category = "06 - Compliance"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 python ${CHECK_LICENSES_GO_SCRIPT} --config ${LICENSES_GO_CFG} --module ${PROJECT_GO_KM_CONTROL_PLANE_FOLDER} --module ${PROJECT_GO_KM_VIRTUAL_KUBELET_FOLDER}"
+    exec --fail-on-error python ${CHECK_LICENSES_GO_SCRIPT} --config ${LICENSES_GO_CFG} --module ${PROJECT_GO_KM_CONTROL_PLANE_FOLDER} --module ${PROJECT_GO_KM_VIRTUAL_KUBELET_FOLDER}
+    ''']
+
+[tasks.__km__license_report_go]
+plugin = "td-task-tracker"
+category = "06 - Compliance"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 python ${REPORT_LICENSES_GO_SCRIPT} --name km --module ${PROJECT_GO_KM_CONTROL_PLANE_FOLDER} --module ${PROJECT_GO_KM_VIRTUAL_KUBELET_FOLDER}"
+    exec --fail-on-error python ${REPORT_LICENSES_GO_SCRIPT} --name km --module ${PROJECT_GO_KM_CONTROL_PLANE_FOLDER} --module ${PROJECT_GO_KM_VIRTUAL_KUBELET_FOLDER}
+    ''']

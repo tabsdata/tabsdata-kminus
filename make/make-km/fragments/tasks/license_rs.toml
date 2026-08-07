@@ -1,0 +1,71 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__license_check_rs]
+plugin = "td-task-tracker"
+category = "06 - Compliance"
+private = true
+run_task = [
+    { name = [
+        "__km__license_check_rs_kcommon",
+        "__km__license_check_rs_kminus",
+        "__km__license_check_rs_pod_runner"
+    ] }
+]
+
+[tasks.__km__license_check_rs_kcommon]
+plugin = "td-task-tracker"
+category = "06 - Compliance"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 cargo %{td-toolchain-token}%{td-toolchain} deny --locked --log-level error --all-features --manifest-path ${PROJECT_RS_KM_KCOMMON_FOLDER}/Cargo.toml --config ${DENY_TOML} check --hide-inclusion-graph licenses"
+    exec --fail-on-error cargo %{td-toolchain-token}%{td-toolchain} deny --locked --log-level error --all-features --manifest-path ${PROJECT_RS_KM_KCOMMON_FOLDER}/Cargo.toml --config ${DENY_TOML} check --hide-inclusion-graph licenses
+    ''']
+
+[tasks.__km__license_check_rs_kminus]
+plugin = "td-task-tracker"
+category = "06 - Compliance"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 cargo %{td-toolchain-token}%{td-toolchain} deny --locked --log-level error --all-features --manifest-path ${PROJECT_RS_KM_KMINUS_FOLDER}/Cargo.toml --config ${DENY_TOML} check --hide-inclusion-graph licenses"
+    exec --fail-on-error cargo %{td-toolchain-token}%{td-toolchain} deny --locked --log-level error --all-features --manifest-path ${PROJECT_RS_KM_KMINUS_FOLDER}/Cargo.toml --config ${DENY_TOML} check --hide-inclusion-graph licenses
+    ''']
+
+[tasks.__km__license_check_rs_pod_runner]
+plugin = "td-task-tracker"
+category = "06 - Compliance"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 cargo %{td-toolchain-token}%{td-toolchain} deny --locked --log-level error --all-features --manifest-path ${PROJECT_RS_KM_POD_RUNNER_FOLDER}/Cargo.toml --config ${DENY_TOML} check --hide-inclusion-graph licenses"
+    exec --fail-on-error cargo %{td-toolchain-token}%{td-toolchain} deny --locked --log-level error --all-features --manifest-path ${PROJECT_RS_KM_POD_RUNNER_FOLDER}/Cargo.toml --config ${DENY_TOML} check --hide-inclusion-graph licenses
+    ''']
+
+[tasks.__km__license_report_rs]
+plugin = "td-task-tracker"
+category = "06 - Compliance"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 python ${REPORT_LICENSES_RS_SCRIPT} --name km --project ${PROJECT_RS_KM_KCOMMON_FOLDER} --project ${PROJECT_RS_KM_KMINUS_FOLDER} --project ${PROJECT_RS_KM_POD_RUNNER_FOLDER}"
+    exec --fail-on-error python ${REPORT_LICENSES_RS_SCRIPT} --name km --project ${PROJECT_RS_KM_KCOMMON_FOLDER} --project ${PROJECT_RS_KM_KMINUS_FOLDER} --project ${PROJECT_RS_KM_POD_RUNNER_FOLDER}
+    ''']
