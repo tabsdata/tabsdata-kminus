@@ -544,7 +544,10 @@ These files are the record of what was scheduled; nothing reads them back to dec
   There is no scanning daemon: a deadline is known the moment it is written, so the runner waits
   on it directly instead of re-reading every finished pod dir to rediscover what it already knew.
   Each sleep is raced against shutdown, so a pending deadline never holds the runner's exit --
-  what it would have done is dropped, and rotation picks it up next run.
+  what it would have done is dropped, and rotation picks it up next run. A pod's two timers can
+  come due at the same moment, since deleting a pod that is still live starts both clocks at
+  once; the delete tolerates the reap dropping its marker into the dir mid-walk and simply walks
+  it again.
 - **Rotation**: on startup, every pod dir in the just-rotated `run.N` has its data dirs reaped
   regardless of its own deadline -- those pods belong to a runner that no longer exists. This is
   also what takes over the deadlines dropped at shutdown, and it covers pods a `SIGKILL`ed runner

@@ -398,20 +398,57 @@ fn reap_data_dirs_and_mark(pod_dir: &Path, now: DateTime<Utc>) {
     }
 }
 
+/// How many times [`delete_pod_dir`] walks the dir before giving up. A
+/// racing reap refills it at most once — it writes one marker and then
+/// finishes — so the second walk is the one that succeeds and the third is
+/// margin.
+const DELETE_ATTEMPTS: u32 = 3;
+
 /// Delete the whole pod dir, record included. Returns whether it went.
 fn delete_pod_dir(pod_dir: &Path) -> bool {
-    match fs::remove_dir_all(pod_dir) {
-        Ok(()) => {
-            debug!(dir = ?pod_dir, "Pod dir deleted");
-            true
-        }
-        // Already gone — nothing to report.
-        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-        Err(e) => {
-            warn!(error = %e, dir = ?pod_dir, "Failed to delete pod dir");
-            false
+    delete_pod_dir_with(pod_dir, |dir| fs::remove_dir_all(dir))
+}
+
+/// [`delete_pod_dir`] over an injectable removal, so the retry is testable
+/// without having to win a race against a real walk.
+///
+/// `ENOTEMPTY` means an entry appeared while the walk was in flight. Since
+/// `readdir` batches, anything created after the last batch was read is
+/// missed by the walk and only surfaces when the final `rmdir` refuses. The
+/// only writer that can be racing here is this pod's own reap task: both
+/// deadlines of one pod come due together when it is deleted while still
+/// live, and the reap drops a [`REAPED_MARKER`] into a dir this call had
+/// already emptied. It writes that marker once and then finishes, so walking
+/// again converges rather than chasing a moving target.
+///
+/// Left unhandled this stranded the pod dir holding nothing but that marker:
+/// nothing reclaims it later, because the walk took the outcome marker that
+/// [`reap_pod_dir`] needs and [`reap_rotated_pod_dirs`] skips a dir that is
+/// already marked reaped — and the marker it kept is a false record, claiming
+/// `log/` and `store/` were preserved when the walk had destroyed them.
+fn delete_pod_dir_with(pod_dir: &Path, remove: impl Fn(&Path) -> io::Result<()>) -> bool {
+    for attempt in 1..=DELETE_ATTEMPTS {
+        match remove(pod_dir) {
+            Ok(()) => {
+                debug!(dir = ?pod_dir, "Pod dir deleted");
+                return true;
+            }
+            // Already gone — nothing to report.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return false,
+            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty && attempt < DELETE_ATTEMPTS => {
+                debug!(
+                    dir = ?pod_dir,
+                    attempt,
+                    "Pod dir refilled while being deleted, walking it again",
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, dir = ?pod_dir, "Failed to delete pod dir");
+                return false;
+            }
         }
     }
+    false
 }
 
 /// Apply the reap and delete deadlines to one pod dir.
@@ -1359,6 +1396,74 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // -- delete_pod_dir retry --
+
+    /// The reap's marker landing in the tail of the delete's walk must not
+    /// strand the dir: the second walk takes it. Injected rather than raced,
+    /// so this covers the retry on every run and every platform.
+    #[test]
+    fn delete_walks_again_when_a_racing_reap_refills_the_dir() {
+        let dir = tmp("delete-refilled");
+        plant_pod_dir(&dir, &[]);
+
+        let attempts = std::cell::Cell::new(0u32);
+        let deleted = delete_pod_dir_with(&dir, |pod_dir| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                // Exactly what the racing reap leaves behind: the walk
+                // emptied the dir, then the marker landed in it, so the
+                // final `rmdir` refuses.
+                for entry in fs::read_dir(pod_dir).unwrap().filter_map(|e| e.ok()) {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        fs::remove_dir_all(&path).unwrap();
+                    } else {
+                        fs::remove_file(&path).unwrap();
+                    }
+                }
+                fs::write(pod_dir.join(REAPED_MARKER), "stamp").unwrap();
+                return Err(io::Error::from(io::ErrorKind::DirectoryNotEmpty));
+            }
+            fs::remove_dir_all(pod_dir)
+        });
+
+        assert!(deleted, "the retry must finish what the first walk started");
+        assert_eq!(attempts.get(), 2, "one refill needs exactly one retry");
+        assert!(!dir.exists(), "the pod dir must not survive as a shell");
+    }
+
+    /// Bounded, so a dir being refilled faster than it can be walked fails
+    /// loudly instead of spinning.
+    #[test]
+    fn delete_gives_up_after_a_bounded_number_of_walks() {
+        let dir = tmp("delete-refilled-forever");
+        plant_pod_dir(&dir, &[]);
+
+        let attempts = std::cell::Cell::new(0u32);
+        let deleted = delete_pod_dir_with(&dir, |_| {
+            attempts.set(attempts.get() + 1);
+            Err(io::Error::from(io::ErrorKind::DirectoryNotEmpty))
+        });
+
+        assert!(!deleted);
+        assert_eq!(attempts.get(), DELETE_ATTEMPTS, "bounded, not a spin");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A dir already taken by its own reap's delete, or by rotation, is not
+    /// worth a second walk.
+    #[test]
+    fn delete_of_an_absent_dir_is_not_retried() {
+        let attempts = std::cell::Cell::new(0u32);
+        let deleted = delete_pod_dir_with(&tmp("delete-absent"), |_| {
+            attempts.set(attempts.get() + 1);
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        });
+
+        assert!(!deleted);
+        assert_eq!(attempts.get(), 1, "a dir already gone needs no retry");
+    }
+
     // -- schedule_deadline --
 
     /// The replacement for the reaping daemon: a deadline still ahead is
@@ -1472,6 +1577,106 @@ mod tests {
             tokio::task::yield_now().await;
             assert!(pod_dir.exists(), "{name} should not have been scheduled");
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A pod deleted while it is still running starts both clocks at the
+    /// same instant, so equal TTLs put the two deadlines microseconds apart
+    /// and their tasks act at the same moment on different workers. The reap
+    /// must not be able to strand the delete: `remove_dir_all` reports
+    /// `ENOTEMPTY` when the reap's marker lands after the walk emptied the
+    /// dir but before the final `rmdir`, which left the pod dir behind
+    /// holding nothing but [`REAPED_MARKER`] — a dir no later pass reclaims,
+    /// and a marker claiming the record was kept when the walk had destroyed
+    /// it.
+    ///
+    /// Real time and several workers on purpose: the interleaving needs the
+    /// two blocking walks to genuinely overlap, which a current-thread
+    /// runtime cannot produce — it runs each task's sync block to
+    /// completion. Many pods and a wide dir widen the window enough to hit
+    /// it reliably.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_reap_and_delete_leaves_no_pod_dir_behind() {
+        /// Pods racing at once — one is enough to hit the window sometimes,
+        /// this many makes it near-certain.
+        const RACING_PODS: usize = 40;
+        /// Filler entries per pod dir. `readdir` batches, so an entry created
+        /// in the tail of a walk is missed and only surfaces at `rmdir` —
+        /// this many entries makes that tail wide enough to aim at (~10ms of
+        /// walk on a warm APFS volume).
+        const FILLER_ENTRIES: usize = 400;
+        /// How far out the delete deadline is set.
+        const DUE_IN_MS: i64 = 50;
+        /// How far the reap wakes after the delete, placing its marker write
+        /// about three quarters of the way through the walk — measured to
+        /// strand an unprotected delete a third to a half of the time.
+        const REAP_LAG_MS: i64 = 8;
+
+        let root = tmp("schedule-race");
+        let (_tx, rx) = watch::channel(());
+        let pod_dirs: Vec<PathBuf> = (0..RACING_PODS)
+            .map(|i| root.join(format!("default_app_uid-{i}")))
+            .collect();
+
+        for pod_dir in &pod_dirs {
+            // As the incident's pods were: deleted while still preparing, so
+            // no `work/` or `volumes/` were ever created and the reap has
+            // only its marker to write. Filler entries lengthen the delete's
+            // walk so that write lands before its final `rmdir`.
+            plant_ttls(pod_dir, &[]);
+            for f in 0..FILLER_ENTRIES {
+                fs::write(pod_dir.join(format!("filler-{f}")), "x").unwrap();
+            }
+
+            // The incident's two deadlines were 341µs apart, but timer
+            // granularity expired them in the same tick and the delete got a
+            // worker first — its walk was already running when the reap woke
+            // and stamped its marker 2.3ms before the `rmdir` failed. The
+            // offsets here reproduce that interleaving directly instead of
+            // relying on which task the scheduler happens to pick.
+            let now = Utc::now();
+            let delete_at = now + chrono::Duration::milliseconds(DUE_IN_MS);
+            let reap_at = delete_at + chrono::Duration::milliseconds(REAP_LAG_MS);
+            schedule_deadline(
+                pod_dir,
+                ScheduledReap::DataDirs,
+                Some(Deadline::At(reap_at)),
+                now,
+                &rx,
+            );
+            schedule_deadline(
+                pod_dir,
+                ScheduledReap::PodDir,
+                Some(Deadline::At(delete_at)),
+                now,
+                &rx,
+            );
+        }
+
+        // Real time here: wait out the deadlines and both walks.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let stranded: Vec<String> = pod_dirs
+            .iter()
+            .filter(|d| d.exists())
+            .map(|d| {
+                let left: Vec<String> = fs::read_dir(d)
+                    .map(|entries| {
+                        entries
+                            .filter_map(|e| e.ok())
+                            .map(|e| e.file_name().to_string_lossy().into_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                format!("{} -> {left:?}", d.display())
+            })
+            .collect();
+
+        assert!(
+            stranded.is_empty(),
+            "a concurrent reap must not strand the delete; {} of {RACING_PODS} left behind: {stranded:#?}",
+            stranded.len(),
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }
