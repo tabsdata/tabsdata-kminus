@@ -26,6 +26,12 @@
 //!   warning. Only `configMap` sources are supported; other source types
 //!   are skipped with a warning. `volumeMount.subPath` is not supported.
 //!
+//! A mount path that overlaps its own volume directory is never replaced:
+//! identical paths are left alone (the mount is already satisfied) and a
+//! containment overlap is a [`PrepareError::MountPathOverlap`]. Admission
+//! keeps mount paths inside `<pod_dir>/work/<container>` — this is the
+//! backstop for a `hostPath` source that reaches into that subtree.
+//!
 //! Read-only mounts are NOT enforced (mounts are plain symlinks); the
 //! pod executor writes a warning at the beginning of the container log
 //! for each read-only mount instead (see
@@ -232,8 +238,36 @@ fn materialize_volume(
 /// symlink or an empty directory already at the mount path (e.g. created
 /// by an image template) is replaced; any other existing content is a
 /// [`PrepareError::MountPathConflict`].
+///
+/// A mount path that overlaps the volume directory is never replaced — see
+/// [`mount_overlap`]. Replacing it would delete the volume's own source, or
+/// leave a symlink pointing at itself through the volume.
 fn link_mount(container: &str, vm: &VolumeMount, vol_dir: &Path) -> Result<(), PrepareError> {
     let mount = Path::new(&vm.mount_path);
+
+    match mount_overlap(mount, vol_dir) {
+        // The mount path already *is* the volume (a hostPath volume whose
+        // source is the mount path itself). The mount is satisfied as it
+        // stands: replacing the directory with a symlink to the volume
+        // would aim it back at itself and make the path unresolvable.
+        MountOverlap::Same => {
+            warn!(
+                container = %container, volume = %vm.name, path = %vm.mount_path,
+                "mount path and volume directory are the same object; the mount is \
+                 already satisfied, leaving the existing directory in place"
+            );
+            return Ok(());
+        }
+        MountOverlap::Nested => {
+            return Err(PrepareError::MountPathOverlap {
+                container: container.to_string(),
+                volume: vm.name.clone(),
+                path: vm.mount_path.clone(),
+                volume_path: vol_dir.to_string_lossy().to_string(),
+            });
+        }
+        MountOverlap::Distinct => {}
+    }
 
     if let Some(parent) = mount.parent() {
         fs::create_dir_all(parent).map_err(|source| PrepareError::Io {
@@ -267,6 +301,73 @@ fn link_mount(container: &str, vm: &VolumeMount, vol_dir: &Path) -> Result<(), P
         ),
         source,
     })
+}
+
+/// How a container mount path relates to its materialized volume directory.
+#[derive(Debug, PartialEq, Eq)]
+enum MountOverlap {
+    /// Separate objects — the mount can be linked to the volume.
+    Distinct,
+    /// The same object: the mount path and the volume directory resolve to
+    /// one directory on disk.
+    Same,
+    /// One is reached through the other.
+    Nested,
+}
+
+/// Classify a mount path against its volume directory.
+///
+/// A mount is materialized by replacing whatever sits at the mount path with
+/// a symlink to the volume directory. That is only safe while the two are
+/// separate objects. When they are the same — a `hostPath` volume whose
+/// source is the mount path itself — the replacement destroys the source and
+/// leaves two symlinks aiming at each other, which no OS can resolve (on
+/// Windows: `ERROR_CANT_RESOLVE_FILENAME`). When one contains the other, the
+/// replacement either deletes the volume's source or nests the volume inside
+/// itself.
+///
+/// Both sides are compared in canonical form, so the check sees through
+/// symlinks — the volume directory of a `hostPath` volume *is* a symlink, and
+/// its host source is what matters.
+fn mount_overlap(mount: &Path, vol_dir: &Path) -> MountOverlap {
+    // Without a canonical form for both sides there is nothing to compare.
+    // A mount path that cannot be resolved even partially (e.g. a symlink
+    // cycle already in the way) is left to the existing handling below.
+    let (Some(mount_real), Some(vol_real)) = (
+        resolve_existing_prefix(mount),
+        resolve_existing_prefix(vol_dir),
+    ) else {
+        return MountOverlap::Distinct;
+    };
+
+    if mount_real == vol_real {
+        MountOverlap::Same
+    } else if mount_real.starts_with(&vol_real) || vol_real.starts_with(&mount_real) {
+        MountOverlap::Nested
+    } else {
+        MountOverlap::Distinct
+    }
+}
+
+/// Canonical form of `path`, resolving as much of it as exists on disk.
+///
+/// [`fs::canonicalize`] requires the whole path to exist, but a mount path
+/// usually does not — it is about to be created. Resolve the deepest existing
+/// ancestor and re-append the components below it, so containment can be
+/// compared for a path that isn't there yet. Returns `None` when no ancestor
+/// resolves at all.
+fn resolve_existing_prefix(path: &Path) -> Option<PathBuf> {
+    let mut below = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(real) = fs::canonicalize(current) {
+            let mut resolved = real;
+            resolved.extend(below.iter().rev());
+            return Some(resolved);
+        }
+        below.push(current.file_name()?);
+        current = current.parent()?;
+    }
 }
 
 /// Create a directory symlink at `link` pointing to `target`.
@@ -773,6 +874,199 @@ mod tests {
         assert_eq!(
             fs::read_link(&mount_path).unwrap(),
             base.join(VOLUMES_DIR).join("data")
+        );
+    }
+
+    // -- mount path / volume directory overlap --
+
+    fn host_path_pod(mount_path: &Path, host_dir: &Path) -> PodSpec {
+        make_pod(
+            vec![Container {
+                name: "app".to_string(),
+                volume_mounts: vec![VolumeMount {
+                    name: "runtimes".to_string(),
+                    mount_path: mount_path.to_string_lossy().to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            vec![Volume {
+                name: "runtimes".to_string(),
+                host_path: Some(HostPathVolume {
+                    path: host_dir.to_string_lossy().to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        )
+    }
+
+    #[test]
+    fn mount_path_equal_to_host_source_is_left_intact() {
+        // The pymanager regression: a hostPath volume mounted at its own
+        // source. Replacing the mount would delete the host directory and
+        // leave it symlinked to a volume that symlinks back — unresolvable.
+        let base = setup_dir("mount-equals-source");
+        let host_dir = base.join("instance").join("runtimes");
+        fs::create_dir_all(&host_dir).unwrap();
+        fs::write(host_dir.join("keep.txt"), "precious").unwrap();
+
+        let pod = host_path_pod(&host_dir, &host_dir);
+        resolve_volumes(&pod, &ResolvedK8sValues::default(), &base).unwrap();
+
+        // The host directory survives as a real directory, contents intact.
+        assert!(host_dir.is_dir());
+        assert!(!host_dir.is_symlink());
+        assert_eq!(
+            fs::read_to_string(host_dir.join("keep.txt")).unwrap(),
+            "precious"
+        );
+        // And it is still reachable through the volume directory.
+        let vol_dir = base.join(VOLUMES_DIR).join("runtimes");
+        assert!(vol_dir.is_symlink());
+        assert_eq!(
+            fs::read_to_string(vol_dir.join("keep.txt")).unwrap(),
+            "precious"
+        );
+    }
+
+    #[test]
+    fn mount_path_equal_to_empty_host_source_is_left_intact() {
+        // Same shape, but with an empty source — the case that actually
+        // slipped through, since `remove_dir` only succeeds when empty.
+        let base = setup_dir("mount-equals-empty-source");
+        let host_dir = base.join("instance").join("runtimes");
+        fs::create_dir_all(&host_dir).unwrap();
+
+        let pod = host_path_pod(&host_dir, &host_dir);
+        resolve_volumes(&pod, &ResolvedK8sValues::default(), &base).unwrap();
+
+        assert!(host_dir.is_dir());
+        assert!(!host_dir.is_symlink());
+        // Writing through the mount path lands in a real directory.
+        fs::write(host_dir.join("built.txt"), "x").unwrap();
+        assert_eq!(
+            fs::read_to_string(base.join(VOLUMES_DIR).join("runtimes").join("built.txt")).unwrap(),
+            "x"
+        );
+    }
+
+    #[test]
+    fn mount_path_containing_host_source_errors() {
+        // The host source lives under the mount path: replacing the mount
+        // would delete the volume's own source.
+        let base = setup_dir("mount-contains-source");
+        let mount_path = base.join("work").join("app").join("mounted");
+        let host_dir = mount_path.join("inner");
+        fs::create_dir_all(&host_dir).unwrap();
+
+        let pod = host_path_pod(&mount_path, &host_dir);
+        let err = resolve_volumes(&pod, &ResolvedK8sValues::default(), &base).unwrap_err();
+
+        assert!(
+            matches!(err, PrepareError::MountPathOverlap { ref volume, .. } if volume == "runtimes"),
+            "got: {err}"
+        );
+        // Nothing was removed on the way to the error.
+        assert!(host_dir.is_dir());
+        assert!(mount_path.is_dir());
+        assert!(!mount_path.is_symlink());
+    }
+
+    #[test]
+    fn mount_path_under_host_source_errors() {
+        // The reverse containment, and the one a pod def can express today:
+        // a hostPath source that is an ancestor of the pod dir (`hostPath: /`
+        // is a common k8s pattern for node agents). Linking the mount would
+        // aim it at a directory that contains it — every write through the
+        // mount escapes into the host tree, and the path recurses without
+        // bound.
+        let base = setup_dir("mount-under-source");
+        let mount_path = base.join("work").join("app").join("mnt");
+        fs::create_dir_all(&mount_path).unwrap();
+
+        let pod = host_path_pod(&mount_path, &base);
+        let err = resolve_volumes(&pod, &ResolvedK8sValues::default(), &base).unwrap_err();
+
+        assert!(
+            matches!(err, PrepareError::MountPathOverlap { .. }),
+            "got: {err}"
+        );
+        // The mount path is still a plain directory, not a door to the host.
+        assert!(mount_path.is_dir());
+        assert!(!mount_path.is_symlink());
+    }
+
+    #[test]
+    fn mount_path_inside_volume_dir_errors() {
+        // The mount path points inside the volume directory itself, which
+        // would nest the volume in itself. The mount path does not exist
+        // yet, so this only trips if partially-resolved paths are compared.
+        let base = setup_dir("mount-inside-volume");
+        let mount_path = base.join(VOLUMES_DIR).join("data").join("sub");
+
+        let pod = make_pod(
+            vec![Container {
+                name: "app".to_string(),
+                volume_mounts: vec![VolumeMount {
+                    name: "data".to_string(),
+                    mount_path: mount_path.to_string_lossy().to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            vec![Volume {
+                name: "data".to_string(),
+                empty_dir: Some(EmptyDirVolume {}),
+                ..Default::default()
+            }],
+        );
+
+        let err = resolve_volumes(&pod, &ResolvedK8sValues::default(), &base).unwrap_err();
+        assert!(
+            matches!(err, PrepareError::MountPathOverlap { .. }),
+            "got: {err}"
+        );
+        assert!(!mount_path.exists());
+    }
+
+    #[test]
+    fn mount_overlap_classifies_distinct_paths() {
+        // The ordinary layout: a mount under the container work dir and a
+        // volume under <pod_dir>/volumes are unrelated.
+        let base = setup_dir("mount-overlap-distinct");
+        let vol_dir = base.join(VOLUMES_DIR).join("data");
+        let mount = base.join("work").join("app").join("data");
+        fs::create_dir_all(&vol_dir).unwrap();
+        fs::create_dir_all(mount.parent().unwrap()).unwrap();
+
+        assert_eq!(mount_overlap(&mount, &vol_dir), MountOverlap::Distinct);
+        assert_eq!(mount_overlap(&vol_dir, &vol_dir), MountOverlap::Same);
+        assert_eq!(
+            mount_overlap(&vol_dir.join("nested"), &vol_dir),
+            MountOverlap::Nested
+        );
+    }
+
+    #[test]
+    fn mount_overlap_sees_through_symlinks() {
+        // A hostPath volume dir is a symlink; the comparison must resolve it
+        // rather than compare link paths.
+        let base = setup_dir("mount-overlap-symlink");
+        let host_dir = base.join("host-data");
+        let vol_dir = base.join(VOLUMES_DIR).join("vol");
+        fs::create_dir_all(&host_dir).unwrap();
+        fs::create_dir_all(vol_dir.parent().unwrap()).unwrap();
+        symlink_dir(&host_dir, &vol_dir).unwrap();
+
+        assert_eq!(mount_overlap(&host_dir, &vol_dir), MountOverlap::Same);
+        assert_eq!(
+            mount_overlap(&host_dir.join("under"), &vol_dir),
+            MountOverlap::Nested
+        );
+        assert_eq!(
+            mount_overlap(&base.join("elsewhere"), &vol_dir),
+            MountOverlap::Distinct
         );
     }
 

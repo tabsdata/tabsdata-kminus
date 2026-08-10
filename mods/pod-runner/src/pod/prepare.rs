@@ -103,6 +103,19 @@ pub enum PrepareError {
         volume: String,
         path: String,
     },
+    /// A container mount path and its volume's materialized directory
+    /// overlap — one is reached through the other, so linking the mount
+    /// would destroy the volume or produce a symlink cycle.
+    #[error(
+        "Container '{container}' mount path for volume '{volume}' overlaps \
+         the volume directory: {path} vs {volume_path}"
+    )]
+    MountPathOverlap {
+        container: String,
+        volume: String,
+        path: String,
+        volume_path: String,
+    },
     /// Image archive file is missing for a container.
     #[error("Image archive for container '{container}' not found at {path}")]
     ImageArchiveMissing { container: String, path: String },

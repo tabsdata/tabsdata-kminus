@@ -22,6 +22,11 @@
 //!   rejected (it would otherwise be a no-op that always "succeeds").
 //! - `volumeMount.subPath` / `subPathExpr` is rejected — a mount always
 //!   exposes the whole volume directory.
+//! - `volumeMount.mountPath` must be a container-absolute path: `/`-rooted,
+//!   free of `':'` (the k8s `VolumeMount` contract) and of `..` segments. A
+//!   host path — notably a Windows drive-absolute one — is rejected; see
+//!   [`check_mount_paths`] for why it is destructive rather than merely
+//!   misplaced.
 //!
 //! # Known limitations
 //!
@@ -60,8 +65,36 @@ pub const ERR_UNSUPPORTED_PROBE: &str =
 pub const ERR_SUBPATH_NOT_SUPPORTED: &str =
     "pod-runner does not support volumeMount subPath/subPathExpr";
 
+/// Error message prefix when a volumeMount's `mountPath` is not a
+/// container-absolute path (`/`-rooted, no `':'`, no `..` segment). The
+/// specific reason is reported in the error's location.
+pub const ERR_INVALID_MOUNT_PATH: &str =
+    "pod-runner requires volumeMount mountPath to be container-absolute";
+
 /// Volume mount fields that pod-runner cannot honor.
 const UNSUPPORTED_MOUNT_FIELDS: &[&str] = &["subPath", "subPathExpr"];
+
+/// Root a `mountPath` must start with — mount paths are container-absolute
+/// POSIX paths, never host paths.
+const MOUNT_PATH_ROOT: char = '/';
+
+/// Character the k8s `VolumeMount` contract forbids in a `mountPath`.
+/// Rejecting it also rules out Windows drive-absolute paths (`C:\dir`).
+const MOUNT_PATH_FORBIDDEN_CHAR: char = ':';
+
+/// Segment that would let a mount escape the container root.
+const MOUNT_PATH_PARENT_SEGMENT: &str = "..";
+
+/// Separators recognized when splitting a `mountPath` into segments. Both
+/// are honored on every platform so a spec is admitted or rejected
+/// identically regardless of the host OS.
+const MOUNT_PATH_SEPARATORS: [char; 2] = ['/', '\\'];
+
+/// Why a `mountPath` was rejected.
+const MOUNT_PATH_REASON_EMPTY: &str = "empty";
+const MOUNT_PATH_REASON_NOT_ROOTED: &str = "not '/'-rooted";
+const MOUNT_PATH_REASON_FORBIDDEN_CHAR: &str = "contains ':'";
+const MOUNT_PATH_REASON_PARENT_SEGMENT: &str = "contains a '..' segment";
 
 /// Errors raised when admitting a pod spec.
 #[derive(Debug, thiserror::Error)]
@@ -78,6 +111,9 @@ pub enum AdmissionError {
     /// A volumeMount sets `subPath` or `subPathExpr`.
     #[error("{ERR_SUBPATH_NOT_SUPPORTED} ({location})")]
     SubPathNotSupported { location: String },
+    /// A volumeMount's `mountPath` is not a container-absolute path.
+    #[error("{ERR_INVALID_MOUNT_PATH} ({location})")]
+    InvalidMountPath { location: String },
 }
 
 /// Validate a pod spec. Returns `Ok(())` if the spec is accepted, or an
@@ -104,6 +140,7 @@ pub fn admit(spec: &PodSpec) -> Result<(), AdmissionError> {
         check_no_optional_refs(c)?;
         check_supported_probes(c)?;
         check_no_subpath_mounts(c)?;
+        check_mount_paths(c)?;
     }
     Ok(())
 }
@@ -170,6 +207,53 @@ fn check_no_subpath_mounts(c: &Container) -> Result<(), AdmissionError> {
                     ),
                 });
             }
+        }
+    }
+    Ok(())
+}
+
+/// Reject any `mountPath` that is not a container-absolute path.
+///
+/// `mountPath` addresses a location *inside* the container, so it is
+/// `/`-rooted and — per the k8s `VolumeMount` contract — must not contain
+/// `':'`. Rejecting a host path here is not pedantry, it prevents data loss:
+/// [`crate::pod::prepare::rewrite_pod_paths`] rebases a mount under
+/// `<pod_dir>/work/<container>` by stripping the leading `/` and joining, and
+/// `Path::join` discards the base when handed an absolute path. On Windows a
+/// drive-absolute `mountPath` (`C:\dir`) therefore survives the rewrite
+/// untouched, and [`crate::pod::resolver::volume`] then removes that host
+/// directory and replaces it with a symlink to the volume. When the volume's
+/// own source is that same directory (a `hostPath` whose path equals the
+/// `mountPath`), the two links point at each other and every access through
+/// the host path fails to resolve. A `..` segment escapes the container root
+/// the same way, on every platform.
+///
+/// Separators are checked platform-independently so a spec is admitted or
+/// rejected identically on Linux, macOS and Windows.
+fn check_mount_paths(c: &Container) -> Result<(), AdmissionError> {
+    for vm in &c.volume_mounts {
+        let reason = if vm.mount_path.is_empty() {
+            Some(MOUNT_PATH_REASON_EMPTY)
+        } else if !vm.mount_path.starts_with(MOUNT_PATH_ROOT) {
+            Some(MOUNT_PATH_REASON_NOT_ROOTED)
+        } else if vm.mount_path.contains(MOUNT_PATH_FORBIDDEN_CHAR) {
+            Some(MOUNT_PATH_REASON_FORBIDDEN_CHAR)
+        } else if vm
+            .mount_path
+            .split(MOUNT_PATH_SEPARATORS)
+            .any(|segment| segment == MOUNT_PATH_PARENT_SEGMENT)
+        {
+            Some(MOUNT_PATH_REASON_PARENT_SEGMENT)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(AdmissionError::InvalidMountPath {
+                location: format!(
+                    "container '{}', volumeMount '{}' mountPath '{}': {reason}",
+                    c.name, vm.name, vm.mount_path
+                ),
+            });
         }
     }
     Ok(())
@@ -637,5 +721,128 @@ spec:
             ..Default::default()
         });
         assert!(admit(&pod).is_ok());
+    }
+
+    // -- volumeMount mountPath --
+
+    fn pod_with_mount_path(mount_path: &str) -> PodSpec {
+        pod_with_container(Container {
+            name: "app".to_string(),
+            volume_mounts: vec![VolumeMount {
+                name: "runtimes".to_string(),
+                mount_path: mount_path.to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn accepts_container_absolute_mount_paths() {
+        // A leading '..' in a *segment name* (not a segment) is fine, and so
+        // is a path whose segments merely start with dots.
+        for mount_path in [
+            "/data",
+            "/tabsdata/runtimes",
+            "/a/b/c",
+            "/.tools",
+            "/..data",
+        ] {
+            assert!(
+                admit(&pod_with_mount_path(mount_path)).is_ok(),
+                "expected '{mount_path}' to be admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_rooted_mount_path() {
+        for mount_path in ["", "data", "tabsdata/runtimes", "\\tabsdata\\runtimes"] {
+            let err = admit(&pod_with_mount_path(mount_path))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(ERR_INVALID_MOUNT_PATH), "{mount_path}: {err}");
+            assert!(err.contains("runtimes"), "{mount_path}: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_windows_host_mount_path() {
+        // The pymanager/venvloader regression: a kminus pod def whose
+        // mountPath expanded to the instance's runtimes host path. Left
+        // unchecked, the volume resolver deletes that directory and replaces
+        // it with a symlink pointing back at the volume.
+        let err = admit(&pod_with_mount_path(
+            "C:\\Users\\dimas\\.tabsdata\\instances\\tabsdata\\runtimes",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(ERR_INVALID_MOUNT_PATH), "got: {err}");
+        assert!(err.contains(MOUNT_PATH_REASON_NOT_ROOTED), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_mount_path_with_colon() {
+        // '/'-rooted but still carrying a drive/stream separator.
+        let err = admit(&pod_with_mount_path("/C:/runtimes"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(ERR_INVALID_MOUNT_PATH), "got: {err}");
+        assert!(err.contains(MOUNT_PATH_REASON_FORBIDDEN_CHAR), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_mount_path_escaping_container_root() {
+        // Both separators are honored on every platform, so a backslash-only
+        // escape is caught on Unix too.
+        for mount_path in ["/../escape", "/a/../../escape", "/a\\..\\escape"] {
+            let err = admit(&pod_with_mount_path(mount_path))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(ERR_INVALID_MOUNT_PATH), "{mount_path}: {err}");
+            assert!(
+                err.contains(MOUNT_PATH_REASON_PARENT_SEGMENT),
+                "{mount_path}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_mount_path_in_init_container() {
+        let pod = pod_with_init(Container {
+            name: "setup".to_string(),
+            volume_mounts: vec![VolumeMount {
+                name: "runtimes".to_string(),
+                mount_path: "C:\\runtimes".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let err = admit(&pod).unwrap_err().to_string();
+        assert!(err.contains(ERR_INVALID_MOUNT_PATH), "got: {err}");
+        assert!(err.contains("setup"), "got: {err}");
+    }
+
+    #[test]
+    fn invalid_mount_path_from_yaml_is_rejected() {
+        // The full pipeline, as the pod def reached the runner.
+        let yaml = r#"
+spec:
+  volumes:
+    - name: runtimes
+      hostPath:
+        path: 'C:\Users\dimas\.tabsdata\instances\tabsdata\runtimes'
+  containers:
+    - name: app
+      image: /dev/null
+      volumeMounts:
+        - name: runtimes
+          mountPath: 'C:\Users\dimas\.tabsdata\instances\tabsdata\runtimes'
+"#;
+        let pod: PodSpec = serde_yaml_ng::from_str(yaml).unwrap();
+        assert!(matches!(
+            admit(&pod),
+            Err(AdmissionError::InvalidMountPath { .. })
+        ));
     }
 }
