@@ -26,6 +26,21 @@ import (
 	"syscall"
 	"time"
 
+	// Must be built with CGO_ENABLED=0: gopsutil v3 pulls in go-m1cpu, whose cgo
+	// package initializer reads M1-era IORegistry keys ("voltage-states5-sram")
+	// and null-derefs on Apple Silicon generations that no longer publish them,
+	// killing this binary before main() runs. Without cgo that initializer is
+	// not compiled in and gopsutil takes its pure-Go paths.
+	//
+	// This is a workaround, not a fix: it constrains the whole binary to satisfy
+	// one transitive dependency. The clean fix is to upgrade to gopsutil v4,
+	// which dropped go-m1cpu entirely in favour of ebitengine/purego and needs
+	// no cgo. The process API used here (Processes, PidExists, NewProcess, Ppid,
+	// Name) is unchanged between v3 and v4, so the migration is an import-path
+	// bump; once done, CGO_ENABLED=0 can be dropped from build_go.toml.
+	//
+	// Note a newer Go toolchain does NOT help: go-m1cpu's cgo initializer is
+	// still compiled and still crashes, regardless of Go version.
 	"github.com/shirou/gopsutil/v3/process"
 	"gopkg.in/natefinch/lumberjack.v2"
 	"gopkg.in/yaml.v2"

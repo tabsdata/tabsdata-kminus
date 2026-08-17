@@ -47,6 +47,33 @@ The K8s version is configured by `K8S_VERSION` in the root `Makeroot.toml`
 (`darwin-arm64`, `linux-amd64`, …) and skips work entirely when the cache
 already contains the binaries for that platform.
 
+## Why `control-plane` Is Built Without cgo
+
+The build sets `CGO_ENABLED=0` for the `control-plane` binary itself. This is a
+workaround, not a design choice: `gopsutil` v3 pulls in the indirect dependency
+`github.com/shoenig/go-m1cpu`, whose cgo package initializer reads M1-era
+IORegistry keys (`voltage-states5-sram`) and null-dereferences on Apple Silicon
+generations that no longer publish them — killing the binary before `main()`
+runs. Disabling cgo drops that initializer from the build and lets `gopsutil`
+take its pure-Go paths.
+
+The clean fix is to upgrade to **gopsutil v4**, which removed `go-m1cpu`
+entirely in favour of `ebitengine/purego` and needs no cgo. The `process` API
+used by `control-plane` is unchanged between v3 and v4, so the migration is an
+import-path bump; once done, `CGO_ENABLED=0` can be dropped from
+`make/fragments/tasks/build_go.toml`.
+
+Two things worth knowing before revisiting this:
+
+- **Upgrading the Go toolchain does not help.** The offending cgo initializer is
+  still compiled and still crashes, independent of Go version. (The build
+  already requires Go ≥ 1.26.2 via `permit_go.toml`.)
+- **The crash is host-specific.** It does not reproduce on every Apple Silicon
+  machine, so a successful local build is not evidence the problem is gone.
+
+Note this is separate from `kube-controller-manager`, which is compiled with
+`CGO_ENABLED=0` for static-linking reasons and is unaffected by the above.
+
 ## Cache Behavior
 
 - **`cargo make build`** — fetches binaries for the current platform if not

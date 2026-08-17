@@ -3,6 +3,11 @@ module control-plane
 go 1.23
 
 require (
+	// v3 drags in the indirect github.com/shoenig/go-m1cpu below, whose cgo
+	// initializer crashes on newer Apple Silicon; that is why the build forces
+	// CGO_ENABLED=0. Upgrading to gopsutil v4 removes go-m1cpu entirely (it uses
+	// ebitengine/purego instead) and lets cgo be re-enabled. The process API used
+	// here is identical in v4, so it is an import-path bump.
 	github.com/shirou/gopsutil/v3 v3.24.5
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	k8s.io/api v0.29.0
