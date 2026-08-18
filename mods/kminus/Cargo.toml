@@ -6,7 +6,7 @@
 description = "Tabsdata kminus: stack orchestrator that launches and supervises the control-plane, pod-runner, and virtual-kubelet."
 name = "km"
 edition = "2024"
-version = "2.0.0"
+version = "2.0.1"
 
 authors = [
     "Aleix Lascorz Guiu    (tabsleix)      <aleix@tabsdata.com>",
