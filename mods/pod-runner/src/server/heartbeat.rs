@@ -150,11 +150,11 @@ fn load_client(vk_prconfig: &Path) -> Result<(reqwest::Client, String), String> 
 /// Publish one beat. Write failures are logged, never fatal: km reads the
 /// resulting staleness and decides what to do about it.
 fn write(file: &Path, status: &str, detail: &str) {
-    if let Some(parent) = file.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            warn!(dir = %parent.display(), "Cannot create heartbeat directory: {}", e);
-            return;
-        }
+    if let Some(parent) = file.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        warn!(dir = %parent.display(), "Cannot create heartbeat directory: {}", e);
+        return;
     }
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)

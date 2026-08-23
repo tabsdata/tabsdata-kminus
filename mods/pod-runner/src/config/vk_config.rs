@@ -12,6 +12,10 @@ use std::path::Path;
 use super::template::VK_PRCONFIG_FILENAME;
 
 /// Write (or overwrite) `vk-prconfig.yaml` in the given directory.
+// Launcher-style: every parameter is an independent value the caller
+// already has, so bundling them into a struct moves the list rather
+// than shortening it.
+#[allow(clippy::too_many_arguments)]
 pub fn write_vk_prconfig(
     configdir: &Path,
     url: &str,

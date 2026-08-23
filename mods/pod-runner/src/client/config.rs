@@ -48,6 +48,10 @@ impl VKPRConfig {
     }
 
     /// Parse from a YAML string.
+    // Inherent rather than std::str::FromStr on purpose: the parse is
+    // YAML-specific and fails with a message, and making it the trait
+    // would change this type's public API and every caller's imports.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(yaml: &str) -> Result<Self, String> {
         serde_yaml_ng::from_str(yaml).map_err(|e| format!("Failed to parse YAML: {e}"))
     }

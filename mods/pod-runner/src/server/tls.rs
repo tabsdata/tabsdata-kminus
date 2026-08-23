@@ -197,25 +197,26 @@ mod tests {
     }
 
     fn make_tls_config(cert_pem: &str, key_pem: &str) -> PRConfig {
-        let mut c = PRConfig::default();
-        c.tls = ServerTlsConfig {
-            certificate: CertSource {
-                path: None,
-                data: Some(base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    cert_pem,
-                )),
+        PRConfig {
+            tls: ServerTlsConfig {
+                certificate: CertSource {
+                    path: None,
+                    data: Some(base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        cert_pem,
+                    )),
+                },
+                certificate_key: CertSource {
+                    path: None,
+                    data: Some(base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        key_pem,
+                    )),
+                },
+                client_ca: CertSource::default(),
             },
-            certificate_key: CertSource {
-                path: None,
-                data: Some(base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    key_pem,
-                )),
-            },
-            client_ca: CertSource::default(),
-        };
-        c
+            ..Default::default()
+        }
     }
 
     fn make_mtls_config(cert_pem: &str, key_pem: &str, ca_pem: &str) -> PRConfig {

@@ -122,6 +122,10 @@ pub const VK_KUBECONFIG_FILE: &str = "vk-kubeconfig.yaml";
 /// heartbeat file — which it writes only once etcd, the API server and
 /// kube-controller-manager have all answered their own health probes.
 /// Exits the process on failure.
+// Launcher-style: every parameter is an independent value the caller
+// already has, so bundling them into a struct moves the list rather
+// than shortening it.
+#[allow(clippy::too_many_arguments)]
 pub fn start(
     workdir: &Path,
     configdir: &Path,

@@ -117,6 +117,10 @@ struct ProbeTracking {
 /// `stop_txs` maps container names to their stop signals. When a
 /// container exits, the orchestrator sends `true` on the corresponding
 /// stop channel, which causes that container's probe task to exit.
+// Launcher-style: every parameter is an independent value the caller
+// already has, so bundling them into a struct moves the list rather
+// than shortening it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_probe_tasks(
     containers: &[Container],
     join_set: &mut JoinSet<()>,
@@ -181,6 +185,10 @@ pub(crate) fn spawn_probe_tasks(
 /// Each probe execution is wrapped in a `select!` with stop/shutdown
 /// so it can be interrupted mid-probe. On interruption, exec probe
 /// processes are explicitly killed.
+// Launcher-style: every parameter is an independent value the caller
+// already has, so bundling them into a struct moves the list rather
+// than shortening it.
+#[allow(clippy::too_many_arguments)]
 async fn run_container_probes(
     container_name: &str,
     working_dir: &Path,
@@ -431,6 +439,10 @@ async fn run_container_probes(
 ///
 /// Returns `Some(success)` on normal completion, `None` if interrupted.
 /// On interruption, exec probe processes are explicitly killed.
+// Launcher-style: every parameter is an independent value the caller
+// already has, so bundling them into a struct moves the list rather
+// than shortening it.
+#[allow(clippy::too_many_arguments)]
 async fn execute_probe_interruptible(
     probe: &Probe,
     container_name: &str,
@@ -493,6 +505,10 @@ async fn execute_network_probe(probe: &Probe, timeout: Duration) -> bool {
 ///
 /// The shutdown receiver is passed to the process executor so its
 /// I/O pump tasks also exit promptly on shutdown.
+// Launcher-style: every parameter is an independent value the caller
+// already has, so bundling them into a struct moves the list rather
+// than shortening it.
+#[allow(clippy::too_many_arguments)]
 async fn execute_exec_probe_interruptible(
     command: &[String],
     container_name: &str,

@@ -21,6 +21,9 @@ pub const BIN: &str = "virtual-kubelet";
 /// registered with the API server and its status sync is running. Exits
 /// the process on failure, rather than leaving km to report a ready
 /// stack over a dead kubelet.
+// Launcher-style: every parameter is an independent value the caller
+// already has, so bundling them into a struct moves the list rather
+// than shortening it.
 #[allow(clippy::too_many_arguments)]
 pub fn start(
     workdir: &Path,

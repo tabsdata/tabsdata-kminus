@@ -399,6 +399,10 @@ fn step_done(step: Step) {
 /// Print the ready banner to stdout: PIDs, ports, capacity, existing
 /// pods, and important paths. Best-effort: missing data is rendered
 /// as "?" or skipped.
+// Launcher-style: every parameter is an independent value the caller
+// already has, so bundling them into a struct moves the list rather
+// than shortening it.
+#[allow(clippy::too_many_arguments)]
 fn print_status(
     paths: &Paths,
     cp: &Child,

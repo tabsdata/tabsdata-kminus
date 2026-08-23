@@ -54,6 +54,10 @@ impl YamlPRConfig {
         Self::from_str(&content)
     }
 
+    // Inherent rather than std::str::FromStr on purpose: the parse is
+    // YAML-specific and fails with a message, and making it the trait
+    // would change this type's public API and every caller's imports.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(yaml: &str) -> Result<Self, String> {
         serde_yaml_ng::from_str(yaml).map_err(|e| format!("Failed to parse prconfig YAML: {e}"))
     }
@@ -279,6 +283,10 @@ impl YamlSysConfig {
         Self::from_str(&content)
     }
 
+    // Inherent rather than std::str::FromStr on purpose: the parse is
+    // YAML-specific and fails with a message, and making it the trait
+    // would change this type's public API and every caller's imports.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(yaml: &str) -> Result<Self, String> {
         serde_yaml_ng::from_str(yaml).map_err(|e| format!("Failed to parse prsysconfig YAML: {e}"))
     }
@@ -431,15 +439,19 @@ server:
 
     #[test]
     fn prconfig_validate_rejects_http() {
-        let mut c = YamlPRConfig::default();
-        c.url = "http://localhost:3000".into();
+        let c = YamlPRConfig {
+            url: "http://localhost:3000".into(),
+            ..Default::default()
+        };
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn prconfig_validate_ok_with_all_certs() {
-        let mut c = YamlPRConfig::default();
-        c.url = "https://localhost:3000".into();
+        let mut c = YamlPRConfig {
+            url: "https://localhost:3000".into(),
+            ..Default::default()
+        };
         c.server.tls.certificate_data = "cert".into();
         c.server.tls.certificate_key_data = "key".into();
         c.server.tls.certificate_authority_data = "ca".into();

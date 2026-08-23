@@ -1059,6 +1059,10 @@ fn build_initial_status(spec: &PodSpec) -> PodStatus {
 /// Runs until the pod reaches a terminal state or the executor channel
 /// closes. On completion, removes the runtime entry so future deletes
 /// just clean up the store.
+// Launcher-style: every parameter is an independent value the caller
+// already has, so bundling them into a struct moves the list rather
+// than shortening it.
+#[allow(clippy::too_many_arguments)]
 async fn monitor_pod(
     mut handle: PodHandle,
     store: Arc<dyn PodStore>,
@@ -1800,10 +1804,10 @@ mod tests {
             let result = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     tokio::time::sleep(Duration::from_millis(50)).await;
-                    if let Ok(snap) = logic.get_pod("default", name, SpecView::Running).await {
-                        if snap.status.phase == target {
-                            return;
-                        }
+                    if let Ok(snap) = logic.get_pod("default", name, SpecView::Running).await
+                        && snap.status.phase == target
+                    {
+                        return;
                     }
                 }
             })
@@ -1834,15 +1838,12 @@ mod tests {
                 }
             })
             .await;
-            result.expect(&format!(
-                "Timed out waiting for pod '{}' to terminate",
-                name
-            ))
+            result.unwrap_or_else(|_| panic!("Timed out waiting for pod '{}' to terminate", name))
         }
 
         /// Wait until a pod is removed from the store, with timeout.
         async fn wait_for_removal(store: &MemoryStore, name: &str) {
-            let id = PodId::new("default", name, &format!("uid-{}", name));
+            let id = PodId::new("default", name, format!("uid-{}", name));
             let result = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1852,10 +1853,7 @@ mod tests {
                 }
             })
             .await;
-            result.expect(&format!(
-                "Timed out waiting for pod '{}' to be removed",
-                name
-            ));
+            result.unwrap_or_else(|_| panic!("Timed out waiting for pod '{}' to be removed", name));
         }
 
         // -- create_pod --

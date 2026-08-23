@@ -353,6 +353,10 @@ async fn cmd_list(client: &reqwest::Client, base_url: &str) -> u8 {
     handle_response(resp).await
 }
 
+// Launcher-style: every parameter is an independent value the caller
+// already has, so bundling them into a struct moves the list rather
+// than shortening it.
+#[allow(clippy::too_many_arguments)]
 async fn cmd_logs(
     client: &reqwest::Client,
     base_url: &str,
@@ -496,6 +500,100 @@ fn connection_error(base_url: &str, err: reqwest::Error) -> u8 {
         eprintln!("Error: {err}");
     }
     EXIT_CONNECTION
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let mut cli = Cli::parse();
+
+    // Resolve from env vars
+    if cli.kubeconfig.is_none() {
+        cli.kubeconfig = std::env::var(ENV_KUBECONFIG).ok();
+    }
+    if cli.prconfig.is_none() {
+        cli.prconfig = std::env::var(ENV_PRCONFIG).ok();
+    }
+
+    // Load client config (required)
+    let config = match &cli.prconfig {
+        Some(path) => match VKPRConfig::from_file(&PathBuf::from(path)) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("Error loading prconfig: {e}");
+                return ExitCode::from(EXIT_VALIDATION);
+            }
+        },
+        None => None,
+    };
+
+    // Determine base URL from prconfig
+    let base_url = match &config {
+        Some(cfg) if !cfg.url.is_empty() => cfg.url.trim_end_matches('/').to_string(),
+        _ => {
+            eprintln!("Error: --prconfig or PRCONFIG env var is required.");
+            return ExitCode::from(EXIT_VALIDATION);
+        }
+    };
+
+    // Build HTTP client
+    let client = match build_client(&config) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(EXIT_VALIDATION);
+        }
+    };
+
+    // Dispatch command
+    let code = match cli.command {
+        Command::Create { ref deployment } => cmd_create(&client, &base_url, deployment).await,
+        Command::Delete {
+            ref name,
+            ref namespace,
+        } => cmd_delete(&client, &base_url, name, namespace).await,
+        Command::Get {
+            ref name,
+            ref namespace,
+        } => cmd_get(&client, &base_url, name, namespace).await,
+        Command::Status {
+            ref name,
+            ref namespace,
+        } => cmd_status(&client, &base_url, name, namespace).await,
+        Command::List => cmd_list(&client, &base_url).await,
+        Command::Logs {
+            ref name,
+            ref namespace,
+            ref container,
+            stream,
+            tail,
+            previous,
+        } => {
+            cmd_logs(
+                &client, &base_url, name, namespace, container, stream, tail, previous,
+            )
+            .await
+        }
+        Command::Capacity => cmd_capacity(&client, &base_url).await,
+        Command::NodeConditions => cmd_node_conditions(&client, &base_url).await,
+        Command::NodeAddresses => cmd_node_addresses(&client, &base_url).await,
+        Command::Metrics => {
+            let metrics_url = config
+                .as_ref()
+                .map(|c| c.metrics_url.as_str())
+                .unwrap_or("");
+            if metrics_url.is_empty() {
+                eprintln!("Error: metricsUrl not configured in prconfig.");
+                return ExitCode::from(EXIT_VALIDATION);
+            }
+            cmd_metrics(metrics_url).await
+        }
+    };
+
+    ExitCode::from(code)
 }
 
 // ---------------------------------------------------------------------------
@@ -1254,98 +1352,4 @@ spec:
         let result = Cli::try_parse_from(["kpr", "--insecure-skip-tls-verify", "list"]);
         assert!(result.is_err());
     }
-}
-
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
-
-#[tokio::main]
-async fn main() -> ExitCode {
-    let mut cli = Cli::parse();
-
-    // Resolve from env vars
-    if cli.kubeconfig.is_none() {
-        cli.kubeconfig = std::env::var(ENV_KUBECONFIG).ok();
-    }
-    if cli.prconfig.is_none() {
-        cli.prconfig = std::env::var(ENV_PRCONFIG).ok();
-    }
-
-    // Load client config (required)
-    let config = match &cli.prconfig {
-        Some(path) => match VKPRConfig::from_file(&PathBuf::from(path)) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                eprintln!("Error loading prconfig: {e}");
-                return ExitCode::from(EXIT_VALIDATION);
-            }
-        },
-        None => None,
-    };
-
-    // Determine base URL from prconfig
-    let base_url = match &config {
-        Some(cfg) if !cfg.url.is_empty() => cfg.url.trim_end_matches('/').to_string(),
-        _ => {
-            eprintln!("Error: --prconfig or PRCONFIG env var is required.");
-            return ExitCode::from(EXIT_VALIDATION);
-        }
-    };
-
-    // Build HTTP client
-    let client = match build_client(&config) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            return ExitCode::from(EXIT_VALIDATION);
-        }
-    };
-
-    // Dispatch command
-    let code = match cli.command {
-        Command::Create { ref deployment } => cmd_create(&client, &base_url, deployment).await,
-        Command::Delete {
-            ref name,
-            ref namespace,
-        } => cmd_delete(&client, &base_url, name, namespace).await,
-        Command::Get {
-            ref name,
-            ref namespace,
-        } => cmd_get(&client, &base_url, name, namespace).await,
-        Command::Status {
-            ref name,
-            ref namespace,
-        } => cmd_status(&client, &base_url, name, namespace).await,
-        Command::List => cmd_list(&client, &base_url).await,
-        Command::Logs {
-            ref name,
-            ref namespace,
-            ref container,
-            stream,
-            tail,
-            previous,
-        } => {
-            cmd_logs(
-                &client, &base_url, name, namespace, container, stream, tail, previous,
-            )
-            .await
-        }
-        Command::Capacity => cmd_capacity(&client, &base_url).await,
-        Command::NodeConditions => cmd_node_conditions(&client, &base_url).await,
-        Command::NodeAddresses => cmd_node_addresses(&client, &base_url).await,
-        Command::Metrics => {
-            let metrics_url = config
-                .as_ref()
-                .map(|c| c.metrics_url.as_str())
-                .unwrap_or("");
-            if metrics_url.is_empty() {
-                eprintln!("Error: metricsUrl not configured in prconfig.");
-                return ExitCode::from(EXIT_VALIDATION);
-            }
-            cmd_metrics(metrics_url).await
-        }
-    };
-
-    ExitCode::from(code)
 }

@@ -2028,16 +2028,11 @@ mod tests {
 
     async fn collect_events(handle: &mut PodHandle) -> Vec<PodEvent> {
         let mut events = Vec::new();
-        loop {
-            match handle.wait().await {
-                Ok(event) => {
-                    let done = matches!(&event.kind, PodEventKind::Completed { .. });
-                    events.push(event);
-                    if done {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        while let Ok(event) = handle.wait().await {
+            let done = matches!(&event.kind, PodEventKind::Completed { .. });
+            events.push(event);
+            if done {
+                break;
             }
         }
         events
@@ -3867,10 +3862,10 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 let ev = h.wait().await.unwrap();
-                if let PodEventKind::ProbeResult { probe_type, .. } = &ev.kind {
-                    if !probe_types.contains(probe_type) {
-                        probe_types.push(probe_type.clone());
-                    }
+                if let PodEventKind::ProbeResult { probe_type, .. } = &ev.kind
+                    && !probe_types.contains(probe_type)
+                {
+                    probe_types.push(probe_type.clone());
                 }
                 if matches!(&ev.kind, PodEventKind::ContainerReady { .. }) {
                     got_ready = true;
@@ -4289,7 +4284,7 @@ mod tests {
             .count();
         // With 5s runtime and 2s period, expect 2-3 probes (not 10)
         assert!(
-            probe_count >= 1 && probe_count <= 4,
+            (1..=4).contains(&probe_count),
             "with period=2s over 5s, expected 2-3 probes, got {}",
             probe_count,
         );
