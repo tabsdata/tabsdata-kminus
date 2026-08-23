@@ -29,17 +29,20 @@ mod system;
 
 use loglevel::LogLevel;
 
-use config::{KM_SYSCONFIG_FILE, KmSysConfig};
+use config::{KM_SYSCONFIG_FILE, KmPorts, KmSysConfig};
 use process::{control_plane, pod_runner, virtual_kubelet};
 use system::file::{CONFIG_DIR, LOG_DIR};
 use system::pid::{
     BIN_KM, cleanup_stale_pids, is_alive, kill_descendants, pids_dir, read_pid, remove_pid,
     terminate_process, write_pid,
 };
-use system::port::check_port;
+use system::port::check_ports;
 
 /// Filename of km's own log file under `<logdir>/`.
 const KM_LOG_FILE: &str = "km.log";
+
+/// Default `--portstart` for `km create`.
+const DEFAULT_PORTSTART: u16 = 10300;
 
 /// Development-only env var honored by the control-plane subprocess: when set
 /// to "true", the admin token written to `kubeconfig.yaml` is derived
@@ -108,7 +111,8 @@ enum Command {
     Restart(StartArgs),
 }
 
-/// Create-time arguments. Writes `kmsysconfig.yaml` and exits.
+/// Create-time arguments. Verifies the ports and target folders, then
+/// writes `kmsysconfig.yaml` and exits.
 ///
 /// `kmsysconfig.yaml` records log rotation settings and port assignments.
 /// Any port set to 0 in the file is replaced with a free random port at
@@ -128,10 +132,17 @@ struct CreateArgs {
     #[arg(long)]
     configdir: Option<String>,
 
-    /// Starting port for the initial `kmsysconfig.yaml`. If 0, random
-    /// free ports are used at every start. Default: 10300.
-    #[arg(long, default_value_t = 10300)]
+    /// Starting port for the initial `kmsysconfig.yaml`. The whole range
+    /// must be free, or create fails without writing anything. If 0,
+    /// random free ports are used at every start. Default: 10300.
+    #[arg(long, default_value_t = DEFAULT_PORTSTART)]
     portstart: u16,
+
+    /// Run the checks only: the port range must be free and neither the
+    /// workdir nor the configdir may exist. Creates nothing and reports
+    /// what would be created.
+    #[arg(long)]
+    dryrun: bool,
 }
 
 /// Start-time arguments. Boots the cluster from an existing instance.
@@ -191,24 +202,55 @@ struct Paths {
     pids: PathBuf,
 }
 
-impl Paths {
-    /// Resolve paths for a brand-new instance. The workdir must not
-    /// exist yet — this method creates it. Errors otherwise.
-    fn for_create(workdir: &str, configdir: Option<&str>) -> Result<Self, String> {
+/// Folders a `km create` would create, resolved but not yet touched.
+///
+/// Resolving is kept separate from creating so that `km create` can run
+/// every check — ports included — before anything lands on disk, and so
+/// that `--dryrun` can run the same checks and create nothing.
+struct CreateTargets {
+    workdir: PathBuf,
+    configdir: PathBuf,
+}
+
+impl CreateTargets {
+    /// Resolve `--workdir` and `--configdir` without touching the
+    /// filesystem. Errors if either folder already exists.
+    fn resolve(workdir: &str, configdir: Option<&str>) -> Result<Self, String> {
         let workdir = PathBuf::from(workdir);
         if workdir.exists() {
             return Err(format!("Folder '{}' already exists.", workdir.display()));
         }
-        fs::create_dir_all(&workdir)
-            .map_err(|e| format!("Cannot create folder '{}': {e}", workdir.display()))?;
-        let workdir = canonicalize("create.workdir", &workdir).unwrap_or(workdir);
-
         let configdir = configdir
             .map(PathBuf::from)
             .unwrap_or_else(|| workdir.join(CONFIG_DIR));
-        fs::create_dir_all(&configdir)
-            .map_err(|e| format!("Cannot create config folder '{}': {e}", configdir.display()))?;
-        let configdir = canonicalize("create.configdir", &configdir).unwrap_or(configdir);
+        if configdir.exists() {
+            return Err(format!(
+                "Config folder '{}' already exists.",
+                configdir.display()
+            ));
+        }
+        Ok(Self { workdir, configdir })
+    }
+}
+
+impl Paths {
+    /// Create the folders of a brand-new instance and resolve the rest
+    /// of its paths. Both targets are expected to be absent — that is
+    /// checked by [`CreateTargets::resolve`].
+    fn for_create(targets: &CreateTargets) -> Result<Self, String> {
+        fs::create_dir_all(&targets.workdir)
+            .map_err(|e| format!("Cannot create folder '{}': {e}", targets.workdir.display()))?;
+        let workdir = canonicalize("create.workdir", &targets.workdir)
+            .unwrap_or_else(|_| targets.workdir.clone());
+
+        fs::create_dir_all(&targets.configdir).map_err(|e| {
+            format!(
+                "Cannot create config folder '{}': {e}",
+                targets.configdir.display()
+            )
+        })?;
+        let configdir = canonicalize("create.configdir", &targets.configdir)
+            .unwrap_or_else(|_| targets.configdir.clone());
 
         // logdir is a runtime concern; record the default but don't create it here.
         let logdir = workdir.join(LOG_DIR);
@@ -526,23 +568,16 @@ fn shutdown_from_pids(paths: &Paths) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Verify all non-randomly-allocated ports are free before launching
-/// any subprocess. Logs and exits on conflict.
-fn verify_ports_free(port_api: &str, port_kcm: &str, port_pr: &str, port_vk: &str) {
-    let cp_api_label = format!("{} API server", control_plane::BIN);
-    let port_checks: [(&str, &str); 4] = [
-        (port_api, &cp_api_label),
-        (port_kcm, control_plane::KCM),
-        (port_pr, pod_runner::BIN),
-        (port_vk, virtual_kubelet::BIN),
-    ];
-    let mut port_errors = Vec::new();
-    for (port, name) in &port_checks {
-        if let Err(e) = check_port(port, name) {
-            port_errors.push(e);
-        }
-    }
-    if !port_errors.is_empty() {
+/// Verify every port the instance will bind is free before launching any
+/// subprocess. Logs and exits on conflict.
+///
+/// Run unconditionally, including for ports just drawn by
+/// [`KmSysConfig::resolve_random_ports`]: re-checking one of those is a
+/// cheap no-op bind, and skipping the whole check whenever any port was
+/// 0 would silently exempt the fixed ports of a hand-edited config that
+/// mixes the two.
+fn verify_ports_free(ports: &KmPorts) {
+    if let Err(port_errors) = check_ports(&ports.labeled()) {
         for e in &port_errors {
             error!("{}", e);
         }
@@ -574,9 +609,81 @@ fn clear_regenerated_configs(configdir: &Path) {
 // Subcommands
 // ---------------------------------------------------------------------------
 
+/// Print the `label  port` block of a create summary, or a one-liner
+/// when `portstart` is 0 and ports are drawn randomly at every start.
+fn print_port_plan(portstart: u16, ports: &KmPorts) {
+    if portstart == 0 {
+        println!("  ports      random free ports at every start");
+        return;
+    }
+    let labeled = ports.labeled();
+    let width = labeled.iter().map(|(_, l)| l.len()).max().unwrap_or(0);
+    for (i, (port, label)) in labeled.iter().enumerate() {
+        let head = if i == 0 { "  ports    " } else { "           " };
+        println!("{head}  {label:width$}  {port}");
+    }
+}
+
 /// Initialize a new kminus instance in `args.workdir`.
+///
+/// Every check runs before anything is written: the `--portstart` range
+/// must fit and be free, and neither the workdir nor the configdir may
+/// exist. A failed `km create` therefore leaves nothing behind. With
+/// `--dryrun` the checks run and nothing is created either way.
 fn command_create(args: CreateArgs) {
-    let paths = Paths::for_create(&args.workdir, args.configdir.as_deref()).unwrap_or_else(|e| {
+    let mut errors: Vec<String> = Vec::new();
+
+    // Ports first, as the check most likely to collide with another
+    // instance — no folder is created if the range is unusable.
+    let ports = match KmPorts::from_portstart(args.portstart) {
+        Ok(ports) => {
+            // portstart 0 means "random free ports at every start":
+            // there is no fixed range to check now.
+            if args.portstart != 0
+                && let Err(mut in_use) = check_ports(&ports.labeled())
+            {
+                errors.append(&mut in_use);
+            }
+            Some(ports)
+        }
+        Err(e) => {
+            errors.push(e);
+            None
+        }
+    };
+
+    let targets = match CreateTargets::resolve(&args.workdir, args.configdir.as_deref()) {
+        Ok(targets) => Some(targets),
+        Err(e) => {
+            errors.push(e);
+            None
+        }
+    };
+
+    if !errors.is_empty() {
+        for e in &errors {
+            eprintln!("ERROR: {e}");
+        }
+        eprintln!("Cannot create: {} check(s) failed", errors.len());
+        std::process::exit(1);
+    }
+    let (Some(ports), Some(targets)) = (ports, targets) else {
+        unreachable!("no errors collected, so both checks produced a value");
+    };
+
+    if args.dryrun {
+        println!();
+        println!("Tabsdata K- (K minus) instance can be created");
+        println!();
+        println!("  workdir    {}", targets.workdir.display());
+        println!("  configdir  {}", targets.configdir.display());
+        print_port_plan(args.portstart, &ports);
+        println!();
+        println!("Nothing was created. Re-run without --dryrun to create it.");
+        return;
+    }
+
+    let paths = Paths::for_create(&targets).unwrap_or_else(|e| {
         eprintln!("ERROR: {e}");
         std::process::exit(1);
     });
@@ -595,6 +702,7 @@ fn command_create(args: CreateArgs) {
     }
     println!("  workdir    {}", paths.workdir.display());
     println!("  configdir  {}", paths.configdir.display());
+    print_port_plan(args.portstart, &ports);
     println!();
     println!(
         "Edit '{}' to customize ports or log settings, then run:",
@@ -661,9 +769,7 @@ fn command_start(args: StartArgs) {
     let port_pr_metrics = sys_cfg.ports.pr_metrics.to_string();
     let port_vk = sys_cfg.ports.vk.to_string();
 
-    if !random_ports_allocated {
-        verify_ports_free(&port_api, &port_kcm, &port_pr, &port_vk);
-    }
+    verify_ports_free(&sys_cfg.ports);
 
     println!();
     if random_ports_allocated {
@@ -1021,23 +1127,51 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    // -- Paths::for_create --------------------------------------------------
+    // -- CreateTargets::resolve ---------------------------------------------
 
     #[test]
-    fn for_create_errors_when_folder_already_exists() {
+    fn resolve_errors_when_workdir_already_exists() {
         let dir = tempdir();
         let workdir = dir.join("wd");
         fs::create_dir_all(&workdir).unwrap();
-        let result = Paths::for_create(&workdir.to_string_lossy(), None);
+        let result = CreateTargets::resolve(&workdir.to_string_lossy(), None);
         assert!(result.is_err());
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
+    fn resolve_errors_when_explicit_configdir_already_exists() {
+        let dir = tempdir();
+        let workdir = dir.join("wd");
+        let cdir = dir.join("custom-config");
+        fs::create_dir_all(&cdir).unwrap();
+        let result =
+            CreateTargets::resolve(&workdir.to_string_lossy(), Some(&cdir.to_string_lossy()));
+        assert!(result.is_err());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_defaults_configdir_under_workdir_and_creates_nothing() {
+        let dir = tempdir();
+        let workdir = dir.join("wd");
+        let targets = CreateTargets::resolve(&workdir.to_string_lossy(), None).unwrap();
+        assert_eq!(targets.workdir, workdir);
+        assert_eq!(targets.configdir, workdir.join(CONFIG_DIR));
+        // Resolving must not touch the filesystem.
+        assert!(!targets.workdir.exists());
+        assert!(!targets.configdir.exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- Paths::for_create --------------------------------------------------
+
+    #[test]
     fn for_create_creates_workdir_and_configdir() {
         let dir = tempdir();
         let workdir = dir.join("wd");
-        let paths = Paths::for_create(&workdir.to_string_lossy(), None).unwrap();
+        let targets = CreateTargets::resolve(&workdir.to_string_lossy(), None).unwrap();
+        let paths = Paths::for_create(&targets).unwrap();
         assert!(paths.workdir.exists());
         assert!(paths.configdir.exists());
         assert!(
@@ -1055,8 +1189,10 @@ mod tests {
         let dir = tempdir();
         let workdir = dir.join("wd");
         let cdir = dir.join("custom-config");
-        let paths =
-            Paths::for_create(&workdir.to_string_lossy(), Some(&cdir.to_string_lossy())).unwrap();
+        let targets =
+            CreateTargets::resolve(&workdir.to_string_lossy(), Some(&cdir.to_string_lossy()))
+                .unwrap();
+        let paths = Paths::for_create(&targets).unwrap();
         assert_eq!(paths.configdir, cdir.canonicalize().unwrap());
         fs::remove_dir_all(&dir).ok();
     }

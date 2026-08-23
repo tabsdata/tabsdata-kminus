@@ -27,5 +27,20 @@ pub fn check_port(port: &str, component: &str) -> Result<(), String> {
     }
 }
 
+/// Verify that every `(port, component)` pair is free on 127.0.0.1.
+/// Returns one error message per port in use, so the caller can report
+/// all conflicts at once instead of only the first.
+pub fn check_ports<S: AsRef<str>>(ports: &[(u16, S)]) -> Result<(), Vec<String>> {
+    let errors: Vec<String> = ports
+        .iter()
+        .filter_map(|(port, component)| check_port(&port.to_string(), component.as_ref()).err())
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
 #[cfg(test)]
 mod tests;

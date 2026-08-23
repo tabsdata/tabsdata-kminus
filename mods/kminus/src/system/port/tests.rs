@@ -32,3 +32,45 @@ fn check_port_fails_when_bound() {
     assert!(msg.contains("test"));
     assert!(msg.contains(&port.to_string()));
 }
+
+#[test]
+fn check_ports_succeeds_when_all_free() {
+    let ports = [
+        (find_free_port(), "a"),
+        (find_free_port(), "b"),
+        (find_free_port(), "c"),
+    ];
+    assert!(check_ports(&ports).is_ok());
+}
+
+#[test]
+fn check_ports_reports_every_port_in_use() {
+    let busy_a = TcpListener::bind("127.0.0.1:0").unwrap();
+    let busy_b = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port_a = busy_a.local_addr().unwrap().port();
+    let port_b = busy_b.local_addr().unwrap().port();
+    let ports = [
+        (port_a, "first"),
+        (find_free_port(), "free"),
+        (port_b, "second"),
+    ];
+
+    let errors = check_ports(&ports).unwrap_err();
+    assert_eq!(errors.len(), 2);
+    assert!(errors[0].contains("first"));
+    assert!(errors[0].contains(&port_a.to_string()));
+    assert!(errors[1].contains("second"));
+    assert!(errors[1].contains(&port_b.to_string()));
+}
+
+#[test]
+fn check_ports_succeeds_when_empty() {
+    let ports: [(u16, &str); 0] = [];
+    assert!(check_ports(&ports).is_ok());
+}
+
+#[test]
+fn check_ports_accepts_owned_labels() {
+    let ports = vec![(find_free_port(), String::from("owned"))];
+    assert!(check_ports(&ports).is_ok());
+}
