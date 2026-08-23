@@ -240,6 +240,7 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
 
         tls,
 
+        config_dir: configdir.clone(),
         run_dir,
         pods_dir,
         log_dir,
@@ -447,6 +448,8 @@ mod tests {
             logmaxsizemb: 100,
             logmaxfiles: 3,
             loglevel: crate::config::loglevel::LogLevel::Debug,
+            heartbeat_file: None,
+            heartbeat_secs: crate::config::cli::DEFAULT_HEARTBEAT_SECS,
         };
 
         let config = resolve_config(&cli).unwrap();
@@ -523,6 +526,8 @@ podDataReapTtlOnPodSuccess: "5m"
             logmaxsizemb: 100,
             logmaxfiles: 3,
             loglevel: crate::config::loglevel::LogLevel::Debug,
+            heartbeat_file: None,
+            heartbeat_secs: crate::config::cli::DEFAULT_HEARTBEAT_SECS,
         };
 
         let config = resolve_config(&cli).unwrap();
@@ -578,6 +583,8 @@ podDataReapTtlOnPodSuccess: "5m"
             logmaxsizemb: 100,
             logmaxfiles: 3,
             loglevel: crate::config::loglevel::LogLevel::Debug,
+            heartbeat_file: None,
+            heartbeat_secs: crate::config::cli::DEFAULT_HEARTBEAT_SECS,
         };
 
         let config = resolve_config(&cli).unwrap();
@@ -624,6 +631,8 @@ podDataReapTtlOnPodSuccess: "5m"
             logmaxsizemb: 100,
             logmaxfiles: 3,
             loglevel: crate::config::loglevel::LogLevel::Debug,
+            heartbeat_file: None,
+            heartbeat_secs: crate::config::cli::DEFAULT_HEARTBEAT_SECS,
         };
 
         let c = resolve_config(&cli).unwrap();
@@ -666,6 +675,8 @@ podDataReapTtlOnPodSuccess: "5m"
             logmaxsizemb: 100,
             logmaxfiles: 3,
             loglevel: crate::config::loglevel::LogLevel::Debug,
+            heartbeat_file: None,
+            heartbeat_secs: crate::config::cli::DEFAULT_HEARTBEAT_SECS,
         };
 
         let c = resolve_config(&cli).unwrap();
@@ -710,6 +721,8 @@ podDataReapTtlOnPodSuccess: "5m"
             logmaxsizemb: 100,
             logmaxfiles: 3,
             loglevel: crate::config::loglevel::LogLevel::Debug,
+            heartbeat_file: None,
+            heartbeat_secs: crate::config::cli::DEFAULT_HEARTBEAT_SECS,
         };
 
         let c = resolve_config(&cli).unwrap();
@@ -778,6 +791,8 @@ capacity:
             logmaxsizemb: 100,
             logmaxfiles: 3,
             loglevel: crate::config::loglevel::LogLevel::Debug,
+            heartbeat_file: None,
+            heartbeat_secs: crate::config::cli::DEFAULT_HEARTBEAT_SECS,
         };
 
         let c = resolve_config(&cli).unwrap();
@@ -848,6 +863,8 @@ server:
             logmaxsizemb: 100,
             logmaxfiles: 3,
             loglevel: crate::config::loglevel::LogLevel::Debug,
+            heartbeat_file: None,
+            heartbeat_secs: crate::config::cli::DEFAULT_HEARTBEAT_SECS,
         };
 
         let result = resolve_config(&cli);

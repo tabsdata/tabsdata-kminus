@@ -122,6 +122,10 @@ pub struct PRConfig {
     pub tls: ServerTlsConfig,
 
     // -- directories --
+    /// Directory holding `prconfig.yaml`, `prsysconfig.yaml` and the
+    /// generated `vk-prconfig.yaml`.
+    pub config_dir: PathBuf,
+
     /// Run directory: `<workdir>/run/`. Rotated on startup.
     pub run_dir: PathBuf,
 
@@ -213,6 +217,7 @@ impl Default for PRConfig {
 
             tls: ServerTlsConfig::default(),
 
+            config_dir: PathBuf::from(crate::config::cli::DEFAULT_CONFIGDIR),
             run_dir: run.clone(),
             pods_dir: run.join(PODS_SUBDIR),
             log_dir: PathBuf::from("log"),

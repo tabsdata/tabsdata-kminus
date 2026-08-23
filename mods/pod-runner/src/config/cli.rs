@@ -19,6 +19,10 @@ pub const DEFAULT_LOGDIR: &str = "log";
 pub const DEFAULT_IMAGESDIR: &str = "images";
 
 /// Pod Runner — executes pods as local processes.
+/// Default seconds between readiness heartbeats. Matches km's own
+/// default so a standalone run behaves like a supervised one.
+pub const DEFAULT_HEARTBEAT_SECS: u64 = 15;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "pod-runner",
@@ -81,6 +85,17 @@ pub struct CliArgs {
     /// which is ignored. km forwards its own `--loglevel` here.
     #[arg(long, value_enum, default_value_t = LogLevel::Debug)]
     pub loglevel: LogLevel,
+
+    /// File to publish the readiness heartbeat into. Every interval the
+    /// server calls its own `/capacity` and rewrites this file with the
+    /// result; km gates startup and supervision on it. No heartbeat is
+    /// published when unset (standalone runs).
+    #[arg(long)]
+    pub heartbeat_file: Option<String>,
+
+    /// Seconds between readiness heartbeats.
+    #[arg(long, default_value_t = DEFAULT_HEARTBEAT_SECS)]
+    pub heartbeat_secs: u64,
 }
 
 // ---------------------------------------------------------------------------

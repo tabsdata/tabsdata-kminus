@@ -23,15 +23,18 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::filter::LevelFilter;
 
 mod config;
+mod exit;
 mod loglevel;
 mod process;
 mod system;
 
 use loglevel::LogLevel;
 
-use config::{KM_SYSCONFIG_FILE, KmPorts, KmSysConfig};
+use config::{KM_SYSCONFIG_FILE, KmHeartbeat, KmPorts, KmSysConfig};
+use exit::ExitReason;
 use process::{control_plane, pod_runner, virtual_kubelet};
 use system::file::{CONFIG_DIR, LOG_DIR};
+use system::heartbeat::{self, Beat, HeartbeatMonitor, heartbeat_file};
 use system::pid::{
     BIN_KM, cleanup_stale_pids, is_alive, kill_descendants, pids_dir, read_pid, remove_pid,
     terminate_process, write_pid,
@@ -464,7 +467,6 @@ fn print_status(
     println!();
     println!("  export KUBECONFIG={}", kubeconfig.display());
     println!();
-    println!("Press Ctrl+C to stop");
 
     info!(
         kubeconfig = %kubeconfig.display(),
@@ -500,7 +502,13 @@ fn install_signal_shutdown(paths: Paths) {
                 .enable_all()
                 .build()
                 .unwrap();
-            rt.block_on(arm_and_wait_for_shutdown(armed_tx));
+            let signal = rt.block_on(arm_and_wait_for_shutdown(armed_tx));
+            if !exit::claim() {
+                // A component failure already owns the exit; let it finish
+                // rather than reporting a second reason over the top.
+                return;
+            }
+            exit::report(&ExitReason::Signal(signal));
             shutdown_from_pids(&paths);
             std::process::exit(130);
         })
@@ -586,8 +594,232 @@ fn verify_ports_free(ports: &KmPorts) {
     }
 }
 
-/// Delete config files that are regenerated on every startup so that
-/// `wait_for_file` can detect fresh creation. `prsysconfig.yaml` is
+/// Slice the monitor sleeps in, so a shutdown request is noticed promptly
+/// rather than one whole heartbeat interval later.
+const MONITOR_TICK: Duration = Duration::from_millis(250);
+
+/// How often the process watcher looks for a component that has gone away.
+/// Checking a pid is far cheaper than a heartbeat round, so this runs tight:
+/// a crash is worth knowing about immediately, and unlike a stale beat it
+/// needs no interval to interpret.
+const PROCESS_WATCH_TICK: Duration = Duration::from_millis(250);
+
+/// Sleep up to `total`, returning false as soon as a shutdown request is
+/// seen — the monitor must not act on a component that km is stopping.
+fn sleep_unless_shutdown(total: Duration) -> bool {
+    let deadline = Instant::now() + total;
+    while Instant::now() < deadline {
+        if exit::in_progress() {
+            return false;
+        }
+        std::thread::sleep(MONITOR_TICK);
+    }
+    !exit::in_progress()
+}
+
+/// What a supervision round observed about a child process, kept separate
+/// from [`Child`] so the decision below can be exercised without spawning
+/// one.
+#[derive(Debug, PartialEq, Eq)]
+enum ProcessState {
+    Running,
+    /// The child is gone; the string describes how.
+    Exited(String),
+    /// Its state could not be read at all, which is itself a failure.
+    Unknown(String),
+}
+
+/// One component's fate for one round.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    Ok,
+    Failed(String),
+}
+
+/// A supervised child: its process handle and its heartbeat counter.
+struct Watched<C> {
+    name: &'static str,
+    child: C,
+    monitor: HeartbeatMonitor,
+}
+
+/// Read a child's process state without blocking.
+trait ChildState {
+    fn state(&mut self) -> ProcessState;
+}
+
+impl ChildState for Child {
+    fn state(&mut self) -> ProcessState {
+        match self.try_wait() {
+            Ok(Some(status)) => ProcessState::Exited(format!("process exited ({status})")),
+            Ok(None) => ProcessState::Running,
+            Err(e) => ProcessState::Unknown(format!("cannot check process state: {e}")),
+        }
+    }
+}
+
+/// Judge one component from its process state and its heartbeat.
+///
+/// An exit is failure immediately — there is no point waiting for beats to
+/// go stale once the process is gone. A live process is judged only by its
+/// heartbeat, and a single miss is not yet a failure: that is what the
+/// consecutive-miss budget is for.
+fn assess(process: ProcessState, monitor: &mut HeartbeatMonitor) -> Verdict {
+    match process {
+        ProcessState::Exited(how) | ProcessState::Unknown(how) => Verdict::Failed(how),
+        ProcessState::Running => match monitor.poll() {
+            Beat::Healthy | Beat::Missed { .. } => Verdict::Ok,
+            Beat::Failed { misses, reason } => {
+                Verdict::Failed(format!("missed {misses} consecutive heartbeats — {reason}"))
+            }
+        },
+    }
+}
+
+/// One supervision round over every component. Returns the first failure,
+/// having polled the components before it — so their miss counters stay
+/// current and their warnings are logged even when a later one fails.
+fn monitor_round<C: ChildState>(watched: &mut [Watched<C>]) -> Option<(&'static str, String)> {
+    let mut failure = None;
+    for w in watched.iter_mut() {
+        if let Verdict::Failed(reason) = assess(w.child.state(), &mut w.monitor) {
+            failure = failure.or(Some((w.name, reason)));
+        }
+    }
+    failure
+}
+
+/// The first component whose recorded process is no longer alive.
+///
+/// Reads the PID files km writes immediately after each spawn — so the list
+/// grows as the stack comes up, and a component not started yet is simply
+/// absent rather than reported dead.
+fn first_dead_component(pids: &Path) -> Option<(&'static str, u32)> {
+    [control_plane::BIN, pod_runner::BIN, virtual_kubelet::BIN]
+        .into_iter()
+        .find_map(|name| match read_pid(pids, name) {
+            Some(pid) if !is_alive(pid) => Some((name, pid)),
+            _ => None,
+        })
+}
+
+/// What a component last reported in its heartbeat, when that was trouble.
+///
+/// A component usually publishes a `degraded` beat naming the cause before it
+/// exits, so surfacing it turns "the control-plane is gone" into "the
+/// control-plane is gone because kube-apiserver stopped listening" — the
+/// difference between reading a log afterwards and not having to.
+fn last_reported(paths: &Paths, name: &str) -> Option<String> {
+    let (_, beat) = heartbeat::read(&heartbeat_file(&paths.workdir, name))?;
+    if beat.status == heartbeat::STATUS_READY || beat.detail.is_empty() {
+        return None;
+    }
+    Some(beat.detail)
+}
+
+/// Watch every component km has spawned for its process disappearing, from
+/// the first spawn until shutdown.
+///
+/// This runs alongside — and ahead of — the heartbeat monitor, which only
+/// starts once the whole stack is ready. Without it, a component dying while
+/// km is still gating on a later one goes unnoticed until that gate times
+/// out: the full startup budget spent waiting, and then the failure reported
+/// against the wrong component.
+fn watch_spawned_processes(paths: Paths) {
+    std::thread::Builder::new()
+        .name("km-procwatch".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(PROCESS_WATCH_TICK);
+                if exit::in_progress() {
+                    return;
+                }
+                if let Some((name, pid)) = first_dead_component(&paths.pids) {
+                    let reason = match last_reported(&paths, name) {
+                        Some(detail) => format!("process {pid} is gone (last reported: {detail})"),
+                        None => format!("process {pid} is gone"),
+                    };
+                    fail_stack(&paths, name, &reason);
+                }
+            }
+        })
+        .expect("spawn km-procwatch thread");
+}
+
+/// Supervise the stack until a component fails or a signal arrives.
+///
+/// Each round checks both channels: the child process itself, which makes an
+/// outright exit immediate rather than waiting for heartbeats to go stale,
+/// and the component's heartbeat file, which catches a process that is alive
+/// but no longer serving. Never returns: a component failure exits 1 here, a
+/// signal exits from the km-signal thread.
+fn monitor_stack(paths: &Paths, hb: &KmHeartbeat, children: Vec<(&'static str, Child)>) -> ! {
+    let interval = hb.interval();
+    let max_missed = hb.max_missed();
+    let stale_after = heartbeat::stale_after(interval);
+
+    let mut watched: Vec<Watched<Child>> = children
+        .into_iter()
+        .map(|(name, child)| Watched {
+            name,
+            child,
+            monitor: HeartbeatMonitor::new(
+                name,
+                heartbeat_file(&paths.workdir, name),
+                stale_after,
+                max_missed,
+            ),
+        })
+        .collect();
+
+    info!(
+        interval_secs = interval.as_secs(),
+        max_missed,
+        stale_after_secs = stale_after.as_secs(),
+        "Monitoring component heartbeats"
+    );
+
+    // Process liveness is the watcher thread's job, at its own tighter tick;
+    // this loop owns the heartbeat rounds. `monitor_round` still checks the
+    // child handles, which is what turns a race the monitor wins into an
+    // "exited (status)" message rather than a bare "process is gone".
+    loop {
+        if !sleep_unless_shutdown(interval) {
+            stand_down();
+        }
+        if let Some((name, reason)) = monitor_round(&mut watched) {
+            fail_stack(paths, name, &reason);
+        }
+    }
+}
+
+/// Park forever: km is stopping and the signal thread owns teardown and exit.
+fn stand_down() -> ! {
+    loop {
+        std::thread::park();
+    }
+}
+
+/// Log the failing component, tear the stack down and exit non-zero.
+///
+/// The process watcher, the heartbeat monitor and the signal thread can all
+/// reach teardown, so the flag is claimed first: whoever gets it drives the
+/// shutdown and the exit code, and the others stand down rather than tearing
+/// down a second time over the top.
+fn fail_stack(paths: &Paths, name: &'static str, reason: &str) -> ! {
+    if !exit::claim() {
+        stand_down();
+    }
+    exit::report(&ExitReason::Liveness {
+        component: name,
+        detail: reason.to_string(),
+    });
+    shutdown_from_pids(paths);
+    std::process::exit(1);
+}
+
+/// Delete config files that are regenerated on every startup so that a
+/// stale copy is never mistaken for this run's. `prsysconfig.yaml` is
 /// preserved (user-editable).
 fn clear_regenerated_configs(configdir: &Path) {
     for name in [
@@ -711,12 +943,9 @@ fn command_create(args: CreateArgs) {
     println!("  km start --workdir {}", paths.workdir.display());
 }
 
-/// Boot the cluster from an existing kminus instance in `args.workdir`.
-// The cp/pr/vk `Child` handles are intentionally not `wait()`ed: teardown
-// is owned by the km-signal thread (it stops them by PID file, then exits
-// the process), so the handles are held alive in the parked frame and the
-// kernel reaps the children once km exits — no lingering zombies.
-#[allow(clippy::zombie_processes)]
+/// Boot the cluster from an existing kminus instance in `args.workdir`,
+/// then supervise it in [`monitor_stack`], which owns the `Child` handles
+/// and reaps them.
 fn command_start(args: StartArgs) {
     let paths = Paths::for_start(
         &args.workdir,
@@ -805,6 +1034,9 @@ fn command_start(args: StartArgs) {
     // Ctrl+C at any point during the (multi-second) startup tears the
     // stack down in order rather than orphaning it.
     install_signal_shutdown(paths.clone());
+    // Started before anything is spawned, so a component dying mid-startup is
+    // caught while km is still gating on a later one.
+    watch_spawned_processes(paths.clone());
 
     // Start subprocesses in dependency order, reporting each phase to stdout
     // so the (multi-second) startup shows live progress instead of a silent
@@ -820,12 +1052,11 @@ fn command_start(args: StartArgs) {
         &sys_cfg,
         &port_api,
         &port_kcm,
-        &vk_kubeconfig,
     );
     step_done(phase);
 
     phase = step("Starting pod-runner");
-    let pr = pod_runner::start(
+    let mut pr = pod_runner::start(
         &paths.workdir,
         &paths.configdir,
         &paths.logdir,
@@ -834,7 +1065,6 @@ fn command_start(args: StartArgs) {
         &port_pr,
         &port_pr_metrics,
         &kubeconfig,
-        &vk_prconfig,
         args.imagesdir.as_deref(),
         args.loglevel,
         &mut cp,
@@ -855,6 +1085,8 @@ fn command_start(args: StartArgs) {
         &port_vk,
         &vk_kubeconfig,
         &vk_prconfig,
+        &mut cp,
+        &mut pr,
     );
     step_done(phase);
 
@@ -877,12 +1109,27 @@ fn command_start(args: StartArgs) {
         &kubeconfig,
     );
 
-    // Teardown is owned by the km-signal thread installed above (it exits
-    // the process on SIGINT/SIGTERM, stopping cp/pr/vk by PID file). Park
-    // here until then; the Child handles stay alive in this frame.
-    loop {
-        std::thread::park();
-    }
+    println!(
+        "  liveness/readiness check every {}ms/{}s, readiness tolerance {} misses",
+        PROCESS_WATCH_TICK.as_millis(),
+        sys_cfg.heartbeat.interval().as_secs(),
+        sys_cfg.heartbeat.max_missed()
+    );
+    println!();
+    println!("Press Ctrl+C to stop");
+
+    // Supervise from here on. Teardown on signal is still owned by the
+    // km-signal thread installed above; the monitor stands down when it
+    // fires. The Child handles move into the monitor, which reaps them.
+    monitor_stack(
+        &paths,
+        &sys_cfg.heartbeat,
+        vec![
+            (control_plane::BIN, cp),
+            (pod_runner::BIN, pr),
+            (virtual_kubelet::BIN, vk),
+        ],
+    )
 }
 
 /// Grace period km's own signal-driven teardown may need before `stop`
@@ -950,9 +1197,16 @@ fn command_stop(args: StopArgs) {
 }
 
 /// One line of status output for a component.
-fn print_component_status(pids: &Path, name: &str) {
-    match read_pid(pids, name) {
-        Some(pid) if is_alive(pid) => println!("  {:<16} running   pid={}", name, pid),
+fn print_component_status(paths: &Paths, name: &str) {
+    // Heartbeat age is what distinguishes "serving" from merely "alive";
+    // km itself does not beat, so it has none to show.
+    let beat = match heartbeat::age(&heartbeat_file(&paths.workdir, name)) {
+        Some(age) => format!("  beat={}s ago", age.as_secs()),
+        None if name == BIN_KM => String::new(),
+        None => "  beat=none".to_string(),
+    };
+    match read_pid(&paths.pids, name) {
+        Some(pid) if is_alive(pid) => println!("  {:<16} running   pid={}{}", name, pid, beat),
         Some(pid) => println!("  {:<16} DEAD      pid={} (stale PID file)", name, pid),
         None => println!("  {:<16} stopped", name),
     }
@@ -965,15 +1219,15 @@ fn print_component_status(pids: &Path, name: &str) {
 fn print_instance_status(paths: &Paths) -> bool {
     let km_running = read_pid(&paths.pids, BIN_KM).is_some_and(is_alive);
 
-    print_component_status(&paths.pids, BIN_KM);
-    print_component_status(&paths.pids, control_plane::BIN);
+    print_component_status(paths, BIN_KM);
+    print_component_status(paths, control_plane::BIN);
     for (name, pid) in control_plane::read_children(&paths.workdir) {
         let alive = pid.parse::<u32>().map(is_alive).unwrap_or(false);
         let state = if alive { "running" } else { "DEAD   " };
         println!("    {:<14} {}   pid={}", name, state, pid);
     }
-    print_component_status(&paths.pids, pod_runner::BIN);
-    print_component_status(&paths.pids, virtual_kubelet::BIN);
+    print_component_status(paths, pod_runner::BIN);
+    print_component_status(paths, virtual_kubelet::BIN);
 
     km_running
 }
@@ -1019,26 +1273,26 @@ fn command_restart(args: StartArgs) {
 /// requests graceful shutdown via `GenerateConsoleCtrlEvent(
 /// CTRL_BREAK_EVENT, ...)`, which only fires `ctrl_break`.
 #[cfg(unix)]
-async fn arm_and_wait_for_shutdown(armed: std::sync::mpsc::Sender<()>) {
+async fn arm_and_wait_for_shutdown(armed: std::sync::mpsc::Sender<()>) -> String {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
     let _ = armed.send(());
     tokio::select! {
-        _ = sigterm.recv() => {}
-        _ = sigint.recv() => {}
+        _ = sigterm.recv() => "SIGTERM".to_string(),
+        _ = sigint.recv() => "SIGINT (Ctrl+C)".to_string(),
     }
 }
 
 #[cfg(windows)]
-async fn arm_and_wait_for_shutdown(armed: std::sync::mpsc::Sender<()>) {
+async fn arm_and_wait_for_shutdown(armed: std::sync::mpsc::Sender<()>) -> String {
     use tokio::signal::windows::{ctrl_break, ctrl_c};
     let mut ctrlc = ctrl_c().expect("install Ctrl+C handler");
     let mut ctrlbreak = ctrl_break().expect("install Ctrl+Break handler");
     let _ = armed.send(());
     tokio::select! {
-        _ = ctrlc.recv() => {}
-        _ = ctrlbreak.recv() => {}
+        _ = ctrlc.recv() => "Ctrl+C".to_string(),
+        _ = ctrlbreak.recv() => "Ctrl+Break".to_string(),
     }
 }
 
@@ -1124,6 +1378,282 @@ mod tests {
     fn clear_regenerated_configs_no_op_when_files_absent() {
         let dir = tempdir();
         clear_regenerated_configs(&dir);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- monitor round ------------------------------------------------------
+
+    /// Scripted process states, so the round can be driven without
+    /// spawning children.
+    struct FakeChild(ProcessState);
+
+    impl ChildState for FakeChild {
+        fn state(&mut self) -> ProcessState {
+            match &self.0 {
+                ProcessState::Running => ProcessState::Running,
+                ProcessState::Exited(how) => ProcessState::Exited(how.clone()),
+                ProcessState::Unknown(how) => ProcessState::Unknown(how.clone()),
+            }
+        }
+    }
+
+    fn ready_beat(dir: &Path) -> PathBuf {
+        let path = dir.join(system::heartbeat::HEARTBEAT_FILE);
+        fs::write(&path, r#"{"ts":1,"status":"ready","detail":""}"#).unwrap();
+        path
+    }
+
+    fn watched(
+        name: &'static str,
+        state: ProcessState,
+        beat: PathBuf,
+        max_missed: u32,
+    ) -> Watched<FakeChild> {
+        Watched {
+            name,
+            child: FakeChild(state),
+            monitor: HeartbeatMonitor::new(name, beat, Duration::from_secs(15), max_missed),
+        }
+    }
+
+    #[test]
+    fn assess_fails_immediately_on_an_exited_process() {
+        let dir = tempdir();
+        let mut monitor =
+            HeartbeatMonitor::new("test", ready_beat(&dir), Duration::from_secs(15), 4);
+        // A fresh, ready beat must not save a process that is already gone.
+        let verdict = assess(
+            ProcessState::Exited("process exited (0)".into()),
+            &mut monitor,
+        );
+        assert_eq!(verdict, Verdict::Failed("process exited (0)".into()));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn assess_fails_when_the_process_state_is_unreadable() {
+        let dir = tempdir();
+        let mut monitor =
+            HeartbeatMonitor::new("test", ready_beat(&dir), Duration::from_secs(15), 4);
+        let verdict = assess(
+            ProcessState::Unknown("permission denied".into()),
+            &mut monitor,
+        );
+        assert_eq!(verdict, Verdict::Failed("permission denied".into()));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn assess_accepts_a_live_process_with_a_fresh_beat() {
+        let dir = tempdir();
+        let mut monitor =
+            HeartbeatMonitor::new("test", ready_beat(&dir), Duration::from_secs(15), 4);
+        assert_eq!(assess(ProcessState::Running, &mut monitor), Verdict::Ok);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn assess_tolerates_misses_until_the_budget_is_spent() {
+        let dir = tempdir();
+        // No beat file at all: every round is a miss.
+        let mut monitor = HeartbeatMonitor::new(
+            "test",
+            dir.join(system::heartbeat::HEARTBEAT_FILE),
+            Duration::from_secs(15),
+            3,
+        );
+        assert_eq!(assess(ProcessState::Running, &mut monitor), Verdict::Ok);
+        assert_eq!(assess(ProcessState::Running, &mut monitor), Verdict::Ok);
+        let Verdict::Failed(reason) = assess(ProcessState::Running, &mut monitor) else {
+            panic!("the third miss must fail the component");
+        };
+        assert!(reason.starts_with("missed 3 consecutive heartbeats"));
+        assert!(reason.contains("no readable heartbeat"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn monitor_round_passes_when_every_component_is_healthy() {
+        let dir = tempdir();
+        let beat = ready_beat(&dir);
+        let mut all = vec![
+            watched("cp", ProcessState::Running, beat.clone(), 4),
+            watched("pr", ProcessState::Running, beat.clone(), 4),
+            watched("vk", ProcessState::Running, beat, 4),
+        ];
+        assert_eq!(monitor_round(&mut all), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn monitor_round_reports_the_first_failure() {
+        let dir = tempdir();
+        let beat = ready_beat(&dir);
+        let mut all = vec![
+            watched("cp", ProcessState::Running, beat.clone(), 4),
+            watched(
+                "pr",
+                ProcessState::Exited("process exited (1)".into()),
+                beat.clone(),
+                4,
+            ),
+            watched(
+                "vk",
+                ProcessState::Exited("process exited (2)".into()),
+                beat,
+                4,
+            ),
+        ];
+        let (name, reason) = monitor_round(&mut all).unwrap();
+        assert_eq!(name, "pr");
+        assert_eq!(reason, "process exited (1)");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn monitor_round_keeps_counting_components_after_a_failure() {
+        let dir = tempdir();
+        let missing = dir.join(system::heartbeat::HEARTBEAT_FILE);
+        let mut all = vec![
+            watched(
+                "cp",
+                ProcessState::Exited("process exited (1)".into()),
+                missing.clone(),
+                4,
+            ),
+            watched("pr", ProcessState::Running, missing, 2),
+        ];
+        // cp fails on round one, but pr must still be polled: its miss
+        // counter has to be current if the stack somehow keeps running.
+        assert_eq!(monitor_round(&mut all).unwrap().0, "cp");
+        assert_eq!(monitor_round(&mut all).unwrap().0, "cp");
+        // pr has now missed twice, so it would fail on its own merits.
+        let pr_verdict = assess(ProcessState::Running, &mut all[1].monitor);
+        assert!(matches!(pr_verdict, Verdict::Failed(_)));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- process watcher ---------------------------------------------------
+
+    #[test]
+    fn first_dead_component_ignores_components_not_started_yet() {
+        let dir = tempdir();
+        // No PID files at all: the stack has not started, nothing is dead.
+        assert_eq!(first_dead_component(&dir), None);
+
+        // A component that is up must not be reported either.
+        write_pid(&dir, control_plane::BIN, std::process::id());
+        assert_eq!(first_dead_component(&dir), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn first_dead_component_reports_a_recorded_process_that_is_gone() {
+        let dir = tempdir();
+        // A pid this high cannot belong to a live process.
+        let dead_pid = u32::MAX - 1;
+        write_pid(&dir, control_plane::BIN, std::process::id());
+        write_pid(&dir, pod_runner::BIN, dead_pid);
+
+        assert_eq!(
+            first_dead_component(&dir),
+            Some((pod_runner::BIN, dead_pid))
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn first_dead_component_reports_in_start_order() {
+        let dir = tempdir();
+        let dead_pid = u32::MAX - 1;
+        // Both gone: the control-plane is named, being the one started first
+        // and the one the others depend on.
+        write_pid(&dir, control_plane::BIN, dead_pid);
+        write_pid(&dir, virtual_kubelet::BIN, dead_pid);
+
+        assert_eq!(
+            first_dead_component(&dir),
+            Some((control_plane::BIN, dead_pid))
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn last_reported_surfaces_a_components_own_complaint() {
+        let dir = tempdir();
+        let workdir = dir.join("wd");
+        let paths = Paths {
+            workdir: workdir.clone(),
+            configdir: workdir.join(CONFIG_DIR),
+            logdir: workdir.join(LOG_DIR),
+            pids: pids_dir(&workdir, BIN_KM),
+        };
+        let beat = heartbeat_file(&workdir, control_plane::BIN);
+        fs::create_dir_all(beat.parent().unwrap()).unwrap();
+
+        // Nothing written yet: nothing to add to the failure.
+        assert_eq!(last_reported(&paths, control_plane::BIN), None);
+
+        // A ready beat is not a complaint either.
+        fs::write(&beat, r#"{"ts":1,"status":"ready","detail":""}"#).unwrap();
+        assert_eq!(last_reported(&paths, control_plane::BIN), None);
+
+        // A degraded beat is what the operator needs to see.
+        fs::write(
+            &beat,
+            r#"{"ts":1,"status":"degraded","detail":"kube-apiserver is no longer listening"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            last_reported(&paths, control_plane::BIN).as_deref(),
+            Some("kube-apiserver is no longer listening")
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- heartbeat startup gate --------------------------------------------
+
+    #[test]
+    fn wait_until_ready_returns_at_once_for_a_ready_component() {
+        let dir = tempdir();
+        let beat = ready_beat(&dir);
+        let started = Instant::now();
+        // A generous timeout the call must not wait out. The bound is loose
+        // enough to survive a loaded machine, tight enough to prove it
+        // returned on the first poll rather than on the deadline.
+        assert!(heartbeat::wait_until_ready(
+            "test",
+            &beat,
+            Duration::from_secs(30)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wait_until_ready_times_out_when_no_beat_appears() {
+        let dir = tempdir();
+        let started = Instant::now();
+        let timeout = Duration::from_millis(600);
+        assert!(!heartbeat::wait_until_ready(
+            "test",
+            &dir.join(system::heartbeat::HEARTBEAT_FILE),
+            timeout
+        ));
+        assert!(started.elapsed() >= timeout);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wait_until_ready_ignores_a_degraded_beat() {
+        let dir = tempdir();
+        let path = dir.join(system::heartbeat::HEARTBEAT_FILE);
+        fs::write(&path, r#"{"ts":1,"status":"degraded","detail":"starting"}"#).unwrap();
+        assert!(!heartbeat::wait_until_ready(
+            "test",
+            &path,
+            Duration::from_millis(400)
+        ));
         fs::remove_dir_all(&dir).ok();
     }
 

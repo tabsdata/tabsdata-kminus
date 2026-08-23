@@ -5,14 +5,13 @@
 use std::fs;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
 
-use tracing::{error, info};
+use tracing::info;
 
 use crate::config::KmSysConfig;
 use crate::loglevel::LogLevel;
 use crate::process::control_plane;
-use crate::system::file::wait_for_file;
+use crate::system::heartbeat::{self, heartbeat_file};
 use crate::system::pid::{apply_subprocess_flags, kill_child, remove_pid, write_pid};
 use crate::system::proc::resolve_binary;
 
@@ -40,8 +39,10 @@ const CAPACITY_CPU_KEY: &str = "cpu:";
 const CAPACITY_MEMORY_GB_KEY: &str = "memoryGB:";
 const CAPACITY_PODS_KEY: &str = "pods:";
 
-/// Spawn the pod-runner and wait until its `vk-prconfig.yaml`
-/// appears (signalling readiness). On failure, kills the
+/// Spawn the pod-runner and wait until it reports itself ready in its
+/// heartbeat file — which it writes only after its own `/capacity` call
+/// succeeds, so the listener is proven to be serving before the
+/// virtual-kubelet is started against it. On failure, kills the
 /// already-running control-plane and exits.
 ///
 /// When `imagesdir` is `Some`, it is forwarded to the pod-runner as
@@ -57,7 +58,6 @@ pub fn start(
     port_pr: &str,
     port_pr_metrics: &str,
     kubeconfig: &Path,
-    vk_prconfig: &Path,
     imagesdir: Option<&str>,
     loglevel: LogLevel,
     cp: &mut Child,
@@ -67,6 +67,9 @@ pub fn start(
     let log_max_size = sys_cfg.log.max_size_mb.to_string();
     let log_max_files = sys_cfg.log.max_files.to_string();
     let loglevel = loglevel.to_string();
+    let heartbeat = heartbeat_file(workdir, BIN);
+    let heartbeat_secs = sys_cfg.heartbeat.interval().as_secs().to_string();
+    heartbeat::clear(&heartbeat);
     let mut command = Command::new(&pr_bin);
     command
         .args([
@@ -88,6 +91,10 @@ pub fn start(
             port_pr,
             "--metrics-port",
             port_pr_metrics,
+            "--heartbeat-file",
+            heartbeat.to_str().unwrap(),
+            "--heartbeat-secs",
+            &heartbeat_secs,
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -101,11 +108,20 @@ pub fn start(
 
     write_pid(pids, BIN, pr.id());
 
-    if !wait_for_file(vk_prconfig, Duration::from_secs(30)) {
-        error!(
-            "{} did not become ready (vk-prconfig.yaml not created)",
-            BIN
-        );
+    if !heartbeat::wait_until_ready(BIN, &heartbeat, sys_cfg.heartbeat.startup_timeout()) {
+        // Claimed before the children are killed below, so the process
+        // watcher does not report those kills as a liveness failure.
+        if !crate::exit::claim() {
+            std::process::exit(1);
+        }
+        crate::exit::report(&crate::exit::ExitReason::Readiness {
+            component: BIN,
+            detail: format!(
+                "did not report ready within {}s ({})",
+                sys_cfg.heartbeat.startup_timeout().as_secs(),
+                heartbeat.display()
+            ),
+        });
         kill_child(&mut pr, BIN);
         kill_child(cp, control_plane::BIN);
         remove_pid(pids, BIN);

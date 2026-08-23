@@ -109,6 +109,9 @@ async fn main() {
     .expect("Failed to initialize resolvers");
 
     let (shutdown_tx, _) = watch::channel(());
+    // Subscribed before `shutdown_tx` is moved into the serve future, so the
+    // heartbeat task stops the moment a shutdown signal arrives.
+    let heartbeat_shutdown = shutdown_tx.subscribe();
     let cleanup_config = CleanupConfig::from(&pr_config);
     let logic = PodLogic::new(
         &pr_config,
@@ -150,6 +153,25 @@ async fn main() {
         .await
         .unwrap();
     info!(addr = %pr_config.bind_address, tls = "mTLS", "Server listening");
+
+    // Readiness heartbeat. Spawned before serving starts: its first
+    // successful self-probe is what tells km this server is up, so it has
+    // to be running by the time the listener starts accepting.
+    if let Some(file) = cli.heartbeat_file.as_deref() {
+        let file = std::path::PathBuf::from(file);
+        let vk_prconfig = pr_config
+            .config_dir
+            .join(pod_runner::config::template::VK_PRCONFIG_FILENAME);
+        let interval = std::time::Duration::from_secs(cli.heartbeat_secs.max(1));
+        tokio::spawn(pod_runner::server::heartbeat::run(
+            file,
+            interval,
+            vk_prconfig,
+            heartbeat_shutdown,
+        ));
+    } else {
+        info!("No --heartbeat-file given; readiness heartbeat disabled");
+    }
 
     let server_config = pod_runner::server::tls::build_server_config(&pr_config)
         .expect("Failed to build TLS config");

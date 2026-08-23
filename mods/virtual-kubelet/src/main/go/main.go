@@ -13,8 +13,10 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -23,6 +25,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -58,6 +61,10 @@ var (
 	kubeletPort    = flag.String("kubelet-port", "10250", "Kubelet API server port")
 	vkLogMaxSizeMB = flag.Int("logmaxsizemb", 100, "Max log file size in MB before rotation")
 	vkLogMaxFiles  = flag.Int("logmaxfiles", 3, "Max number of log files to keep")
+	heartbeatFile  = flag.String("heartbeat-file", "",
+		"File to publish the readiness heartbeat into (disabled when empty)")
+	heartbeatSecs = flag.Int("heartbeat-secs", defaultHeartbeatSecs,
+		"Seconds between readiness heartbeats")
 )
 
 // vkSysConfig contains tunables for the virtual-kubelet runtime.
@@ -186,6 +193,184 @@ func buildPodRunnerHTTPClient(caPEM, clientCertPEM, clientKeyPEM []byte, insecur
 			TLSClientConfig: tlsConfig,
 		},
 	}, nil
+}
+
+// Heartbeat defaults, mirroring km's own so a standalone run behaves like a
+// supervised one.
+const defaultHeartbeatSecs = 15
+
+// Heartbeat statuses. Only statusReady is accepted as healthy by km.
+// Kept in step with the control-plane copy; see the note above writeHeartbeat.
+const (
+	statusReady    = "ready"
+	statusDegraded = "degraded"
+)
+
+// heartbeatTmpSuffix names the staging file the beat is written to before
+// being renamed into place.
+const heartbeatTmpSuffix = ".tmp"
+
+// syncStaleFactor scales the pod status sync interval into the age at which
+// a missing sync round makes this kubelet unhealthy. Two skipped rounds
+// absorb a slow tick; three mean the loop is not running.
+const syncStaleFactor = 3
+
+// lastSyncUnixNano is stamped by the pod status sync loop at the end of
+// every completed round. The heartbeat requires it to be recent, so the
+// readiness signal comes from the loop that does the work rather than from
+// a timer that would keep ticking after the work stopped.
+var lastSyncUnixNano atomic.Int64
+
+// markSyncCompleted records that a pod status sync round finished.
+func markSyncCompleted() {
+	lastSyncUnixNano.Store(time.Now().UnixNano())
+}
+
+// sinceLastSync reports how long ago a sync round last completed. Before the
+// first round it is the time since the process started counting, which is
+// deliberately large: nothing has been synced yet.
+func sinceLastSync() time.Duration {
+	stamp := lastSyncUnixNano.Load()
+	if stamp == 0 {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Since(time.Unix(0, stamp))
+}
+
+// writeHeartbeat, the status/suffix constants above, and the wait rule
+// (heartbeatWait here, probeWait there) are duplicated near-verbatim in the
+// control-plane: mods/control-plane/src/main/go/main.go.
+//
+// Why there is no common package yet: these are two separate Go modules —
+// "minimal-vk" and "control-plane", each with its own go.mod — so sharing
+// ~40 lines means adding a third module plus require/replace wiring in both,
+// or vendoring a copy that drifts anyway. At two consumers that costs more
+// than the duplication; extract it when a third Go component needs to beat.
+//
+// What must stay in step across the copies: the {ts,status,detail} shape, the
+// tmp-then-rename publish, the ".tmp" suffix, and the status strings — km
+// accepts only "ready", so a typo here reads as a permanently degraded
+// component rather than an error. The same contract is implemented again in
+// Rust, by km (mods/kminus/src/system/heartbeat.rs, the reader) and the
+// pod-runner (mods/pod-runner/src/server/heartbeat.rs), which no Go package
+// can unify — docs/KmReadinessLiveness.md is the source of truth for it.
+//
+// writeHeartbeat publishes one beat for km to read. Failures are logged and
+// never fatal: km sees the file go stale and decides what to do.
+func writeHeartbeat(logger *logrus.Logger, file, status, detail string) {
+	if file == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(file), 0755); err != nil {
+		logger.Errorf("cannot create heartbeat directory %s: %v", filepath.Dir(file), err)
+		return
+	}
+	body, err := json.Marshal(map[string]any{
+		"ts":     time.Now().Unix(),
+		"status": status,
+		"detail": detail,
+	})
+	if err != nil {
+		logger.Errorf("cannot encode heartbeat: %v", err)
+		return
+	}
+	// Write then rename, so km never reads a half-written beat and counts it
+	// as a miss. Rename replaces the target on Windows as well as POSIX.
+	tmp := file + heartbeatTmpSuffix
+	if err := os.WriteFile(tmp, body, 0644); err != nil {
+		logger.Errorf("cannot write heartbeat %s: %v", tmp, err)
+		return
+	}
+	if err := os.Rename(tmp, file); err != nil {
+		logger.Errorf("cannot publish heartbeat %s: %v", file, err)
+		os.Remove(tmp)
+	}
+}
+
+// nodeLookupTimeout bounds the node lookup behind each beat. Without it a
+// wedged API server — one whose etcd is gone, say — blocks the heartbeat loop
+// and the beat simply stops, which tells km that this kubelet is unreachable
+// but not why. With it, the beat reports the timeout instead.
+const nodeLookupTimeout = 5 * time.Second
+
+// heartbeatStartupRetry spaces beats before the first healthy one, since km's
+// readiness gate is waiting on it and would otherwise sit out a whole
+// interval.
+const heartbeatStartupRetry = 250 * time.Millisecond
+
+// beatDetail reports why this kubelet is not ready, or "" when it is. Split
+// from the loop so the decision is testable without an API server: nodeErr is
+// the node lookup's result, syncAge the age of the last completed sync round.
+func beatDetail(nodeName string, nodeErr error, syncAge, syncStale time.Duration) string {
+	if nodeErr != nil {
+		return fmt.Sprintf("node %q not registered: %v", nodeName, nodeErr)
+	}
+	if syncAge > syncStale {
+		// Before the first round syncAge is unbounded, so this also covers
+		// "has never synced".
+		return fmt.Sprintf("pod status sync last completed a round over %s ago", syncStale)
+	}
+	return ""
+}
+
+// heartbeatWait spaces the next beat.
+func heartbeatWait(everHealthy bool, interval time.Duration) time.Duration {
+	if everHealthy {
+		return interval
+	}
+	return heartbeatStartupRetry
+}
+
+// runHeartbeat publishes the readiness beat km watches, until ctx is done.
+//
+// A beat is written only while this kubelet is doing its job: its node is
+// still registered with the API server and the pod status sync has completed
+// a round recently. The node check is the one that matters — a node
+// controller that exited takes the node registration with it, which is
+// exactly the failure km could not otherwise see.
+func runHeartbeat(
+	ctx context.Context,
+	logger *logrus.Logger,
+	nodes corev1.NodeInterface,
+	nodeName string,
+	file string,
+	interval time.Duration,
+	syncStale time.Duration,
+) {
+	logger.Infof("Readiness heartbeat every %s into %s (sync must be under %s old)",
+		interval, file, syncStale)
+
+	everHealthy := false
+	for {
+		// ctx cancellation surfaces as a lookup error first; the select
+		// below is what actually exits.
+		lookupCtx, cancelLookup := context.WithTimeout(ctx, nodeLookupTimeout)
+		_, nodeErr := nodes.Get(lookupCtx, nodeName, metav1.GetOptions{})
+		cancelLookup()
+		detail := beatDetail(nodeName, nodeErr, sinceLastSync(), syncStale)
+
+		if detail == "" {
+			if !everHealthy {
+				logger.Info("Node registered and syncing; reporting ready")
+				everHealthy = true
+			}
+			writeHeartbeat(logger, file, statusReady, "")
+		} else {
+			if everHealthy {
+				logger.Warnf("Reporting degraded: %s", detail)
+			} else {
+				logger.Debugf("Not ready yet: %s", detail)
+			}
+			writeHeartbeat(logger, file, statusDegraded, detail)
+		}
+
+		select {
+		case <-ctx.Done():
+			logger.Info("Readiness heartbeat stopped")
+			return
+		case <-time.After(heartbeatWait(everHealthy, interval)):
+		}
+	}
 }
 
 // klogFormatter outputs klog-like format: I0405 01:28:07.931074] message
@@ -669,9 +854,13 @@ func main() {
 				// and per-pod GetPodStatus — zero per-pod HTTP calls.
 				entries, err := provider.GetAllPodStatuses(ctx)
 				if err != nil {
-					logger.WithError(err).Debug("Failed to get pod statuses for sync")
+					logger.WithError(err).Debugf("Failed to get pod statuses for sync: %v", err)
 					continue
 				}
+				// The round is live from here: the loop is turning and the
+				// pod-runner answered. Stamped before the per-pod work below,
+				// which is skipped entirely when there are no pods to sync.
+				markSyncCompleted()
 
 				// Finalize Terminating pods whose containers the provider has
 				// already finished, so they don't sit in Terminating for the
@@ -799,6 +988,20 @@ func main() {
 			}
 		}
 	}()
+
+	if *heartbeatFile != "" {
+		go runHeartbeat(
+			ctx,
+			logger,
+			clientset.CoreV1().Nodes(),
+			vkNodeName,
+			*heartbeatFile,
+			time.Duration(*heartbeatSecs)*time.Second,
+			syncStaleFactor*syncInterval,
+		)
+	} else {
+		logger.Info("No --heartbeat-file given; readiness heartbeat disabled")
+	}
 
 	if err := podController.Run(ctx, vkSys.PodControllerWorkers); err != nil && ctx.Err() == nil {
 		logger.WithError(err).Fatal("pod controller exited with error")

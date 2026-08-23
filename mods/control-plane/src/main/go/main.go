@@ -8,14 +8,17 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/csv"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	mathrand "math/rand"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -111,6 +114,60 @@ const (
 	kcmUserName   = "system:kube-controller-manager"
 )
 
+// Heartbeat defaults, mirroring km's own so a standalone run behaves like
+// a supervised one.
+const (
+	defaultHeartbeatSecs       = 15
+	defaultMaxMissedHeartbeats = 4
+)
+
+// Heartbeat statuses. Only statusReady is accepted as healthy by km.
+// Kept in step with the virtual-kubelet copy; see the note above writeHeartbeat.
+const (
+	statusReady    = "ready"
+	statusDegraded = "degraded"
+)
+
+// heartbeatTmpSuffix names the staging file the beat is written to before
+// being renamed into place.
+const heartbeatTmpSuffix = ".tmp"
+
+// kcmName is the kube-controller-manager's binary and process name, used for
+// its pid file, its probe label and its liveness check.
+const kcmName = "kube-controller-manager"
+
+// kcmStopTimeout bounds the wait for kube-controller-manager to exit after
+// SIGTERM at shutdown.
+const kcmStopTimeout = 10 * time.Second
+
+// envtestStopTimeout bounds envtest's own attempt to stop etcd and the API
+// server at shutdown.
+const envtestStopTimeout = 5 * time.Second
+
+// listenerDialTimeout bounds one tick-speed port check. Generous for
+// loopback, where a listening socket accepts immediately.
+const listenerDialTimeout = time.Second
+
+// processTick is how often the children are checked for still being
+// processes, in between the slower probe rounds. An exited child is
+// definitive and costs nothing to see, so it should not wait out an interval.
+const processTick = time.Second
+
+// probeTimeout bounds a single child probe, kept well under the heartbeat
+// interval so a wedged child fails its round instead of stalling it.
+const probeTimeout = 5 * time.Second
+
+// startupRetry spaces probe rounds until the first success: km's readiness
+// gate waits on that first beat, so it must not be an interval away.
+const startupRetry = 250 * time.Millisecond
+
+// Health endpoints of the children. etcd predates the /healthz convention.
+const (
+	etcdHealthPath      = "/health"
+	kcmHealthPath       = "/healthz"
+	apiServerReadyzPath = "/readyz"
+)
+
 // tokenUsers defines the users provisioned in tokens.csv and the groups
 // embedded in each token's identity.
 var tokenUsers = []struct {
@@ -120,6 +177,284 @@ var tokenUsers = []struct {
 	{adminUserName, "system:masters"},
 	{vkUserName, "system:masters,system:nodes"},
 	{kcmUserName, "system:masters"},
+}
+
+// writeHeartbeat, the status/suffix constants above, and the wait rule
+// (probeWait here, heartbeatWait there) are duplicated near-verbatim in the
+// virtual-kubelet: mods/virtual-kubelet/src/main/go/main.go.
+//
+// Why there is no common package yet: these are two separate Go modules —
+// "control-plane" and "minimal-vk", each with its own go.mod — so sharing
+// ~40 lines means adding a third module plus require/replace wiring in both,
+// or vendoring a copy that drifts anyway. At two consumers that costs more
+// than the duplication; extract it when a third Go component needs to beat.
+//
+// What must stay in step across the copies: the {ts,status,detail} shape, the
+// tmp-then-rename publish, the ".tmp" suffix, and the status strings — km
+// accepts only "ready", so a typo here reads as a permanently degraded
+// component rather than an error. The same contract is implemented again in
+// Rust, by km (mods/kminus/src/system/heartbeat.rs, the reader) and the
+// pod-runner (mods/pod-runner/src/server/heartbeat.rs), which no Go package
+// can unify — docs/KmReadinessLiveness.md is the source of truth for it.
+//
+// writeHeartbeat publishes one beat for km to read. Failures are logged and
+// never fatal: km sees the file go stale and decides what to do.
+func writeHeartbeat(path, status, detail string, warn func(string, ...any)) {
+	if path == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		warn("cannot create heartbeat directory %s: %v", filepath.Dir(path), err)
+		return
+	}
+	body, err := json.Marshal(map[string]any{
+		"ts":     time.Now().Unix(),
+		"status": status,
+		"detail": detail,
+	})
+	if err != nil {
+		warn("cannot encode heartbeat: %v", err)
+		return
+	}
+	// Write then rename, so km never reads a half-written beat and counts it
+	// as a miss. Rename replaces the target on Windows as well as POSIX.
+	tmp := path + heartbeatTmpSuffix
+	if err := os.WriteFile(tmp, body, 0644); err != nil {
+		warn("cannot write heartbeat %s: %v", tmp, err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		warn("cannot publish heartbeat %s: %v", path, err)
+		os.Remove(tmp)
+	}
+}
+
+// childProbe is the health check for one control-plane child.
+type childProbe struct {
+	name  string
+	check func(ctx context.Context) error
+}
+
+// listenerGone reports whether a probe error means nothing is listening any
+// more, as opposed to a slow or unhealthy child. A refused connection is as
+// definitive as a dead pid: the socket is closed, and no amount of waiting
+// will bring it back on its own.
+//
+// The errno comparison is platform-split; see connectionRefused.
+func listenerGone(err error) bool {
+	return connectionRefused(err)
+}
+
+// httpProbe expects a 2xx from url — etcd's /health and the
+// kube-controller-manager's /healthz, both of which need no credentials.
+func httpProbe(client *http.Client, url string) func(context.Context) error {
+	return func(ctx context.Context) error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			return fmt.Errorf("GET %s returned %s", url, resp.Status)
+		}
+		return nil
+	}
+}
+
+// probeAll runs every probe and returns a description of the failures, or
+// "" when all children are healthy. Each probe gets its own timeout so one
+// wedged child cannot consume the whole round.
+//
+// `gone` is set when a failure means a child has stopped listening
+// altogether, which the caller acts on immediately instead of spending the
+// miss budget on something that cannot recover.
+func probeAll(ctx context.Context, probes []childProbe) (detail string, gone bool) {
+	var failures []string
+	for _, probe := range probes {
+		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+		err := probe.check(probeCtx)
+		cancel()
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", probe.name, err))
+			gone = gone || listenerGone(err)
+		}
+	}
+	return strings.Join(failures, "; "), gone
+}
+
+// childProcess is a child the control-plane can only check by pid: envtest
+// owns etcd's and the API server's `exec.Cmd`, not this process.
+type childProcess struct {
+	name string
+	pid  int
+}
+
+// childProcessName normalises a process name for comparison, trimming the
+// Windows executable suffix so one spelling works on every platform.
+func childProcessName(name string) string {
+	return strings.TrimSuffix(name, ".exe")
+}
+
+// processGone reports whether a recorded child is no longer running.
+//
+// Two guards matter: a zombie still "exists" but is dead, and would otherwise
+// read as alive until something reaps it; and a recycled pid belongs to a
+// different process, so the name is compared too (as killStaleProcesses does).
+func processGone(name string, pid int) bool {
+	p, err := process.NewProcess(int32(pid))
+	if err != nil {
+		return true
+	}
+	if statuses, err := p.Status(); err == nil {
+		for _, status := range statuses {
+			if status == process.Zombie {
+				return true
+			}
+		}
+	}
+	running, err := p.Name()
+	if err != nil {
+		return true
+	}
+	return childProcessName(running) != name
+}
+
+// childListener is a child's listening address. Checked at tick speed
+// alongside the pids, because a closed port is just as cheap to detect — and
+// catches what a pid cannot: a child shutting down gracefully closes its
+// listener first and can stay alive for a long time afterwards, which is
+// exactly what a plain `kill` on kube-apiserver looks like.
+type childListener struct {
+	name string
+	addr string
+}
+
+// listenerRefused reports whether nothing accepts connections on addr.
+//
+// Only a refused connection counts: a dial timeout means the port may still
+// be there but slow, which is the interval probe's business, not a reason to
+// tear the stack down.
+func listenerRefused(addr string) bool {
+	conn, err := net.DialTimeout("tcp", addr, listenerDialTimeout)
+	if err != nil {
+		return listenerGone(err)
+	}
+	conn.Close()
+	return false
+}
+
+// watchExit reaps `cmd` and reports how it ended on a buffered channel.
+//
+// Waiting in a goroutine buys two things a health probe cannot: the exit
+// status, so the log says why rather than just "connection refused", and the
+// reaping itself — otherwise a child that dies early stays a zombie until the
+// control-plane exits.
+func watchExit(name string, cmd *exec.Cmd) <-chan string {
+	exited := make(chan string, 1)
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			exited <- fmt.Sprintf("%s exited: %v", name, err)
+			return
+		}
+		exited <- fmt.Sprintf("%s exited cleanly, which it must not do while the control plane runs", name)
+	}()
+	return exited
+}
+
+// childLost describes a child that is definitively lost, or "" when nothing is
+// conclusively wrong. Unlike a failed probe these answers cannot improve on
+// their own — an exited process is not coming back and a refused port is not
+// reopening — so the caller acts at once instead of spending the miss budget.
+//
+// Only the cheap checks live here, because this runs on every tick: a
+// non-blocking channel receive for the child this process owns, and a loopback
+// dial per listener (tens of microseconds). `served` gates the ports, since
+// before a child has ever answered a refused connection only means it is still
+// binding.
+func childLost(exited <-chan string, listeners []childListener, served bool) string {
+	select {
+	case detail := <-exited:
+		return detail
+	default:
+	}
+	if !served {
+		return ""
+	}
+	for _, listener := range listeners {
+		if listenerRefused(listener.addr) {
+			return fmt.Sprintf("%s is no longer listening on %s", listener.name, listener.addr)
+		}
+	}
+	return ""
+}
+
+// deadChildProcess names a recorded child whose process is gone, or "" while
+// they are all running.
+//
+// This rides the probe round rather than the tick: gopsutil reads a process's
+// name and state by invoking `ps` on some platforms, which costs milliseconds
+// and a subprocess per child — 85x the price of the port check above, for an
+// answer the port check almost always reaches first. What it adds is naming a
+// process that has died, and catching one whose port something else has since
+// taken over.
+func deadChildProcess(procs []childProcess) string {
+	for _, child := range procs {
+		if processGone(child.name, child.pid) {
+			return fmt.Sprintf("%s (pid %d) is no longer running", child.name, child.pid)
+		}
+	}
+	return ""
+}
+
+// monitorAction is what the supervision loop does after a probe round.
+type monitorAction int
+
+const (
+	actionContinue monitorAction = iota
+	actionShutdown
+)
+
+// monitorRound folds one probe round into the new consecutive-miss count and
+// the action to take: a healthy round clears the count, and the limit is
+// reached only by consecutive failures. Pure — the logging, the heartbeat and
+// the waiting are the caller's.
+func monitorRound(detail string, missed, maxMissed int) (int, monitorAction) {
+	if maxMissed < 1 {
+		// 0 would fail the very first round, before any child can answer.
+		maxMissed = 1
+	}
+	if detail == "" {
+		return 0, actionContinue
+	}
+	missed++
+	if missed >= maxMissed {
+		return missed, actionShutdown
+	}
+	return missed, actionContinue
+}
+
+// tickWait is how long to sleep before looking again: one process tick, or
+// less when the next probe round falls sooner — so a 250ms startup retry is
+// not stretched out to a whole tick.
+func tickWait(untilNextRound, tick time.Duration) time.Duration {
+	if untilNextRound > 0 && untilNextRound < tick {
+		return untilNextRound
+	}
+	return tick
+}
+
+// probeWait spaces the next round: fast until the first healthy one, since
+// km's readiness gate is waiting on that first beat and would otherwise sit
+// out a whole interval.
+func probeWait(everHealthy bool, interval time.Duration) time.Duration {
+	if everHealthy {
+		return interval
+	}
+	return startupRetry
 }
 
 func currentUsername() string {
@@ -253,32 +588,44 @@ users:
 	return os.WriteFile(path, []byte(content), 0600)
 }
 
+// writePid records a pid file. A failure here means teardown and the next
+// start cannot find this process, so it is reported rather than dropped.
 func writePid(path string, pid int) {
-	os.WriteFile(path, []byte(strconv.Itoa(pid)), 0644)
+	if err := os.WriteFile(path, []byte(strconv.Itoa(pid)), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "WARNING: cannot write pid file %s: %v\n", path, err)
+	}
 }
 
-func writeChildPids(pidsDir string) {
+// writeChildPids records the pids of the children envtest started, which it
+// does not expose. Returns what it found: anything missing cannot be reaped at
+// teardown, cleaned up by the next start, or watched while running, so the
+// caller warns.
+func writeChildPids(pidsDir string) []childProcess {
+	var found []childProcess
 	myPid := int32(os.Getpid())
 	procs, err := process.Processes()
 	if err != nil {
-		return
+		return found
 	}
 	for _, p := range procs {
 		ppid, err := p.Ppid()
 		if err != nil || ppid != myPid {
 			continue
 		}
-		name, err := p.Name()
+		running, err := p.Name()
 		if err != nil {
 			continue
 		}
+		name := childProcessName(running)
 		switch name {
 		case "etcd", "kube-apiserver":
 			writePid(filepath.Join(pidsDir, fmt.Sprintf("%d.%s", p.Pid, name)), int(p.Pid))
+			found = append(found, childProcess{name: name, pid: int(p.Pid)})
 			now := time.Now()
 			log.Printf("I%s %s [+] %s pid: %d", now.Format("0102"), now.Format("15:04:05.000000"), name, p.Pid)
 		}
 	}
+	return found
 }
 
 // processAlive reports whether a process with the given pid is running.
@@ -384,7 +731,7 @@ func killStaleProcesses(pidsDir string, warn func(string, ...any)) {
 		}
 
 		pName, err := p.Name()
-		if err != nil || pName != processName {
+		if err != nil || childProcessName(pName) != processName {
 			// PID reused by a different process, clean up stale PID file
 			os.Remove(filepath.Join(pidsDir, name))
 			continue
@@ -405,15 +752,29 @@ func main() {
 	logDir := fs.String("logdir", "", "Log directory (default: <workdir>/log)")
 	logMaxSizeMB := fs.Int("logmaxsizemb", 100, "Max log file size in MB before rotation")
 	logMaxFiles := fs.Int("logmaxfiles", 3, "Max number of log files to keep")
+	heartbeatFile := fs.String("heartbeat-file", "",
+		"File to publish the readiness heartbeat into (disabled when empty)")
+	heartbeatSecs := fs.Int("heartbeat-secs", defaultHeartbeatSecs,
+		"Seconds between health probe rounds")
+	maxMissedHeartbeats := fs.Int("max-missed-heartbeats", defaultMaxMissedHeartbeats,
+		"Consecutive failed probe rounds tolerated before shutting down")
 	fs.Parse(os.Args[1:])
 
-	exe, _ := os.Executable()
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "CRITICAL: cannot resolve own executable path: %v\n", err)
+		os.Exit(1)
+	}
 	baseDir := filepath.Dir(exe)
 
 	// Resolve workdir to absolute
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "CRITICAL: cannot resolve the current directory: %v\n", err)
+		os.Exit(1)
+	}
 	wd := *workDir
 	if !filepath.IsAbs(wd) {
-		cwd, _ := os.Getwd()
 		wd = filepath.Join(cwd, wd)
 	}
 
@@ -429,10 +790,12 @@ func main() {
 		outDir = filepath.Join(wd, "config")
 	}
 	if !filepath.IsAbs(outDir) {
-		cwd, _ := os.Getwd()
 		outDir = filepath.Join(cwd, outDir)
 	}
-	os.MkdirAll(outDir, 0755)
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "CRITICAL: cannot create config dir %s: %v\n", outDir, err)
+		os.Exit(1)
+	}
 
 	// Load or create cpsysconfig.yaml
 	cpSys, err := loadOrCreateCPSysConfig(outDir)
@@ -455,10 +818,12 @@ func main() {
 		ld = filepath.Join(wd, "log")
 	}
 	if !filepath.IsAbs(ld) {
-		cwd, _ := os.Getwd()
 		ld = filepath.Join(cwd, ld)
 	}
-	os.MkdirAll(ld, 0755)
+	if err := os.MkdirAll(ld, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "CRITICAL: cannot create log dir %s: %v\n", ld, err)
+		os.Exit(1)
+	}
 
 	// Setup control-plane's own rotating log (log package → file only)
 	kmLog := newRotatingLog(ld, "control-plane", *logMaxSizeMB, *logMaxFiles)
@@ -477,11 +842,26 @@ func main() {
 		fmt.Println(msg)
 		log.Println(kfmt('I', "%s", msg))
 	}
+	// Warnings and errors were previously logged at 'I' like everything
+	// else, which made a failing probe indistinguishable from progress.
+	warn := func(format string, args ...any) {
+		msg := fmt.Sprintf(format, args...)
+		fmt.Println("WARNING: " + msg)
+		log.Println(kfmt('W', "%s", msg))
+	}
+	fail := func(format string, args ...any) {
+		msg := fmt.Sprintf(format, args...)
+		fmt.Fprintln(os.Stderr, "ERROR: "+msg)
+		log.Println(kfmt('E', "%s", msg))
+	}
 
 	// PID directory — kill stale processes from a previous run
 	pidsDir := filepath.Join(dataDir, "pids")
-	os.MkdirAll(pidsDir, 0755)
-	killStaleProcesses(pidsDir, info)
+	if err := os.MkdirAll(pidsDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "CRITICAL: cannot create pids dir %s: %v\n", pidsDir, err)
+		os.Exit(1)
+	}
+	killStaleProcesses(pidsDir, warn)
 
 	// Write own PID file
 	writePid(filepath.Join(pidsDir, fmt.Sprintf("%d.control-plane", os.Getpid())), os.Getpid())
@@ -502,6 +882,11 @@ func main() {
 	// Check if asset binaries exist next to td_km
 	if _, err := os.Stat(filepath.Join(baseDir, "kube-apiserver"+ext)); os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "CRITICAL: kube-apiserver%s not found next to td_km!\n", ext)
+		os.Exit(1)
+	}
+
+	if _, err := os.Stat(filepath.Join(baseDir, "etcd"+ext)); os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "CRITICAL: etcd%s not found next to td_km!\n", ext)
 		os.Exit(1)
 	}
 
@@ -538,6 +923,14 @@ func main() {
 	info("[+] Generating kubeconfigs...")
 
 	testEnv := &envtest.Environment{
+		// Stated rather than inherited from envtest's 20s default, so the
+		// budget for bringing etcd and the API server up is visible here.
+		ControlPlaneStartTimeout: time.Duration(*heartbeatSecs**maxMissedHeartbeats) * time.Second,
+		// Deliberately short: stopAndCleanPid below force-kills whatever
+		// envtest could not stop, so a long wait here only adds latency to
+		// exactly the case where a child is wedged and will not go quietly —
+		// a dead etcd leaving the API server unable to exit, for instance.
+		ControlPlaneStopTimeout: envtestStopTimeout,
 		ControlPlane: envtest.ControlPlane{
 			APIServer: &envtest.APIServer{
 				Out: apiserverLog,
@@ -567,7 +960,11 @@ func main() {
 	}
 
 	// Write PID files for etcd and kube-apiserver (envtest child processes)
-	writeChildPids(pidsDir)
+	envtestChildren := writeChildPids(pidsDir)
+	if len(envtestChildren) < 2 {
+		warn("found only %d of the 2 envtest children under this process; the rest cannot be watched or reaped by pid",
+			len(envtestChildren))
+	}
 
 	fmt.Println("\n[+] API Server Listening:", cfg.Host)
 
@@ -578,7 +975,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx := context.Background()
+	// Cancelled as main returns; kube-controller-manager is started under it,
+	// so a stop that outlives its SIGTERM still gets killed.
+	ctx, cancelAll := context.WithCancel(context.Background())
+	defer cancelAll()
 
 	// Create kube-node-lease namespace
 	info("[+] Creating kube-node-lease namespace...")
@@ -646,6 +1046,9 @@ func main() {
 	}
 	writePid(filepath.Join(pidsDir, fmt.Sprintf("%d.kube-controller-manager", kcmCmd.Process.Pid)), kcmCmd.Process.Pid)
 	info("[+] kube-controller-manager started (pid: %d)", kcmCmd.Process.Pid)
+	// This process owns kcm, so its exit status is available — unlike the
+	// envtest pair, which can only be checked by pid.
+	kcmExited := watchExit(kcmName, kcmCmd)
 
 	// Generate VK kubeconfig
 	vkConfigPath := filepath.Join(outDir, "vk-kubeconfig.yaml")
@@ -668,18 +1071,162 @@ func main() {
 	info("\n[+] Cluster is ready!")
 	info("Press Ctrl+C to stop.")
 
-	// Wait for interrupt
+	// Supervise the children from here on. Each round probes all three and
+	// republishes the heartbeat km watches; km never probes them itself,
+	// since only this process knows the port envtest gave etcd.
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	<-sigChan
+
+	// Derived from ctx so a shutdown aborts an in-flight probe at once,
+	// separate from ctx so it does not kill kube-controller-manager before
+	// its graceful stop below.
+	probeCtx, cancelProbes := context.WithCancel(ctx)
+
+	plainClient := &http.Client{}
+	// kube-controller-manager serves HTTPS with a certificate it generates
+	// for itself, so there is no CA to pin: verification is skipped for the
+	// health probe, which carries no credentials and reads no data.
+	selfSignedClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	etcdAddr := testEnv.ControlPlane.Etcd.URL.Host
+	listeners := []childListener{
+		{name: "etcd", addr: etcdAddr},
+		{name: "kube-apiserver", addr: net.JoinHostPort("127.0.0.1", *port)},
+		{name: kcmName, addr: net.JoinHostPort("127.0.0.1", *kcmPort)},
+	}
+
+	probes := []childProbe{
+		{
+			name:  "etcd",
+			check: httpProbe(plainClient, testEnv.ControlPlane.Etcd.URL.String()+etcdHealthPath),
+		},
+		{
+			// The API server is probed through the same authenticated client
+			// the cluster uses, so this also proves tokens.csv still matches.
+			name: "kube-apiserver",
+			check: func(ctx context.Context) error {
+				_, err := client.Discovery().RESTClient().
+					Get().AbsPath(apiServerReadyzPath).DoRaw(ctx)
+				return err
+			},
+		},
+		{
+			name: kcmName,
+			check: httpProbe(selfSignedClient,
+				fmt.Sprintf("https://127.0.0.1:%s%s", *kcmPort, kcmHealthPath)),
+		},
+	}
+
+	interval := time.Duration(*heartbeatSecs) * time.Second
+	info("[+] Probing %d children every %ds, %d missed rounds tolerated",
+		len(probes), *heartbeatSecs, *maxMissedHeartbeats)
+	addrs := make([]string, 0, len(listeners))
+	for _, listener := range listeners {
+		addrs = append(addrs, listener.addr)
+	}
+	info("[+] Checking listeners every %s: %s", processTick, strings.Join(addrs, " "))
+	pids := make([]string, 0, len(envtestChildren))
+	for _, child := range envtestChildren {
+		pids = append(pids, fmt.Sprintf("%s(%d)", child.name, child.pid))
+	}
+	info("[+] Checking child pids every %ds: %s", *heartbeatSecs, strings.Join(pids, " "))
+	info("[+] Watching %s(%d) continuously (this process owns it)", kcmName, kcmCmd.Process.Pid)
+	if *heartbeatFile == "" {
+		info("[+] No -heartbeat-file given; readiness heartbeat disabled")
+	}
+
+	exitCode := 0
+	missed := 0
+	everHealthy := false
+	shuttingDown := false
+	// Two cadences in one loop: the children are checked for still being
+	// processes every tick, while the probe round runs when it comes due.
+	nextRound := time.Now()
+	// A child found definitively lost is handled the same wherever it is
+	// noticed: say so, publish it, and stop.
+	lost := func(detail string) {
+		fail("%s; shutting down the control plane", detail)
+		writeHeartbeat(*heartbeatFile, statusDegraded, detail, warn)
+		exitCode = 1
+	}
+
+	for !shuttingDown {
+		// Cheap checks, every tick. A definitive loss does not go through the
+		// miss budget: there is nothing to wait for and nothing left to probe.
+		if death := childLost(kcmExited, listeners, everHealthy); death != "" {
+			lost(death)
+			break
+		}
+
+		if !time.Now().Before(nextRound) {
+			// Costly checks, once per round.
+			if death := deadChildProcess(envtestChildren); death != "" {
+				lost(death)
+				break
+			}
+			detail, gone := probeAll(probeCtx, probes)
+			// Once a child has been healthy, a refused connection means its
+			// listener is gone for good — no point spending the miss budget.
+			if gone && everHealthy {
+				lost(detail)
+				break
+			}
+			var action monitorAction
+			missed, action = monitorRound(detail, missed, *maxMissedHeartbeats)
+
+			if detail == "" {
+				if !everHealthy {
+					info("[+] All children healthy")
+					everHealthy = true
+				}
+				writeHeartbeat(*heartbeatFile, statusReady, "", warn)
+			} else {
+				// Before the first healthy round this is just a child still
+				// binding its port, not a fault worth a warning.
+				if everHealthy {
+					warn("health probe round failed (%d/%d): %s", missed, *maxMissedHeartbeats, detail)
+				} else {
+					info("[.] Waiting for children (%d/%d): %s", missed, *maxMissedHeartbeats, detail)
+				}
+				writeHeartbeat(*heartbeatFile, statusDegraded, detail, warn)
+			}
+
+			if action == actionShutdown {
+				fail("%d consecutive failed probe rounds; shutting down the control plane", missed)
+				exitCode = 1
+				break
+			}
+			nextRound = time.Now().Add(probeWait(everHealthy, interval))
+		}
+
+		select {
+		case <-sigChan:
+			info("\n[+] Shutdown requested")
+			cancelProbes()
+			shuttingDown = true
+		case <-time.After(tickWait(time.Until(nextRound), processTick)):
+		}
+	}
+	cancelProbes()
 
 	info("\n[+] Shutting down...")
 
-	// Stop kube-controller-manager
-	if kcmCmd.Process != nil {
+	// Stop kube-controller-manager. The watcher goroutine owns Wait(), so take
+	// its result rather than calling Wait() again, which would error — and skip
+	// the whole dance when it has already exited and been reaped.
+	if kcmCmd.Process != nil && !processGone(kcmName, kcmCmd.Process.Pid) {
 		info("[+] Stopping kube-controller-manager...")
-		kcmCmd.Process.Signal(syscall.SIGTERM)
-		kcmCmd.Wait()
+		if err := kcmCmd.Process.Signal(syscall.SIGTERM); err != nil {
+			warn("cannot signal kube-controller-manager: %v", err)
+		}
+		select {
+		case <-kcmExited:
+		case <-time.After(kcmStopTimeout):
+			warn("kube-controller-manager did not exit within %s", kcmStopTimeout)
+		}
 	}
 
 	// Stop the test environment (etcd + kube-apiserver)
@@ -701,4 +1248,8 @@ func main() {
 	os.Remove(pidsDir)
 
 	info("[+] Stopped successfully")
+
+	if exitCode != 0 {
+		os.Exit(exitCode)
+	}
 }

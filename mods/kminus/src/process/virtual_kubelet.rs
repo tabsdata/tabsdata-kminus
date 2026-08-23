@@ -2,30 +2,26 @@
 
 //! Virtual-kubelet subprocess: startup, readiness, status gathering.
 
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
 
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::config::KmSysConfig;
-use crate::system::file::wait_for_file;
-use crate::system::pid::{apply_subprocess_flags, pids_dir, write_pid};
+use crate::process::{control_plane, pod_runner};
+use crate::system::heartbeat::{self, heartbeat_file};
+use crate::system::pid::{apply_subprocess_flags, kill_child, pids_dir, remove_pid, write_pid};
 use crate::system::proc::resolve_binary;
 
 /// Binary name for the virtual-kubelet subprocess.
 pub const BIN: &str = "virtual-kubelet";
 
-/// How long to wait for the kubelet API port to start accepting connections.
-const PORT_READY_TIMEOUT: Duration = Duration::from_secs(15);
-/// Interval between readiness checks.
-const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// Per-attempt TCP connect timeout for the kubelet port probe.
-const PORT_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
-
-/// Spawn the virtual-kubelet, then wait until its kubelet API port is
-/// accepting connections (the process is up and serving) before returning.
+/// Spawn the virtual-kubelet and wait until it reports itself ready in
+/// its heartbeat file — which it writes only while its node is
+/// registered with the API server and its status sync is running. Exits
+/// the process on failure, rather than leaving km to report a ready
+/// stack over a dead kubelet.
+#[allow(clippy::too_many_arguments)]
 pub fn start(
     workdir: &Path,
     configdir: &Path,
@@ -35,11 +31,16 @@ pub fn start(
     port_vk: &str,
     vk_kubeconfig: &Path,
     vk_prconfig: &Path,
+    cp: &mut Child,
+    pr: &mut Child,
 ) -> Child {
     info!("Starting {}...", BIN);
     let vk_bin = resolve_binary(BIN);
     let log_max_size = sys_cfg.log.max_size_mb.to_string();
     let log_max_files = sys_cfg.log.max_files.to_string();
+    let heartbeat = heartbeat_file(workdir, BIN);
+    let heartbeat_secs = sys_cfg.heartbeat.interval().as_secs().to_string();
+    heartbeat::clear(&heartbeat);
     let mut command = Command::new(&vk_bin);
     command
         .env("KUBECONFIG", vk_kubeconfig)
@@ -57,66 +58,44 @@ pub fn start(
             &log_max_files,
             "--kubelet-port",
             port_vk,
+            "--heartbeat-file",
+            heartbeat.to_str().unwrap(),
+            "--heartbeat-secs",
+            &heartbeat_secs,
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     apply_subprocess_flags(&mut command);
-    let vk = command
+    let mut vk = command
         .spawn()
         .unwrap_or_else(|e| panic!("Failed to start {}: {}", BIN, e));
 
     write_pid(pids, BIN, vk.id());
 
-    let vk_pids_dir = pids_dir_in(workdir);
-    if !wait_for_file(&vk_pids_dir, Duration::from_secs(15)) {
-        warn!("{} may not have fully started, continuing...", BIN);
+    if !heartbeat::wait_until_ready(BIN, &heartbeat, sys_cfg.heartbeat.startup_timeout()) {
+        // Claimed before the children are killed below, so the process
+        // watcher does not report those kills as a liveness failure.
+        if !crate::exit::claim() {
+            std::process::exit(1);
+        }
+        crate::exit::report(&crate::exit::ExitReason::Readiness {
+            component: BIN,
+            detail: format!(
+                "did not report ready within {}s ({})",
+                sys_cfg.heartbeat.startup_timeout().as_secs(),
+                heartbeat.display()
+            ),
+        });
+        kill_child(&mut vk, BIN);
+        kill_child(pr, pod_runner::BIN);
+        kill_child(cp, control_plane::BIN);
+        for name in [BIN, pod_runner::BIN, control_plane::BIN] {
+            remove_pid(pids, name);
+        }
+        std::process::exit(1);
     }
-    wait_until_ready(port_vk, vk.id());
-    info!(pid = vk.id(), "{} started", BIN);
+    info!(pid = vk.id(), "{} ready", BIN);
     vk
-}
-
-/// Poll until the virtual-kubelet's kubelet API port accepts a TCP
-/// connection — i.e. the process is up and serving — or the timeout elapses.
-/// Replaces a fixed warm-up sleep, so startup returns as soon as the VK is
-/// serving rather than after a worst-case delay.
-fn wait_until_ready(port_vk: &str, pid: u32) {
-    let start = Instant::now();
-    let deadline = start + PORT_READY_TIMEOUT;
-    loop {
-        if kubelet_port_open(port_vk) {
-            info!(
-                pid,
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                "{} kubelet port ready",
-                BIN
-            );
-            return;
-        }
-        if Instant::now() >= deadline {
-            warn!(
-                pid,
-                "{} kubelet port {} not accepting connections after {}s; continuing",
-                BIN,
-                port_vk,
-                PORT_READY_TIMEOUT.as_secs()
-            );
-            return;
-        }
-        std::thread::sleep(READY_POLL_INTERVAL);
-    }
-}
-
-/// Whether the kubelet API port accepts a TCP connection on loopback.
-fn kubelet_port_open(port_vk: &str) -> bool {
-    let Ok(port) = port_vk.parse::<u16>() else {
-        return false;
-    };
-    TcpStream::connect_timeout(
-        &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-        PORT_CONNECT_TIMEOUT,
-    )
-    .is_ok()
 }
 
 /// The virtual-kubelet's pids directory under `<workdir>/data/<BIN>/pids`.

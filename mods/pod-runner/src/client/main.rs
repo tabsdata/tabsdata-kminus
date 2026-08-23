@@ -3,15 +3,14 @@
 //! `kpr` — HTTP client CLI for a running Pod Runner server.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
-use reqwest::Certificate;
 
 use pod_runner::client::config::VKPRConfig;
-use pod_runner::tls::resolve_cert_bytes;
+use pod_runner::client::http::build_client;
 
 // ---------------------------------------------------------------------------
 // Exit codes
@@ -196,63 +195,6 @@ enum Command {
 
     /// Prometheus metrics (HTTP only).
     Metrics,
-}
-
-// ---------------------------------------------------------------------------
-// HTTP client builder
-// ---------------------------------------------------------------------------
-
-fn build_client(config: &Option<VKPRConfig>) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder();
-
-    if let Some(config) = config {
-        // TLS verification
-        if config.server.tls.insecure_skip_tls_verify {
-            builder = builder.danger_accept_invalid_certs(true);
-        } else {
-            // Add server CA certificate
-            let ca_bytes = resolve_cert_bytes(
-                Path::new(&config.server.tls.certificate_authority),
-                &config.server.tls.certificate_authority_data,
-            )
-            .map_err(|e| format!("Server CA: {e}"))?;
-
-            if let Some(pem) = ca_bytes {
-                let cert = Certificate::from_pem(&pem)
-                    .map_err(|e| format!("Server CA: invalid PEM: {e}"))?;
-                builder = builder.add_root_certificate(cert);
-            }
-        }
-
-        // Client certificate for mTLS
-        if let Some(client_cfg) = config.client.as_ref() {
-            let cert_bytes = resolve_cert_bytes(
-                Path::new(&client_cfg.certificate),
-                &client_cfg.certificate_data,
-            )
-            .map_err(|e| format!("Client cert: {e}"))?;
-
-            let key_bytes = resolve_cert_bytes(
-                Path::new(&client_cfg.certificate_key),
-                &client_cfg.certificate_key_data,
-            )
-            .map_err(|e| format!("Client key: {e}"))?;
-
-            if let (Some(cert), Some(key)) = (cert_bytes, key_bytes) {
-                // reqwest expects a combined PEM (cert + key) for Identity
-                let mut combined = cert;
-                combined.push(b'\n');
-                combined.extend_from_slice(&key);
-                let identity = reqwest::Identity::from_pem(&combined)
-                    .map_err(|e| format!("Client identity: {e}"))?;
-                builder = builder.identity(identity);
-            }
-        }
-    }
-
-    builder
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {e}"))
 }
 
 // ---------------------------------------------------------------------------

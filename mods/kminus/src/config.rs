@@ -8,6 +8,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +26,14 @@ pub const KM_PORT_COUNT: u16 = 5;
 /// instance's [`KM_PORT_COUNT`] consecutive ports past the top of the
 /// port space.
 pub const MAX_PORTSTART: u16 = u16::MAX - (KM_PORT_COUNT - 1);
+
+/// Default heartbeat interval, in seconds: how often every component
+/// re-verifies itself and rewrites its heartbeat file.
+pub const DEFAULT_HEARTBEAT_SECS: u32 = 15;
+
+/// Default number of consecutive missed heartbeats tolerated before a
+/// component is declared dead.
+pub const DEFAULT_MAX_MISSED_HEARTBEATS: u32 = 4;
 
 /// Label suffix for the control-plane's API server port.
 const API_SERVER_LABEL: &str = "API server";
@@ -107,11 +116,66 @@ pub struct KmLog {
     pub max_files: u32,
 }
 
+/// Heartbeat settings persisted in `kmsysconfig.yaml`. Shared by km and,
+/// forwarded on the command line, by every component it supervises.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KmHeartbeat {
+    #[serde(default = "default_heartbeat_secs", rename = "intervalSecs")]
+    pub interval_secs: u32,
+    #[serde(default = "default_max_missed", rename = "maxMissed")]
+    pub max_missed: u32,
+}
+
+fn default_heartbeat_secs() -> u32 {
+    DEFAULT_HEARTBEAT_SECS
+}
+
+fn default_max_missed() -> u32 {
+    DEFAULT_MAX_MISSED_HEARTBEATS
+}
+
+impl Default for KmHeartbeat {
+    fn default() -> Self {
+        Self {
+            interval_secs: DEFAULT_HEARTBEAT_SECS,
+            max_missed: DEFAULT_MAX_MISSED_HEARTBEATS,
+        }
+    }
+}
+
+impl KmHeartbeat {
+    /// Interval between heartbeats. A configured 0 would spin every
+    /// component and every monitor, so it falls back to the default.
+    pub fn interval(&self) -> Duration {
+        let secs = if self.interval_secs == 0 {
+            DEFAULT_HEARTBEAT_SECS
+        } else {
+            self.interval_secs
+        };
+        Duration::from_secs(secs as u64)
+    }
+
+    /// Consecutive misses tolerated. 0 would fail a component before it
+    /// could ever beat, so the floor is 1.
+    pub fn max_missed(&self) -> u32 {
+        self.max_missed.max(1)
+    }
+
+    /// How long a component gets to report ready at startup: the same
+    /// budget the monitor gives it to stay ready afterwards.
+    pub fn startup_timeout(&self) -> Duration {
+        self.interval() * self.max_missed()
+    }
+}
+
 /// Full km system configuration.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KmSysConfig {
     pub log: KmLog,
     pub ports: KmPorts,
+    /// Absent in files written before heartbeats existed: defaulted.
+    #[serde(default)]
+    pub heartbeat: KmHeartbeat,
 }
 
 impl KmSysConfig {
@@ -124,6 +188,7 @@ impl KmSysConfig {
                 max_files: 3,
             },
             ports: KmPorts::from_portstart(portstart)?,
+            heartbeat: KmHeartbeat::default(),
         })
     }
 
@@ -144,11 +209,13 @@ impl KmSysConfig {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         fs::create_dir_all(configdir)?;
         let header = "# km system configuration.\n\
-            # Log rotation settings and ports for the kminus stack.\n\
+            # Log rotation, ports and heartbeat settings for the kminus stack.\n\
+            # heartbeat.intervalSecs: how often each component re-verifies\n\
+            # itself; heartbeat.maxMissed: consecutive misses tolerated\n\
+            # before the stack is torn down.\n\
             # A port value of 0 means: pick a free random port on startup\n\
             # (the file value stays 0; resolution happens in memory only).\n\n";
-        let body = serde_yaml::to_string(&cfg)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let body = serde_yaml::to_string(&cfg).map_err(|e| std::io::Error::other(e.to_string()))?;
         fs::write(&path, format!("{}{}", header, body))?;
         Ok(cfg)
     }
@@ -284,6 +351,57 @@ mod tests {
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
         assert!(!dir.join(KM_SYSCONFIG_FILE).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heartbeat_defaults_are_the_documented_ones() {
+        let hb = KmHeartbeat::default();
+        assert_eq!(hb.interval_secs, DEFAULT_HEARTBEAT_SECS);
+        assert_eq!(hb.max_missed, DEFAULT_MAX_MISSED_HEARTBEATS);
+        assert_eq!(hb.interval(), Duration::from_secs(15));
+        assert_eq!(hb.max_missed(), 4);
+        assert_eq!(hb.startup_timeout(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn heartbeat_rejects_degenerate_values() {
+        let hb = KmHeartbeat {
+            interval_secs: 0,
+            max_missed: 0,
+        };
+        // A 0 interval would spin; 0 misses would fail before the first beat.
+        assert_eq!(
+            hb.interval(),
+            Duration::from_secs(DEFAULT_HEARTBEAT_SECS as u64)
+        );
+        assert_eq!(hb.max_missed(), 1);
+    }
+
+    #[test]
+    fn load_defaults_heartbeat_when_the_section_is_absent() {
+        let dir = tempdir();
+        let yaml = "log:\n  maxSizeMB: 50\n  maxFiles: 7\n\
+                    ports:\n  api: 9000\n  kcm: 9001\n  pr: 9002\n  prMetrics: 9003\n  vk: 9004\n";
+        fs::write(dir.join(KM_SYSCONFIG_FILE), yaml).unwrap();
+
+        let cfg = KmSysConfig::load(&dir).unwrap();
+        assert_eq!(cfg.heartbeat, KmHeartbeat::default());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_reads_configured_heartbeat_values() {
+        let dir = tempdir();
+        let yaml = "log:\n  maxSizeMB: 50\n  maxFiles: 7\n\
+                    ports:\n  api: 9000\n  kcm: 9001\n  pr: 9002\n  prMetrics: 9003\n  vk: 9004\n\
+                    heartbeat:\n  intervalSecs: 5\n  maxMissed: 2\n";
+        fs::write(dir.join(KM_SYSCONFIG_FILE), yaml).unwrap();
+
+        let cfg = KmSysConfig::load(&dir).unwrap();
+        assert_eq!(cfg.heartbeat.interval(), Duration::from_secs(5));
+        assert_eq!(cfg.heartbeat.max_missed(), 2);
+        assert_eq!(cfg.heartbeat.startup_timeout(), Duration::from_secs(10));
         let _ = fs::remove_dir_all(&dir);
     }
 
