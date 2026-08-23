@@ -40,7 +40,7 @@ use system::pid::{
     BIN_KM, cleanup_stale_pids, is_alive, kill_descendants, pids_dir, read_pid, remove_pid,
     terminate_process, write_pid,
 };
-use system::port::check_ports;
+use system::port::{PortCheck, check_ports, port_failures};
 
 /// Filename of km's own log file under `<logdir>/`.
 const KM_LOG_FILE: &str = "km.log";
@@ -599,13 +599,27 @@ fn shutdown_from_pids(paths: &Paths) {
 /// 0 would silently exempt the fixed ports of a hand-edited config that
 /// mixes the two.
 fn verify_ports_free(ports: &KmPorts) {
-    if let Err(port_errors) = check_ports(&ports.labeled()) {
-        for e in &port_errors {
-            error!("{}", e);
-        }
-        error!("Cannot start: {} port(s) in use", port_errors.len());
-        std::process::exit(1);
+    let checks = check_ports(&ports.labeled());
+
+    println!();
+    print_ports(ports, Some(&checks));
+
+    if checks.iter().all(PortCheck::is_free) {
+        info!(ports = checks.len(), "All ports free");
+        return;
     }
+    let failures = port_failures(&checks);
+    // Printed as well as logged. This is the most common reason a start does
+    // not happen, and it used to reach only km.log — so `km start` exited
+    // non-zero having said nothing at all to the terminal it was run from.
+    println!();
+    for failure in &failures {
+        eprintln!("ERROR: {failure}");
+        error!("{}", failure);
+    }
+    eprintln!("Cannot start: {} port(s) unusable", failures.len());
+    error!("Cannot start: {} port(s) unusable", failures.len());
+    std::process::exit(1);
 }
 
 /// Slice the monitor sleeps in, so a shutdown request is noticed promptly
@@ -857,16 +871,35 @@ fn clear_regenerated_configs(configdir: &Path) {
 
 /// Print the `label  port` block of a create summary, or a one-liner
 /// when `portstart` is 0 and ports are drawn randomly at every start.
-fn print_port_plan(portstart: u16, ports: &KmPorts) {
+fn print_port_plan(portstart: u16, ports: &KmPorts, checks: Option<&[PortCheck]>) {
     if portstart == 0 {
         println!("  ports      random free ports at every start");
         return;
     }
+    print_ports(ports, checks);
+}
+
+/// Print one row per port the instance will occupy, with the result of the
+/// availability check beside it when one has been run.
+///
+/// The whole list is printed whether or not the check passed. Passing, it is
+/// how an operator confirms which ports this instance takes and that the
+/// `kmsysconfig.yaml` being read is the one they edited — neither of which is
+/// visible anywhere else. Failing, the whole list beats the first conflict
+/// followed by another run to discover the next.
+fn print_ports(ports: &KmPorts, checks: Option<&[PortCheck]>) {
     let labeled = ports.labeled();
     let width = labeled.iter().map(|(_, l)| l.len()).max().unwrap_or(0);
     for (i, (port, label)) in labeled.iter().enumerate() {
         let head = if i == 0 { "  ports    " } else { "           " };
-        println!("{head}  {label:width$}  {port}");
+        let status = match checks.and_then(|c| c.get(i)) {
+            None => String::new(),
+            Some(check) => match &check.reason {
+                None => "  free".to_string(),
+                Some(reason) => format!("  IN USE ({reason})"),
+            },
+        };
+        println!("{head}  {label:width$}  {port}{status}");
     }
 }
 
@@ -881,14 +914,15 @@ fn command_create(args: CreateArgs) {
 
     // Ports first, as the check most likely to collide with another
     // instance — no folder is created if the range is unusable.
+    let mut checks: Option<Vec<PortCheck>> = None;
     let ports = match KmPorts::from_portstart(args.portstart) {
         Ok(ports) => {
             // portstart 0 means "random free ports at every start":
             // there is no fixed range to check now.
-            if args.portstart != 0
-                && let Err(mut in_use) = check_ports(&ports.labeled())
-            {
-                errors.append(&mut in_use);
+            if args.portstart != 0 {
+                let run = check_ports(&ports.labeled());
+                errors.extend(port_failures(&run));
+                checks = Some(run);
             }
             Some(ports)
         }
@@ -907,6 +941,13 @@ fn command_create(args: CreateArgs) {
     };
 
     if !errors.is_empty() {
+        // The check comes before the complaints: which ports were tried, and
+        // which of them are the problem.
+        if let Some(ports) = &ports {
+            println!();
+            print_port_plan(args.portstart, ports, checks.as_deref());
+        }
+        println!();
         for e in &errors {
             eprintln!("ERROR: {e}");
         }
@@ -923,7 +964,7 @@ fn command_create(args: CreateArgs) {
         println!();
         println!("  workdir    {}", targets.workdir.display());
         println!("  configdir  {}", targets.configdir.display());
-        print_port_plan(args.portstart, &ports);
+        print_port_plan(args.portstart, &ports, checks.as_deref());
         println!();
         println!("Nothing was created. Re-run without --dryrun to create it.");
         return;
@@ -948,7 +989,7 @@ fn command_create(args: CreateArgs) {
     }
     println!("  workdir    {}", paths.workdir.display());
     println!("  configdir  {}", paths.configdir.display());
-    print_port_plan(args.portstart, &ports);
+    print_port_plan(args.portstart, &ports, checks.as_deref());
     println!();
     println!(
         "Edit '{}' to customize ports or log settings, then run:",
@@ -1012,14 +1053,16 @@ fn command_start(args: StartArgs) {
     let port_pr_metrics = sys_cfg.ports.pr_metrics.to_string();
     let port_vk = sys_cfg.ports.vk.to_string();
 
-    verify_ports_free(&sys_cfg.ports);
-
     println!();
     if random_ports_allocated {
         println!("Tabsdata K- (K minus) starting (random ports)");
     } else {
         println!("Tabsdata K- (K minus) starting");
     }
+
+    // After the banner, before anything is spawned: the port table is the
+    // first thing the start reports, and on a clash it is the only thing.
+    verify_ports_free(&sys_cfg.ports);
     println!();
 
     if fixed_auth_token_enabled() {
