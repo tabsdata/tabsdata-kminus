@@ -170,3 +170,55 @@ fn a_free_port_has_no_message() {
     assert!(check.is_free());
     assert!(check.message().is_none());
 }
+
+// -- probe_ports -------------------------------------------------------------
+
+// The plain bind test: one result per pair, no cross-checking, so a port
+// listed twice reports its real state both times rather than the second
+// being called a duplicate. Confirming a port was released depends on this.
+#[test]
+fn probe_ports_does_not_treat_a_repeat_as_a_duplicate() {
+    retry_until_ok(|| {
+        let shared = find_free_port();
+        let probed = probe_ports(&[(shared, "first"), (shared, "second")]);
+        if !probed[0].is_free() {
+            return Err(port_failures(&probed));
+        }
+        assert!(
+            probed[1].is_free(),
+            "probe_ports flagged the repeat: {:?}",
+            probed[1].reason
+        );
+
+        // check_ports, by contrast, is meant to catch exactly that.
+        let checked = check_ports(&[(shared, "first"), (shared, "second")]);
+        assert!(!checked[1].is_free(), "check_ports missed the duplicate");
+        Ok(())
+    });
+}
+
+#[test]
+fn probe_ports_reports_a_held_port() {
+    let busy = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = busy.local_addr().unwrap().port();
+
+    let probed = probe_ports(&[(port, "held")]);
+
+    assert_eq!(probed.len(), 1);
+    assert!(!probed[0].is_free());
+    assert_eq!(probed[0].label, "held");
+}
+
+#[test]
+fn probe_ports_keeps_order_and_labels() {
+    let busy = TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = busy.local_addr().unwrap().port();
+    let free = find_free_port();
+
+    let probed = probe_ports(&[(taken, "one"), (free, "two")]);
+
+    assert_eq!(probed[0].port, taken);
+    assert_eq!(probed[0].label, "one");
+    assert_eq!(probed[1].port, free);
+    assert_eq!(probed[1].label, "two");
+}

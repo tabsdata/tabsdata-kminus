@@ -40,7 +40,7 @@ use system::pid::{
     BIN_KM, cleanup_stale_pids, is_alive, kill_descendants, pids_dir, read_pid, remove_pid,
     terminate_process, write_pid,
 };
-use system::port::{PortCheck, check_ports, port_failures};
+use system::port::{PortCheck, check_ports, port_failures, probe_ports};
 
 /// Filename of km's own log file under `<logdir>/`.
 const KM_LOG_FILE: &str = "km.log";
@@ -499,7 +499,7 @@ fn print_status(
 ///
 /// Returns once the handlers are installed, closing the window where an
 /// early signal would hit the default disposition.
-fn install_signal_shutdown(paths: Paths) {
+fn install_signal_shutdown(paths: Paths, ports: KmPorts) {
     let (armed_tx, armed_rx) = std::sync::mpsc::channel::<()>();
     std::thread::Builder::new()
         .name("km-signal".into())
@@ -515,7 +515,7 @@ fn install_signal_shutdown(paths: Paths) {
                 return;
             }
             exit::report(&ExitReason::Signal(signal));
-            shutdown_from_pids(&paths);
+            shutdown_from_pids(&paths, Some(&ports));
             std::process::exit(130);
         })
         .expect("spawn km-signal thread");
@@ -548,7 +548,70 @@ fn shutdown_grace_for(name: &str) -> Duration {
     }
 }
 
-fn shutdown_from_pids(paths: &Paths) {
+/// How long km waits after the stack is down for its ports to become
+/// bindable again. Generous: the point is to outlast the kernel finishing
+/// with a socket, not to give a leaked one time to go away.
+const PORT_RELEASE_WAIT: Duration = Duration::from_secs(30);
+
+/// How often the release wait re-tests the ports.
+const PORT_RELEASE_TICK: Duration = Duration::from_millis(250);
+
+/// Re-test `labeled` until every port is free or `deadline` passes, and
+/// return the last observation either way.
+///
+/// Probed rather than checked: the same port assigned to two components is a
+/// configuration error, and treating the repeat as a duplicate here would
+/// only stop it ever reading as released.
+fn await_port_release(labeled: &[(u16, String)], deadline: Instant) -> Vec<PortCheck> {
+    let mut checks = probe_ports(labeled);
+    while !checks.iter().all(PortCheck::is_free) && Instant::now() < deadline {
+        std::thread::sleep(PORT_RELEASE_TICK);
+        checks = probe_ports(labeled);
+    }
+    checks
+}
+
+/// Wait for every port the stack bound to become bindable again, then report
+/// what came back.
+///
+/// A component's port can outlive the component: the kernel takes a moment to
+/// finish with a socket, and anything the component spawned that inherited
+/// one keeps it open for as long as it lives. Either way the next `km start`
+/// fails its own port check for reasons that have nothing to do with the new
+/// run, so it is worth saying here, while the instance that owned the port is
+/// still the obvious suspect.
+///
+/// Reports and returns either way. A port that never comes back is not a
+/// reason to hold the exit open — km has already stopped everything it knows
+/// about, and the name in the table is the useful part.
+fn wait_for_ports_released(ports: &KmPorts) {
+    let labeled = ports.labeled();
+    let checks = await_port_release(&labeled, Instant::now() + PORT_RELEASE_WAIT);
+
+    println!();
+    print_ports(ports, Some(&checks), PORTS_AFTER_STOP);
+
+    let held: Vec<String> = checks
+        .iter()
+        .filter(|c| !c.is_free())
+        .map(|c| format!("{} port {}", c.label, c.port))
+        .collect();
+    if held.is_empty() {
+        info!(ports = checks.len(), "All ports released");
+        return;
+    }
+    let note = format!(
+        "{} port(s) still held after {}s: {}",
+        held.len(),
+        PORT_RELEASE_WAIT.as_secs(),
+        held.join(", ")
+    );
+    println!();
+    eprintln!("WARNING: {note}");
+    warn!("{}", note);
+}
+
+fn shutdown_from_pids(paths: &Paths, ports: Option<&KmPorts>) {
     info!("Shutting down...");
 
     for name in [virtual_kubelet::BIN, pod_runner::BIN, control_plane::BIN] {
@@ -583,6 +646,12 @@ fn shutdown_from_pids(paths: &Paths) {
     messages::report(&paths.workdir, messages::Phase::Start);
     messages::report(&paths.workdir, messages::Phase::Stop);
 
+    // Last, because it is the only step that can take time, and because the
+    // answer is only meaningful once everything above has gone.
+    if let Some(ports) = ports {
+        wait_for_ports_released(ports);
+    }
+
     info!("Stopped");
 }
 
@@ -602,7 +671,7 @@ fn verify_ports_free(ports: &KmPorts) {
     let checks = check_ports(&ports.labeled());
 
     println!();
-    print_ports(ports, Some(&checks));
+    print_ports(ports, Some(&checks), PORTS_BEFORE_START);
 
     if checks.iter().all(PortCheck::is_free) {
         info!(ports = checks.len(), "All ports free");
@@ -753,7 +822,7 @@ fn last_reported(paths: &Paths, name: &str) -> Option<String> {
 /// km is still gating on a later one goes unnoticed until that gate times
 /// out: the full startup budget spent waiting, and then the failure reported
 /// against the wrong component.
-fn watch_spawned_processes(paths: Paths) {
+fn watch_spawned_processes(paths: Paths, ports: KmPorts) {
     std::thread::Builder::new()
         .name("km-procwatch".into())
         .spawn(move || {
@@ -767,7 +836,7 @@ fn watch_spawned_processes(paths: Paths) {
                         Some(detail) => format!("process {pid} is gone (last reported: {detail})"),
                         None => format!("process {pid} is gone"),
                     };
-                    fail_stack(&paths, name, &reason);
+                    fail_stack(&paths, &ports, name, &reason);
                 }
             }
         })
@@ -781,7 +850,12 @@ fn watch_spawned_processes(paths: Paths) {
 /// and the component's heartbeat file, which catches a process that is alive
 /// but no longer serving. Never returns: a component failure exits 1 here, a
 /// signal exits from the km-signal thread.
-fn monitor_stack(paths: &Paths, hb: &KmHeartbeat, children: Vec<(&'static str, Child)>) -> ! {
+fn monitor_stack(
+    paths: &Paths,
+    ports: &KmPorts,
+    hb: &KmHeartbeat,
+    children: Vec<(&'static str, Child)>,
+) -> ! {
     let interval = hb.interval();
     let max_missed = hb.max_missed();
     let stale_after = heartbeat::stale_after(interval);
@@ -816,7 +890,7 @@ fn monitor_stack(paths: &Paths, hb: &KmHeartbeat, children: Vec<(&'static str, C
             stand_down();
         }
         if let Some((name, reason)) = monitor_round(&mut watched) {
-            fail_stack(paths, name, &reason);
+            fail_stack(paths, ports, name, &reason);
         }
     }
 }
@@ -834,7 +908,7 @@ fn stand_down() -> ! {
 /// reach teardown, so the flag is claimed first: whoever gets it drives the
 /// shutdown and the exit code, and the others stand down rather than tearing
 /// down a second time over the top.
-fn fail_stack(paths: &Paths, name: &'static str, reason: &str) -> ! {
+fn fail_stack(paths: &Paths, ports: &KmPorts, name: &'static str, reason: &str) -> ! {
     if !exit::claim() {
         stand_down();
     }
@@ -842,7 +916,7 @@ fn fail_stack(paths: &Paths, name: &'static str, reason: &str) -> ! {
         component: name,
         detail: reason.to_string(),
     });
-    shutdown_from_pids(paths);
+    shutdown_from_pids(paths, Some(ports));
     std::process::exit(1);
 }
 
@@ -876,8 +950,28 @@ fn print_port_plan(portstart: u16, ports: &KmPorts, checks: Option<&[PortCheck]>
         println!("  ports      random free ports at every start");
         return;
     }
-    print_ports(ports, checks);
+    print_ports(ports, checks, PORTS_BEFORE_START);
 }
+
+/// How the status column is worded. Checking before a start asks whether a
+/// port is free; confirming after a stop asks whether it came back.
+#[derive(Clone, Copy)]
+struct PortWording {
+    free: &'static str,
+    busy: &'static str,
+}
+
+/// Wording for the check that runs before anything is spawned.
+const PORTS_BEFORE_START: PortWording = PortWording {
+    free: "free",
+    busy: "IN USE",
+};
+
+/// Wording for the confirmation that runs once the stack is down.
+const PORTS_AFTER_STOP: PortWording = PortWording {
+    free: "released",
+    busy: "STILL IN USE",
+};
 
 /// Print one row per port the instance will occupy, with the result of the
 /// availability check beside it when one has been run.
@@ -887,7 +981,7 @@ fn print_port_plan(portstart: u16, ports: &KmPorts, checks: Option<&[PortCheck]>
 /// `kmsysconfig.yaml` being read is the one they edited — neither of which is
 /// visible anywhere else. Failing, the whole list beats the first conflict
 /// followed by another run to discover the next.
-fn print_ports(ports: &KmPorts, checks: Option<&[PortCheck]>) {
+fn print_ports(ports: &KmPorts, checks: Option<&[PortCheck]>, wording: PortWording) {
     let labeled = ports.labeled();
     let width = labeled.iter().map(|(_, l)| l.len()).max().unwrap_or(0);
     for (i, (port, label)) in labeled.iter().enumerate() {
@@ -895,8 +989,8 @@ fn print_ports(ports: &KmPorts, checks: Option<&[PortCheck]>) {
         let status = match checks.and_then(|c| c.get(i)) {
             None => String::new(),
             Some(check) => match &check.reason {
-                None => "  free".to_string(),
-                Some(reason) => format!("  IN USE ({reason})"),
+                None => format!("  {}", wording.free),
+                Some(reason) => format!("  {} ({reason})", wording.busy),
             },
         };
         println!("{head}  {label:width$}  {port}{status}");
@@ -1093,10 +1187,10 @@ fn command_start(args: StartArgs) {
     // Install signal-driven shutdown BEFORE spawning anything, so a
     // Ctrl+C at any point during the (multi-second) startup tears the
     // stack down in order rather than orphaning it.
-    install_signal_shutdown(paths.clone());
+    install_signal_shutdown(paths.clone(), sys_cfg.ports.clone());
     // Started before anything is spawned, so a component dying mid-startup is
     // caught while km is still gating on a later one.
-    watch_spawned_processes(paths.clone());
+    watch_spawned_processes(paths.clone(), sys_cfg.ports.clone());
 
     // Start subprocesses in dependency order, reporting each phase to stdout
     // so the (multi-second) startup shows live progress instead of a silent
@@ -1178,6 +1272,7 @@ fn command_start(args: StartArgs) {
     // fires. The Child handles move into the monitor, which reaps them.
     monitor_stack(
         &paths,
+        &sys_cfg.ports,
         &sys_cfg.heartbeat,
         vec![
             (control_plane::BIN, cp),
@@ -1208,6 +1303,15 @@ fn command_stop(args: StopArgs) {
         std::process::exit(1);
     });
 
+    // Only pinned ports can be confirmed released. With `portstart: 0` the
+    // file keeps its zeros and the ports actually drawn live in the memory of
+    // the km being stopped, so this process has nothing to wait on — that km
+    // reports them in its own terminal instead.
+    let ports = KmSysConfig::load(&paths.configdir)
+        .ok()
+        .map(|cfg| cfg.ports)
+        .filter(|ports| ports.labeled().iter().all(|(port, _)| *port != 0));
+
     let km_pid = read_pid(&paths.pids, BIN_KM);
     match km_pid {
         Some(pid) if is_alive(pid) => {
@@ -1224,7 +1328,7 @@ fn command_stop(args: StopArgs) {
             // km's own shutdown thread removes the PID files on a clean
             // exit, but sweep any it left behind (e.g. it was SIGKILLed
             // mid-teardown or crashed) so a later `status` reads clean.
-            shutdown_from_pids(&paths);
+            shutdown_from_pids(&paths, ports.as_ref());
             println!("Stopped.");
         }
         _ => {
@@ -1237,15 +1341,17 @@ fn command_stop(args: StopArgs) {
 
             if stale.is_empty() {
                 println!("Tabsdata K- (K minus) is not running.");
-                // Best-effort cleanup of any leftover PID files/dirs.
-                shutdown_from_pids(&paths);
+                // Best-effort cleanup of any leftover PID files/dirs. No
+                // port wait: nothing was running, so nothing can be holding
+                // one on this instance's behalf.
+                shutdown_from_pids(&paths, None);
                 return;
             }
             println!(
                 "km orchestrator not running; tearing down orphaned components: {}",
                 stale.join(", ")
             );
-            shutdown_from_pids(&paths);
+            shutdown_from_pids(&paths, ports.as_ref());
             println!("Stopped.");
         }
     }
@@ -1423,6 +1529,88 @@ fn main() {
 mod tests {
     use super::*;
     use std::env;
+    use std::net::TcpListener;
+
+    // -- await_port_release ------------------------------------------------
+
+    #[test]
+    fn await_port_release_returns_at_once_when_every_port_is_free() {
+        let labeled = vec![
+            (system::port::find_free_port(), "a".to_string()),
+            (system::port::find_free_port(), "b".to_string()),
+        ];
+        let started = Instant::now();
+        // A deadline far enough out that returning early is the only way to
+        // finish quickly.
+        let checks = await_port_release(&labeled, started + Duration::from_secs(30));
+
+        assert_eq!(checks.len(), 2);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited {:?} for ports that were already free",
+            started.elapsed()
+        );
+    }
+
+    // A port still held must not hold the exit open past the deadline, and
+    // must come back named so the report can say which one it was.
+    #[test]
+    fn await_port_release_gives_up_at_the_deadline_and_names_the_holder() {
+        let held = TcpListener::bind("127.0.0.1:0").unwrap();
+        let held_port = held.local_addr().unwrap().port();
+        let labeled = vec![
+            (system::port::find_free_port(), "free-one".to_string()),
+            (held_port, "still-held".to_string()),
+        ];
+
+        let started = Instant::now();
+        let checks = await_port_release(&labeled, started + Duration::from_millis(600));
+        let waited = started.elapsed();
+
+        assert!(
+            waited >= Duration::from_millis(500),
+            "returned after {waited:?}, before the deadline"
+        );
+        assert!(
+            waited < Duration::from_secs(10),
+            "waited {waited:?}, well past the deadline"
+        );
+        let holder = checks.iter().find(|c| !c.is_free()).expect("the held port");
+        assert_eq!(holder.label, "still-held");
+        assert_eq!(holder.port, held_port);
+    }
+
+    // Releasing mid-wait must be noticed rather than waited out.
+    #[test]
+    fn await_port_release_notices_a_port_coming_back() {
+        let held = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        let labeled = vec![(port, "late".to_string())];
+
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+
+        let started = Instant::now();
+        let checks = await_port_release(&labeled, started + Duration::from_secs(20));
+
+        assert!(checks[0].is_free(), "the released port still reads as held");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "waited {:?} for a port released after 300ms",
+            started.elapsed()
+        );
+    }
+
+    // -- port wording ------------------------------------------------------
+
+    #[test]
+    fn port_wording_differs_between_a_start_and_a_stop() {
+        assert_eq!(PORTS_BEFORE_START.free, "free");
+        assert_eq!(PORTS_AFTER_STOP.free, "released");
+        assert_ne!(PORTS_BEFORE_START.busy, PORTS_AFTER_STOP.busy);
+    }
 
     fn tempdir() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};

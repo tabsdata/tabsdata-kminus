@@ -50,7 +50,7 @@ const ETCD_LABEL: &str = "etcd";
 const ETCD_PEER_LABEL: &str = "etcd peer";
 
 /// Port assignments persisted in `kmsysconfig.yaml`.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KmPorts {
     #[serde(default)]
     pub api: u16,

@@ -82,6 +82,23 @@ pub fn check_ports<S: AsRef<str>>(ports: &[(u16, S)]) -> Vec<PortCheck> {
     checks
 }
 
+/// Bind-test each pair on its own, with no cross-checking between them.
+///
+/// This is [`check_ports`] without the duplicate-assignment detection, for
+/// the case where the question is "has this port been released yet". There,
+/// two entries sharing a number is not the concern, and reporting the second
+/// as a duplicate would stop it ever reading as released.
+pub fn probe_ports<S: AsRef<str>>(ports: &[(u16, S)]) -> Vec<PortCheck> {
+    ports
+        .iter()
+        .map(|(port, label)| PortCheck {
+            port: *port,
+            label: label.as_ref().to_string(),
+            reason: port_in_use(*port),
+        })
+        .collect()
+}
+
 /// The explanations for every port that is not usable, in the order checked.
 pub fn port_failures(checks: &[PortCheck]) -> Vec<String> {
     checks.iter().filter_map(|c| c.message()).collect()
