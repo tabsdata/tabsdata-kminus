@@ -144,6 +144,7 @@ pub fn start(
     let heartbeat = heartbeat_file(workdir, BIN);
     let heartbeat_secs = sys_cfg.heartbeat.interval().as_secs().to_string();
     let max_missed = sys_cfg.heartbeat.max_missed().to_string();
+    let startup_secs = sys_cfg.heartbeat.startup_timeout().as_secs().to_string();
     heartbeat::clear(&heartbeat);
     let mut command = Command::new(&cp_bin);
     command
@@ -172,6 +173,11 @@ pub fn start(
             &heartbeat_secs,
             "-max-missed-heartbeats",
             &max_missed,
+            // Its own budget, not the steady-state one: the control-plane
+            // applies it to etcd, the API server and kube-controller-manager
+            // all answering their health probes.
+            "-startup-secs",
+            &startup_secs,
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null());

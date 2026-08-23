@@ -157,6 +157,22 @@ const (
 const (
 	defaultHeartbeatSecs       = 15
 	defaultMaxMissedHeartbeats = 4
+
+	// defaultStartupSecs is how long the children get, in total, to all
+	// answer their health probes before this process gives up on coming up.
+	//
+	// Its own budget rather than heartbeatSecs * maxMissedHeartbeats, which
+	// describes a running control plane and is far too tight for a starting
+	// one: bringing up etcd, an API server and a controller manager is the
+	// expensive part, and on a cold or loaded machine it is nothing like the
+	// work a steady-state round measures. km overrides this with the value
+	// from kmsysconfig.yaml.
+	//
+	// Generous rather than tuned, because overrunning it is not how a failed
+	// start is normally caught: a child that exits is noticed within a tick,
+	// by pid, and ends the wait immediately. This bounds only the other case
+	// — a child that stays alive and never becomes healthy.
+	defaultStartupSecs = 120
 )
 
 // Heartbeat statuses. Only statusReady is accepted as healthy by km.
@@ -663,6 +679,25 @@ func tickWait(untilNextRound, tick time.Duration) time.Duration {
 		return untilNextRound
 	}
 	return tick
+}
+
+// startupBudget is how long the children get, in total, to all answer their
+// health probes before the control plane gives up on coming up.
+//
+// Wall clock, not a count of rounds. probeWait spaces startup rounds at
+// startupRetry (250ms) so km's readiness gate is not rounded up to a whole
+// interval; applying the steady-state miss budget to rounds that fast allowed
+// about a second, and kube-controller-manager routinely needs longer than
+// that to answer /healthz on a busy machine. The control plane was shutting
+// itself down over a child that was merely still starting.
+//
+// A non-positive setting falls back to the default rather than failing the
+// first round, which is what 0 would otherwise mean.
+func startupBudget(startupSecs int) time.Duration {
+	if startupSecs < 1 {
+		startupSecs = defaultStartupSecs
+	}
+	return time.Duration(startupSecs) * time.Second
 }
 
 // probeWait spaces the next round: fast until the first healthy one, since
@@ -1315,6 +1350,8 @@ func main() {
 		"Seconds between health probe rounds")
 	maxMissedHeartbeats := fs.Int("max-missed-heartbeats", defaultMaxMissedHeartbeats,
 		"Consecutive failed probe rounds tolerated before shutting down")
+	startupSecs := fs.Int("startup-secs", defaultStartupSecs,
+		"Seconds for the children to all become healthy before giving up on startup")
 	fs.Parse(os.Args[1:])
 
 	exe, err := os.Executable()
@@ -1491,7 +1528,7 @@ func main() {
 	testEnv := &envtest.Environment{
 		// Stated rather than inherited from envtest's 20s default, so the
 		// budget for bringing etcd and the API server up is visible here.
-		ControlPlaneStartTimeout: time.Duration(*heartbeatSecs**maxMissedHeartbeats) * time.Second,
+		ControlPlaneStartTimeout: startupBudget(*startupSecs),
 		// Deliberately short: stopAndCleanPid below force-kills whatever
 		// envtest could not stop, so a long wait here only adds latency to
 		// exactly the case where a child is wedged and will not go quietly —
@@ -1751,6 +1788,12 @@ func main() {
 	missed := 0
 	everHealthy := false
 	shuttingDown := false
+	// Coming up is bounded by wall clock, not by round count: see
+	// startupBudget. Fixed here rather than recomputed so a slow first round
+	// does not extend it.
+	startupAllowance := startupBudget(*startupSecs)
+	startupStarted := time.Now()
+	startupDeadline := startupStarted.Add(startupAllowance)
 
 	// Only beats once the children have been healthy at least once: km's
 	// readiness gate opens on the first ready beat, so beating before then
@@ -1813,6 +1856,16 @@ func main() {
 
 			var action monitorAction
 			missed, action = monitorRound(detail, missed, *maxMissedHeartbeats)
+			// Until the first healthy round the miss count is the wrong
+			// yardstick — rounds are 250ms apart, so it would allow about a
+			// second. Give the children the full startup allowance instead.
+			if !everHealthy && detail != "" {
+				if time.Now().Before(startupDeadline) {
+					action = actionContinue
+				} else {
+					action = actionShutdown
+				}
+			}
 
 			if detail == "" {
 				if !everHealthy {
@@ -1826,7 +1879,9 @@ func main() {
 				if everHealthy {
 					warn("health probe round failed (%d/%d): %s", missed, *maxMissedHeartbeats, detail)
 				} else {
-					info("[.] Waiting for children (%d/%d): %s", missed, *maxMissedHeartbeats, detail)
+					info("[.] Waiting for children (%s/%s): %s",
+						time.Since(startupStarted).Round(time.Second),
+						startupAllowance, detail)
 				}
 				writeHeartbeat(*heartbeatFile, statusDegraded, detail, warn)
 			}
@@ -1835,7 +1890,12 @@ func main() {
 				if why := maintainer.diagnosis(); why != "" {
 					fail("%s", why)
 				}
-				fail("%d consecutive failed probe rounds; shutting down the control plane", missed)
+				if everHealthy {
+					fail("%d consecutive failed probe rounds; shutting down the control plane", missed)
+				} else {
+					fail("children did not all become healthy within %s; shutting down the control plane",
+						startupAllowance)
+				}
 				exitCode = 1
 				break
 			}

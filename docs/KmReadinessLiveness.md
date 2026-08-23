@@ -103,36 +103,55 @@ before km managed these simply has no `etcd`/`etcdPeer` entries: they default
 to 0, which already means "pick a free one at startup", so km chooses them and
 still knows what they are.
 
-Both heartbeat knobs live in `kmsysconfig.yaml` and are forwarded to every
-component, so the whole stack shares one cadence:
+The knobs live in `kmsysconfig.yaml` and are forwarded to every component, so
+the whole stack shares one cadence:
 
 ```yaml
 heartbeat:
-  intervalSecs: 15
-  maxMissed: 4
+  intervalSecs: 15   # how often a component re-verifies itself and beats
+  maxMissed: 4       # consecutive misses tolerated while running
+  startupSecs: 120   # how long a component gets to become ready
 ```
-
-Derived from them:
 
 - **Stale after** = `interval + 2s` — the age at which a poll counts as a
   miss. The 2s absorbs jitter, so a merely late beat does not trip the
   counter.
-- **Startup budget** = `interval × maxMissed` — how long a component gets to
-  report ready before km gives up. Also the control-plane's envtest start
-  timeout.
 - **Detection** = `interval × maxMissed` — consecutive misses before a
-  component is declared dead.
+  running component is declared dead.
+- **Startup budget** = `startupSecs` — how long a component gets to report
+  ready. Also what the control-plane allows etcd, the API server and
+  kube-controller-manager to all answer their health probes in, and its
+  envtest start timeout.
 
-Until its first successful beat a component retries every 250ms, so
-readiness is not rounded up to a whole interval. km and the control-plane
-log their interval and miss budget at startup.
+Until its first successful beat a component retries every 250ms, so readiness
+is not rounded up to a whole interval.
 
-One floor to respect when tuning: `interval × maxMissed` must exceed the
-slowest component's real startup time, since it is also the readiness budget.
-The virtual-kubelet is the slowest — it waits 5s for its node to register
-before it can serve — so a configuration like `intervalSecs: 3` with
-`maxMissed: 2` gives a 6s budget the virtual-kubelet cannot meet, and the
-stack fails to start for no better reason than the tuning.
+## Why startup has its own budget
+
+Starting is not steady state. The control-plane brings up etcd, an API server
+and a controller manager; the virtual-kubelet registers a node and waits for a
+status sync. None of that resembles the work a running component does between
+two beats, so a budget sized from the running one does not fit it.
+
+It used to be sized that way — `interval × maxMissed` — and worse, the
+control-plane applied that *miss count* to its own startup rounds, which are
+250ms apart rather than a full interval. That gave its children under a
+second: enough that a kube-controller-manager needing ~800ms to answer
+`/healthz` on a busy machine would take the whole control plane down with it,
+intermittently and for no real reason.
+
+`startupSecs` is therefore generous rather than tuned, because **overrunning
+it is not how a failed start is normally caught**. Every component's pid is
+watched from the moment it is spawned — km's process watcher every 250ms, the
+control-plane's own children by exit status and pid — and a component that
+dies ends the wait at once, naming what died. Nothing restarts a failed
+component, so there is nothing to gain by waiting for it. In practice a
+crashed start is reported in a few seconds; the timeout only bounds the
+narrower case of a component that stays alive and never becomes ready.
+
+One floor to respect when tuning: `startupSecs` must exceed the slowest
+component's real startup time. The virtual-kubelet is the slowest — it waits
+5s for its node to register before it can serve.
 
 ## Two cadences
 

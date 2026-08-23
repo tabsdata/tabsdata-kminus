@@ -1225,3 +1225,75 @@ func TestLogStorageReportsInfoWhenTheBackendHasRoom(t *testing.T) {
 		t.Fatalf("message nags about the quota with room to spare: %q", got.Message)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Startup budget
+// ---------------------------------------------------------------------------
+
+// Coming up gets its own budget because it is the expensive part: bringing up
+// etcd, an API server and a controller manager is nothing like the work a
+// steady-state probe round measures.
+func TestStartupBudgetIsItsOwnSetting(t *testing.T) {
+	if got := startupBudget(120); got != 2*time.Minute {
+		t.Fatalf("startupBudget(120) = %s, want 2m", got)
+	}
+	if got := startupBudget(30); got != 30*time.Second {
+		t.Fatalf("startupBudget(30) = %s, want 30s", got)
+	}
+}
+
+// The regression this exists to prevent. probeWait spaces startup rounds at
+// startupRetry, so applying the steady-state miss budget to them allowed
+// (maxMissed-1) * 250ms — monitorRound shuts down *on* the last miss, not
+// after it. Observed in the field: kube-controller-manager took ~785ms to
+// answer /healthz and the control plane shut down on the fourth round.
+func TestStartupBudgetClearsTheObservedKcmStartup(t *testing.T) {
+	const observedKcmStartup = 785 * time.Millisecond
+
+	byRounds := startupRetry * (defaultMaxMissedHeartbeats - 1)
+	if byRounds >= observedKcmStartup {
+		t.Fatalf("counting rounds allowed %s, so it would not have failed at %s",
+			byRounds, observedKcmStartup)
+	}
+
+	budget := startupBudget(defaultStartupSecs)
+	if budget < 100*observedKcmStartup {
+		t.Fatalf("startup budget %s leaves little room over the %s kcm needed",
+			budget, observedKcmStartup)
+	}
+}
+
+// 0 would fail the very first round, before any child could answer, so it
+// falls back to the default rather than being taken literally.
+func TestStartupBudgetFallsBackOnANonPositiveSetting(t *testing.T) {
+	want := time.Duration(defaultStartupSecs) * time.Second
+	for _, secs := range []int{0, -1} {
+		if got := startupBudget(secs); got != want {
+			t.Fatalf("startupBudget(%d) = %s, want the default %s", secs, got, want)
+		}
+	}
+}
+
+// The default has to be well clear of a real cold start, which the log that
+// prompted this showed reaching ready in about 4s once it got the chance.
+func TestDefaultStartupSecsIsGenerous(t *testing.T) {
+	if defaultStartupSecs < 60 {
+		t.Fatalf("defaultStartupSecs = %d, too tight for a cold start", defaultStartupSecs)
+	}
+	steadyState := defaultHeartbeatSecs * defaultMaxMissedHeartbeats
+	if defaultStartupSecs <= steadyState {
+		t.Fatalf("startup budget %ds is no more generous than the steady state (%ds)",
+			defaultStartupSecs, steadyState)
+	}
+}
+
+// probeWait keeps startup rounds fast — that is what makes the budget
+// wall-clock rather than a round count, so it is pinned here beside it.
+func TestProbeWaitStaysFastUntilHealthyWhichIsWhyTheBudgetIsWallClock(t *testing.T) {
+	if got := probeWait(false, 15*time.Second); got != startupRetry {
+		t.Fatalf("probeWait before healthy = %s, want %s", got, startupRetry)
+	}
+	if got := probeWait(true, 15*time.Second); got != 15*time.Second {
+		t.Fatalf("probeWait once healthy = %s, want the interval", got)
+	}
+}

@@ -37,6 +37,23 @@ pub const DEFAULT_HEARTBEAT_SECS: u32 = 15;
 /// component is declared dead.
 pub const DEFAULT_MAX_MISSED_HEARTBEATS: u32 = 4;
 
+/// Default seconds a component gets to become ready at startup.
+///
+/// Deliberately far larger than the steady-state budget
+/// (`intervalSecs * maxMissed`): coming up is the expensive part. The
+/// control-plane brings up etcd, an API server and a controller manager;
+/// the virtual-kubelet registers a node and waits for a status sync. None
+/// of that is representative of the work a running component does, so
+/// sizing the startup wait from the running one made a cold or loaded
+/// machine look like a broken instance.
+///
+/// Generous rather than tuned, because overrunning it is not how a failed
+/// start is normally detected: km watches every component's pid from the
+/// moment it is spawned, so a component that dies is caught in
+/// milliseconds and the wait is cut short. This timeout only bounds the
+/// other case — a component that stays alive and never becomes ready.
+pub const DEFAULT_STARTUP_SECS: u32 = 120;
+
 /// Label suffix for the control-plane's API server port.
 const API_SERVER_LABEL: &str = "API server";
 
@@ -147,6 +164,10 @@ pub struct KmHeartbeat {
     pub interval_secs: u32,
     #[serde(default = "default_max_missed", rename = "maxMissed")]
     pub max_missed: u32,
+    /// Seconds a component gets to report ready at startup. Absent from
+    /// files written before it was configurable, hence the default.
+    #[serde(default = "default_startup_secs", rename = "startupSecs")]
+    pub startup_secs: u32,
 }
 
 fn default_heartbeat_secs() -> u32 {
@@ -157,11 +178,16 @@ fn default_max_missed() -> u32 {
     DEFAULT_MAX_MISSED_HEARTBEATS
 }
 
+fn default_startup_secs() -> u32 {
+    DEFAULT_STARTUP_SECS
+}
+
 impl Default for KmHeartbeat {
     fn default() -> Self {
         Self {
             interval_secs: DEFAULT_HEARTBEAT_SECS,
             max_missed: DEFAULT_MAX_MISSED_HEARTBEATS,
+            startup_secs: DEFAULT_STARTUP_SECS,
         }
     }
 }
@@ -184,10 +210,18 @@ impl KmHeartbeat {
         self.max_missed.max(1)
     }
 
-    /// How long a component gets to report ready at startup: the same
-    /// budget the monitor gives it to stay ready afterwards.
+    /// How long a component gets to report ready at startup.
+    ///
+    /// Its own setting rather than the steady-state budget: see
+    /// [`DEFAULT_STARTUP_SECS`]. A configured 0 would fail every start
+    /// before any component could beat, so it falls back to the default.
     pub fn startup_timeout(&self) -> Duration {
-        self.interval() * self.max_missed()
+        let secs = if self.startup_secs == 0 {
+            DEFAULT_STARTUP_SECS
+        } else {
+            self.startup_secs
+        };
+        Duration::from_secs(secs as u64)
     }
 }
 
@@ -235,7 +269,11 @@ impl KmSysConfig {
             # Log rotation, ports and heartbeat settings for the kminus stack.\n\
             # heartbeat.intervalSecs: how often each component re-verifies\n\
             # itself; heartbeat.maxMissed: consecutive misses tolerated\n\
-            # before the stack is torn down.\n\
+            # before the stack is torn down; heartbeat.startupSecs: how long\n\
+            # a component gets to become ready when starting, which is far\n\
+            # longer because initialization is the expensive part. A\n\
+            # component that dies is caught by its pid at once and does not\n\
+            # wait this out.\n\
             # A port value of 0 means: pick a free random port on startup\n\
             # (the file value stays 0; resolution happens in memory only).\n\n";
         let body = serde_yaml::to_string(&cfg).map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -395,9 +433,12 @@ mod tests {
         let hb = KmHeartbeat::default();
         assert_eq!(hb.interval_secs, DEFAULT_HEARTBEAT_SECS);
         assert_eq!(hb.max_missed, DEFAULT_MAX_MISSED_HEARTBEATS);
+        assert_eq!(hb.startup_secs, DEFAULT_STARTUP_SECS);
         assert_eq!(hb.interval(), Duration::from_secs(15));
         assert_eq!(hb.max_missed(), 4);
-        assert_eq!(hb.startup_timeout(), Duration::from_secs(60));
+        // Steady state: 15s x 4. Startup is separate and much longer.
+        assert_eq!(hb.interval() * hb.max_missed(), Duration::from_secs(60));
+        assert_eq!(hb.startup_timeout(), Duration::from_secs(120));
     }
 
     #[test]
@@ -405,13 +446,19 @@ mod tests {
         let hb = KmHeartbeat {
             interval_secs: 0,
             max_missed: 0,
+            startup_secs: 0,
         };
-        // A 0 interval would spin; 0 misses would fail before the first beat.
+        // A 0 interval would spin; 0 misses would fail before the first beat;
+        // a 0 startup budget would fail every start.
         assert_eq!(
             hb.interval(),
             Duration::from_secs(DEFAULT_HEARTBEAT_SECS as u64)
         );
         assert_eq!(hb.max_missed(), 1);
+        assert_eq!(
+            hb.startup_timeout(),
+            Duration::from_secs(DEFAULT_STARTUP_SECS as u64)
+        );
     }
 
     #[test]
@@ -437,7 +484,26 @@ mod tests {
         let cfg = KmSysConfig::load(&dir).unwrap();
         assert_eq!(cfg.heartbeat.interval(), Duration::from_secs(5));
         assert_eq!(cfg.heartbeat.max_missed(), 2);
-        assert_eq!(cfg.heartbeat.startup_timeout(), Duration::from_secs(10));
+        // startupSecs is absent from this file, so it defaults rather than
+        // being derived from the two above: tightening the heartbeat must not
+        // silently tighten how long a component gets to come up.
+        assert_eq!(
+            cfg.heartbeat.startup_timeout(),
+            Duration::from_secs(DEFAULT_STARTUP_SECS as u64)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_reads_a_configured_startup_timeout() {
+        let dir = tempdir();
+        let yaml = "log:\n  maxSizeMB: 50\n  maxFiles: 7\n\
+                    ports:\n  api: 9000\n  kcm: 9001\n  pr: 9002\n  prMetrics: 9003\n  vk: 9004\n\
+                    heartbeat:\n  intervalSecs: 5\n  maxMissed: 2\n  startupSecs: 45\n";
+        fs::write(dir.join(KM_SYSCONFIG_FILE), yaml).unwrap();
+
+        let cfg = KmSysConfig::load(&dir).unwrap();
+        assert_eq!(cfg.heartbeat.startup_timeout(), Duration::from_secs(45));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -474,6 +540,62 @@ mod tests {
         let res = KmSysConfig::load(&dir);
         assert!(res.is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- startup timeout ---------------------------------------------------
+
+    // Coming up is the expensive part, so its budget is its own setting and
+    // must not be derived from the steady-state one.
+    #[test]
+    fn startup_timeout_is_its_own_setting() {
+        let hb = KmHeartbeat::default();
+        assert_eq!(
+            hb.startup_timeout(),
+            Duration::from_secs(DEFAULT_STARTUP_SECS as u64)
+        );
+        assert_eq!(hb.startup_timeout(), Duration::from_secs(120));
+        // Not the steady-state budget, which is what it used to be.
+        assert_ne!(hb.startup_timeout(), hb.interval() * hb.max_missed());
+        assert!(hb.startup_timeout() > hb.interval() * hb.max_missed());
+    }
+
+    #[test]
+    fn startup_timeout_honours_the_configured_value() {
+        let hb = KmHeartbeat {
+            interval_secs: 15,
+            max_missed: 4,
+            startup_secs: 300,
+        };
+        assert_eq!(hb.startup_timeout(), Duration::from_secs(300));
+    }
+
+    // 0 would fail every start before any component could beat.
+    #[test]
+    fn startup_timeout_falls_back_when_zero() {
+        let hb = KmHeartbeat {
+            interval_secs: 15,
+            max_missed: 4,
+            startup_secs: 0,
+        };
+        assert_eq!(
+            hb.startup_timeout(),
+            Duration::from_secs(DEFAULT_STARTUP_SECS as u64)
+        );
+    }
+
+    // A kmsysconfig.yaml written before the setting existed must keep
+    // working, with the new field defaulted rather than zeroed.
+    #[test]
+    fn heartbeat_without_startup_secs_defaults_it() {
+        let yaml = "intervalSecs: 5\nmaxMissed: 2\n";
+        let hb: KmHeartbeat = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(hb.interval_secs, 5);
+        assert_eq!(hb.max_missed, 2);
+        assert_eq!(hb.startup_secs, DEFAULT_STARTUP_SECS);
+        assert_eq!(
+            hb.startup_timeout(),
+            Duration::from_secs(DEFAULT_STARTUP_SECS as u64)
+        );
     }
 
     #[test]
