@@ -43,6 +43,7 @@ use crate::pod::executor::{
 };
 use crate::pod::prepare::prepare_pod;
 pub use crate::pod::resolver::ResolverSet;
+use crate::process::sweep;
 use crate::spec::constants::*;
 use crate::spec::node::{NodeAddress, NodeCapacity, NodeCondition};
 use crate::spec::pod::PodSpec;
@@ -704,6 +705,12 @@ impl PodLogic {
         // unexplainable. `evict` drops the index entry but keeps the record.
         if snap.status.phase.is_terminal() {
             debug!(phase = ?snap.status.phase, "Evicting terminal pod");
+            // A terminal pod's containers are gone, but a process that
+            // escaped a container's process group can still be running,
+            // and this path signals nothing else — the executor is done
+            // and its handles are dropped. The sweep is the only thing
+            // that can act here.
+            sweep::kill_orphans(&sweep::pod_prefix(&snap.id.name, &snap.id.uid)).await;
             self.evict_pod(&snap.id).await;
             // Mark deleted so if the monitor is still finishing, it skips
             // its own eviction (store entry already dropped above).

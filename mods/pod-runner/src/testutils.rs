@@ -24,6 +24,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use chrono::Utc;
 
@@ -142,6 +143,146 @@ pub fn unique_name(prefix: &str) -> String {
     let raw = uuid::Uuid::new_v4().into_bytes();
     let suffix = data_encoding::BASE32_NOPAD.encode(&raw).to_lowercase();
     format!("{}-{}", prefix, suffix)
+}
+
+// ---------------------------------------------------------------------------
+// Helper process
+// ---------------------------------------------------------------------------
+
+/// Environment variable that turns a re-executed test binary into a
+/// long-lived helper process, and selects which mode it runs in.
+///
+/// Tests that need to watch a real process being signalled re-execute the
+/// test binary rather than running `sleep` or `sh`. macOS hides the
+/// environment of SIP platform binaries even from the same uid —
+/// `/bin/sleep` and `/bin/sh` report no environment at all — so anything
+/// that reads a spawned process's environment (the orphan sweep in
+/// [`crate::process::sweep`]) cannot see through them. A cargo-built
+/// binary is visible, like the tarball binaries (postgres, python) that a
+/// real container runs.
+pub const HELPER_VAR: &str = "TD_TEST_HELPER";
+
+/// Helper mode: sleep, and die on SIGTERM like any ordinary process.
+pub const HELPER_SLEEP: &str = "sleep";
+
+/// Helper mode: ignore SIGTERM, so that only SIGKILL ends it.
+pub const HELPER_IGNORE_SIGTERM: &str = "ignore-sigterm";
+
+/// Helper mode: spawn a detached copy of itself in [`HELPER_SLEEP`] mode,
+/// then exit immediately — the full `pg_ctl` shape, where the launcher is
+/// gone and the daemon is reparented away. Unix only.
+pub const HELPER_DAEMONIZE_AND_EXIT: &str = "daemonize-and-exit";
+
+/// Helper mode: spawn a plain (non-detached) copy of itself in
+/// [`HELPER_SLEEP`] mode, record its PID, then sleep.
+///
+/// The copy inherits this process's group, which is the shape a server
+/// that has daemonised itself takes: a postgres postmaster in its own
+/// group, with its backends forked into that same group. Unix only.
+pub const HELPER_FORK_CHILD: &str = "fork-child";
+
+/// Path a daemonising or forking helper writes its child's PID to, so a
+/// test can identify a process it did not spawn itself.
+pub const HELPER_PID_FILE_VAR: &str = "TD_TEST_HELPER_PID_FILE";
+
+/// Helper mode: spawn a detached copy of itself in [`HELPER_SLEEP`] mode,
+/// then sleep.
+///
+/// The copy calls `setsid()` before exec, which is what `pg_ctl` does to
+/// daemonise the postmaster: it lands in its own session and process
+/// group, so no signal aimed at this process's group can reach it, and it
+/// inherits this process's environment — including any kill token. Unix
+/// only; elsewhere the mode just sleeps.
+pub const HELPER_DAEMONIZE: &str = "daemonize";
+
+/// Substring that selects [`test_helper_process`] when the test binary is
+/// re-executed with it as a filter argument.
+pub const HELPER_FILTER: &str = "test_helper_process";
+
+/// How long a helper lives if the test that spawned it fails to kill it.
+pub const HELPER_TTL: Duration = Duration::from_secs(30);
+
+/// Argv that re-executes this test binary as a helper process. Pair it
+/// with [`HELPER_VAR`] set to one of the modes above.
+pub fn helper_command() -> Vec<String> {
+    vec![
+        std::env::current_exe()
+            .expect("test binary path")
+            .to_string_lossy()
+            .into_owned(),
+        HELPER_FILTER.to_string(),
+    ]
+}
+
+/// The helper process described by [`HELPER_VAR`].
+///
+/// Without that variable this is a no-op, so an ordinary run of the suite
+/// passes through it instantly.
+#[test]
+fn test_helper_process() {
+    let Ok(mode) = std::env::var(HELPER_VAR) else {
+        return;
+    };
+
+    #[cfg(unix)]
+    if mode == HELPER_IGNORE_SIGTERM {
+        // SAFETY: the disposition is set before anything in this process
+        // relies on SIGTERM; the helper does nothing but sleep.
+        unsafe {
+            nix::sys::signal::signal(
+                nix::sys::signal::Signal::SIGTERM,
+                nix::sys::signal::SigHandler::SigIgn,
+            )
+            .expect("ignore SIGTERM");
+        }
+    }
+
+    #[cfg(unix)]
+    if mode == HELPER_FORK_CHILD {
+        let argv = helper_command();
+        // No `setsid`: the child stays in this process's group, exactly
+        // where a forked postgres backend sits.
+        #[allow(clippy::zombie_processes)]
+        let child = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .env(HELPER_VAR, HELPER_SLEEP)
+            .spawn()
+            .expect("spawn child helper");
+        if let Ok(path) = std::env::var(HELPER_PID_FILE_VAR) {
+            fs::write(path, child.id().to_string()).expect("write helper pid file");
+        }
+    }
+
+    #[cfg(unix)]
+    if mode == HELPER_DAEMONIZE || mode == HELPER_DAEMONIZE_AND_EXIT {
+        use std::os::unix::process::CommandExt;
+
+        let argv = helper_command();
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]).env(HELPER_VAR, HELPER_SLEEP);
+        // SAFETY: `setsid` is async-signal-safe and is the only call made
+        // between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                let _ = nix::unistd::setsid();
+                Ok(())
+            });
+        }
+        // Spawn and let go. Never waiting is the point: this process
+        // exits while the child keeps running, so the child is reparented
+        // away — the same state `pg_ctl` leaves the postmaster in.
+        #[allow(clippy::zombie_processes)]
+        let child = cmd.spawn().expect("spawn detached helper");
+
+        if let Ok(path) = std::env::var(HELPER_PID_FILE_VAR) {
+            fs::write(path, child.id().to_string()).expect("write helper pid file");
+        }
+        if mode == HELPER_DAEMONIZE_AND_EXIT {
+            return;
+        }
+    }
+
+    std::thread::sleep(HELPER_TTL);
 }
 
 // ---------------------------------------------------------------------------

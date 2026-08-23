@@ -1021,7 +1021,7 @@ fn now_or_never(handle: &mut JoinHandle<i32>) -> Option<Result<i32, tokio::task:
 // Process signal helpers
 // ---------------------------------------------------------------------------
 
-fn is_pid_alive(pid: u32) -> bool {
+pub(crate) fn is_pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
@@ -1036,8 +1036,10 @@ fn is_pid_alive(pid: u32) -> bool {
     }
 }
 
-/// Send SIGKILL to a single process (used by [`cleanup_stale_pids`]).
-fn force_kill(pid: u32) {
+/// Send SIGKILL to a single process (used by [`cleanup_stale_pids`] and
+/// by the orphan sweep, which signals by PID because an escaped process
+/// is by definition no longer in its container's process group).
+pub(crate) fn force_kill(pid: u32) {
     #[cfg(unix)]
     {
         let _ = nix::sys::signal::kill(
@@ -1053,13 +1055,36 @@ fn force_kill(pid: u32) {
     }
 }
 
+/// Send SIGTERM to a single process (used by the orphan sweep, which
+/// gives an escaped process the same grace its container gets before
+/// escalating to [`force_kill`]).
+///
+/// Windows has no SIGTERM: `taskkill` without `/F` is the closest
+/// equivalent, and `/T` covers descendants that sanitised the token out
+/// of their own environment.
+pub(crate) fn send_sigterm_pid(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T"])
+            .output();
+    }
+}
+
 /// Send SIGTERM to the entire process group led by `pid`.
 ///
 /// Every child spawned by [`ProcessExecutor`] is placed in its own
 /// process group (via `setpgid` or `setsid`), so `pid` equals the pgid.
 /// Signaling the group ensures all descendants (sub-shells, sleep, etc.)
 /// receive the signal instead of just the direct child.
-fn send_sigterm_group(pid: u32) {
+pub(crate) fn send_sigterm_group(pid: u32) {
     #[cfg(unix)]
     {
         let _ = nix::sys::signal::kill(
@@ -1077,7 +1102,7 @@ fn send_sigterm_group(pid: u32) {
 }
 
 /// Send SIGKILL to the entire process group led by `pid`.
-fn force_kill_group(pid: u32) {
+pub(crate) fn force_kill_group(pid: u32) {
     #[cfg(unix)]
     {
         let _ = nix::sys::signal::kill(

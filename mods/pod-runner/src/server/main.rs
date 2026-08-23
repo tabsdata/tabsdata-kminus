@@ -87,6 +87,18 @@ async fn main() {
         warn!(stale_killed, "Killed stale processes from previous run");
     }
 
+    // Container processes that escaped their process group are not in
+    // those PID files — nothing recorded them. They carry a kill token
+    // naming the pod-runner that started them, so the ones whose runner
+    // is provably gone can be reclaimed here and nowhere else.
+    let orphans_killed = pod_runner::process::sweep::kill_dead_runner_orphans().await;
+    if orphans_killed > 0 {
+        warn!(
+            orphans_killed,
+            "Killed escaped container processes from previous run"
+        );
+    }
+
     // Create metrics
     let metrics = Metrics::new();
 
@@ -179,6 +191,22 @@ async fn main() {
         wait_for_shutdown_signal().await;
         info!("Shutting down...");
         let _ = shutdown_tx.send(());
+        // Every pod is going down, so sweep once for all of them instead
+        // of once per pod. Doing it here rather than at the end of the
+        // drain means an escaped server starts shutting down at the same
+        // moment the containers do, and still has the drain window to
+        // finish in — which for an embedded postgres is the difference
+        // between a checkpoint and a recovery on next start.
+        let signalled = pod_runner::process::sweep::terminate_orphans(
+            &pod_runner::process::sweep::runner_prefix(),
+        )
+        .await;
+        if signalled > 0 {
+            warn!(
+                signalled,
+                "SIGTERM sent to container processes that escaped their process group"
+            );
+        }
     });
     pod_runner::server::tls::axum_serve_tls(listener, app, server_config, shutdown).await;
 
@@ -187,6 +215,20 @@ async fn main() {
     // monitor's post-completion work.
     let wait_timeout = std::time::Duration::from_secs(grace_secs * 2 + 10);
     state.logic.wait_for_pods(wait_timeout).await;
+
+    // Whatever ignored the SIGTERM above, or escaped a container while the
+    // drain ran. One scan for every pod this runner started; the per-pod
+    // sweeps are skipped on this path precisely so this is the only one.
+    let killed =
+        pod_runner::process::sweep::kill_orphans(&pod_runner::process::sweep::runner_prefix())
+            .await;
+    if killed > 0 {
+        warn!(
+            killed,
+            "SIGKILLed container processes that outlived their pods"
+        );
+    }
+
     info!("Server stopped");
 }
 

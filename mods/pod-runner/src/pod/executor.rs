@@ -86,6 +86,7 @@ use crate::process::executor::{
     DevNullOutput, DirectFileOutput, ExecutorHandle, MergedOutput, OutputRedirector,
     ProcessExecutor,
 };
+use crate::process::sweep;
 use crate::spec::constants::*;
 use crate::spec::pod::{Container, PodSpec};
 use crate::spec::status::PodStatus;
@@ -732,6 +733,7 @@ impl PodExecutor {
             max_restarts: self.max_restarts,
             restart_backoff_base: self.restart_backoff_base,
             shutdown_grace_period,
+            kill_token_prefix: Some(sweep::pod_prefix(&pod.metadata.name, &pod.metadata.uid)),
         });
 
         let log_dir = config.log_dir().cloned();
@@ -835,6 +837,13 @@ struct ContainerConfig {
     restart_backoff_base: Duration,
     /// Grace period for container kills triggered by shutdown or phase failures.
     shutdown_grace_period: Duration,
+    /// Prefix of the [`sweep::KILL_TOKEN_VAR`] token injected into every
+    /// container of this pod, from [`sweep::pod_prefix`].
+    ///
+    /// Every process in a container's tree inherits the token, which is
+    /// what lets the orphan sweep find the ones that escaped the
+    /// container's process group. `None` disables the sweep for this pod.
+    kill_token_prefix: Option<String>,
 }
 
 impl ContainerConfig {
@@ -927,6 +936,15 @@ impl ContainerConfig {
             .collect();
         if !container_envs.is_empty() {
             builder = builder.envs(container_envs);
+        }
+
+        // Injected last: a pod spec that declares the same variable must
+        // not be able to shadow the token the orphan sweep matches on.
+        if let Some(ref prefix) = self.kill_token_prefix {
+            builder = builder.env(
+                sweep::KILL_TOKEN_VAR,
+                sweep::container_token(prefix, &container.name),
+            );
         }
 
         builder = builder.output_boxed(self.output_for(container, restart_count));
@@ -1168,7 +1186,42 @@ struct ContainerExited {
 /// 5. **Finalize** — emit Completed event
 ///
 /// On failure at any phase, all running containers are killed.
+///
+/// Wraps [`run_pod`] so that nothing the pod started outlives it. The
+/// final sweep belongs here rather than in each of the phases' exit
+/// paths because it has to happen on all of them — including the ones
+/// that kill nothing at all: a container that daemonises a server and
+/// then exits on its own leaves that server running without any kill
+/// path ever being involved.
 async fn run_orchestrator(
+    pod: Arc<PodSpec>,
+    state: Arc<Mutex<PodState>>,
+    config: Arc<ContainerConfig>,
+    event_tx: mpsc::Sender<PodEvent>,
+    kill_rx: mpsc::Receiver<Duration>,
+    kill_watch: watch::Receiver<bool>,
+    shutdown: watch::Receiver<()>,
+) {
+    let token_prefix = config.kill_token_prefix.clone();
+    // Observed after the pod finishes, to tell a single pod ending from
+    // the whole runner going down. `run_pod` consumes its own receiver.
+    let runner_shutdown = shutdown.clone();
+
+    run_pod(pod, state, config, event_tx, kill_rx, kill_watch, shutdown).await;
+
+    // On a runner shutdown the sweep is done once for all pods, so skip
+    // the per-pod one. An unreadable channel counts as "not shutting
+    // down": sweeping redundantly is cheap, not sweeping is a leak.
+    if runner_shutdown.has_changed().unwrap_or(false) {
+        return;
+    }
+    if let Some(prefix) = token_prefix {
+        sweep::kill_orphans(&prefix).await;
+    }
+}
+
+/// Drive the pod through its phases and return once it is terminal.
+async fn run_pod(
     pod: Arc<PodSpec>,
     state: Arc<Mutex<PodState>>,
     config: Arc<ContainerConfig>,
@@ -1209,7 +1262,12 @@ async fn run_orchestrator(
     let init_ms = phase_start.elapsed().as_millis();
     if let Err(e) = init_result {
         warn!("Init containers failed: {}", e);
-        kill_all_in_state(&state, config.shutdown_grace_period).await;
+        kill_all_in_state(
+            &state,
+            config.shutdown_grace_period,
+            config.kill_token_prefix.as_deref(),
+        )
+        .await;
         fail_pod(&state, &event_tx, &format!("Init failed: {}", e)).await;
         debug!(
             init_ms,
@@ -1219,7 +1277,12 @@ async fn run_orchestrator(
         return;
     }
     if shutdown.has_changed().unwrap_or(true) || *kill_watch.borrow() {
-        kill_all_in_state(&state, config.shutdown_grace_period).await;
+        kill_all_in_state(
+            &state,
+            config.shutdown_grace_period,
+            config.kill_token_prefix.as_deref(),
+        )
+        .await;
         fail_pod(&state, &event_tx, "Shutdown/kill during init").await;
         debug!(
             init_ms,
@@ -1250,7 +1313,12 @@ async fn run_orchestrator(
     let start_result = start_main_containers(&pod, &state, &config, &event_tx, &shutdown).await;
     if let Err(e) = start_result {
         warn!("Failed to start main containers: {}", e);
-        kill_all_in_state(&state, config.shutdown_grace_period).await;
+        kill_all_in_state(
+            &state,
+            config.shutdown_grace_period,
+            config.kill_token_prefix.as_deref(),
+        )
+        .await;
         fail_pod(&state, &event_tx, &format!("Container start failed: {}", e)).await;
         debug!(
             init_ms,
@@ -1352,7 +1420,34 @@ async fn succeed_pod(state: &Mutex<PodState>, event_tx: &mpsc::Sender<PodEvent>,
 /// Used during init/start failure cleanup. Handles that are held by
 /// monitor tasks (removed from state during wait) won't be found here —
 /// those are reached via the kill channel during monitoring.
-async fn kill_all_in_state(state: &Mutex<PodState>, grace_period: Duration) {
+/// Kill every running container of the pod, and every process that
+/// escaped a container's process group.
+///
+/// The escapees are signalled in two stages around the group kills, so
+/// they see the same grace period the containers do: SIGTERM first, so an
+/// escaped server shuts itself down while the group kills are still
+/// waiting, then SIGKILL for whatever is left once that grace has
+/// elapsed. Both stages act on one scan — the token prefix covers every
+/// container of the pod, so a pod kill walks the process table once, not
+/// once per container and not once per stage.
+///
+/// `token_prefix` is the pod's [`sweep::pod_prefix`]. `None` skips the
+/// sweep, which is what a runner-wide shutdown does: it sweeps once for
+/// all pods instead of once per pod.
+async fn kill_all_in_state(
+    state: &Mutex<PodState>,
+    grace_period: Duration,
+    token_prefix: Option<&str>,
+) {
+    let orphans = match token_prefix {
+        Some(prefix) => {
+            let orphans = sweep::Orphans::find(prefix).await;
+            orphans.terminate();
+            Some(orphans)
+        }
+        None => None,
+    };
+
     let names: Vec<String> = {
         let st = state.lock().await;
         st.handles.keys().cloned().collect()
@@ -1362,6 +1457,10 @@ async fn kill_all_in_state(state: &Mutex<PodState>, grace_period: Duration) {
     }
     for name in &names {
         kill_container(name, state, grace_period).await;
+    }
+
+    if let Some(orphans) = orphans {
+        orphans.force_kill();
     }
 }
 
@@ -1706,7 +1805,7 @@ async fn monitor_main_containers(
                     Some(grace_period) => {
                         debug!("Kill request received — broadcasting to monitor tasks");
                         let _ = kill_signal_tx.send(Some(grace_period));
-                        kill_all_in_state(state, grace_period).await;
+                        kill_all_in_state(state, grace_period, config.kill_token_prefix.as_deref()).await;
                     }
                     None => {
                         debug!("Kill channel closed");
@@ -1734,7 +1833,13 @@ async fn monitor_main_containers(
                 // Backstop: on a drain timeout some tasks may have re-inserted
                 // their (already-signaled) handles without exiting. Kill anything
                 // still recorded; a no-op for processes already gone.
-                kill_all_in_state(state, config.shutdown_grace_period).await;
+                //
+                // No per-pod sweep: the runner is going down, and it
+                // sweeps once for every pod it started — at the start of
+                // shutdown, so escapees get their SIGTERM immediately
+                // rather than waiting for their own pod's turn, and again
+                // after the drain.
+                kill_all_in_state(state, config.shutdown_grace_period, None).await;
                 return PodPhase::Failed;
             }
         }
@@ -1881,11 +1986,18 @@ mod tests {
         }
     }
 
+    /// A pod spec with a unique uid.
+    ///
+    /// The uid matters even though no test asserts on it: it is half of
+    /// the pod's orphan-sweep token prefix, and tests run in parallel in
+    /// one process. Sharing a uid would let one test's pod teardown sweep
+    /// another test's container processes.
     fn pod_spec(init_containers: Vec<Container>, containers: Vec<Container>) -> Arc<PodSpec> {
         Arc::new(PodSpec {
             metadata: PodMetadata {
                 name: "test-pod".to_string(),
                 namespace: "default".to_string(),
+                uid: crate::testutils::unique_name("uid"),
                 ..Default::default()
             },
             spec: PodSpecBody {
@@ -1902,6 +2014,7 @@ mod tests {
             metadata: PodMetadata {
                 name: "test-pod".to_string(),
                 namespace: "default".to_string(),
+                uid: crate::testutils::unique_name("uid"),
                 ..Default::default()
             },
             spec: PodSpecBody {
@@ -2414,6 +2527,218 @@ mod tests {
         assert!(std::fs::read_to_string(&out).unwrap().contains("cv"));
     }
 
+    // -- orphan sweep --------------------------------------------------------
+
+    /// Poll until `count` processes carry a token under `prefix`.
+    async fn wait_for_orphans(prefix: &str, count: usize) -> Vec<u32> {
+        for _ in 0..100 {
+            let pids = sweep::orphan_pids(prefix).await;
+            if pids.len() >= count {
+                return pids;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        sweep::orphan_pids(prefix).await
+    }
+
+    async fn wait_dead(pid: u32) -> bool {
+        for _ in 0..100 {
+            if !crate::process::executor::is_pid_alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// A pod spec with a chosen name and its own uid.
+    fn named_pod_spec(name: &str, containers: Vec<Container>) -> Arc<PodSpec> {
+        Arc::new(PodSpec {
+            metadata: PodMetadata {
+                name: name.to_string(),
+                namespace: "default".to_string(),
+                uid: crate::testutils::unique_name("uid"),
+                ..Default::default()
+            },
+            spec: PodSpecBody {
+                containers,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn test_kill_token_injected_into_container_env() {
+        let dir = test_dir!();
+        let out = dir.join("token.txt");
+        let pod = pod_spec(
+            vec![],
+            vec![container(
+                "main",
+                &format!("echo ${} > {}", sweep::KILL_TOKEN_VAR, out.display()),
+            )],
+        );
+        let expected = sweep::container_token(
+            &sweep::pod_prefix(&pod.metadata.name, &pod.metadata.uid),
+            "main",
+        );
+        let (_tx, rx) = shutdown();
+        let mut h = PodExecutor::new(pod).spawn(rx).await.unwrap();
+        let _ = h.wait_for_completion().await;
+
+        // A process can always read its own environment — the platform
+        // restrictions only apply to reading someone else's.
+        let written = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(written.trim(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_pod_spec_cannot_shadow_the_kill_token() {
+        let dir = test_dir!();
+        let out = dir.join("token.txt");
+        let mut c = container(
+            "main",
+            &format!("echo ${} > {}", sweep::KILL_TOKEN_VAR, out.display()),
+        );
+        c.env.push(EnvVar {
+            name: sweep::KILL_TOKEN_VAR.to_string(),
+            value: Some("hijacked".to_string()),
+            value_from: None,
+        });
+        let pod = pod_spec(vec![], vec![c]);
+        let expected = sweep::container_token(
+            &sweep::pod_prefix(&pod.metadata.name, &pod.metadata.uid),
+            "main",
+        );
+        let (_tx, rx) = shutdown();
+        let mut h = PodExecutor::new(pod).spawn(rx).await.unwrap();
+        let _ = h.wait_for_completion().await;
+
+        let written = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(
+            written.trim(),
+            expected,
+            "a pod spec must not be able to shadow the token",
+        );
+    }
+
+    /// The regression test for a container that daemonises a server the
+    /// way `pg_ctl` daemonises the postmaster: fork, `setsid`, exec, and
+    /// the result sits outside every process group pod-runner signals.
+    /// Killing the pod must still reap it.
+    // Serial with the sweep tests in `process::sweep`: a
+    // runner-wide sweep there reaches this pod's escapee too.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_pod_kill_reaps_process_that_escaped_container_group() {
+        use crate::testutils::{HELPER_DAEMONIZE, HELPER_VAR, helper_command};
+        use nix::unistd::{Pid as NixPid, getpgid};
+
+        let mut c = Container {
+            name: "main".to_string(),
+            command: helper_command(),
+            ..Default::default()
+        };
+        c.env.push(EnvVar {
+            name: HELPER_VAR.to_string(),
+            value: Some(HELPER_DAEMONIZE.to_string()),
+            value_from: None,
+        });
+        let pod = named_pod_spec("escapee-pod", vec![c]);
+        let prefix = sweep::pod_prefix(&pod.metadata.name, &pod.metadata.uid);
+
+        let (_tx, rx) = shutdown();
+        let mut h = PodExecutor::new(pod)
+            .shutdown_grace_period(Duration::from_secs(2))
+            .spawn(rx)
+            .await
+            .unwrap();
+
+        // The container plus the process it daemonised, both carrying the
+        // token the sweep matches on.
+        let pids = wait_for_orphans(&prefix, 2).await;
+        assert_eq!(pids.len(), 2, "expected container + escapee, got {pids:?}");
+
+        // They are in different process groups, so no single group signal
+        // can reach both: whichever of the two the group kill targets, the
+        // other survives it.
+        let pgids: Vec<i32> = pids
+            .iter()
+            .map(|pid| {
+                getpgid(Some(NixPid::from_raw(*pid as i32)))
+                    .expect("pgid")
+                    .as_raw()
+            })
+            .collect();
+        assert_ne!(
+            pgids[0], pgids[1],
+            "the daemonised process must have left the container's group",
+        );
+
+        h.kill(Duration::from_secs(1));
+        let _ = h.wait_for_completion().await;
+
+        for pid in pids {
+            assert!(wait_dead(pid).await, "pid {pid} outlived its pod");
+        }
+    }
+
+    /// The commonest shape of the bug: the container starts a server that
+    /// daemonises itself and then exits on its own. The pod succeeds and
+    /// no kill path runs at all, so only the sweep at the end of the
+    /// orchestrator can reap what the container left behind.
+    // Serial with the sweep tests in `process::sweep`: a
+    // runner-wide sweep there reaches this pod's escapee too.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_pod_completion_reaps_process_that_escaped_container_group() {
+        use crate::testutils::{
+            HELPER_DAEMONIZE_AND_EXIT, HELPER_PID_FILE_VAR, HELPER_VAR, helper_command,
+        };
+
+        let dir = test_dir!();
+        let pid_file = dir.join("escapee.pid");
+        let mut c = Container {
+            name: "main".to_string(),
+            command: helper_command(),
+            ..Default::default()
+        };
+        c.env.push(EnvVar {
+            name: HELPER_VAR.to_string(),
+            value: Some(HELPER_DAEMONIZE_AND_EXIT.to_string()),
+            value_from: None,
+        });
+        c.env.push(EnvVar {
+            name: HELPER_PID_FILE_VAR.to_string(),
+            value: Some(pid_file.display().to_string()),
+            value_from: None,
+        });
+
+        let (_tx, rx) = shutdown();
+        // The handle stays alive for the whole test: dropping it would
+        // abort the orchestrator before its final sweep, which is exactly
+        // what `PodHandle::wait_for_finish` protects against in the logic
+        // layer.
+        let mut h = PodExecutor::new(named_pod_spec("daemonizing-pod", vec![c]))
+            .spawn(rx)
+            .await
+            .unwrap();
+        assert_eq!(h.wait_for_completion().await.unwrap(), PodPhase::Succeeded);
+
+        // Written by the container before it exited, so the process
+        // existed and was sleeping — anything that ended it was a sweep.
+        let escapee: u32 = std::fs::read_to_string(&pid_file)
+            .expect("container should have recorded its daemon's pid")
+            .trim()
+            .parse()
+            .expect("pid");
+        assert!(
+            wait_dead(escapee).await,
+            "pid {escapee} outlived the pod that started it",
+        );
+    }
+
     // -- logging -------------------------------------------------------------
 
     #[tokio::test]
@@ -2515,6 +2840,7 @@ mod tests {
             max_restarts: 0,
             restart_backoff_base: Duration::from_secs(2),
             shutdown_grace_period: Duration::from_secs(1),
+            kill_token_prefix: None,
         };
 
         for restart_count in [0u32, 1, 2] {
