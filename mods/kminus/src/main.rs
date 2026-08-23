@@ -1235,10 +1235,43 @@ fn print_instance_status(paths: &Paths) -> bool {
         let state = if alive { "running" } else { "DEAD   " };
         println!("    {:<14} {}   pid={}", name, state, pid);
     }
+    print_etcd_storage(paths);
     print_component_status(paths, pod_runner::BIN);
     print_component_status(paths, virtual_kubelet::BIN);
 
     km_running
+}
+
+/// Print what the control-plane last reported about etcd's backend file.
+///
+/// Silent when no report exists: an instance that has never started has
+/// nothing to say, and the etcd line above already shows whether it is
+/// running. The figures are as of the report's timestamp rather than now,
+/// since km cannot query etcd itself.
+fn print_etcd_storage(paths: &Paths) {
+    let Some(storage) = control_plane::read_etcd_storage(&paths.workdir) else {
+        return;
+    };
+    let free = storage.db_size.saturating_sub(storage.db_size_in_use);
+    println!(
+        "    {:<14} {} live of {} on disk ({} reusable), {} quota",
+        "etcd storage",
+        control_plane::human_bytes(storage.db_size_in_use),
+        control_plane::human_bytes(storage.db_size),
+        control_plane::human_bytes(free),
+        control_plane::human_bytes(storage.quota_bytes),
+    );
+    let defrag = if storage.defrag_mins > 0 {
+        format!("defrag every {}m", storage.defrag_mins)
+    } else {
+        "defrag disabled".to_string()
+    };
+    println!(
+        "    {:<14} fsync {}, {}",
+        "",
+        if storage.fsync { "on" } else { "OFF" },
+        defrag
+    );
 }
 
 /// Report the status of the kminus instance in `args.workdir`.

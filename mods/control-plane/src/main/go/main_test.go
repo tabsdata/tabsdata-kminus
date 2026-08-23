@@ -14,7 +14,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -521,4 +523,546 @@ func TestFixedEtcdURLOnlyWhenPinned(t *testing.T) {
 	if got.Scheme != "http" || got.Host != "127.0.0.1:10305" {
 		t.Errorf("fixedEtcdURL(10305) = %v, want http://127.0.0.1:10305", got)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// etcd backend maintenance
+// ---------------------------------------------------------------------------
+
+// fakeEtcd serves the three maintenance endpoints etcdMaintainer calls and
+// records which were hit. Defragmentation returns the backend to its live
+// size, the way a real one does once compaction has freed the pages.
+type fakeEtcd struct {
+	mu          sync.Mutex
+	size, inUse int64
+	alarmed     bool
+	calls       []string
+}
+
+func (f *fakeEtcd) start(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.calls = append(f.calls, r.URL.Path)
+		switch r.URL.Path {
+		case etcdStatusPath:
+			body := map[string]any{
+				"header":      map[string]any{"member_id": "42"},
+				"dbSize":      strconv.FormatInt(f.size, 10),
+				"dbSizeInUse": strconv.FormatInt(f.inUse, 10),
+			}
+			if f.alarmed {
+				body["errors"] = []string{"memberID:42 alarm:NOSPACE "}
+			}
+			json.NewEncoder(w).Encode(body)
+		case etcdDefragPath:
+			f.size = f.inUse
+			w.Write([]byte("{}"))
+		case etcdAlarmPath:
+			f.alarmed = false
+			w.Write([]byte("{}"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func (f *fakeEtcd) called(path string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.calls {
+		if c == path {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fakeEtcd) forget() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = nil
+}
+
+func (f *fakeEtcd) arm() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.alarmed = true
+}
+
+func (f *fakeEtcd) backend() int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.size
+}
+
+// quietMaintainer builds a maintainer against base with the logs discarded.
+func quietMaintainer(base string, cfg cpSysConfig) *etcdMaintainer {
+	return countingMaintainer(base, cfg, nil)
+}
+
+// countingMaintainer is quietMaintainer with a heartbeat callback that
+// increments beats, so the pre-pause beat can be asserted on.
+func countingMaintainer(base string, cfg cpSysConfig, beats *int) *etcdMaintainer {
+	silent := func(string, ...any) {}
+	var beat func()
+	if beats != nil {
+		beat = func() { *beats++ }
+	}
+	// No data directory: publishing the storage report is not under test here,
+	// and an empty storagePath makes publish a no-op.
+	return newEtcdMaintainer(&http.Client{}, base, "", cfg, silent, silent, beat)
+}
+
+func TestEtcdStatusReadsTheGatewayStringEncoding(t *testing.T) {
+	var st etcdStatus
+	body := `{"header":{"member_id":"42"},"dbSize":"466894848","dbSizeInUse":"2867200"}`
+	if err := json.Unmarshal([]byte(body), &st); err != nil {
+		t.Fatalf("decoding a status reply failed: %v", err)
+	}
+	if st.size() != 466894848 {
+		t.Fatalf("size() = %d, want 466894848", st.size())
+	}
+	if st.inUse() != 2867200 {
+		t.Fatalf("inUse() = %d, want 2867200", st.inUse())
+	}
+	if st.noSpace() {
+		t.Fatalf("noSpace() true with no alarms reported")
+	}
+}
+
+// The alarm arrives as free text in the errors list, not as a typed field.
+func TestEtcdStatusSpotsANoSpaceAlarmAmongOtherErrors(t *testing.T) {
+	st := etcdStatus{Errors: []string{"memberID:9 alarm:CORRUPT ", "memberID:9 alarm:NOSPACE "}}
+	if !st.noSpace() {
+		t.Fatalf("noSpace() false with a NOSPACE alarm present")
+	}
+	if (etcdStatus{Errors: []string{"memberID:9 alarm:CORRUPT "}}).noSpace() {
+		t.Fatalf("noSpace() true for an unrelated alarm")
+	}
+}
+
+// Recovery ignores the size and cadence gates: the backend here is far below
+// etcdDefragMinBytes, and the cluster is read-only until the alarm is
+// disarmed, which neither compaction nor defragmentation does by itself.
+func TestEtcdMaintainerClearsANoSpaceAlarm(t *testing.T) {
+	fake := &fakeEtcd{size: 100 << 20, inUse: 90 << 20, alarmed: true}
+	srv := fake.start(t)
+	m := quietMaintainer(srv.URL, cpSysConfig{EtcdQuotaMB: 128, EtcdDefragMins: 60})
+
+	m.run(context.Background(), time.Now())
+
+	if !fake.called(etcdDefragPath) {
+		t.Fatalf("an armed alarm did not trigger defragmentation")
+	}
+	if !fake.called(etcdAlarmPath) {
+		t.Fatalf("an armed alarm was never disarmed")
+	}
+	fake.mu.Lock()
+	stillArmed := fake.alarmed
+	fake.mu.Unlock()
+	if stillArmed {
+		t.Fatalf("alarm still armed after recovery")
+	}
+}
+
+// Disabling the periodic pass must not disable recovery: a read-only cluster
+// is shut down by the probe loop, which is worse than a pause.
+func TestEtcdMaintainerRecoversEvenWithDefragDisabled(t *testing.T) {
+	fake := &fakeEtcd{size: 100 << 20, inUse: 90 << 20, alarmed: true}
+	srv := fake.start(t)
+	m := quietMaintainer(srv.URL, cpSysConfig{EtcdQuotaMB: 128, EtcdDefragMins: 0})
+
+	m.run(context.Background(), time.Now())
+
+	if !fake.called(etcdAlarmPath) {
+		t.Fatalf("alarm left armed when periodic defragmentation is disabled")
+	}
+}
+
+// A quota too small for the live data re-arms immediately; without the rate
+// limit that would defragment on every probe round.
+func TestEtcdMaintainerRateLimitsAlarmRecovery(t *testing.T) {
+	fake := &fakeEtcd{size: 100 << 20, inUse: 99 << 20, alarmed: true}
+	srv := fake.start(t)
+	m := quietMaintainer(srv.URL, cpSysConfig{EtcdQuotaMB: 100, EtcdDefragMins: 60})
+	start := time.Now()
+
+	m.run(context.Background(), start)
+	if !fake.called(etcdDefragPath) {
+		t.Fatalf("first recovery did not run")
+	}
+
+	fake.arm()
+	fake.forget()
+	m.run(context.Background(), start.Add(etcdAlarmRetryInterval-time.Second))
+	if fake.called(etcdDefragPath) {
+		t.Fatalf("recovery retried inside the rate limit")
+	}
+
+	fake.forget()
+	m.run(context.Background(), start.Add(etcdAlarmRetryInterval+time.Second))
+	if !fake.called(etcdDefragPath) {
+		t.Fatalf("recovery never retried after the rate limit elapsed")
+	}
+}
+
+func TestEtcdMaintainerSkipsDefragBelowTheSizeGate(t *testing.T) {
+	// Almost entirely free, but too small to be worth pausing the cluster.
+	fake := &fakeEtcd{size: etcdDefragMinBytes - 1, inUse: 1 << 20}
+	srv := fake.start(t)
+	m := quietMaintainer(srv.URL, cpSysConfig{EtcdQuotaMB: 8192, EtcdDefragMins: 60})
+
+	m.run(context.Background(), time.Now())
+
+	if fake.called(etcdDefragPath) {
+		t.Fatalf("defragmented a backend below etcdDefragMinBytes")
+	}
+}
+
+func TestEtcdMaintainerSkipsDefragWhenLittleIsFree(t *testing.T) {
+	size := etcdDefragMinBytes * 2
+	// Ten per cent free: compaction has little to give back here.
+	fake := &fakeEtcd{size: size, inUse: size - size/10}
+	srv := fake.start(t)
+	m := quietMaintainer(srv.URL, cpSysConfig{EtcdQuotaMB: 8192, EtcdDefragMins: 60})
+
+	m.run(context.Background(), time.Now())
+
+	if fake.called(etcdDefragPath) {
+		t.Fatalf("defragmented a backend that was mostly live data")
+	}
+}
+
+func TestEtcdMaintainerDefragsWhenTheBackendIsMostlyFree(t *testing.T) {
+	size := etcdDefragMinBytes * 2
+	fake := &fakeEtcd{size: size, inUse: size / 10}
+	srv := fake.start(t)
+	m := quietMaintainer(srv.URL, cpSysConfig{EtcdQuotaMB: 8192, EtcdDefragMins: 60})
+
+	m.run(context.Background(), time.Now())
+
+	if !fake.called(etcdDefragPath) {
+		t.Fatalf("a mostly-free backend was not defragmented")
+	}
+	if got := fake.backend(); got != size/10 {
+		t.Fatalf("backend after defragmentation = %d, want %d", got, size/10)
+	}
+}
+
+func TestEtcdMaintainerHonoursTheDefragCadence(t *testing.T) {
+	size := etcdDefragMinBytes * 2
+	fake := &fakeEtcd{size: size, inUse: size / 10}
+	srv := fake.start(t)
+	m := quietMaintainer(srv.URL, cpSysConfig{EtcdQuotaMB: 8192, EtcdDefragMins: 60})
+	start := time.Now()
+
+	m.run(context.Background(), start)
+	if !fake.called(etcdDefragPath) {
+		t.Fatalf("the first round did not defragment")
+	}
+
+	// Refill so the gates would pass again, and confirm the cadence holds.
+	fake.mu.Lock()
+	fake.size = size
+	fake.mu.Unlock()
+	fake.forget()
+	m.run(context.Background(), start.Add(59*time.Minute))
+	if fake.called(etcdDefragPath) {
+		t.Fatalf("defragmented again before the cadence elapsed")
+	}
+
+	fake.forget()
+	m.run(context.Background(), start.Add(61*time.Minute))
+	if !fake.called(etcdDefragPath) {
+		t.Fatalf("did not defragment once the cadence elapsed")
+	}
+}
+
+func TestEtcdMaintainerNeverDefragsWhenDisabled(t *testing.T) {
+	size := etcdDefragMinBytes * 2
+	fake := &fakeEtcd{size: size, inUse: size / 10}
+	srv := fake.start(t)
+	m := quietMaintainer(srv.URL, cpSysConfig{EtcdQuotaMB: 8192, EtcdDefragMins: 0})
+
+	m.run(context.Background(), time.Now())
+	m.run(context.Background(), time.Now().Add(24*time.Hour))
+
+	if fake.called(etcdDefragPath) {
+		t.Fatalf("defragmented with etcdDefragMins set to 0")
+	}
+}
+
+// An unreachable etcd is the probes' business, not the maintainer's: it must
+// return quietly rather than fail the round.
+func TestEtcdMaintainerToleratesAnUnreachableEtcd(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	m := quietMaintainer(srv.URL, cpSysConfig{EtcdQuotaMB: 8192, EtcdDefragMins: 60})
+	m.run(context.Background(), time.Now())
+}
+
+// ---------------------------------------------------------------------------
+// cpsysconfig.yaml etcd fields
+// ---------------------------------------------------------------------------
+
+func TestClampEtcdReplacesNonsenseWithDefaults(t *testing.T) {
+	defaults := defaultCPSysConfig()
+	cfg := cpSysConfig{EtcdQuotaMB: 0, EtcdDefragMins: -1}
+	cfg.clampEtcd()
+	if cfg.EtcdQuotaMB != defaults.EtcdQuotaMB {
+		t.Fatalf("EtcdQuotaMB = %d, want the default %d", cfg.EtcdQuotaMB, defaults.EtcdQuotaMB)
+	}
+	if cfg.EtcdDefragMins != defaults.EtcdDefragMins {
+		t.Fatalf("EtcdDefragMins = %d, want the default %d",
+			cfg.EtcdDefragMins, defaults.EtcdDefragMins)
+	}
+}
+
+// 0 is a real setting for the cadence — "never defragment" — and must survive
+// clamping, unlike 0 for the quota, which etcd would read as its own default.
+func TestClampEtcdKeepsZeroMeaningDisabled(t *testing.T) {
+	cfg := cpSysConfig{EtcdQuotaMB: 100, EtcdDefragMins: 0}
+	cfg.clampEtcd()
+	if cfg.EtcdDefragMins != 0 {
+		t.Fatalf("EtcdDefragMins = %d, want 0 to keep meaning disabled", cfg.EtcdDefragMins)
+	}
+	if cfg.EtcdQuotaMB != 100 {
+		t.Fatalf("EtcdQuotaMB = %d, want the configured 100", cfg.EtcdQuotaMB)
+	}
+}
+
+// A cpsysconfig.yaml written before etcd was tunable must keep working, with
+// the new fields defaulted rather than zeroed.
+func TestLoadOrCreateCPSysConfigDefaultsEtcdFieldsInAnOlderFile(t *testing.T) {
+	dir := t.TempDir()
+	older := "concurrentJobSyncs: 7\nkubeApiQps: 11\nkubeApiBurst: 22\n"
+	if err := os.WriteFile(filepath.Join(dir, "cpsysconfig.yaml"), []byte(older), 0644); err != nil {
+		t.Fatalf("writing the older config failed: %v", err)
+	}
+
+	cfg, err := loadOrCreateCPSysConfig(dir)
+	if err != nil {
+		t.Fatalf("loading the older config failed: %v", err)
+	}
+
+	if cfg.ConcurrentJobSyncs != 7 {
+		t.Fatalf("ConcurrentJobSyncs = %d, want the file's 7", cfg.ConcurrentJobSyncs)
+	}
+	defaults := defaultCPSysConfig()
+	if cfg.EtcdQuotaMB != defaults.EtcdQuotaMB {
+		t.Fatalf("EtcdQuotaMB = %d, want the default %d", cfg.EtcdQuotaMB, defaults.EtcdQuotaMB)
+	}
+	if cfg.EtcdDefragMins != defaults.EtcdDefragMins {
+		t.Fatalf("EtcdDefragMins = %d, want the default %d",
+			cfg.EtcdDefragMins, defaults.EtcdDefragMins)
+	}
+}
+
+func TestLoadOrCreateCPSysConfigWritesTheEtcdFields(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := loadOrCreateCPSysConfig(dir); err != nil {
+		t.Fatalf("creating the config failed: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "cpsysconfig.yaml"))
+	if err != nil {
+		t.Fatalf("reading the created config failed: %v", err)
+	}
+	for _, key := range []string{"etcdQuotaMb", "etcdDefragMins"} {
+		if !strings.Contains(string(data), key) {
+			t.Fatalf("created config does not mention %s:\n%s", key, data)
+		}
+	}
+}
+
+func TestHumanBytesScalesUnits(t *testing.T) {
+	cases := []struct {
+		in   int64
+		want string
+	}{
+		{512, "512B"},
+		{2048, "2.0KiB"},
+		{5 << 20, "5.0MiB"},
+		{int64(8192) << 20, "8.0GiB"},
+	}
+	for _, c := range cases {
+		if got := humanBytes(c.in); got != c.want {
+			t.Fatalf("humanBytes(%d) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// Defragmentation blocks the supervision loop, so km must see a fresh beat
+// going into it rather than one already most of the way to stale.
+func TestEtcdMaintainerBeatsBeforeTheDefragPause(t *testing.T) {
+	size := etcdDefragMinBytes * 2
+	fake := &fakeEtcd{size: size, inUse: size / 10}
+	srv := fake.start(t)
+	beats := 0
+	m := countingMaintainer(srv.URL, cpSysConfig{EtcdQuotaMB: 8192, EtcdDefragMins: 60}, &beats)
+
+	m.run(context.Background(), time.Now())
+
+	if !fake.called(etcdDefragPath) {
+		t.Fatalf("expected this round to defragment")
+	}
+	if beats != 1 {
+		t.Fatalf("heartbeat published %d times before the pause, want 1", beats)
+	}
+}
+
+// A round that decides against defragmenting must not touch the heartbeat:
+// the loop publishes its own beat straight afterwards.
+func TestEtcdMaintainerDoesNotBeatWithoutAPause(t *testing.T) {
+	fake := &fakeEtcd{size: etcdDefragMinBytes - 1, inUse: 1 << 20}
+	srv := fake.start(t)
+	beats := 0
+	m := countingMaintainer(srv.URL, cpSysConfig{EtcdQuotaMB: 8192, EtcdDefragMins: 60}, &beats)
+
+	m.run(context.Background(), time.Now())
+
+	if beats != 0 {
+		t.Fatalf("heartbeat published %d times with no pause taken, want 0", beats)
+	}
+}
+
+// A shutdown caused by a full backend has to say so, and say what to change.
+// The probes cannot: all they report is a 503 from /health.
+func TestEtcdMaintainerDiagnosesAFullBackend(t *testing.T) {
+	fake := &fakeEtcd{size: 100 << 20, inUse: 99 << 20, alarmed: true}
+	srv := fake.start(t)
+	m := quietMaintainer(srv.URL, cpSysConfig{EtcdQuotaMB: 100, EtcdDefragMins: 60})
+
+	if m.diagnosis() != "" {
+		t.Fatalf("diagnosed a full backend before observing one")
+	}
+	m.run(context.Background(), time.Now())
+
+	why := m.diagnosis()
+	for _, want := range []string{"etcd backend is full", "etcdQuotaMb", "cpsysconfig.yaml"} {
+		if !strings.Contains(why, want) {
+			t.Fatalf("diagnosis %q does not mention %q", why, want)
+		}
+	}
+}
+
+// Once the backend is healthy again the diagnosis must stop being offered, or
+// every later failure would be blamed on a quota that is no longer the issue.
+func TestEtcdMaintainerStopsDiagnosingOnceRecovered(t *testing.T) {
+	fake := &fakeEtcd{size: 100 << 20, inUse: 10 << 20, alarmed: true}
+	srv := fake.start(t)
+	m := quietMaintainer(srv.URL, cpSysConfig{EtcdQuotaMB: 8192, EtcdDefragMins: 60})
+	start := time.Now()
+
+	m.run(context.Background(), start)
+	if m.diagnosis() == "" {
+		t.Fatalf("no diagnosis while the alarm was armed")
+	}
+
+	// fakeEtcd disarms on the alarm call, so the next round sees it clear.
+	m.run(context.Background(), start.Add(time.Second))
+	if why := m.diagnosis(); why != "" {
+		t.Fatalf("still diagnosing a full backend after recovery: %q", why)
+	}
+}
+
+// The report km reads must land as a complete file with the numbers the
+// backend actually reported, since `km status` has no other way to see them.
+func TestEtcdMaintainerPublishesTheStorageReport(t *testing.T) {
+	dir := t.TempDir()
+	fake := &fakeEtcd{size: 300 << 20, inUse: 40 << 20}
+	srv := fake.start(t)
+	silent := func(string, ...any) {}
+	m := newEtcdMaintainer(&http.Client{}, srv.URL, dir,
+		cpSysConfig{EtcdQuotaMB: 4096, EtcdDefragMins: 60}, silent, silent, nil)
+
+	m.run(context.Background(), time.Now())
+
+	data, err := os.ReadFile(filepath.Join(dir, etcdStorageFile))
+	if err != nil {
+		t.Fatalf("no storage report published: %v", err)
+	}
+	var got etcdStorageReport
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("storage report is not valid JSON: %v", err)
+	}
+	if got.DBSize != 300<<20 || got.DBSizeInUse != 40<<20 {
+		t.Fatalf("report sizes = %d/%d, want %d/%d",
+			got.DBSize, got.DBSizeInUse, 300<<20, 40<<20)
+	}
+	if got.QuotaBytes != int64(4096)<<20 {
+		t.Fatalf("report quota = %d, want %d", got.QuotaBytes, int64(4096)<<20)
+	}
+	if got.DefragMins != 60 {
+		t.Fatalf("report defragMins = %d, want 60", got.DefragMins)
+	}
+	if !got.Fsync {
+		t.Fatalf("report says fsync is off; these instances are durable")
+	}
+	if got.DataDir != dir {
+		t.Fatalf("report dataDir = %q, want %q", got.DataDir, dir)
+	}
+	if got.TS == 0 {
+		t.Fatalf("report carries no timestamp, so km cannot age it")
+	}
+}
+
+// Both ends of the instance's life publish, so `km status` on a stopped
+// instance still shows the size it was left at.
+func TestEtcdMaintainerLogStoragePublishes(t *testing.T) {
+	dir := t.TempDir()
+	fake := &fakeEtcd{size: 12 << 20, inUse: 8 << 20}
+	srv := fake.start(t)
+	lines := 0
+	count := func(string, ...any) { lines++ }
+	m := newEtcdMaintainer(&http.Client{}, srv.URL, dir,
+		cpSysConfig{EtcdQuotaMB: 4096, EtcdDefragMins: 0}, count, count, nil)
+
+	m.logStorage(context.Background(), "at shutdown")
+
+	if lines == 0 {
+		t.Fatalf("logStorage logged nothing")
+	}
+	if _, err := os.Stat(filepath.Join(dir, etcdStorageFile)); err != nil {
+		t.Fatalf("logStorage published no report: %v", err)
+	}
+}
+
+// A quota default that drifts silently would be a durability surprise, so it
+// is pinned: 4 GiB, deliberately chosen over etcd's own 2 GiB.
+func TestDefaultEtcdQuotaIs4GiB(t *testing.T) {
+	if got := defaultCPSysConfig().EtcdQuotaMB; got != 4096 {
+		t.Fatalf("default EtcdQuotaMB = %d, want 4096", got)
+	}
+}
+
+// filepath.Join("", name) yields a bare relative name, which would drop the
+// report into the working directory. Empty in, empty out.
+func TestStorageReportPathStaysEmptyWithoutADataDir(t *testing.T) {
+	if got := storageReportPath(""); got != "" {
+		t.Fatalf("storageReportPath(\"\") = %q, want \"\"", got)
+	}
+	if got := storageReportPath("/wd/data/cp"); got != filepath.Join("/wd/data/cp", etcdStorageFile) {
+		t.Fatalf("storageReportPath = %q, unexpected", got)
+	}
+}
+
+// A maintainer with no data directory must hold no path at all: a relative
+// one would drop the report into whatever the working directory happens to
+// be, which is how it once landed in the source tree.
+func TestEtcdMaintainerWithoutDataDirHasNoStoragePath(t *testing.T) {
+	fake := &fakeEtcd{size: 1 << 20, inUse: 1 << 20}
+	srv := fake.start(t)
+	m := quietMaintainer(srv.URL, cpSysConfig{EtcdQuotaMB: 4096, EtcdDefragMins: 60})
+
+	if m.storagePath != "" {
+		t.Fatalf("storagePath = %q with no data dir; publish would write there", m.storagePath)
+	}
+	// Exercises publish through the guard: it must be a no-op, not a write.
+	m.run(context.Background(), time.Now())
 }

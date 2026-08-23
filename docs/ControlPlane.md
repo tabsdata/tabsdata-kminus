@@ -132,7 +132,7 @@ Persistent:
 
 | File               | Purpose                                                     |
 |--------------------|-------------------------------------------------------------|
-| `cpsysconfig.yaml` | kube-controller-manager tunables (see below). Auto-created, user-editable. |
+| `cpsysconfig.yaml` | kube-controller-manager and etcd tunables (see below). Auto-created, user-editable. |
 | `tokens.csv`       | Static auth tokens (`token,user,uid,"groups"` per line). Auto-created with random tokens on first start; delete it to rotate them. |
 
 `cpsysconfig.yaml` fields:
@@ -141,7 +141,93 @@ Persistent:
 concurrentJobSyncs: 50   # kube-controller-manager --concurrent-job-syncs
 kubeApiQps: 500          # --kube-api-qps
 kubeApiBurst: 1000       # --kube-api-burst
+etcdQuotaMb: 4096        # etcd --quota-backend-bytes
+etcdDefragMins: 60       # etcd defragmentation cadence; 0 disables it
 ```
+
+Fields missing from an existing file take their default, so a
+`cpsysconfig.yaml` written by an earlier build keeps working unchanged.
+
+### etcd Backend Storage
+
+etcd is an MVCC store: every write adds a revision rather than replacing one.
+Three separate things live under `<workdir>/data/control-plane/member/`, and
+only the last needs managing:
+
+| Path        | What it is                        | Bounded by                                   |
+|-------------|-----------------------------------|----------------------------------------------|
+| `wal/*.wal` | Raft write-ahead log              | `--max-wals`, `--snapshot-count` (constants)  |
+| `snap/*.snap` | Raft snapshots                  | `--max-snapshots` (constant)                  |
+| `snap/db`   | The bbolt backend holding cluster state | `etcdQuotaMb`, compaction and defragmentation |
+
+Durability is not configurable. envtest adds `--unsafe-no-fsync=true` whenever
+the etcd binary accepts it, which suits a test environment whose data dies
+with the test; these instances are durable, so the control plane drops the
+flag and etcd fsyncs normally. The cost is real but modest under load, because
+etcd batches WAL fsyncs across concurrent proposals — roughly 2× on
+concurrent writes, though a single sequential writer sees far worse.
+
+WAL segments are preallocated at 64 MB each, so a freshly created etcd already
+occupies a fixed amount holding no data at all.
+
+**Compaction** discards superseded revisions. kube-apiserver runs it every
+`--etcd-compaction-interval` (5 minutes by default) and etcd repeats it on its
+own `--auto-compaction-retention` as a safety net. Compaction moves pages onto
+bbolt's freelist so etcd can reuse them — it does **not** shrink `snap/db`,
+which never gets smaller on its own.
+
+**Defragmentation** rewrites `snap/db` without its free pages. It matters
+because `etcdQuotaMb` is enforced against the *file*, freelist included: after
+a large load test the peak size stays charged against the quota indefinitely,
+even though the live data is tiny. Defragmentation is checked every
+`etcdDefragMins` and runs only when the backend is over 512 MB and more than
+half free, since it blocks all etcd reads and writes while it runs.
+
+**NOSPACE recovery.** Crossing `etcdQuotaMb` arms a NOSPACE alarm that makes
+the cluster read-only, and etcd then reports itself unhealthy — which would
+exhaust the probe miss budget and shut the control plane down. Neither
+compaction nor defragmentation clears the alarm. The control plane therefore
+checks for it before every probe round and, when it finds one, defragments and
+then explicitly disarms it, at most once every 5 minutes. If the live data
+itself is near the quota, that is logged as a warning: the fix is to raise
+`etcdQuotaMb` or to delete finished pods and jobs, since no amount of
+defragmenting reclaims live data.
+
+Recovery cannot help when the live data itself no longer fits: the alarm
+re-arms as fast as it is cleared, etcd keeps answering `/health` with a 503,
+and the miss budget eventually runs out. The shutdown then names the cause
+rather than only the symptom — both in `control-plane.log` and in the
+heartbeat detail km reports:
+
+```
+WARNING: health probe round failed (4/4): etcd: GET .../health returned 503
+  Service Unavailable; etcd backend is full: 32.7MiB of live data against the
+  32.0MiB etcdQuotaMb in cpsysconfig.yaml — raise etcdQuotaMb and restart, or
+  delete finished pods and jobs to bring the live data back under it
+ERROR: etcd backend is full: 32.7MiB of live data against the 32.0MiB
+  etcdQuotaMb in cpsysconfig.yaml — raise etcdQuotaMb and restart, ...
+ERROR: 4 consecutive failed probe rounds; shutting down the control plane
+```
+
+#### Reporting
+
+The control plane logs the backend's size at startup and at shutdown, and
+publishes `<workdir>/data/control-plane/etcd-storage.json` — refreshed on
+every probe round — which `km status` reads:
+
+```
+  control-plane    running   pid=28775  beat=8s ago
+    etcd           running   pid=28777
+    etcd storage   352.0KiB live of 352.0KiB on disk (0B reusable), 4.0GiB quota
+                   fsync on, defrag every 60m
+```
+
+`live` is `dbSizeInUse`, `on disk` is the file, and `reusable` is the freelist
+between them — the part defragmentation would return. The report persists, so
+`km status` on a stopped instance still shows the size it was left at. km
+cannot query etcd itself: it speaks no HTTP and, with `portstart: 0`, does not
+retain the random port it handed out, so the control plane publishes instead.
+A missing report is not an error — it just means the instance has never run.
 
 ### Log Directory (`<workdir>/log/`)
 

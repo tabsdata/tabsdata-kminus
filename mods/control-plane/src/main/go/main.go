@@ -54,13 +54,33 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 )
 
-// cpSysConfig contains tunables for the kube-controller-manager subprocess.
+// cpSysConfig contains tunables for the control-plane's subprocesses.
 // Persisted in cpsysconfig.yaml — created with defaults on first startup,
-// user-editable thereafter.
+// user-editable thereafter. Fields missing from an existing file keep their
+// default, so a file written by an earlier build stays valid unchanged.
 type cpSysConfig struct {
 	ConcurrentJobSyncs int `yaml:"concurrentJobSyncs"`
 	KubeAPIQPS         int `yaml:"kubeApiQps"`
 	KubeAPIBurst       int `yaml:"kubeApiBurst"`
+
+	// EtcdQuotaMB caps etcd's backend file. Crossing it arms a NOSPACE alarm
+	// that makes the cluster read-only, and etcd reports an armed alarm as
+	// unhealthy — so without the recovery in etcdMaintainer it would also
+	// exhaust the probe miss budget and take the control plane down. etcd's
+	// own default is 2 GiB, which one large load test can reach.
+	EtcdQuotaMB int `yaml:"etcdQuotaMb"`
+
+	// EtcdDefragMins is how often the backend is considered for
+	// defragmentation; 0 disables it. Compaction — which kube-apiserver runs
+	// every 5 minutes by default — only marks pages reusable inside the file:
+	// the file itself never shrinks, and those pages stay charged against
+	// EtcdQuotaMB. Defragmentation rewrites the file without them, so the peak
+	// size of a load test that finished days ago stops costing quota forever.
+	// It pauses every etcd read and write while it runs, which is why it is
+	// periodic and size-gated rather than continuous. Setting 0 disables only
+	// this periodic pass: a NOSPACE alarm is still recovered from, because the
+	// alternative to that pause is a control plane the probe loop shuts down.
+	EtcdDefragMins int `yaml:"etcdDefragMins"`
 }
 
 func defaultCPSysConfig() cpSysConfig {
@@ -68,6 +88,22 @@ func defaultCPSysConfig() cpSysConfig {
 		ConcurrentJobSyncs: 50,
 		KubeAPIQPS:         500,
 		KubeAPIBurst:       1000,
+		EtcdQuotaMB:        4096,
+		EtcdDefragMins:     60,
+	}
+}
+
+// clampEtcd replaces out-of-range etcd tunables with their defaults. etcd
+// reads a non-positive quota as "use the 2 GiB default", which is the cliff
+// EtcdQuotaMB exists to move; a negative interval would defragment every
+// round. Neither is what a typo in the file was meant to say.
+func (c *cpSysConfig) clampEtcd() {
+	defaults := defaultCPSysConfig()
+	if c.EtcdQuotaMB <= 0 {
+		c.EtcdQuotaMB = defaults.EtcdQuotaMB
+	}
+	if c.EtcdDefragMins < 0 {
+		c.EtcdDefragMins = defaults.EtcdDefragMins
 	}
 }
 
@@ -83,12 +119,13 @@ func loadOrCreateCPSysConfig(configDir string) (cpSysConfig, error) {
 		if err := yaml.Unmarshal(data, &cfg); err != nil {
 			return cpSysConfig{}, fmt.Errorf("parse %s: %w", path, err)
 		}
+		cfg.clampEtcd()
 		return cfg, nil
 	}
 	cfg := defaultCPSysConfig()
 	data, _ := yaml.Marshal(&cfg)
 	header := []byte("# Control-plane system configuration.\n" +
-		"# Tunables for the kube-controller-manager subprocess.\n\n")
+		"# Tunables for the kube-controller-manager and etcd subprocesses.\n\n")
 	if err := os.WriteFile(path, append(header, data...), 0644); err != nil {
 		return cpSysConfig{}, fmt.Errorf("write %s: %w", path, err)
 	}
@@ -140,6 +177,105 @@ const portUnset = "0"
 // etcdPeerURLsFlag is etcd's peer-listen flag, overridden by argument because
 // envtest exposes no field for it.
 const etcdPeerURLsFlag = "listen-peer-urls"
+
+// etcd storage tuning. envtest passes etcd nothing but its URLs and data
+// directory, so everything else is etcd's own default — chosen for a
+// throwaway test environment rather than an instance that is kept.
+const (
+	// etcdAutoCompactionRetention is a safety net under kube-apiserver's
+	// compactor, which trims revision history every --etcd-compaction-interval
+	// (5m by default). etcd compacts nothing on its own unless told to, so if
+	// that compactor ever stops, history grows until the quota is reached.
+	etcdAutoCompactionRetention = "30m"
+
+	// etcdMaxWALs and etcdMaxSnapshots bound the write-ahead log and snapshot
+	// files, which are separate from the backend and untouched by
+	// defragmentation. Each WAL segment is preallocated at 64 MB, so the count
+	// is a fixed disk cost paid whether or not the instance is busy: a freshly
+	// created etcd already occupies its first segments holding no data at all.
+	etcdMaxWALs      = 3
+	etcdMaxSnapshots = 3
+
+	// etcdSnapshotCount is lowered from etcd's default of 100000 because WAL
+	// segments only become eligible for purging once a snapshot has passed
+	// them: at the default, a quiet instance retains every segment it has
+	// written for a very long time.
+	etcdSnapshotCount = 10000
+)
+
+// etcdStorageFile is the backend report the control-plane publishes into its
+// data directory for `km status` to read. km speaks no HTTP and, when ports
+// are random, does not know the one envtest gave etcd — so the process that
+// does know publishes, exactly as it already does for pids and heartbeats.
+// Written tmp-then-renamed so a reader never sees half a file.
+const etcdStorageFile = "etcd-storage.json"
+
+// etcdReportTimeout bounds the status call behind a startup or shutdown
+// report. Short: a report is never worth delaying either one for.
+const etcdReportTimeout = 5 * time.Second
+
+// etcdFsync records that this control plane runs etcd with fsync enabled.
+// envtest passes --unsafe-no-fsync=true unconditionally, which suits an
+// environment that is thrown away after a test and not one whose state is
+// meant to survive: without fsync an unclean host shutdown can lose or
+// corrupt recently acknowledged writes. km disables that flag, so this is a
+// constant rather than a setting — durability here is not a tunable.
+const etcdFsync = true
+
+// etcdStorageReport is what km reads. A new, single-purpose contract rather
+// than a wider heartbeat: the {ts,status,detail} beat has four independent
+// implementations, and km treats this file as optional, so a missing or
+// unreadable one degrades to "unknown" instead of failing anything.
+type etcdStorageReport struct {
+	TS          int64  `json:"ts"`
+	DBSize      int64  `json:"dbSize"`
+	DBSizeInUse int64  `json:"dbSizeInUse"`
+	QuotaBytes  int64  `json:"quotaBytes"`
+	DefragMins  int    `json:"defragMins"`
+	Fsync       bool   `json:"fsync"`
+	DataDir     string `json:"dataDir"`
+}
+
+// etcd maintenance endpoints, served over the v3 HTTP gateway that etcd
+// enables by default. Used in preference to the etcd client library, which
+// would be a new module dependency for three calls against a local,
+// unauthenticated, plaintext listener.
+const (
+	// etcdStatusPath reports dbSize, dbSizeInUse and any armed alarms.
+	etcdStatusPath = "/v3/maintenance/status"
+	// etcdDefragPath rewrites the backend without its free pages, blocking
+	// every read and write until it finishes.
+	etcdDefragPath = "/v3/maintenance/defragment"
+	// etcdAlarmPath lists and disarms alarms.
+	etcdAlarmPath = "/v3/maintenance/alarm"
+)
+
+const (
+	// etcdDefragMinBytes is the backend size below which periodic
+	// defragmentation is skipped: there is not enough to reclaim to be worth
+	// pausing the cluster for.
+	etcdDefragMinBytes int64 = 512 << 20
+
+	// etcdDefragMinFreeRatio is the share of the backend that must be free
+	// pages before periodic defragmentation runs. Half means the file has
+	// grown to twice the data it actually holds.
+	etcdDefragMinFreeRatio = 0.5
+
+	// etcdAlarmRetryInterval rate-limits NOSPACE recovery, which ignores both
+	// the size gate and the defragmentation cadence. Without it, a quota that
+	// is genuinely too small for the live data — where defragmenting reclaims
+	// nothing and the alarm re-arms at once — would defragment every round.
+	etcdAlarmRetryInterval = 5 * time.Minute
+
+	// etcdMaintenanceTimeout bounds one status, defragment or disarm call.
+	// Generous because defragmentation rewrites the entire backend.
+	etcdMaintenanceTimeout = 2 * time.Minute
+
+	// etcdQuotaNearlyFull is the share of the quota still live after a
+	// recovery above which the quota itself is reported as too small: at that
+	// point the space is real data and no defragmentation will help.
+	etcdQuotaNearlyFull = 0.8
+)
 
 // fixedEtcdURL renders etcd's client URL for a pinned port, or nil to leave
 // the choice to envtest.
@@ -764,6 +900,317 @@ func killStaleProcesses(pidsDir string, warn func(string, ...any)) {
 	}
 }
 
+// reportCtx bounds a storage report so neither startup nor shutdown can be
+// delayed by an etcd that is slow to answer.
+func reportCtx(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, etcdReportTimeout)
+}
+
+// humanBytes renders a byte count for a log line.
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%dB", n)
+	}
+	div, exp := int64(unit), 0
+	for v := n / unit; v >= unit; v /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// etcdStatus is the subset of /v3/maintenance/status this needs. The HTTP
+// gateway renders 64-bit fields as JSON strings, hence the string types.
+type etcdStatus struct {
+	Header struct {
+		MemberID string `json:"member_id"`
+	} `json:"header"`
+	DBSize      string   `json:"dbSize"`
+	DBSizeInUse string   `json:"dbSizeInUse"`
+	Errors      []string `json:"errors"`
+}
+
+// size is the backend file on disk; inUse is the part of it holding live
+// data. The difference is free pages: reusable by etcd, not returned to the
+// filesystem, and still counted against the backend quota.
+func (s etcdStatus) size() int64 {
+	n, _ := strconv.ParseInt(s.DBSize, 10, 64)
+	return n
+}
+
+func (s etcdStatus) inUse() int64 {
+	n, _ := strconv.ParseInt(s.DBSizeInUse, 10, 64)
+	return n
+}
+
+// noSpace reports whether a NOSPACE alarm is armed. etcd renders alarms into
+// the status "errors" list as free text, e.g. "memberID:12 alarm:NOSPACE ".
+func (s etcdStatus) noSpace() bool {
+	for _, e := range s.Errors {
+		if strings.Contains(e, "NOSPACE") {
+			return true
+		}
+	}
+	return false
+}
+
+// etcdMaintainer keeps etcd's backend file within its quota.
+//
+// Two jobs on different cadences. Every round it reads the backend status and
+// clears a NOSPACE alarm if one is armed. That is the urgent one: etcd
+// reports an armed alarm as unhealthy, so an untended alarm spends the probe
+// miss budget and shuts down a control plane whose only fault is a full
+// backend — and neither compaction nor defragmentation disarms it, so nothing
+// else recovers on its own.
+//
+// On its own slower cadence it defragments, which is what actually returns
+// disk. Compaction leaves the pages it frees inside the file, where they stay
+// charged against the quota, so a single large load test otherwise reserves
+// its peak size for the life of the instance.
+type etcdMaintainer struct {
+	client *http.Client
+	// base is etcd's client URL with no trailing slash.
+	base  string
+	quota int64
+	// every is the defragmentation cadence; zero disables it.
+	every time.Duration
+	// nextDefrag and nextRecovery are the earliest each may next run.
+	nextDefrag   time.Time
+	nextRecovery time.Time
+	// alarmed and alarmInUse hold the last observed NOSPACE state, so that a
+	// shutdown can name a full backend as its cause. The probes never can:
+	// all they see is /health answering "ALARM NOSPACE" with a 503.
+	alarmed    bool
+	alarmInUse int64
+	info       func(string, ...any)
+	warn       func(string, ...any)
+	// storagePath is where the report km reads is published, or "" for none.
+	storagePath string
+	// dataDir is etcd's data directory, echoed into the report so `km status`
+	// can name the directory whose size it is describing.
+	dataDir string
+	// defragMins is echoed into the report so km can show the cadence.
+	defragMins int
+	// beat republishes the readiness heartbeat, or is nil to publish none.
+	// Defragmentation blocks the supervision loop, and km judges this process
+	// by how old its last beat is: entering the pause with a fresh one gives
+	// the pause km's whole detection window rather than whatever remains of
+	// it. Reporting ready across a pause the control plane chose, and will
+	// come back from, is the honest reading — the alternative is being killed
+	// mid-maintenance for doing maintenance.
+	beat func()
+}
+
+func newEtcdMaintainer(client *http.Client, base, dataDir string, cfg cpSysConfig,
+	info, warn func(string, ...any), beat func()) *etcdMaintainer {
+	return &etcdMaintainer{
+		client:      client,
+		base:        strings.TrimSuffix(base, "/"),
+		quota:       int64(cfg.EtcdQuotaMB) << 20,
+		every:       time.Duration(cfg.EtcdDefragMins) * time.Minute,
+		storagePath: storageReportPath(dataDir),
+		dataDir:     dataDir,
+		defragMins:  cfg.EtcdDefragMins,
+		info:        info,
+		warn:        warn,
+		beat:        beat,
+	}
+}
+
+// storageReportPath is where the report is published, or "" when there is no
+// data directory to publish into. Empty must stay empty: filepath.Join("", x)
+// returns a bare relative name, which would drop the report into whatever the
+// working directory happens to be.
+func storageReportPath(dataDir string) string {
+	if dataDir == "" {
+		return ""
+	}
+	return filepath.Join(dataDir, etcdStorageFile)
+}
+
+// publish writes the storage report km reads. Best-effort and silent on
+// failure: `km status` losing a line is not worth a warning per round, and
+// the probes already cover anything that actually threatens the instance.
+func (m *etcdMaintainer) publish(st etcdStatus) {
+	if m.storagePath == "" {
+		return
+	}
+	body, err := json.Marshal(etcdStorageReport{
+		TS:          time.Now().Unix(),
+		DBSize:      st.size(),
+		DBSizeInUse: st.inUse(),
+		QuotaBytes:  m.quota,
+		DefragMins:  m.defragMins,
+		Fsync:       etcdFsync,
+		DataDir:     m.dataDir,
+	})
+	if err != nil {
+		return
+	}
+	tmp := m.storagePath + heartbeatTmpSuffix
+	if err := os.WriteFile(tmp, body, 0644); err != nil {
+		return
+	}
+	if err := os.Rename(tmp, m.storagePath); err != nil {
+		os.Remove(tmp)
+	}
+}
+
+// logStorage logs one line about the backend and republishes the report.
+// `when` labels the moment, e.g. "at startup". Used at both ends of the
+// instance's life, where there is no probe round to piggyback on.
+func (m *etcdMaintainer) logStorage(ctx context.Context, when string) {
+	var st etcdStatus
+	if err := m.call(ctx, etcdStatusPath, "{}", &st); err != nil {
+		m.warn("could not read etcd backend size %s: %v", when, err)
+		return
+	}
+	m.publish(st)
+	fsync := "off"
+	if etcdFsync {
+		fsync = "on"
+	}
+	defrag := "disabled"
+	if m.defragMins > 0 {
+		defrag = fmt.Sprintf("every %dm", m.defragMins)
+	}
+	m.info("[+] etcd backend %s: %s on disk, %s live, %s quota, fsync %s, defrag %s",
+		when, humanBytes(st.size()), humanBytes(st.inUse()),
+		humanBytes(m.quota), fsync, defrag)
+	m.info("[+] etcd data dir: %s", m.dataDir)
+}
+
+// call posts a JSON body to one of etcd's maintenance endpoints and decodes
+// the reply into out, which may be nil.
+func (m *etcdMaintainer) call(ctx context.Context, path, body string, out any) error {
+	ctx, cancel := context.WithTimeout(ctx, etcdMaintenanceTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.base+path, strings.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s returned %s", path, resp.Status)
+	}
+	if out == nil {
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// run performs one maintenance round. Called before the probe round so a
+// recovery lands before etcd's health is consulted. Every failure is logged
+// and swallowed: the probes decide the control plane's fate, and an
+// unreachable etcd is their business rather than this one's.
+func (m *etcdMaintainer) run(ctx context.Context, now time.Time) {
+	var st etcdStatus
+	if err := m.call(ctx, etcdStatusPath, "{}", &st); err != nil {
+		// Routine while etcd is still coming up; the probes report it if not.
+		return
+	}
+	size, inUse := st.size(), st.inUse()
+	m.alarmed, m.alarmInUse = st.noSpace(), inUse
+	m.publish(st)
+
+	if st.noSpace() {
+		if now.Before(m.nextRecovery) {
+			return
+		}
+		m.nextRecovery = now.Add(etcdAlarmRetryInterval)
+		m.clearNoSpace(ctx, st, size, inUse)
+		return
+	}
+
+	if m.every == 0 || now.Before(m.nextDefrag) {
+		return
+	}
+	// Re-armed even when the gates below decline, so the check itself stays
+	// on the configured cadence rather than running every round.
+	m.nextDefrag = now.Add(m.every)
+	if size < etcdDefragMinBytes {
+		return
+	}
+	if float64(size-inUse) < float64(size)*etcdDefragMinFreeRatio {
+		return
+	}
+	m.defrag(ctx, "reclaiming free pages", size, inUse)
+}
+
+// diagnosis explains an unhealthy etcd when a full backend is the cause, or
+// returns "" when it is not. Recovery is automatic and usually silent, so
+// reaching this means it could not keep up — which happens when the live data
+// itself no longer fits, and no amount of defragmenting will change that.
+// Whoever reads the log needs the setting to change, not the alarm's name.
+func (m *etcdMaintainer) diagnosis() string {
+	if !m.alarmed {
+		return ""
+	}
+	return fmt.Sprintf("etcd backend is full: %s of live data against the %s "+
+		"etcdQuotaMb in cpsysconfig.yaml — raise etcdQuotaMb and restart, or "+
+		"delete finished pods and jobs to bring the live data back under it",
+		humanBytes(m.alarmInUse), humanBytes(m.quota))
+}
+
+// clearNoSpace recovers from a NOSPACE alarm: defragment to give the backend
+// room, then disarm. Both steps are needed and the order matters —
+// defragmentation is permitted while the alarm is armed but does not clear
+// it, and until it is disarmed every write is still rejected.
+func (m *etcdMaintainer) clearNoSpace(ctx context.Context, st etcdStatus, size, inUse int64) {
+	m.warn("etcd NOSPACE alarm armed: backend %s, live %s, quota %s — recovering",
+		humanBytes(size), humanBytes(inUse), humanBytes(m.quota))
+	m.defrag(ctx, "clearing NOSPACE", size, inUse)
+
+	disarm := fmt.Sprintf(`{"action":"DEACTIVATE","memberID":%q,"alarm":"NOSPACE"}`,
+		st.Header.MemberID)
+	if err := m.call(ctx, etcdAlarmPath, disarm, nil); err != nil {
+		m.warn("etcd NOSPACE disarm failed, cluster stays read-only: %v", err)
+		return
+	}
+
+	var after etcdStatus
+	if err := m.call(ctx, etcdStatusPath, "{}", &after); err != nil {
+		m.info("[+] etcd NOSPACE alarm disarmed")
+		return
+	}
+	m.info("[+] etcd NOSPACE alarm disarmed, backend now %s", humanBytes(after.size()))
+	if m.quota > 0 && float64(after.inUse()) > float64(m.quota)*etcdQuotaNearlyFull {
+		m.warn("etcd holds %s of live data against a %s quota: this is data rather "+
+			"than fragmentation, so the alarm will return — raise etcdQuotaMb in "+
+			"cpsysconfig.yaml, or delete finished pods and jobs",
+			humanBytes(after.inUse()), humanBytes(m.quota))
+	}
+}
+
+// defrag rewrites the backend without its free pages. Every etcd read and
+// write blocks until it returns, so the elapsed time is logged.
+func (m *etcdMaintainer) defrag(ctx context.Context, why string, size, inUse int64) {
+	m.info("[+] Defragmenting etcd (%s): %s on disk, %s live",
+		why, humanBytes(size), humanBytes(inUse))
+	if m.beat != nil {
+		m.beat()
+	}
+	start := time.Now()
+	if err := m.call(ctx, etcdDefragPath, "{}", nil); err != nil {
+		m.warn("etcd defragmentation failed: %v", err)
+		return
+	}
+	elapsed := time.Since(start).Round(time.Millisecond)
+	var after etcdStatus
+	if err := m.call(ctx, etcdStatusPath, "{}", &after); err != nil {
+		m.info("[+] etcd defragmented in %s", elapsed)
+		return
+	}
+	m.info("[+] etcd defragmented in %s: %s -> %s",
+		elapsed, humanBytes(size), humanBytes(after.size()))
+}
+
 func main() {
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 	port := fs.String("port", "6443", "API server listen port")
@@ -993,6 +1440,27 @@ func main() {
 			Set(etcdPeerURLsFlag, fmt.Sprintf("http://127.0.0.1:%s", *etcdPeerPort))
 	}
 
+	// envtest hands etcd nothing but its URLs and data directory, so every
+	// storage setting below would otherwise be etcd's own default: no
+	// compaction of its own, and a 2 GiB backend quota whose breach arms a
+	// cluster-wide read-only alarm. Fine for a test environment that is thrown
+	// away; not for an instance that is kept.
+	testEnv.ControlPlane.Etcd.Configure().
+		// envtest adds --unsafe-no-fsync=true whenever the etcd binary accepts
+		// it, trading durability for speed on the assumption that the data dies
+		// with the test. These instances are durable, so the flag is dropped
+		// entirely and etcd fsyncs as it normally would. Disable removes it
+		// rather than setting false, so the argument never reaches etcd at all.
+		// Not exposed as a tunable: an instance whose state is meant to survive
+		// does not get to opt out of the writes actually reaching the disk.
+		Disable("unsafe-no-fsync").
+		Set("quota-backend-bytes", strconv.FormatInt(int64(cpSys.EtcdQuotaMB)<<20, 10)).
+		Set("auto-compaction-mode", "periodic").
+		Set("auto-compaction-retention", etcdAutoCompactionRetention).
+		Set("max-wals", strconv.Itoa(etcdMaxWALs)).
+		Set("max-snapshots", strconv.Itoa(etcdMaxSnapshots)).
+		Set("snapshot-count", strconv.Itoa(etcdSnapshotCount))
+
 	testEnv.ControlPlane.GetAPIServer().Configure().
 		Set("runtime-config", "api/all=true,coordination.k8s.io/v1=true").
 		Set("api-audiences", "https://kubernetes.default.svc").
@@ -1183,6 +1651,13 @@ func main() {
 	}
 	info("[+] Checking child pids every %ds: %s", *heartbeatSecs, strings.Join(pids, " "))
 	info("[+] Watching %s(%d) continuously (this process owns it)", kcmName, kcmCmd.Process.Pid)
+	if cpSys.EtcdDefragMins > 0 {
+		info("[+] etcd backend: %s quota, defragmentation considered every %dm",
+			humanBytes(int64(cpSys.EtcdQuotaMB)<<20), cpSys.EtcdDefragMins)
+	} else {
+		info("[+] etcd backend: %s quota, defragmentation disabled",
+			humanBytes(int64(cpSys.EtcdQuotaMB)<<20))
+	}
 	if *heartbeatFile == "" {
 		info("[+] No -heartbeat-file given; readiness heartbeat disabled")
 	}
@@ -1191,6 +1666,21 @@ func main() {
 	missed := 0
 	everHealthy := false
 	shuttingDown := false
+
+	// Only beats once the children have been healthy at least once: km's
+	// readiness gate opens on the first ready beat, so beating before then
+	// would report a control plane that is still coming up as usable.
+	maintainer := newEtcdMaintainer(plainClient,
+		testEnv.ControlPlane.Etcd.URL.String(), dataDir, cpSys, info, warn,
+		func() {
+			if everHealthy {
+				writeHeartbeat(*heartbeatFile, statusReady, "", warn)
+			}
+		})
+
+	startupCtx, cancelStartupReport := reportCtx(ctx)
+	maintainer.logStorage(startupCtx, "at startup")
+	cancelStartupReport()
 	// Two cadences in one loop: the children are checked for still being
 	// processes every tick, while the probe round runs when it comes due.
 	nextRound := time.Now()
@@ -1216,6 +1706,12 @@ func main() {
 				lost(death)
 				break
 			}
+			// Ahead of the probes on purpose: etcd reports an armed NOSPACE
+			// alarm as unhealthy, so clearing it here is what keeps a full
+			// backend from spending the miss budget and taking the control
+			// plane down over something recoverable in place.
+			maintainer.run(probeCtx, time.Now())
+
 			detail, gone := probeAll(probeCtx, probes)
 			// Once a child has been healthy, a refused connection means its
 			// listener is gone for good — no point spending the miss budget.
@@ -1223,6 +1719,13 @@ func main() {
 				lost(detail)
 				break
 			}
+			// The probe only reports that etcd answered /health with a 503.
+			// Name the cause and the fix while the round is still failing, so
+			// it reaches both this log and the beat km reports on.
+			if why := maintainer.diagnosis(); why != "" && detail != "" {
+				detail += "; " + why
+			}
+
 			var action monitorAction
 			missed, action = monitorRound(detail, missed, *maxMissedHeartbeats)
 
@@ -1244,6 +1747,9 @@ func main() {
 			}
 
 			if action == actionShutdown {
+				if why := maintainer.diagnosis(); why != "" {
+					fail("%s", why)
+				}
 				fail("%d consecutive failed probe rounds; shutting down the control plane", missed)
 				exitCode = 1
 				break
@@ -1262,6 +1768,12 @@ func main() {
 	cancelProbes()
 
 	info("\n[+] Shutting down...")
+
+	// Before anything is stopped: this is the last moment etcd can answer, and
+	// the size it finishes at is what the next start inherits.
+	shutdownCtx, cancelShutdownReport := reportCtx(context.Background())
+	maintainer.logStorage(shutdownCtx, "at shutdown")
+	cancelShutdownReport()
 
 	// Stop kube-controller-manager. The watcher goroutine owns Wait(), so take
 	// its result rather than calling Wait() again, which would error — and skip
