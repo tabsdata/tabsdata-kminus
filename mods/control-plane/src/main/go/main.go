@@ -19,6 +19,7 @@ import (
 	mathrand "math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -131,6 +132,26 @@ const (
 // heartbeatTmpSuffix names the staging file the beat is written to before
 // being renamed into place.
 const heartbeatTmpSuffix = ".tmp"
+
+// portUnset is the port value meaning "not pinned by km": envtest allocates a
+// free one instead.
+const portUnset = "0"
+
+// etcdPeerURLsFlag is etcd's peer-listen flag, overridden by argument because
+// envtest exposes no field for it.
+const etcdPeerURLsFlag = "listen-peer-urls"
+
+// fixedEtcdURL renders etcd's client URL for a pinned port, or nil to leave
+// the choice to envtest.
+func fixedEtcdURL(port string) *url.URL {
+	if port == portUnset {
+		return nil
+	}
+	return &url.URL{
+		Scheme: "http",
+		Host:   net.JoinHostPort("127.0.0.1", port),
+	}
+}
 
 // kcmName is the kube-controller-manager's binary and process name, used for
 // its pid file, its probe label and its liveness check.
@@ -747,6 +768,10 @@ func main() {
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 	port := fs.String("port", "6443", "API server listen port")
 	kcmPort := fs.String("kcm-port", "10257", "kube-controller-manager secure port")
+	etcdPort := fs.String("etcd-port", "0",
+		"etcd client port; 0 lets envtest pick a random free one")
+	etcdPeerPort := fs.String("etcd-peer-port", "0",
+		"etcd peer port, bound but unused by a single node; 0 lets envtest pick")
 	workDir := fs.String("workdir", ".", "Working directory (data/control-plane/ created under this)")
 	configDir := fs.String("configdir", "", "Directory for config files (default: <workdir>/config)")
 	logDir := fs.String("logdir", "", "Log directory (default: <workdir>/log)")
@@ -896,11 +921,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Check if ports are available
-	for _, p := range []struct{ name, port string }{
+	// Check if ports are available. etcd's are only listed when km pinned
+	// them; left at 0 they are envtest's to allocate, and by definition free.
+	portsToCheck := []struct{ name, port string }{
 		{"API server", *port},
-		{"kube-controller-manager", *kcmPort},
-	} {
+		{kcmName, *kcmPort},
+	}
+	if *etcdPort != portUnset {
+		portsToCheck = append(portsToCheck, struct{ name, port string }{"etcd", *etcdPort})
+	}
+	if *etcdPeerPort != portUnset {
+		portsToCheck = append(portsToCheck,
+			struct{ name, port string }{"etcd peer", *etcdPeerPort})
+	}
+	for _, p := range portsToCheck {
 		ln, err := net.Listen("tcp", "127.0.0.1:"+p.port)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "CRITICAL: %s port %s is already in use: %v\n", p.name, p.port, err)
@@ -943,9 +977,22 @@ func main() {
 				Out:     etcdLog,
 				Err:     etcdLog,
 				DataDir: dataDir,
+				// Set only when km pinned it: envtest allocates a random
+				// free port whenever this is nil, which is the fallback for
+				// instances created before km managed etcd's ports.
+				URL: fixedEtcdURL(*etcdPort),
 			},
 		},
 	}
+	// The peer URL has to go through arguments: envtest keeps it in a private
+	// field and overwrites it with a fresh random port on every Start, so
+	// there is nothing to set — but a flag the caller sets replaces the
+	// default it would otherwise pass.
+	if *etcdPeerPort != portUnset {
+		testEnv.ControlPlane.Etcd.Configure().
+			Set(etcdPeerURLsFlag, fmt.Sprintf("http://127.0.0.1:%s", *etcdPeerPort))
+	}
+
 	testEnv.ControlPlane.GetAPIServer().Configure().
 		Set("runtime-config", "api/all=true,coordination.k8s.io/v1=true").
 		Set("api-audiences", "https://kubernetes.default.svc").
@@ -967,6 +1014,8 @@ func main() {
 	}
 
 	fmt.Println("\n[+] API Server Listening:", cfg.Host)
+	info("[+] etcd listening: %s (peer %s)",
+		testEnv.ControlPlane.Etcd.URL.Host, *etcdPeerPort)
 
 	// Create a client to set up required namespaces
 	client, err := kubernetes.NewForConfig(cfg)

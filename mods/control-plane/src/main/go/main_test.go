@@ -506,3 +506,19 @@ func TestChildLostAcceptsALiveListener(t *testing.T) {
 		t.Errorf("death = %q, want no death for a listening child", death)
 	}
 }
+
+// A pinned port becomes etcd's client URL; an unset one leaves the choice to
+// envtest, which is what instances created before km managed the port do.
+func TestFixedEtcdURLOnlyWhenPinned(t *testing.T) {
+	if got := fixedEtcdURL(portUnset); got != nil {
+		t.Errorf("fixedEtcdURL(%q) = %v, want nil so envtest allocates", portUnset, got)
+	}
+
+	got := fixedEtcdURL("10305")
+	if got == nil {
+		t.Fatal("a pinned port must produce a URL")
+	}
+	if got.Scheme != "http" || got.Host != "127.0.0.1:10305" {
+		t.Errorf("fixedEtcdURL(10305) = %v, want http://127.0.0.1:10305", got)
+	}
+}

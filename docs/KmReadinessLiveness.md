@@ -65,8 +65,9 @@ serving path only — it does not exercise pod execution.
 ## Two levels
 
 km supervises the three processes it spawns: control-plane, pod-runner,
-virtual-kubelet. It never probes the control-plane's children — and could
-not reach etcd anyway, whose port envtest allocates at random.
+virtual-kubelet. It never probes the control-plane's children: km allocates
+every port the stack binds, but watching the inner three is the
+control-plane's business.
 
 The control-plane supervises its own three (etcd, kube-apiserver,
 kube-controller-manager) with the same pattern, and collapses their verdicts
@@ -80,8 +81,24 @@ control-plane's children, but only for display — no probe, no verdict.
 
 ## Timing
 
-Both knobs live in `kmsysconfig.yaml` and are forwarded to every component,
-so the whole stack shares one cadence:
+Ports are allocated for the whole stack from `--portstart`, seven of them:
+
+    +0 control-plane API server      +4 virtual-kubelet
+    +1 kube-controller-manager       +5 etcd (client)
+    +2 pod-runner                    +6 etcd (peer)
+    +3 pod-runner metrics
+
+etcd's two come last so that adding them left every existing assignment where
+it was. They are pinned explicitly — `Etcd.URL` for the client port, and the
+`listen-peer-urls` flag for the peer, since envtest keeps that one in a
+private field it overwrites on every start — so no port the stack binds is
+left unaccounted for, and none of them move between runs. An instance created
+before km managed these simply has no `etcd`/`etcdPeer` entries: they default
+to 0, which already means "pick a free one at startup", so km chooses them and
+still knows what they are.
+
+Both heartbeat knobs live in `kmsysconfig.yaml` and are forwarded to every
+component, so the whole stack shares one cadence:
 
 ```yaml
 heartbeat:

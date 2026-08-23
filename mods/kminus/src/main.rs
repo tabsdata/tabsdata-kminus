@@ -125,6 +125,8 @@ enum Command {
 ///   portstart+2 = pod-runner
 ///   portstart+3 = pod-runner metrics
 ///   portstart+4 = virtual-kubelet
+///   portstart+5 = etcd (client)
+///   portstart+6 = etcd (peer, bound but unused by a single node)
 #[derive(Args, Debug)]
 struct CreateArgs {
     /// Working directory for the new instance. Must not exist.
@@ -401,11 +403,7 @@ fn print_status(
     cp: &Child,
     pr: &Child,
     vk: &Child,
-    port_api: &str,
-    port_kcm: &str,
-    port_pr: &str,
-    port_pr_metrics: &str,
-    port_vk: &str,
+    ports: &KmPorts,
     kubeconfig: &Path,
 ) {
     let cp_children = control_plane::read_children(&paths.workdir);
@@ -418,24 +416,31 @@ fn print_status(
         "    {}               pid={:<7}port={}  kcm-port={}",
         control_plane::BIN,
         cp.id(),
-        port_api,
-        port_kcm
+        ports.api,
+        ports.kcm
     );
     for (name, pid) in &cp_children {
-        println!("      {:<24}  pid={}", name, pid);
+        // Trimmed so a child with no known ports leaves no trailing padding.
+        let line = format!(
+            "      {:<24}  pid={:<7}{}",
+            name,
+            pid,
+            child_ports(name, ports)
+        );
+        println!("{}", line.trim_end());
     }
     println!(
         "    {}                  pid={:<7}port={}  metrics-port={}",
         pod_runner::BIN,
         pr.id(),
-        port_pr,
-        port_pr_metrics
+        ports.pr,
+        ports.pr_metrics
     );
     println!(
         "    {}             pid={:<7}port={}",
         virtual_kubelet::BIN,
         vk.id(),
-        port_vk
+        ports.vk
     );
     println!(
         "    {BIN_KM}                          pid={}",
@@ -1096,18 +1101,7 @@ fn command_start(args: StartArgs) {
     );
     info!("K- ready");
 
-    print_status(
-        &paths,
-        &cp,
-        &pr,
-        &vk,
-        &port_api,
-        &port_kcm,
-        &port_pr,
-        &port_pr_metrics,
-        &port_vk,
-        &kubeconfig,
-    );
+    print_status(&paths, &cp, &pr, &vk, &sys_cfg.ports, &kubeconfig);
 
     println!(
         "  liveness/readiness check every {}ms/{}s, readiness tolerance {} misses",
@@ -1193,6 +1187,21 @@ fn command_stop(args: StopArgs) {
             shutdown_from_pids(&paths);
             println!("Stopped.");
         }
+    }
+}
+
+/// The ports a control-plane child binds, for the status block. km allocates
+/// all of them, so they can be reported even though km never probes these
+/// processes itself.
+fn child_ports(name: &str, ports: &KmPorts) -> String {
+    if name == control_plane::ETCD {
+        format!("port={}  peer-port={}", ports.etcd, ports.etcd_peer)
+    } else if name == control_plane::KUBE_APISERVER {
+        format!("port={}", ports.api)
+    } else if name == control_plane::KCM {
+        format!("port={}", ports.kcm)
+    } else {
+        String::new()
     }
 }
 
@@ -1531,6 +1540,22 @@ mod tests {
         let pr_verdict = assess(ProcessState::Running, &mut all[1].monitor);
         assert!(matches!(pr_verdict, Verdict::Failed(_)));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn child_ports_reports_what_each_control_plane_child_binds() {
+        let ports = KmPorts::from_portstart(20000).unwrap();
+        assert_eq!(
+            child_ports(control_plane::ETCD, &ports),
+            "port=20005  peer-port=20006"
+        );
+        assert_eq!(
+            child_ports(control_plane::KUBE_APISERVER, &ports),
+            "port=20000"
+        );
+        assert_eq!(child_ports(control_plane::KCM, &ports), "port=20001");
+        // An unknown child must not have a port invented for it.
+        assert_eq!(child_ports("kube-scheduler", &ports), "");
     }
 
     // -- process watcher ---------------------------------------------------

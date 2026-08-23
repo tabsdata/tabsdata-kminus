@@ -19,8 +19,10 @@ use crate::system::port::find_free_port;
 pub const KM_SYSCONFIG_FILE: &str = "kmsysconfig.yaml";
 
 /// Number of consecutive ports an instance occupies, counting up from
-/// `--portstart`: api, kcm, pr, prMetrics, vk — in that order.
-pub const KM_PORT_COUNT: u16 = 5;
+/// `--portstart`: api, kcm, pr, prMetrics, vk, etcd, etcdPeer — in that order.
+/// etcd's two ports come last so that adding them left every existing
+/// assignment where it was.
+pub const KM_PORT_COUNT: u16 = 7;
 
 /// Largest accepted `--portstart`. Anything higher would push the
 /// instance's [`KM_PORT_COUNT`] consecutive ports past the top of the
@@ -41,6 +43,12 @@ const API_SERVER_LABEL: &str = "API server";
 /// Label suffix for the pod-runner's metrics port.
 const METRICS_LABEL: &str = "metrics";
 
+/// Label for etcd's client port.
+const ETCD_LABEL: &str = "etcd";
+
+/// Label for etcd's peer port, which a single-node etcd binds but never uses.
+const ETCD_PEER_LABEL: &str = "etcd peer";
+
 /// Port assignments persisted in `kmsysconfig.yaml`.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KmPorts {
@@ -54,6 +62,15 @@ pub struct KmPorts {
     pub pr_metrics: u16,
     #[serde(default)]
     pub vk: u16,
+    /// etcd's client port. Absent from files written before km managed it,
+    /// where it defaults to 0 — which already means "pick a free one at
+    /// startup", so those instances keep working.
+    #[serde(default)]
+    pub etcd: u16,
+    /// etcd's peer port. Bound but unused by a single-node etcd; managed only
+    /// so that no port the stack binds is left unaccounted for.
+    #[serde(default, rename = "etcdPeer")]
+    pub etcd_peer: u16,
 }
 
 impl KmPorts {
@@ -70,6 +87,8 @@ impl KmPorts {
                 pr: 0,
                 pr_metrics: 0,
                 vk: 0,
+                etcd: 0,
+                etcd_peer: 0,
             });
         }
         if portstart > MAX_PORTSTART {
@@ -85,6 +104,8 @@ impl KmPorts {
             pr: portstart + 2,
             pr_metrics: portstart + 3,
             vk: portstart + 4,
+            etcd: portstart + 5,
+            etcd_peer: portstart + 6,
         })
     }
 
@@ -103,6 +124,8 @@ impl KmPorts {
                 format!("{} {}", pod_runner::BIN, METRICS_LABEL),
             ),
             (self.vk, virtual_kubelet::BIN.to_string()),
+            (self.etcd, ETCD_LABEL.to_string()),
+            (self.etcd_peer, ETCD_PEER_LABEL.to_string()),
         ]
     }
 }
@@ -244,6 +267,8 @@ impl KmSysConfig {
             &mut self.ports.pr,
             &mut self.ports.pr_metrics,
             &mut self.ports.vk,
+            &mut self.ports.etcd,
+            &mut self.ports.etcd_peer,
         ] {
             if *p == 0 {
                 *p = find_free_port();
@@ -281,6 +306,8 @@ mod tests {
         assert_eq!(cfg.ports.pr, 10302);
         assert_eq!(cfg.ports.pr_metrics, 10303);
         assert_eq!(cfg.ports.vk, 10304);
+        assert_eq!(cfg.ports.etcd, 10305);
+        assert_eq!(cfg.ports.etcd_peer, 10306);
         assert_eq!(cfg.log.max_size_mb, 100);
         assert_eq!(cfg.log.max_files, 3);
     }
@@ -293,13 +320,17 @@ mod tests {
         assert_eq!(cfg.ports.pr, 0);
         assert_eq!(cfg.ports.pr_metrics, 0);
         assert_eq!(cfg.ports.vk, 0);
+        assert_eq!(cfg.ports.etcd, 0);
+        assert_eq!(cfg.ports.etcd_peer, 0);
     }
 
     #[test]
     fn from_portstart_accepts_the_highest_fitting_range() {
         let ports = KmPorts::from_portstart(MAX_PORTSTART).unwrap();
         assert_eq!(ports.api, MAX_PORTSTART);
-        assert_eq!(ports.vk, u16::MAX);
+        // The last port assigned must land exactly on the top of the space,
+        // whichever port that is as the set grows.
+        assert_eq!(ports.labeled().last().unwrap().0, u16::MAX);
     }
 
     #[test]
@@ -316,13 +347,18 @@ mod tests {
         let labeled = ports.labeled();
         assert_eq!(labeled.len(), KM_PORT_COUNT as usize);
         let numbers: Vec<u16> = labeled.iter().map(|(p, _)| *p).collect();
-        assert_eq!(numbers, vec![12000, 12001, 12002, 12003, 12004]);
+        assert_eq!(
+            numbers,
+            vec![12000, 12001, 12002, 12003, 12004, 12005, 12006]
+        );
         assert!(labeled[0].1.contains(control_plane::BIN));
         assert!(labeled[0].1.contains(API_SERVER_LABEL));
         assert_eq!(labeled[1].1, control_plane::KCM);
         assert_eq!(labeled[2].1, pod_runner::BIN);
         assert!(labeled[3].1.contains(METRICS_LABEL));
         assert_eq!(labeled[4].1, virtual_kubelet::BIN);
+        assert_eq!(labeled[5].1, ETCD_LABEL);
+        assert_eq!(labeled[6].1, ETCD_PEER_LABEL);
     }
 
     #[test]
@@ -413,6 +449,9 @@ mod tests {
         fs::write(dir.join(KM_SYSCONFIG_FILE), yaml).unwrap();
 
         let cfg = KmSysConfig::load(&dir).unwrap();
+        // Written before km managed etcd's ports: defaulted, not an error.
+        assert_eq!(cfg.ports.etcd, 0);
+        assert_eq!(cfg.ports.etcd_peer, 0);
         assert_eq!(cfg.log.max_size_mb, 50);
         assert_eq!(cfg.log.max_files, 7);
         assert_eq!(cfg.ports.api, 9000);
@@ -449,10 +488,12 @@ mod tests {
             cfg.ports.pr,
             cfg.ports.pr_metrics,
             cfg.ports.vk,
+            cfg.ports.etcd,
+            cfg.ports.etcd_peer,
         ]
         .into_iter()
         .collect();
-        assert_eq!(ports.len(), 5);
+        assert_eq!(ports.len(), KM_PORT_COUNT as usize);
         assert!(ports.iter().all(|&p| p != 0));
     }
 

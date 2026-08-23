@@ -48,7 +48,7 @@ The control plane starts three Kubernetes components, in order:
 
 | Service                     | Started By              | Default Port  |
 |-----------------------------|-------------------------|---------------|
-| **etcd**                    | envtest (child process) | auto-assigned |
+| **etcd**                    | envtest (child process) | `--etcd-port` |
 | **kube-apiserver**          | envtest (child process) | 6443          |
 | **kube-controller-manager** | control-plane (exec)    | 10257         |
 
@@ -72,12 +72,19 @@ If you need custom ports, pass them via CLI flags on each start. Note
 that the API server host/port is embedded in the kubeconfigs, so they
 are only stable across restarts that use the same port.
 
+Under km none of this is manual: km allocates every port the stack binds from
+its `--portstart`, etcd's two included (`portstart+5` client, `+6` peer), and
+passes them in. Left at `0` the etcd ports fall back to envtest's random
+allocation, which is what an instance created before km managed them does.
+
 ## Command-Line Options
 
 | Flag            | Default             | Description                                                                         |
 |-----------------|---------------------|-------------------------------------------------------------------------------------|
 | `--port`        | `6443`              | kube-apiserver listen port                                                          |
 | `--kcm-port`    | `10257`             | kube-controller-manager secure port                                                 |
+| `--etcd-port`   | `0`                 | etcd client port; `0` lets envtest pick a random free one                           |
+| `--etcd-peer-port` | `0`              | etcd peer port, bound but unused by a single node; `0` lets envtest pick             |
 | `--workdir`     | `.`                 | Working directory — `data/control-plane/`, `config/`, `log/` are created under this |
 | `--configdir`   | `<workdir>/config`  | Directory for generated kubeconfig and `cpsysconfig.yaml`                           |
 | `--logdir`      | `<workdir>/log`     | Directory for rotating log files                                                    |
