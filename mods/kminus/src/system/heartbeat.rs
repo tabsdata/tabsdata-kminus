@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use crate::system::pid::DATA_DIR;
+use crate::system::pid::{BIN_KM, DATA_DIR};
 
 /// Filename of a component's heartbeat file, under `<workdir>/data/<bin>/`.
 pub const HEARTBEAT_FILE: &str = "heartbeat.json";
@@ -45,6 +45,58 @@ pub fn heartbeat_file(workdir: &Path, name: &str) -> PathBuf {
 /// How old a heartbeat may get before a poll counts it as missed.
 pub fn stale_after(interval: Duration) -> Duration {
     interval + HEARTBEAT_GRACE
+}
+
+/// Filename of km's own ready marker, under `<workdir>/data/km/`.
+pub const KM_READY_FILE: &str = "ready";
+
+/// Path of km's ready marker.
+///
+/// Only its modification time carries meaning, so it is a marker rather than
+/// a heartbeat: km rewrites the timestamp on every supervision round where
+/// the whole stack is healthy, and stops the moment it is not. `km status`
+/// reads nothing but the age, and ages it with [`stale_after`] against the
+/// same `intervalSecs` km supervises on — so the two cannot drift apart the
+/// way a second opinion about readiness would.
+pub fn ready_file(workdir: &Path) -> PathBuf {
+    workdir.join(DATA_DIR).join(BIN_KM).join(KM_READY_FILE)
+}
+
+/// Stamp the ready marker with the current time, creating it if needed.
+///
+/// Best-effort: failing to record readiness must not bring down a stack that
+/// is, in fact, ready. A marker that stops being stamped goes stale on its
+/// own, which is the same thing `km status` would conclude anyway.
+pub fn touch_ready(workdir: &Path) {
+    let path = ready_file(workdir);
+    if let Some(parent) = path.parent()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        warn!(dir = %parent.display(), error = %e, "Cannot create the ready marker directory");
+        return;
+    }
+    // Rewriting the file is the portable way to set mtime to now; the
+    // contents are never read.
+    if let Err(e) = fs::write(&path, b"ready\n") {
+        warn!(file = %path.display(), error = %e, "Cannot stamp the ready marker");
+    }
+}
+
+/// How long ago km last reported the stack ready, or `None` when it never
+/// has. A marker dated in the future — a backwards clock step — is read as
+/// fresh rather than impossibly old, matching [`read`].
+pub fn ready_age(workdir: &Path) -> Option<Duration> {
+    let modified = fs::metadata(ready_file(workdir)).ok()?.modified().ok()?;
+    Some(modified.elapsed().unwrap_or_default())
+}
+
+/// Remove the ready marker, so a stopped instance cannot read as ready and
+/// the next start cannot inherit this run's answer.
+pub fn clear_ready(workdir: &Path) {
+    let path = ready_file(workdir);
+    if path.exists() {
+        let _ = fs::remove_file(&path);
+    }
 }
 
 /// What a component wrote into its heartbeat file. `detail` carries the

@@ -85,6 +85,37 @@ notices.
 `km status` shows each component's beat age; it also lists the
 control-plane's children, but only for display — no probe, no verdict.
 
+## What `km status` reports
+
+Two independent signals, and neither is recomputed by `status`:
+
+- **Live** — km's own pid is alive. An instance exists.
+- **Ready** — the age of `<workdir>/data/km/ready`, a marker km stamps on
+  every supervision round in which the whole stack answered. Only its
+  modification time carries meaning; nothing reads its contents.
+
+km already decides readiness once per round, across every component. Stamping
+the marker records that decision, and `status` ages it with the same
+`intervalSecs` km supervises on. Re-deriving readiness in `status` would be a
+second opinion, free to disagree with the one actually driving the stack.
+
+The marker is removed at startup before anything is spawned, and again during
+teardown, so a stopped instance cannot read as ready and a new run cannot
+inherit the last one's answer. km stamps it as soon as the stack comes up
+rather than waiting for the first supervision round, so a `status` in that
+first interval says `ready` rather than "not reported yet".
+
+| Exit | Meaning     | Condition                                      |
+|------|-------------|------------------------------------------------|
+| `0`  | ready       | km live, marker fresher than `interval + 2s`   |
+| `1`  | live        | km live, marker stale or never written         |
+| `2`  | not running | no live km pid                                 |
+
+The three cases exist because a caller polling for readiness needs to tell
+"still coming up" from "never started": one code for both makes a script
+either wait on something that will never be ready, or give up on something
+that is about to be.
+
 ## Timing
 
 Ports are allocated for the whole stack from `--portstart`, seven of them:

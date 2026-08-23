@@ -641,6 +641,9 @@ fn shutdown_from_pids(paths: &Paths, ports: Option<&KmPorts>) {
 
     remove_pid(&paths.pids, BIN_KM);
     let _ = fs::remove_dir(&paths.pids);
+    // A stopped instance must not read as ready; the km pid is gone too, so
+    // this only guards against the marker outliving the directory sweep.
+    heartbeat::clear_ready(&paths.workdir);
 
     // Read after the components have gone, so anything they wrote on their
     // way out is already there. The startup set is reported too: a stack that
@@ -896,6 +899,10 @@ fn monitor_stack(
         if let Some((name, reason)) = monitor_round(&mut watched) {
             fail_stack(paths, ports, name, &reason);
         }
+        // Every component answered this round, so readiness still holds. Not
+        // restamping is how the marker goes stale, which is the only signal
+        // `km status` reads.
+        heartbeat::touch_ready(&paths.workdir);
     }
 }
 
@@ -1187,6 +1194,9 @@ fn command_start(args: StartArgs) {
     // Emptied before any component runs, so a previous run's messages cannot
     // be read back as this one's.
     messages::clear(&paths.workdir);
+    // Same reason: a marker left by the last run would make `km status`
+    // report this one ready before it is.
+    heartbeat::clear_ready(&paths.workdir);
 
     // Install signal-driven shutdown BEFORE spawning anything, so a
     // Ctrl+C at any point during the (multi-second) startup tears the
@@ -1253,6 +1263,10 @@ fn command_start(args: StartArgs) {
         started.elapsed().as_secs_f64()
     );
     info!("K- ready");
+    // Stamped here rather than waiting for the first supervision round: the
+    // stack is ready now, and a `km status` in the next interval should say
+    // so rather than "not reported yet".
+    heartbeat::touch_ready(&paths.workdir);
 
     print_status(&paths, &cp, &pr, &vk, &sys_cfg.ports, &kubeconfig);
 
@@ -1445,30 +1459,97 @@ fn print_etcd_storage(paths: &Paths) {
     );
 }
 
+/// What `km status` found: the three cases a caller scripting on it needs to
+/// tell apart.
+///
+/// The two signals are deliberately independent. *Live* is km's own process
+/// being alive — an instance exists. *Ready* is the age of the marker km
+/// stamps on each supervision round where the whole stack is healthy. An
+/// instance whose km is up but whose stack is still coming up, or has gone
+/// degraded, is neither serving nor absent; collapsing that into either one
+/// makes a script wait on something that will never be ready, or give up on
+/// something that is about to be.
+#[derive(Debug, PartialEq, Eq)]
+enum InstanceState {
+    /// km is live and the ready marker is fresh.
+    Ready,
+    /// km is live, but the marker is stale or was never written. Carries why,
+    /// so the reason is on screen rather than only in a log.
+    Live { reason: String },
+    /// No km orchestrator for this instance.
+    NotRunning,
+}
+
+impl InstanceState {
+    /// 0 ready, 1 live, 2 not running.
+    fn exit_code(&self) -> i32 {
+        match self {
+            Self::Ready => 0,
+            Self::Live { .. } => 1,
+            Self::NotRunning => 2,
+        }
+    }
+}
+
+/// Classify the instance at `paths`.
+///
+/// Readiness is not recomputed here. km already decides it once per round,
+/// across every component, and records that decision by stamping the marker;
+/// status reads the age and applies the same `intervalSecs` km supervises on.
+/// Anything else would be a second opinion, free to disagree with the one
+/// actually driving the stack.
+fn instance_state(paths: &Paths, hb: &KmHeartbeat) -> InstanceState {
+    if !read_pid(&paths.pids, BIN_KM).is_some_and(is_alive) {
+        return InstanceState::NotRunning;
+    }
+    let stale_after = heartbeat::stale_after(hb.interval());
+    match heartbeat::ready_age(&paths.workdir) {
+        Some(age) if age <= stale_after => InstanceState::Ready,
+        Some(age) => InstanceState::Live {
+            reason: format!(
+                "last reported ready {}s ago, stale after {}s",
+                age.as_secs(),
+                stale_after.as_secs()
+            ),
+        },
+        None => InstanceState::Live {
+            reason: "has not reported ready yet".to_string(),
+        },
+    }
+}
+
 /// Report the status of the kminus instance in `args.workdir`.
 ///
-/// Exit code reflects overall state: 0 if the km orchestrator is running,
-/// 3 if it is stopped — mirroring LSB `status` conventions so callers can
-/// script on it.
+/// Exit code reflects overall state: 0 ready, 1 live but not ready, 2 not
+/// running. A caller waiting for an instance can therefore poll for 0 and
+/// tell "still coming up" (1) from "never started" (2), which one code for
+/// both could not.
 fn command_status(args: StatusArgs) {
     let paths = Paths::for_existing(&args.workdir).unwrap_or_else(|e| {
         eprintln!("ERROR: {e}");
         std::process::exit(1);
     });
+    // Only the heartbeat interval is needed, to know when a beat is stale.
+    // A config that will not load is not worth failing status over: the
+    // defaults answer the same question, slightly less precisely.
+    let hb = KmSysConfig::load(&paths.configdir)
+        .map(|cfg| cfg.heartbeat)
+        .unwrap_or_default();
 
     println!();
     println!("Tabsdata K- (K minus) status");
     println!("  workdir          {}", paths.workdir.display());
     println!();
-    let km_running = print_instance_status(&paths);
+    print_instance_status(&paths);
     println!();
 
-    if km_running {
-        println!("Overall: running");
-    } else {
-        println!("Overall: stopped");
-        std::process::exit(3);
+    let state = instance_state(&paths, &hb);
+    match &state {
+        InstanceState::Ready => println!("Overall: ready"),
+        InstanceState::Live { reason } => println!("Overall: live, not ready ({reason})"),
+        InstanceState::NotRunning => println!("Overall: not running"),
     }
+    std::process::exit(state.exit_code());
 }
 
 /// Restart the kminus instance: stop it (if running), then start it.
@@ -1623,6 +1704,140 @@ mod tests {
         let dir = env::temp_dir().join(format!("km-main-{}-{}", std::process::id(), n));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // -- instance_state ----------------------------------------------------
+
+    fn status_paths() -> Paths {
+        let workdir = tempdir();
+        let paths = Paths {
+            pids: pids_dir(&workdir, BIN_KM),
+            configdir: workdir.join("config"),
+            logdir: workdir.join("log"),
+            workdir,
+        };
+        fs::create_dir_all(&paths.pids).unwrap();
+        paths
+    }
+
+    /// Record km as running under this test's own pid, which is alive by
+    /// definition.
+    fn mark_km_live(paths: &Paths) {
+        write_pid(&paths.pids, BIN_KM, std::process::id());
+    }
+
+    /// Backdate the ready marker so it reads as stale.
+    fn age_ready_marker(paths: &Paths, by: Duration) {
+        let path = heartbeat::ready_file(&paths.workdir);
+        let when = std::time::SystemTime::now() - by;
+        let file = fs::File::options().write(true).open(&path).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
+    // Not running is km's own process being absent — nothing to do with the
+    // marker, which may well still be lying around.
+    #[test]
+    fn instance_state_is_not_running_without_a_live_km() {
+        let paths = status_paths();
+        heartbeat::touch_ready(&paths.workdir);
+
+        let state = instance_state(&paths, &KmHeartbeat::default());
+        assert_eq!(state, InstanceState::NotRunning);
+        assert_eq!(state.exit_code(), 2);
+        fs::remove_dir_all(&paths.workdir).ok();
+    }
+
+    #[test]
+    fn instance_state_is_ready_when_the_marker_is_fresh() {
+        let paths = status_paths();
+        mark_km_live(&paths);
+        heartbeat::touch_ready(&paths.workdir);
+
+        let state = instance_state(&paths, &KmHeartbeat::default());
+        assert_eq!(state, InstanceState::Ready);
+        assert_eq!(state.exit_code(), 0);
+        fs::remove_dir_all(&paths.workdir).ok();
+    }
+
+    // km up but nothing stamped yet: still coming up, which must read as
+    // neither ready nor absent.
+    #[test]
+    fn instance_state_is_live_before_the_first_stamp() {
+        let paths = status_paths();
+        mark_km_live(&paths);
+
+        let state = instance_state(&paths, &KmHeartbeat::default());
+        assert_eq!(state.exit_code(), 1);
+        let InstanceState::Live { reason } = &state else {
+            panic!("expected live, got {state:?}");
+        };
+        assert!(reason.contains("not reported ready"), "{reason}");
+        fs::remove_dir_all(&paths.workdir).ok();
+    }
+
+    // km stopped stamping: the stack went degraded under a km that is still
+    // alive. Staleness is the whole signal.
+    #[test]
+    fn instance_state_is_live_when_the_marker_goes_stale() {
+        let paths = status_paths();
+        mark_km_live(&paths);
+        heartbeat::touch_ready(&paths.workdir);
+        age_ready_marker(&paths, Duration::from_secs(3600));
+
+        let state = instance_state(&paths, &KmHeartbeat::default());
+        assert_eq!(state.exit_code(), 1);
+        let InstanceState::Live { reason } = &state else {
+            panic!("expected live, got {state:?}");
+        };
+        assert!(reason.contains("3600s ago"), "{reason}");
+        fs::remove_dir_all(&paths.workdir).ok();
+    }
+
+    // Status ages the marker with the same interval km supervises on, so a
+    // slower heartbeat widens the window rather than needing its own rule.
+    #[test]
+    fn instance_state_uses_the_configured_interval_for_staleness() {
+        let paths = status_paths();
+        mark_km_live(&paths);
+        heartbeat::touch_ready(&paths.workdir);
+        age_ready_marker(&paths, Duration::from_secs(30));
+
+        let brisk = KmHeartbeat {
+            interval_secs: 5,
+            ..KmHeartbeat::default()
+        };
+        assert_eq!(instance_state(&paths, &brisk).exit_code(), 1);
+
+        let relaxed = KmHeartbeat {
+            interval_secs: 60,
+            ..KmHeartbeat::default()
+        };
+        assert_eq!(instance_state(&paths, &relaxed), InstanceState::Ready);
+        fs::remove_dir_all(&paths.workdir).ok();
+    }
+
+    #[test]
+    fn instance_state_exit_codes_are_distinct() {
+        assert_eq!(InstanceState::Ready.exit_code(), 0);
+        assert_eq!(InstanceState::Live { reason: "x".into() }.exit_code(), 1);
+        assert_eq!(InstanceState::NotRunning.exit_code(), 2);
+    }
+
+    #[test]
+    fn ready_marker_round_trips_and_clears() {
+        let paths = status_paths();
+        assert!(heartbeat::ready_age(&paths.workdir).is_none());
+
+        heartbeat::touch_ready(&paths.workdir);
+        let age = heartbeat::ready_age(&paths.workdir).expect("marker should exist");
+        assert!(age < Duration::from_secs(5), "fresh marker aged {age:?}");
+
+        heartbeat::clear_ready(&paths.workdir);
+        assert!(heartbeat::ready_age(&paths.workdir).is_none());
+        // Clearing something already absent is not an error.
+        heartbeat::clear_ready(&paths.workdir);
+        fs::remove_dir_all(&paths.workdir).ok();
     }
 
     // -- env_flag_enabled --------------------------------------------------
