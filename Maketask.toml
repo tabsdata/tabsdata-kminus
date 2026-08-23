@@ -239,6 +239,7 @@ description = "Regenerate lockfiles across all modules"
 dependencies = [
     "lock_go",
     "lock_rs",
+    "license",
 ]
 
 [tasks.lock_go]
@@ -647,5 +648,18 @@ description = "Task 'permit' for Go projects"
 run_task = [
     { name = [
         "__km__permit_go",
+    ] }
+]
+
+[tasks.update]
+plugin = "td-task-tracker"
+category = "80 - Verify"
+description = "Verify and update the essential language tools, which no other task does by default"
+env = { "TD_WITH_PERMIT" = "true" }
+run_task = [
+    { name = [
+        "permit_py",
+        "permit_rs",
+        "permit_go"
     ] }
 ]

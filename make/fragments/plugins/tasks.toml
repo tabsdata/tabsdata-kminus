@@ -17,20 +17,32 @@ script ='''
     if not ${is_meta_task}
         permit_done = get_env TD_PERMIT_DONE
         if is_empty ${permit_done}
-            with_permit = get_env TD_WITH_PERMIT
-            with_permit_false = eq ${with_permit} "false"
-            if ${with_permit_false}
-                with_permit = set false
-            else
-                with_permit = set true
+            on_ga = get_env TD_ON_GA
+            if eq ${on_ga} "true"
+                set_env TD_AUTO_LICENSE "true"
             end
+            auto_license = get_env TD_AUTO_LICENSE
+            if not eq ${auto_license} "true"
+                set_env TD_AUTO_LICENSE "false"
+            end
+
+            with_permit = get_env TD_WITH_PERMIT
+            with_permit = eq ${with_permit} "true"
             cli_args = split ${CARGO_MAKE_TASK_ARGS} ;
             for cli_arg in ${cli_args}
                 cli_arg = trim ${cli_arg}
+                is_permit = eq ${cli_arg} "--permit"
+                if ${is_permit}
+                    with_permit = set true
+                end
                 is_no_permit = eq ${cli_arg} "--no-permit"
                 if ${is_no_permit}
                     with_permit = set false
                 end
+            end
+            make_task = get_env CARGO_MAKE_TASK
+            if eq ${make_task} "update"
+                with_permit = set true
             end
 
             if ${with_permit}
