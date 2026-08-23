@@ -23,4 +23,5 @@
 pub mod app;
 pub mod config;
 pub mod heartbeat;
+pub mod messages;
 pub mod tls;

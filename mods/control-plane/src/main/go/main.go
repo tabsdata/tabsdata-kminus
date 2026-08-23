@@ -203,6 +203,67 @@ const (
 	etcdSnapshotCount = 10000
 )
 
+// km's message channel. A component with something the operator should see
+// writes it here as well as into its own log, and km prints the collected set
+// once the stack is up and again as it comes down. Reporting only: readiness
+// stays with the heartbeat, and a message that cannot be written is dropped
+// rather than allowed to affect a start or a stop.
+const (
+	// messagesDir sits under the workdir and is emptied by km at startup.
+	messagesDir = "messages"
+
+	// messageStartPhase and messageStopPhase are the filename prefixes that
+	// keep the two sets apart: km reads <phase><binary>.json.
+	messageStartPhase = "start-"
+	messageStopPhase  = "stop-"
+
+	// messageTimeFormat is RFC 3339 in UTC at fixed millisecond precision.
+	// km sorts these as strings, so the precision and the zone must not vary.
+	messageTimeFormat = "2006-01-02T15:04:05.000Z07:00"
+)
+
+// Levels km understands. Anything else is shown as written.
+const (
+	messageLevelInfo  = "INFO"
+	messageLevelWarn  = "WARN"
+	messageLevelError = "ERROR"
+)
+
+// componentMessage is one newline-delimited JSON record in a message file.
+type componentMessage struct {
+	Time    string `json:"time"`
+	Binary  string `json:"binary"`
+	Level   string `json:"level"`
+	Message string `json:"message"`
+}
+
+// writeMessage appends one message for km to print. Best-effort throughout:
+// the directory is km's to create, and a control plane that cannot report is
+// still a working control plane.
+func writeMessage(workdir, phase, level, format string, args ...any) {
+	if workdir == "" {
+		return
+	}
+	record, err := json.Marshal(componentMessage{
+		Time:    time.Now().UTC().Format(messageTimeFormat),
+		Binary:  "control-plane",
+		Level:   level,
+		Message: fmt.Sprintf(format, args...),
+	})
+	if err != nil {
+		return
+	}
+	path := filepath.Join(workdir, messagesDir, phase+"control-plane.json")
+	// Appended, so several messages accumulate across a phase without the
+	// writer having to hold or re-read what it already said.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.Write(append(record, '\n'))
+}
+
 // etcdStorageFile is the backend report the control-plane publishes into its
 // data directory for `km status` to read. km speaks no HTTP and, when ports
 // are random, does not know the one envtest gave etcd — so the process that
@@ -990,6 +1051,9 @@ type etcdMaintainer struct {
 	// dataDir is etcd's data directory, echoed into the report so `km status`
 	// can name the directory whose size it is describing.
 	dataDir string
+	// workdir roots km's messages directory, where the startup and shutdown
+	// summaries go. Empty disables reporting.
+	workdir string
 	// defragMins is echoed into the report so km can show the cadence.
 	defragMins int
 	// beat republishes the readiness heartbeat, or is nil to publish none.
@@ -1002,7 +1066,7 @@ type etcdMaintainer struct {
 	beat func()
 }
 
-func newEtcdMaintainer(client *http.Client, base, dataDir string, cfg cpSysConfig,
+func newEtcdMaintainer(client *http.Client, base, dataDir, workdir string, cfg cpSysConfig,
 	info, warn func(string, ...any), beat func()) *etcdMaintainer {
 	return &etcdMaintainer{
 		client:      client,
@@ -1011,6 +1075,7 @@ func newEtcdMaintainer(client *http.Client, base, dataDir string, cfg cpSysConfi
 		every:       time.Duration(cfg.EtcdDefragMins) * time.Minute,
 		storagePath: storageReportPath(dataDir),
 		dataDir:     dataDir,
+		workdir:     workdir,
 		defragMins:  cfg.EtcdDefragMins,
 		info:        info,
 		warn:        warn,
@@ -1057,13 +1122,21 @@ func (m *etcdMaintainer) publish(st etcdStatus) {
 	}
 }
 
-// logStorage logs one line about the backend and republishes the report.
-// `when` labels the moment, e.g. "at startup". Used at both ends of the
-// instance's life, where there is no probe round to piggyback on.
-func (m *etcdMaintainer) logStorage(ctx context.Context, when string) {
+// logStorage logs one line about the backend, republishes the `km status`
+// report and hands the same summary to km's message channel, which is where
+// the operator actually sees it: this runs at both ends of the instance's
+// life, where there is no probe round to piggyback on. `phase` is one of
+// messageStartPhase or messageStopPhase.
+func (m *etcdMaintainer) logStorage(ctx context.Context, phase string) {
+	when := "at startup"
+	if phase == messageStopPhase {
+		when = "at shutdown"
+	}
 	var st etcdStatus
 	if err := m.call(ctx, etcdStatusPath, "{}", &st); err != nil {
 		m.warn("could not read etcd backend size %s: %v", when, err)
+		writeMessage(m.workdir, phase, messageLevelWarn,
+			"etcd backend size unavailable %s: %v", when, err)
 		return
 	}
 	m.publish(st)
@@ -1075,10 +1148,22 @@ func (m *etcdMaintainer) logStorage(ctx context.Context, when string) {
 	if m.defragMins > 0 {
 		defrag = fmt.Sprintf("every %dm", m.defragMins)
 	}
+	summary := fmt.Sprintf("etcd backend: %s on disk, %s live, %s quota, fsync %s, defrag %s",
+		humanBytes(st.size()), humanBytes(st.inUse()), humanBytes(m.quota), fsync, defrag)
 	m.info("[+] etcd backend %s: %s on disk, %s live, %s quota, fsync %s, defrag %s",
 		when, humanBytes(st.size()), humanBytes(st.inUse()),
 		humanBytes(m.quota), fsync, defrag)
 	m.info("[+] etcd data dir: %s", m.dataDir)
+
+	// The backend nearing its quota is the one thing here worth raising the
+	// level for: it is the condition that eventually turns the cluster
+	// read-only, and it is fixed by editing a file the operator owns.
+	level := messageLevelInfo
+	if m.quota > 0 && float64(st.inUse()) > float64(m.quota)*etcdQuotaNearlyFull {
+		level = messageLevelWarn
+		summary += " — live data is near the quota; raise etcdQuotaMb in cpsysconfig.yaml"
+	}
+	writeMessage(m.workdir, phase, level, "%s", summary)
 }
 
 // call posts a JSON body to one of etcd's maintenance endpoints and decodes
@@ -1671,7 +1756,7 @@ func main() {
 	// readiness gate opens on the first ready beat, so beating before then
 	// would report a control plane that is still coming up as usable.
 	maintainer := newEtcdMaintainer(plainClient,
-		testEnv.ControlPlane.Etcd.URL.String(), dataDir, cpSys, info, warn,
+		testEnv.ControlPlane.Etcd.URL.String(), dataDir, wd, cpSys, info, warn,
 		func() {
 			if everHealthy {
 				writeHeartbeat(*heartbeatFile, statusReady, "", warn)
@@ -1679,7 +1764,7 @@ func main() {
 		})
 
 	startupCtx, cancelStartupReport := reportCtx(ctx)
-	maintainer.logStorage(startupCtx, "at startup")
+	maintainer.logStorage(startupCtx, messageStartPhase)
 	cancelStartupReport()
 	// Two cadences in one loop: the children are checked for still being
 	// processes every tick, while the probe round runs when it comes due.
@@ -1772,7 +1857,7 @@ func main() {
 	// Before anything is stopped: this is the last moment etcd can answer, and
 	// the size it finishes at is what the next start inherits.
 	shutdownCtx, cancelShutdownReport := reportCtx(context.Background())
-	maintainer.logStorage(shutdownCtx, "at shutdown")
+	maintainer.logStorage(shutdownCtx, messageStopPhase)
 	cancelShutdownReport()
 
 	// Stop kube-controller-manager. The watcher goroutine owns Wait(), so take

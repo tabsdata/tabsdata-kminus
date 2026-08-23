@@ -126,6 +126,11 @@ pub struct PRConfig {
     /// generated `vk-prconfig.yaml`.
     pub config_dir: PathBuf,
 
+    /// The instance workdir. Kept whole rather than derived back out of
+    /// `run_dir`, which sits two levels down, so the messages directory km
+    /// reads can be addressed directly.
+    pub work_dir: PathBuf,
+
     /// Run directory: `<workdir>/run/`. Rotated on startup.
     pub run_dir: PathBuf,
 
@@ -218,6 +223,7 @@ impl Default for PRConfig {
             tls: ServerTlsConfig::default(),
 
             config_dir: PathBuf::from(crate::config::cli::DEFAULT_CONFIGDIR),
+            work_dir: PathBuf::from("."),
             run_dir: run.clone(),
             pods_dir: run.join(PODS_SUBDIR),
             log_dir: PathBuf::from("log"),

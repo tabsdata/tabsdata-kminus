@@ -35,6 +35,7 @@ use exit::ExitReason;
 use process::{control_plane, pod_runner, virtual_kubelet};
 use system::file::{CONFIG_DIR, LOG_DIR};
 use system::heartbeat::{self, Beat, HeartbeatMonitor, heartbeat_file};
+use system::messages;
 use system::pid::{
     BIN_KM, cleanup_stale_pids, is_alive, kill_descendants, pids_dir, read_pid, remove_pid,
     terminate_process, write_pid,
@@ -574,6 +575,14 @@ fn shutdown_from_pids(paths: &Paths) {
     remove_pid(&paths.pids, BIN_KM);
     let _ = fs::remove_dir(&paths.pids);
 
+    // Read after the components have gone, so anything they wrote on their
+    // way out is already there. The startup set is reported too: a stack that
+    // failed before it was ready never reached the report above, and those
+    // messages are usually the ones explaining why. Both calls are no-ops if
+    // their phase has already been printed.
+    messages::report(&paths.workdir, messages::Phase::Start);
+    messages::report(&paths.workdir, messages::Phase::Stop);
+
     info!("Stopped");
 }
 
@@ -1034,6 +1043,9 @@ fn command_start(args: StartArgs) {
     let kubeconfig = paths.configdir.join(control_plane::KUBECONFIG_FILE);
 
     clear_regenerated_configs(&paths.configdir);
+    // Emptied before any component runs, so a previous run's messages cannot
+    // be read back as this one's.
+    messages::clear(&paths.workdir);
 
     // Install signal-driven shutdown BEFORE spawning anything, so a
     // Ctrl+C at any point during the (multi-second) startup tears the
@@ -1109,6 +1121,12 @@ fn command_start(args: StartArgs) {
         sys_cfg.heartbeat.interval().as_secs(),
         sys_cfg.heartbeat.max_missed()
     );
+
+    // Whatever the components asked to have said on the way up. Printed after
+    // the status block so the banner stays in one piece, and before the
+    // supervision loop takes over the terminal.
+    messages::report(&paths.workdir, messages::Phase::Start);
+
     println!();
     println!("Press Ctrl+C to stop");
 

@@ -241,6 +241,7 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
         tls,
 
         config_dir: configdir.clone(),
+        work_dir: workdir.clone(),
         run_dir,
         pods_dir,
         log_dir,

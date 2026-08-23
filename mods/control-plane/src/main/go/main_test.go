@@ -614,7 +614,7 @@ func countingMaintainer(base string, cfg cpSysConfig, beats *int) *etcdMaintaine
 	}
 	// No data directory: publishing the storage report is not under test here,
 	// and an empty storagePath makes publish a no-op.
-	return newEtcdMaintainer(&http.Client{}, base, "", cfg, silent, silent, beat)
+	return newEtcdMaintainer(&http.Client{}, base, "", "", cfg, silent, silent, beat)
 }
 
 func TestEtcdStatusReadsTheGatewayStringEncoding(t *testing.T) {
@@ -978,7 +978,7 @@ func TestEtcdMaintainerPublishesTheStorageReport(t *testing.T) {
 	fake := &fakeEtcd{size: 300 << 20, inUse: 40 << 20}
 	srv := fake.start(t)
 	silent := func(string, ...any) {}
-	m := newEtcdMaintainer(&http.Client{}, srv.URL, dir,
+	m := newEtcdMaintainer(&http.Client{}, srv.URL, dir, "",
 		cpSysConfig{EtcdQuotaMB: 4096, EtcdDefragMins: 60}, silent, silent, nil)
 
 	m.run(context.Background(), time.Now())
@@ -1020,7 +1020,7 @@ func TestEtcdMaintainerLogStoragePublishes(t *testing.T) {
 	srv := fake.start(t)
 	lines := 0
 	count := func(string, ...any) { lines++ }
-	m := newEtcdMaintainer(&http.Client{}, srv.URL, dir,
+	m := newEtcdMaintainer(&http.Client{}, srv.URL, dir, "",
 		cpSysConfig{EtcdQuotaMB: 4096, EtcdDefragMins: 0}, count, count, nil)
 
 	m.logStorage(context.Background(), "at shutdown")
@@ -1065,4 +1065,163 @@ func TestEtcdMaintainerWithoutDataDirHasNoStoragePath(t *testing.T) {
 	}
 	// Exercises publish through the guard: it must be a no-op, not a write.
 	m.run(context.Background(), time.Now())
+}
+
+// ---------------------------------------------------------------------------
+// km message channel
+// ---------------------------------------------------------------------------
+
+// km sorts message lines as plain strings, so the timestamp must be fixed
+// width, fixed precision and always UTC or the ordering silently breaks.
+func TestMessageTimeFormatSortsChronologically(t *testing.T) {
+	earlier := time.Date(2026, 8, 22, 10, 0, 0, 1_000_000, time.UTC).Format(messageTimeFormat)
+	later := time.Date(2026, 8, 22, 10, 0, 0, 2_000_000, time.UTC).Format(messageTimeFormat)
+	nextSecond := time.Date(2026, 8, 22, 10, 0, 1, 0, time.UTC).Format(messageTimeFormat)
+
+	if !(earlier < later && later < nextSecond) {
+		t.Fatalf("timestamps do not sort chronologically: %q %q %q", earlier, later, nextSecond)
+	}
+	if len(earlier) != len(nextSecond) {
+		t.Fatalf("timestamps vary in width (%q vs %q); string ordering would break",
+			earlier, nextSecond)
+	}
+	if !strings.HasSuffix(earlier, "Z") {
+		t.Fatalf("timestamp %q is not UTC", earlier)
+	}
+}
+
+func TestWriteMessageAppendsNdjson(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, messagesDir), 0755); err != nil {
+		t.Fatalf("creating the messages dir failed: %v", err)
+	}
+
+	writeMessage(dir, messageStartPhase, messageLevelInfo, "first %d", 1)
+	writeMessage(dir, messageStartPhase, messageLevelWarn, "second")
+
+	data, err := os.ReadFile(filepath.Join(dir, messagesDir, "start-control-plane.json"))
+	if err != nil {
+		t.Fatalf("no message file written: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 ndjson lines, got %d: %q", len(lines), data)
+	}
+
+	var first componentMessage
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+		t.Fatalf("line 1 is not valid JSON: %v", err)
+	}
+	if first.Message != "first 1" {
+		t.Fatalf("message = %q, want %q", first.Message, "first 1")
+	}
+	if first.Binary != "control-plane" {
+		t.Fatalf("binary = %q, want control-plane", first.Binary)
+	}
+	if first.Level != messageLevelInfo {
+		t.Fatalf("level = %q, want %q", first.Level, messageLevelInfo)
+	}
+	if first.Time == "" {
+		t.Fatalf("no timestamp, so km cannot order the line")
+	}
+
+	var second componentMessage
+	if err := json.Unmarshal([]byte(lines[1]), &second); err != nil {
+		t.Fatalf("line 2 is not valid JSON: %v", err)
+	}
+	if second.Level != messageLevelWarn {
+		t.Fatalf("level = %q, want %q", second.Level, messageLevelWarn)
+	}
+}
+
+// The start and stop sets must not land in the same file, or km would
+// reprint the startup messages as the stack comes down.
+func TestWriteMessageSeparatesPhases(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, messagesDir), 0755); err != nil {
+		t.Fatalf("creating the messages dir failed: %v", err)
+	}
+
+	writeMessage(dir, messageStartPhase, messageLevelInfo, "up")
+	writeMessage(dir, messageStopPhase, messageLevelInfo, "down")
+
+	for name, want := range map[string]string{
+		"start-control-plane.json": "up",
+		"stop-control-plane.json":  "down",
+	} {
+		data, err := os.ReadFile(filepath.Join(dir, messagesDir, name))
+		if err != nil {
+			t.Fatalf("%s missing: %v", name, err)
+		}
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("%s does not carry %q: %s", name, want, data)
+		}
+	}
+}
+
+// Reporting must never be able to break a start or a stop.
+func TestWriteMessageSurvivesAMissingDirectory(t *testing.T) {
+	writeMessage(t.TempDir(), messageStartPhase, messageLevelInfo, "no messages dir here")
+	writeMessage("", messageStartPhase, messageLevelInfo, "no workdir at all")
+}
+
+// The etcd summary reaches km's channel, and a backend close to its quota is
+// raised to WARN with the setting to change named in the text.
+func TestLogStorageReportsThroughTheMessageChannel(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, messagesDir), 0755); err != nil {
+		t.Fatalf("creating the messages dir failed: %v", err)
+	}
+	// 3.9 GiB live against a 4 GiB quota: over etcdQuotaNearlyFull.
+	fake := &fakeEtcd{size: 4090 << 20, inUse: 4000 << 20}
+	srv := fake.start(t)
+	silent := func(string, ...any) {}
+	m := newEtcdMaintainer(&http.Client{}, srv.URL, dir, dir,
+		cpSysConfig{EtcdQuotaMB: 4096, EtcdDefragMins: 60}, silent, silent, nil)
+
+	m.logStorage(context.Background(), messageStartPhase)
+
+	data, err := os.ReadFile(filepath.Join(dir, messagesDir, "start-control-plane.json"))
+	if err != nil {
+		t.Fatalf("etcd summary never reached the message channel: %v", err)
+	}
+	var got componentMessage
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(data))), &got); err != nil {
+		t.Fatalf("message is not valid JSON: %v", err)
+	}
+	if got.Level != messageLevelWarn {
+		t.Fatalf("level = %q, want %q for a backend near its quota", got.Level, messageLevelWarn)
+	}
+	for _, want := range []string{"etcd backend", "quota", "etcdQuotaMb"} {
+		if !strings.Contains(got.Message, want) {
+			t.Fatalf("message %q does not mention %q", got.Message, want)
+		}
+	}
+}
+
+// A backend with room reports at INFO and does not nag about the quota.
+func TestLogStorageReportsInfoWhenTheBackendHasRoom(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, messagesDir), 0755); err != nil {
+		t.Fatalf("creating the messages dir failed: %v", err)
+	}
+	fake := &fakeEtcd{size: 12 << 20, inUse: 8 << 20}
+	srv := fake.start(t)
+	silent := func(string, ...any) {}
+	m := newEtcdMaintainer(&http.Client{}, srv.URL, dir, dir,
+		cpSysConfig{EtcdQuotaMB: 4096, EtcdDefragMins: 60}, silent, silent, nil)
+
+	m.logStorage(context.Background(), messageStartPhase)
+
+	data, _ := os.ReadFile(filepath.Join(dir, messagesDir, "start-control-plane.json"))
+	var got componentMessage
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(data))), &got); err != nil {
+		t.Fatalf("message is not valid JSON: %v", err)
+	}
+	if got.Level != messageLevelInfo {
+		t.Fatalf("level = %q, want %q", got.Level, messageLevelInfo)
+	}
+	if strings.Contains(got.Message, "etcdQuotaMb") {
+		t.Fatalf("message nags about the quota with room to spare: %q", got.Message)
+	}
 }

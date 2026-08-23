@@ -166,6 +166,20 @@ async fn main() {
         .unwrap();
     info!(addr = %pr_config.bind_address, tls = "mTLS", "Server listening");
 
+    // Hand km the node sizing to print with the startup banner. The pod
+    // ceiling in particular is invisible until it is hit, and then only as a
+    // wave of ProviderFailed pods that look like a pod fault rather than a
+    // configured limit.
+    pod_runner::server::messages::report_sizing(
+        &pr_config.work_dir,
+        pr_config.capacity_cpu,
+        pr_config.capacity_memory_gb,
+        pr_config.capacity_pods,
+    );
+    // Kept aside for the shutdown message: the config is consumed by the
+    // server setup below.
+    let work_dir = pr_config.work_dir.clone();
+
     // Readiness heartbeat. Spawned before serving starts: its first
     // successful self-probe is what tells km this server is up, so it has
     // to be running by the time the listener starts accepting.
@@ -230,6 +244,15 @@ async fn main() {
     }
 
     info!("Server stopped");
+
+    // Reported from here rather than mid-drain: by now every pod has been
+    // through its termination grace, so the count is the final one.
+    pod_runner::server::messages::write(
+        &work_dir,
+        pod_runner::server::messages::STOP_PHASE,
+        pod_runner::server::messages::LEVEL_INFO,
+        &format!("stopped; {killed} container processes outlived their pods and were killed"),
+    );
 }
 
 #[cfg(unix)]

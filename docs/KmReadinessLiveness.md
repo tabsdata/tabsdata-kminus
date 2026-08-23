@@ -28,6 +28,12 @@ TLS to any component — it stats a file.
 A fresh beat therefore means *serving*, not merely *process alive*, which a
 bound socket cannot distinguish.
 
+Heartbeats are the only thing readiness and liveness depend on. A component
+with something to *say* rather than to prove — a sizing figure, a warning not
+worth failing over — uses the separate message channel in
+[KmComponentMessages.md](KmComponentMessages.md), which km prints but never
+waits for.
+
 ## The file
 
 `<workdir>/data/<component>/heartbeat.json`, one line of JSON:

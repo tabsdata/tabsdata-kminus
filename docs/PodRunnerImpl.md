@@ -109,7 +109,7 @@ Two YAML files live in the config directory:
 | File               | Lifetime                                                                     |
 |--------------------|------------------------------------------------------------------------------|
 | `prconfig.yaml`    | Endpoint URL + TLS material. Regenerated on every start by the orchestrator (km). |
-| `prsysconfig.yaml` | Node identity, pod limits, executor, cleanup, capacity, resolvers. Persistent and user-editable; auto-created with defaults on first start. |
+| `prsysconfig.yaml` | Node identity, pod limits, executor, cleanup, capacity, resolvers. Persistent and user-editable; auto-created with defaults on first start. The resolved `capacity` is reported to km at startup and printed with its banner — see [KmComponentMessages.md](KmComponentMessages.md). |
 
 ### CLI Arguments
 

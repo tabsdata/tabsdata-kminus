@@ -211,6 +211,13 @@ ERROR: 4 consecutive failed probe rounds; shutting down the control plane
 
 #### Reporting
 
+The startup and shutdown summaries also go to km's component message channel
+(`<workdir>/messages/start-control-plane.json` and `stop-...`), which km
+prints with the startup banner and again as the stack comes down — see
+[KmComponentMessages.md](KmComponentMessages.md). The summary is `INFO`
+normally and `WARN` when the live data is near `etcdQuotaMb`, since that is
+the point at which the setting needs changing.
+
 The control plane logs the backend's size at startup and at shutdown, and
 publishes `<workdir>/data/control-plane/etcd-storage.json` — refreshed on
 every probe round — which `km status` reads:
