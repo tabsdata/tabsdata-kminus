@@ -244,21 +244,29 @@ fn collect_descendants(root: u32) -> Vec<u32> {
 }
 
 /// Send a graceful shutdown request to the process with `pid`, wait up
-/// to `grace` for the whole descendant tree, then force-kill anything
-/// still alive.
+/// to `grace` for it and its descendants to go, then force-kill the tree.
 ///
-/// Unix: `SIGTERM` to the leader, then (after `grace`) `SIGKILL` to the
-/// process group and to each descendant by PID. The per-PID pass catches
-/// kube-apiserver and etcd, which escape the leader's process group.
-/// Windows: `CTRL_BREAK_EVENT` to the process group then (after
-/// `grace`) `taskkill /F /T` to terminate the whole tree.
+/// Unix: `SIGTERM` to the leader, then (after `grace`) `SIGKILL` to its
+/// process group. Windows: `CTRL_BREAK_EVENT` to the process group, then
+/// `taskkill /F /T`.
+///
+/// The descendants are read once, up front, and used only to decide how
+/// long to wait — never as kill targets. That distinction is the whole
+/// point: a PID recorded before the grace may belong to something else by
+/// the time the grace expires, and while *waiting* on a recycled number
+/// can only cost time (bounded by the grace), *killing* one takes an
+/// unrelated process and its tree down. Whatever escapes the leader's
+/// group and outlives the grace — kube-apiserver and etcd call `setpgid`
+/// and do exactly that — is reclaimed by the kill-token sweep that
+/// follows every teardown, which finds processes by identity rather than
+/// by a number remembered from earlier.
 pub fn terminate_process(pid: u32, grace: Duration) {
     let descendants = collect_descendants(pid);
     request_graceful_shutdown(pid);
     if wait_for_tree_exit(pid, &descendants, grace) {
         return;
     }
-    force_kill_tree(pid, &descendants);
+    force_kill_tree(pid);
 }
 
 fn request_graceful_shutdown(pid: u32) {
@@ -277,6 +285,9 @@ fn request_graceful_shutdown(pid: u32) {
     }
 }
 
+/// Wait until `root` and every PID that was its descendant have gone, or
+/// `timeout` elapses. Reading only — see [`terminate_process`] on why a
+/// recycled PID is safe here and not in a kill.
 fn wait_for_tree_exit(root: u32, descendants: &[u32], timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -291,19 +302,21 @@ fn wait_for_tree_exit(root: u32, descendants: &[u32], timeout: Duration) -> bool
     }
 }
 
-fn force_kill_tree(root: u32, descendants: &[u32]) {
+/// SIGKILL the group `root` leads, and on Windows the tree below it.
+///
+/// Only `root` is named. Its group is a live relationship, not a
+/// remembered list: on Unix a process group ID cannot be reused while the
+/// group still has members, so signalling it reaches this leader's
+/// children and nothing else.
+fn force_kill_tree(root: u32) {
     #[cfg(unix)]
     {
         use nix::sys::signal::{self, Signal};
         use nix::unistd::Pid as NixPid;
         let _ = signal::kill(NixPid::from_raw(-(root as i32)), Signal::SIGKILL);
-        for pid in descendants {
-            let _ = signal::kill(NixPid::from_raw(*pid as i32), Signal::SIGKILL);
-        }
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = descendants;
         let mut command = Command::new("taskkill.exe");
         apply_detached_flags(&mut command);
         let _ = command
@@ -358,8 +371,39 @@ pub fn kill_descendants(root: u32) {
     }
 }
 
-/// Walk every PID file in `dir`; if the recorded process is still alive,
-/// terminate it (graceful then force) and remove the file.
+/// The executable name behind `pid`, without directory or extension.
+///
+/// Preferred over `sysinfo`'s process name, which on Linux comes from
+/// `/proc/<pid>/stat` and is capped at 15 characters — `virtual-kubelet`
+/// is exactly 15, so the cap is one rename away from silently truncating
+/// a component's name and defeating the comparison below.
+fn process_stem(pid: u32) -> Option<String> {
+    let mut system = System::new();
+    let pid = Pid::from_u32(pid);
+    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    let process = system.process(pid)?;
+    let from_exe = process
+        .exe()
+        .and_then(|p| p.file_stem())
+        .map(|s| s.to_string_lossy().into_owned());
+    Some(from_exe.unwrap_or_else(|| {
+        Path::new(&process.name().to_string_lossy().into_owned())
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }))
+}
+
+/// Walk every PID file in `dir`; if the recorded process is still alive
+/// *and is still the component the file names*, terminate it (graceful
+/// then force). Remove the file either way.
+///
+/// These are the *un-stamped* PID files (the components' own `pids/`
+/// directories, not km's identity-carrying ones), so the number is all
+/// there is and it dates from a previous run — the longest possible time
+/// for the operating system to have handed it to something else. The name
+/// comparison is weaker than an identity or a token, but it is what a
+/// bare number allows, and the kill-token sweep covers what it cannot.
 pub fn cleanup_stale_pids(dir: &Path) {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -378,8 +422,22 @@ pub fn cleanup_stale_pids(dir: &Path) {
         let process_name = parts[1];
 
         if is_alive(pid) {
-            warn!(pid, process_name, "Killing stale process");
-            terminate_process(pid, Duration::from_secs(2));
+            match process_stem(pid) {
+                Some(stem) if stem == process_name => {
+                    warn!(pid, process_name, "Killing stale process");
+                    terminate_process(pid, Duration::from_secs(2));
+                }
+                Some(stem) => warn!(
+                    pid,
+                    expected = process_name,
+                    running = %stem,
+                    "PID reused by a different process, leaving it alone",
+                ),
+                None => warn!(
+                    pid,
+                    process_name, "Cannot identify the process holding this PID, leaving it alone",
+                ),
+            }
         }
         let _ = fs::remove_file(entry.path());
     }

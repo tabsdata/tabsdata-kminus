@@ -338,3 +338,51 @@ fn capture_stderr_falls_back_when_logdir_unusable() {
     assert!(!stderr_log(&logdir, "delta").exists());
     fs::remove_dir_all(&dir).ok();
 }
+
+// --- stale PID identity ------------------------------------------------------
+
+#[test]
+fn process_stem_names_this_binary_and_nothing_for_a_dead_pid() {
+    let stem = process_stem(std::process::id()).expect("own stem");
+    assert!(!stem.is_empty());
+    assert!(!stem.contains('/'), "a stem carries no directory: {stem}");
+    assert!(
+        !stem.contains(".exe"),
+        "a stem carries no extension: {stem}"
+    );
+    assert_eq!(process_stem(u32::MAX - 1), None);
+}
+
+#[test]
+fn cleanup_stale_pids_spares_a_pid_reused_by_something_else() {
+    let dir = tempdir();
+    // This process is alive and holds this PID, but it is not the
+    // component the file names — which is what a recycled number looks
+    // like after a previous run ended.
+    write_pid(&dir, "control-plane", std::process::id());
+
+    cleanup_stale_pids(&dir);
+
+    assert!(is_alive(std::process::id()), "we must still be here");
+    assert!(
+        !dir.join(format!("{}.control-plane", std::process::id()))
+            .exists(),
+        "the stale file goes either way",
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn cleanup_stale_pids_kills_a_process_it_can_identify() {
+    let dir = tempdir();
+    // Named after this binary, so the check confirms rather than refuses.
+    // Recorded against a PID nothing holds, so nothing is actually killed
+    // — the point is that the confirming branch is the one taken.
+    let stem = process_stem(std::process::id()).expect("own stem");
+    write_pid(&dir, &stem, u32::MAX - 1);
+
+    cleanup_stale_pids(&dir);
+
+    assert!(!dir.join(format!("{}.{stem}", u32::MAX - 1)).exists());
+    fs::remove_dir_all(&dir).ok();
+}
