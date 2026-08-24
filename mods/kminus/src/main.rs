@@ -547,7 +547,11 @@ fn install_signal_shutdown(paths: Paths, ports: KmPorts) {
 /// embedded postgres it owns). Killing pod-runner after only a few seconds
 /// SIGKILLs it mid-drain, so those pod stops never complete and their servers
 /// are orphaned. The other components own no pods and stop promptly.
-const POD_RUNNER_SHUTDOWN_GRACE: Duration = Duration::from_secs(90);
+///
+/// Must stay above the pod-runner's `defaultGracePeriodSecs` (120), or a
+/// single default-grace pod outwaits pod-runner's own grace and the drain
+/// is cut short by exactly the SIGKILL described above.
+const POD_RUNNER_SHUTDOWN_GRACE: Duration = Duration::from_secs(150);
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Filename of the seed file under `<workdir>/data/km/`, next to the PID

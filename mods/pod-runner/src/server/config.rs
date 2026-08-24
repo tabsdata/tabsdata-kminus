@@ -235,7 +235,7 @@ impl Default for PRConfig {
             log_dir: PathBuf::from("log"),
             pid_dir: run.join(PIDS_SUBDIR),
 
-            default_grace_period_secs: 30,
+            default_grace_period_secs: 120,
             container_max_restarts: 0,
             container_restart_backoff_base_secs: 2,
 

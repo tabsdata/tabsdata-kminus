@@ -31,7 +31,7 @@ namespace: "default"
 # Pod limits
 # ---------------------------------------------------------------------------
 
-defaultGracePeriodSecs: 30
+defaultGracePeriodSecs: 120
 maxRestartCount: 5
 restartBackoffBaseSecs: 10
 cleanUpForceKillWaitSecs: 10
