@@ -5,3 +5,6 @@
 //! Components shared between the km binaries.
 
 pub mod identity;
+pub mod scan;
+pub mod signal;
+pub mod token;
