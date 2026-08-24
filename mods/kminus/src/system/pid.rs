@@ -8,9 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use kcommon::identity;
-use sysinfo::{Pid, ProcessStatus, ProcessesToUpdate, System};
-use tracing::warn;
+use kcommon::{identity, signal};
+use tracing::{info, warn};
 
 pub const DATA_DIR: &str = "data";
 pub const PIDS_DIR: &str = "pids";
@@ -212,119 +211,45 @@ pub fn capture_stderr(command: &mut Command, logdir: &Path, bin: &str) {
     }
 }
 
-/// Check whether a process with the given PID is currently running.
-pub fn is_alive(pid: u32) -> bool {
-    let mut system = System::new();
-    system.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
-    match system.process(Pid::from_u32(pid)) {
-        Some(process) => process.status() != ProcessStatus::Zombie,
-        None => false,
-    }
-}
-
-/// Walk the process table by PPID and return every descendant of `root`.
-/// Needed because some children (notably kube-apiserver and etcd) call
-/// `setpgid` and escape the leader's process group, so a group-wide
-/// SIGKILL alone leaves them dangling.
-fn collect_descendants(root: u32) -> Vec<u32> {
-    let mut system = System::new();
-    system.refresh_processes(ProcessesToUpdate::All, true);
-    let root_pid = Pid::from_u32(root);
-    let mut descendants: Vec<u32> = Vec::new();
-    let mut frontier: Vec<Pid> = vec![root_pid];
-    while let Some(current) = frontier.pop() {
-        for (pid, process) in system.processes() {
-            if process.parent() == Some(current) {
-                descendants.push(pid.as_u32());
-                frontier.push(*pid);
-            }
-        }
-    }
-    descendants
-}
-
-/// Send a graceful shutdown request to the process with `pid`, wait up
-/// to `grace` for it and its descendants to go, then force-kill the tree.
+/// Ask the process a PID file records to stop, wait up to `grace` for it
+/// to go, then force-kill it and the group it leads.
 ///
-/// Unix: `SIGTERM` to the leader, then (after `grace`) `SIGKILL` to its
-/// process group. Windows: `CTRL_BREAK_EVENT` to the process group, then
-/// `taskkill /F /T`.
+/// Judged by [`recorded`] throughout, so every step acts on an identity
+/// rather than a number: nothing is asked of a file whose subject is
+/// gone or reused, the wait ends the moment the subject does (a zombie
+/// awaiting its reaper counts as gone), and the escalation cannot fire
+/// at a recycled PID because the identity was re-verified on the same
+/// poll that found it still there.
 ///
-/// The descendants are read once, up front, and used only to decide how
-/// long to wait — never as kill targets. That distinction is the whole
-/// point: a PID recorded before the grace may belong to something else by
-/// the time the grace expires, and while *waiting* on a recycled number
-/// can only cost time (bounded by the grace), *killing* one takes an
-/// unrelated process and its tree down. Whatever escapes the leader's
-/// group and outlives the grace — kube-apiserver and etcd call `setpgid`
-/// and do exactly that — is reclaimed by the kill-token sweep that
-/// follows every teardown, which finds processes by identity rather than
-/// by a number remembered from earlier.
-pub fn terminate_process(pid: u32, grace: Duration) {
-    let descendants = collect_descendants(pid);
-    request_graceful_shutdown(pid);
-    if wait_for_tree_exit(pid, &descendants, grace) {
+/// This stops the recorded process and its process group. Its wider tree
+/// is not this function's job: everything below a km component carries
+/// the run's kill token, and the token sweep after a teardown reclaims
+/// whatever outlives this.
+pub fn stop_recorded(dir: &Path, name: &str, grace: Duration) {
+    let Recorded::Live(pid) = recorded(dir, name) else {
         return;
-    }
-    force_kill_tree(pid);
-}
+    };
+    info!(
+        name,
+        pid,
+        grace_secs = grace.as_secs(),
+        "Requesting graceful shutdown"
+    );
+    signal::request_graceful(pid);
 
-fn request_graceful_shutdown(pid: u32) {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{self, Signal};
-        use nix::unistd::Pid as NixPid;
-        let _ = signal::kill(NixPid::from_raw(pid as i32), Signal::SIGTERM);
-    }
-    #[cfg(target_os = "windows")]
-    {
-        use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
-        unsafe {
-            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
-        }
-    }
-}
-
-/// Wait until `root` and every PID that was its descendant have gone, or
-/// `timeout` elapses. Reading only — see [`terminate_process`] on why a
-/// recycled PID is safe here and not in a kill.
-fn wait_for_tree_exit(root: u32, descendants: &[u32], timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let any_alive = is_alive(root) || descendants.iter().any(|pid| is_alive(*pid));
-        if !any_alive {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if !matches!(recorded(dir, name), Recorded::Live(_)) {
+            return;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-}
 
-/// SIGKILL the group `root` leads, and on Windows the tree below it.
-///
-/// Only `root` is named. Its group is a live relationship, not a
-/// remembered list: on Unix a process group ID cannot be reused while the
-/// group still has members, so signalling it reaches this leader's
-/// children and nothing else.
-fn force_kill_tree(root: u32) {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{self, Signal};
-        use nix::unistd::Pid as NixPid;
-        let _ = signal::kill(NixPid::from_raw(-(root as i32)), Signal::SIGKILL);
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let mut command = Command::new("taskkill.exe");
-        apply_detached_flags(&mut command);
-        let _ = command
-            .arg("/PID")
-            .arg(root.to_string())
-            .arg("/T")
-            .arg("/F")
-            .status();
+    warn!(name, pid, "Grace period expired, killing");
+    if signal::leads_own_group(pid) {
+        signal::force_kill_group(pid);
+    } else {
+        signal::force_kill(pid);
     }
 }
 
@@ -344,6 +269,26 @@ fn force_kill_tree(root: u32) {
 /// does not. Elsewhere the sweep sees everything this would, identifies
 /// what it kills, and additionally reaches processes reparented away —
 /// which no parent-link walk can.
+#[cfg(target_os = "macos")]
+fn collect_descendants(root: u32) -> Vec<u32> {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    let root_pid = Pid::from_u32(root);
+    let mut descendants: Vec<u32> = Vec::new();
+    let mut frontier: Vec<Pid> = vec![root_pid];
+    while let Some(current) = frontier.pop() {
+        for (pid, process) in system.processes() {
+            if process.parent() == Some(current) {
+                descendants.push(pid.as_u32());
+                frontier.push(*pid);
+            }
+        }
+    }
+    descendants
+}
+
 #[cfg(target_os = "macos")]
 pub fn kill_descendants(root: u32) {
     let descendants = collect_descendants(root);
@@ -371,39 +316,16 @@ pub fn kill_descendants(root: u32) {
     }
 }
 
-/// The executable name behind `pid`, without directory or extension.
+/// Walk every PID file in `dir`; if its subject is still running — the
+/// same process the file recorded, verified by identity — stop it
+/// (graceful, then force). Remove the file either way.
 ///
-/// Preferred over `sysinfo`'s process name, which on Linux comes from
-/// `/proc/<pid>/stat` and is capped at 15 characters — `virtual-kubelet`
-/// is exactly 15, so the cap is one rename away from silently truncating
-/// a component's name and defeating the comparison below.
-fn process_stem(pid: u32) -> Option<String> {
-    let mut system = System::new();
-    let pid = Pid::from_u32(pid);
-    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-    let process = system.process(pid)?;
-    let from_exe = process
-        .exe()
-        .and_then(|p| p.file_stem())
-        .map(|s| s.to_string_lossy().into_owned());
-    Some(from_exe.unwrap_or_else(|| {
-        Path::new(&process.name().to_string_lossy().into_owned())
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    }))
-}
-
-/// Walk every PID file in `dir`; if the recorded process is still alive
-/// *and is still the component the file names*, terminate it (graceful
-/// then force). Remove the file either way.
-///
-/// These are the *un-stamped* PID files (the components' own `pids/`
-/// directories, not km's identity-carrying ones), so the number is all
-/// there is and it dates from a previous run — the longest possible time
-/// for the operating system to have handed it to something else. The name
-/// comparison is weaker than an identity or a token, but it is what a
-/// bare number allows, and the kill-token sweep covers what it cannot.
+/// These files are km's own identity-stamped records from a previous run,
+/// so the numbers in them have had the longest possible time to be
+/// reused; the stamp is what makes acting on one safe. Content that does
+/// not verify — the old bare-number format included — is never signalled:
+/// whatever really is still running from that run carries its kill token,
+/// and the startup sweep reclaims it by that instead.
 pub fn cleanup_stale_pids(dir: &Path) {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -413,32 +335,11 @@ pub fn cleanup_stale_pids(dir: &Path) {
         let fname = entry.file_name();
         let fname = fname.to_string_lossy();
         let parts: Vec<&str> = fname.splitn(2, '.').collect();
-        if parts.len() != 2 {
+        if parts.len() != 2 || parts[0].parse::<u32>().is_err() {
             continue;
         }
-        let Ok(pid) = parts[0].parse::<u32>() else {
-            continue;
-        };
-        let process_name = parts[1];
-
-        if is_alive(pid) {
-            match process_stem(pid) {
-                Some(stem) if stem == process_name => {
-                    warn!(pid, process_name, "Killing stale process");
-                    terminate_process(pid, Duration::from_secs(2));
-                }
-                Some(stem) => warn!(
-                    pid,
-                    expected = process_name,
-                    running = %stem,
-                    "PID reused by a different process, leaving it alone",
-                ),
-                None => warn!(
-                    pid,
-                    process_name, "Cannot identify the process holding this PID, leaving it alone",
-                ),
-            }
-        }
+        let name = parts[1];
+        stop_recorded(dir, name, Duration::from_secs(2));
         let _ = fs::remove_file(entry.path());
     }
 }

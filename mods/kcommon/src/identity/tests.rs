@@ -74,3 +74,36 @@ fn running_since_confirms_this_process_and_rejects_impostors() {
     // A pid nothing holds.
     assert!(!running_since(u32::MAX - 1, &owner_stamp(start)));
 }
+
+#[cfg(unix)]
+#[test]
+fn running_since_rejects_a_zombie() {
+    // Exited but deliberately not reaped: the process table still lists
+    // it, with its original start time. It is not running — nothing can
+    // be asked of it or waited for — and must not read as though it were.
+    let mut child = std::process::Command::new("true")
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let pid = child.id();
+    let stamp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let stamp = loop {
+        if let Some(secs) = process_start_time(pid) {
+            break owner_stamp(secs);
+        }
+        assert!(std::time::Instant::now() < stamp_deadline);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+
+    // Poll until the exit has landed in the process table.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while running_since(pid, &stamp) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "an unreaped exited child must stop reading as running",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let _ = child.wait();
+}

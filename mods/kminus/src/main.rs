@@ -42,8 +42,7 @@ use system::messages;
 #[cfg(target_os = "macos")]
 use system::pid::kill_descendants;
 use system::pid::{
-    BIN_KM, Recorded, cleanup_stale_pids, is_alive, pids_dir, recorded, remove_pid,
-    terminate_process, write_pid,
+    BIN_KM, Recorded, cleanup_stale_pids, pids_dir, recorded, remove_pid, stop_recorded, write_pid,
 };
 use system::port::{PortCheck, check_ports, port_failures, probe_ports};
 
@@ -655,19 +654,9 @@ fn shutdown_from_pids(paths: &Paths, ports: Option<&KmPorts>) {
         if handled.contains(&name) {
             continue;
         }
-        // Stale means either gone or now somebody else's number; both
-        // make signalling it the wrong thing to do — whatever really is
-        // still running is the sweep's to find, by identity.
-        if let Recorded::Live(pid) = recorded(&paths.pids, name) {
-            let grace = shutdown_grace_for(name);
-            info!(
-                name,
-                pid,
-                grace_secs = grace.as_secs(),
-                "Requesting graceful shutdown"
-            );
-            terminate_process(pid, grace);
-        }
+        // Acts only on a file whose subject still verifies; whatever is
+        // really left of a run that does not is the sweep's to find.
+        stop_recorded(&paths.pids, name, shutdown_grace_for(name));
         remove_pid(&paths.pids, name);
     }
 
@@ -1394,7 +1383,7 @@ fn command_stop(args: StopArgs) {
             println!("Stopping Tabsdata K- (K minus) [km pid={pid}]...");
             // Signal the foreground `km start` and let its own shutdown
             // thread drive the orderly teardown, then wait for it to exit.
-            terminate_process(pid, STOP_WAIT);
+            stop_recorded(&paths.pids, BIN_KM, STOP_WAIT);
             // Asked of the PID file again rather than of the number: km
             // removes its file on a clean exit, so a still-verifying entry
             // is km itself refusing to go, where a bare liveness check
@@ -1482,7 +1471,10 @@ fn print_instance_status(paths: &Paths) -> bool {
         // are the control-plane's own and record a number without a start
         // stamp, so there is nothing to verify against. It only decides a
         // status line, never a signal.
-        let alive = pid.parse::<u32>().map(is_alive).unwrap_or(false);
+        let alive = pid
+            .parse::<u32>()
+            .map(kcommon::signal::is_pid_alive)
+            .unwrap_or(false);
         let state = if alive { "running" } else { "DEAD   " };
         println!("    {:<14} {}   pid={}", name, state, pid);
     }

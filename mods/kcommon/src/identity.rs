@@ -86,8 +86,22 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
 
 /// Whether a live process holds `pid` and started at `stamp` — the one
 /// question a bare liveness check cannot answer.
+///
+/// A zombie is not running: it has exited and merely awaits its reaper,
+/// yet the process table still lists it with its original start time. A
+/// caller asking this question wants to know whether there is anything
+/// left to wait for or signal, and for a zombie the answer is no.
 pub fn running_since(pid: u32, stamp: &str) -> bool {
-    process_start_time(pid).is_some_and(|secs| owner_stamp(secs) == stamp)
+    let mut system = System::new();
+    let pid = Pid::from_u32(pid);
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        false,
+        ProcessRefreshKind::nothing(),
+    );
+    system.process(pid).is_some_and(|p| {
+        p.status() != sysinfo::ProcessStatus::Zombie && owner_stamp(p.start_time()) == stamp
+    })
 }
 
 #[cfg(test)]

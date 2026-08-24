@@ -151,25 +151,20 @@ fn kill_descendants_kills_a_child() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn sleep");
-    let pid = child.id();
-    assert!(is_alive(pid));
+    assert!(kcommon::signal::is_pid_alive(child.id()));
 
     // Kill everything parented under this test process.
     kill_descendants(std::process::id());
 
-    // The child should die promptly.
-    let mut dead = false;
-    for _ in 0..50 {
-        if !is_alive(pid) {
-            dead = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    // Reap the zombie so it does not linger.
+    // Judged on the wait status: until reaped, an exited child is a
+    // zombie and still holds its number.
     let mut child = child;
-    let _ = child.wait();
-    assert!(dead, "child should have been killed by kill_descendants");
+    let status = child.wait().expect("reap child");
+    use std::os::unix::process::ExitStatusExt;
+    assert!(
+        status.signal().is_some(),
+        "child should have been killed by kill_descendants",
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -205,16 +200,6 @@ fn cleanup_stale_pids_ignores_malformed_filenames() {
 #[test]
 fn cleanup_stale_pids_no_op_when_dir_missing() {
     cleanup_stale_pids(Path::new("/nonexistent/km/pids"));
-}
-
-#[test]
-fn is_alive_true_for_self() {
-    assert!(is_alive(std::process::id()));
-}
-
-#[test]
-fn is_alive_false_for_unlikely_pid() {
-    assert!(!is_alive(999_999));
 }
 
 #[cfg(unix)]
@@ -339,50 +324,118 @@ fn capture_stderr_falls_back_when_logdir_unusable() {
     fs::remove_dir_all(&dir).ok();
 }
 
-// --- stale PID identity ------------------------------------------------------
+// --- stopping by record -------------------------------------------------------
+
+/// A child that outlives any grace a test gives it.
+fn sleeper() -> std::process::Child {
+    #[cfg(unix)]
+    let mut c = {
+        let mut c = Command::new("sh");
+        c.args(["-c", "sleep 30"]);
+        c
+    };
+    #[cfg(windows)]
+    let mut c = {
+        let mut c = Command::new("cmd");
+        c.args(["/C", "ping -n 31 127.0.0.1"]);
+        c
+    };
+    c.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    c.spawn().expect("spawn sleeper")
+}
+
+/// Reap `child` and report whether it was killed rather than exiting on
+/// its own terms.
+fn killed(child: &mut std::process::Child) -> bool {
+    let status = child.wait().expect("reap child");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().is_some()
+    }
+    #[cfg(windows)]
+    {
+        !status.success()
+    }
+}
 
 #[test]
-fn process_stem_names_this_binary_and_nothing_for_a_dead_pid() {
-    let stem = process_stem(std::process::id()).expect("own stem");
-    assert!(!stem.is_empty());
-    assert!(!stem.contains('/'), "a stem carries no directory: {stem}");
+fn stop_recorded_returns_at_once_when_there_is_nothing_to_stop() {
+    let dir = tempdir();
+    // Absent, and stale: neither may burn the grace or signal anything.
+    write_pid(&dir, "gone", u32::MAX - 1);
+
+    let started = std::time::Instant::now();
+    stop_recorded(&dir, "absent", Duration::from_secs(90));
+    stop_recorded(&dir, "gone", Duration::from_secs(90));
     assert!(
-        !stem.contains(".exe"),
-        "a stem carries no extension: {stem}"
+        started.elapsed() < Duration::from_secs(2),
+        "took {:?}",
+        started.elapsed()
     );
-    assert_eq!(process_stem(u32::MAX - 1), None);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn stop_recorded_stops_a_live_verified_subject() {
+    let dir = tempdir();
+    let mut child = sleeper();
+    write_pid(&dir, "sleeper", child.id());
+
+    let started = std::time::Instant::now();
+    stop_recorded(&dir, "sleeper", Duration::from_secs(30));
+
+    // Died to the graceful request, not to the grace expiring.
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert!(killed(&mut child));
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn cleanup_stale_pids_spares_a_pid_reused_by_something_else() {
     let dir = tempdir();
-    // This process is alive and holds this PID, but it is not the
-    // component the file names — which is what a recycled number looks
-    // like after a previous run ended.
-    write_pid(&dir, "control-plane", std::process::id());
+    // This process is alive and holds this PID, but the file records a
+    // different start time — what a recycled number looks like after a
+    // previous run ended. Signalling it would signal a stranger.
+    let own = std::process::id();
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!("{own}.control-plane")),
+        format!("{own}@19700101T000000Z"),
+    )
+    .unwrap();
 
+    let started = std::time::Instant::now();
     cleanup_stale_pids(&dir);
 
-    assert!(is_alive(std::process::id()), "we must still be here");
     assert!(
-        !dir.join(format!("{}.control-plane", std::process::id()))
-            .exists(),
+        started.elapsed() < Duration::from_secs(2),
+        "an unverified entry must not be waited on, took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        !dir.join(format!("{own}.control-plane")).exists(),
         "the stale file goes either way",
     );
     fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn cleanup_stale_pids_kills_a_process_it_can_identify() {
+fn cleanup_stale_pids_stops_a_verified_survivor() {
     let dir = tempdir();
-    // Named after this binary, so the check confirms rather than refuses.
-    // Recorded against a PID nothing holds, so nothing is actually killed
-    // — the point is that the confirming branch is the one taken.
-    let stem = process_stem(std::process::id()).expect("own stem");
-    write_pid(&dir, &stem, u32::MAX - 1);
+    // A component from "the previous run" that is genuinely still itself:
+    // the one case cleanup exists to stop.
+    let mut child = sleeper();
+    write_pid(&dir, "sleeper", child.id());
 
     cleanup_stale_pids(&dir);
 
-    assert!(!dir.join(format!("{}.{stem}", u32::MAX - 1)).exists());
+    assert!(killed(&mut child), "the recorded survivor must be stopped");
+    assert!(!dir.join(format!("{}.sleeper", child.id())).exists());
     fs::remove_dir_all(&dir).ok();
 }
