@@ -1201,7 +1201,30 @@ fn command_start(args: StartArgs) {
         println!("Tabsdata K- (K minus) starting");
     }
 
-    // After the banner, before anything is spawned: the port table is the
+    // Reclaim the previous life before the port check: its processes can
+    // still hold this instance's ports, and killing them is what frees
+    // those ports — checked first, the start would refuse over ports the
+    // reclaim is about to release. The run-token file names everything the
+    // previous run ever started — including processes that escaped their
+    // groups and were reparented, which no PID file or parent link can
+    // reach — and the dead-owner sweep behind it covers runs whose file
+    // was lost. Safe next to a *concurrent* instance because the
+    // single-instance guard above is identity-verified, and because a
+    // dead owner is decidable from a token alone.
+    let token_path = run_token_file(&paths.workdir);
+    match Run::load(&token_path) {
+        Ok(Some(previous)) => {
+            kill_until_clean(KM_KILL_TOKEN_VAR, previous.as_prefix(), SWEEP_ROUNDS);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(error = %e, "Cannot read previous run token; relying on the dead-owner sweep")
+        }
+    }
+    kill_strays_of_dead_runs(KM_KILL_TOKEN_VAR);
+
+    // After the banner, and after the previous life is gone so the answer
+    // reflects what this run will actually find: the port table is the
     // first thing the start reports, and on a clash it is the only thing.
     verify_ports_free(&sys_cfg.ports);
     println!();
@@ -1221,25 +1244,6 @@ fn command_start(args: StartArgs) {
     cleanup_stale_pids(&paths.pids);
     fs::create_dir_all(&paths.pids).ok();
     write_pid(&paths.pids, BIN_KM, std::process::id());
-
-    // Reclaim the previous life. Its run-token file names everything it
-    // ever started — including processes that escaped their groups and
-    // were reparented, which no PID file or parent link can reach — and
-    // the dead-owner sweep behind it covers runs whose file was lost.
-    // Safe next to a *concurrent* instance because the single-instance
-    // guard above is identity-verified, and because a dead owner is
-    // decidable from a token alone.
-    let token_path = run_token_file(&paths.workdir);
-    match Run::load(&token_path) {
-        Ok(Some(previous)) => {
-            kill_until_clean(KM_KILL_TOKEN_VAR, previous.as_prefix(), SWEEP_ROUNDS);
-        }
-        Ok(None) => {}
-        Err(e) => {
-            warn!(error = %e, "Cannot read previous run token; relying on the dead-owner sweep")
-        }
-    }
-    kill_strays_of_dead_runs(KM_KILL_TOKEN_VAR);
 
     // Mint and persist this run's token root before anything is spawned,
     // so a km that dies mid-startup still left the trail the next run
