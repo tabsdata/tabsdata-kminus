@@ -190,8 +190,7 @@ pub fn start(
 
     let pid = cp.pid();
     write_pid(pids, BIN, pid);
-    // Registered before the readiness gate, so the watcher covers it while
-    // km is still waiting for it to report.
+    // Registered before the readiness gate, so the watcher already covers it.
     components.register(BIN, cp);
 
     if !heartbeat::wait_until_ready(BIN, &heartbeat, sys_cfg.heartbeat.startup_timeout()) {

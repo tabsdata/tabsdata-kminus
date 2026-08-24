@@ -55,23 +55,16 @@ impl Scan {
         Self(system)
     }
 
-    /// Every process whose `var` token starts with `prefix`, excluding
-    /// this process.
-    ///
-    /// Excluding ourselves matters whenever a supervisor runs underneath
-    /// another one and so carries the outer token: a sweep that found the
-    /// outer owner dead would otherwise kill the process performing the
-    /// sweep.
+    /// Every process whose `var` token starts with `prefix` — excluding
+    /// this process, so a supervisor carrying an outer token can never
+    /// sweep itself.
     pub fn under(&self, var: &str, prefix: &str) -> Vec<Found> {
         self.matching(var, |token| token.starts_with(prefix))
     }
 
     /// Every process whose `var` token names an owner that is no longer
-    /// running, excluding this process.
-    ///
-    /// A token that cannot be parsed, or whose owner cannot be checked,
-    /// is *not* returned: a sweep kills only what it can positively prove
-    /// is orphaned, and an unreadable token is not proof of anything.
+    /// running. An unparseable token is *not* returned: a sweep kills only
+    /// what it can positively prove is orphaned.
     pub fn strays_of_dead_owners(&self, var: &str) -> Vec<Found> {
         self.matching(var, |token| !self.owner_alive(token))
     }
@@ -110,12 +103,8 @@ impl Scan {
 }
 
 /// Whether the process at `pid` still carries exactly this token in `var`
-/// — re-read from the live process, not from any snapshot.
-///
-/// This is what makes killing from an aged snapshot safe: the snapshot
-/// found an identity, and this confirms the identity is still at that
-/// number immediately before the signal. Costs one single-process
-/// environment read.
+/// — re-read from the live process, which is what makes killing from an
+/// aged snapshot safe. One single-process environment read.
 pub fn still_carries(pid: u32, var: &str, expected: &str) -> bool {
     let mut system = System::new();
     let pid = Pid::from_u32(pid);
@@ -136,15 +125,10 @@ pub fn still_carries(pid: u32, var: &str, expected: &str) -> bool {
     })
 }
 
-/// Ask each found process to shut down, so it does so inside the same
-/// grace period whatever owns it is being given. Returns how many were
-/// asked.
-///
-/// The process alone is signalled, never its group: a process that
-/// escaped by calling `setsid` is normally the top of its own tree — a
-/// postgres postmaster, not one of its backends — and it knows how to
-/// stop what it started. Tearing its children out from under it would
-/// turn an orderly shutdown into what looks like a crash.
+/// Ask each found process to shut down. The process alone is signalled,
+/// never its group: an escapee that called `setsid` is normally the top
+/// of its own tree (a postgres postmaster, not a backend) and knows how
+/// to stop what it started. Returns how many were asked.
 pub fn terminate_found(found: &[Found]) -> usize {
     let mut asked = 0;
     for f in found {
@@ -162,20 +146,11 @@ pub fn terminate_found(found: &[Found]) -> usize {
     asked
 }
 
-/// SIGKILL each found process that still carries its token in `var`.
-/// Returns how many were killed.
-///
-/// The re-read before each signal is the staleness defence: `found` may
-/// come from a snapshot taken a whole grace period ago, and in that time
-/// the operating system may have handed any of these numbers to something
-/// else. A process that no longer carries the token is left alone,
-/// whoever it is.
-///
-/// The group is killed where the process leads one: `setsid` made an
-/// escapee a group leader, and everything it forked afterwards inherited
-/// that group — including children forked after the scan, which no
-/// snapshot could contain. Past the grace there is no orderly shutdown
-/// left to preserve.
+/// SIGKILL each found process that still carries its token in `var` —
+/// re-read immediately before each signal, since `found` may be a grace
+/// period old and any of these numbers may have been reassigned. Kills
+/// the group where the process leads one, reaching children forked after
+/// the scan. Returns how many were killed.
 pub fn kill_found(var: &str, found: &[Found]) -> usize {
     let mut killed = 0;
     for f in found {
@@ -198,18 +173,10 @@ pub fn kill_found(var: &str, found: &[Found]) -> usize {
 }
 
 /// Fresh-scan-and-kill under `prefix` until a round finds nothing, or
-/// `max_rounds` is spent. Returns the total killed.
-///
-/// The rounds exist for the window between a scan and its signals: a
-/// process forked in that window was never in the scan, so one pass can
-/// miss it. Assuming processes are well behaved — they stop spawning once
-/// asked to shut down — round two finds only that window's stragglers and
-/// round three finds nothing. A process ill-behaved enough to keep
-/// forking through SIGKILL rounds exhausts `max_rounds` and is *reported*
-/// as a leak by the round's kills, never silently absorbed.
-///
-/// No re-verify inside: each round's scan is its own identity check,
-/// microseconds before the signal.
+/// `max_rounds` is spent. The rounds cover processes forked between a
+/// scan and its signals; a forker that outlasts the bound is reported,
+/// never silently absorbed. Each round's scan is its own identity check.
+/// Returns the total killed.
 pub fn kill_until_clean(var: &str, prefix: &str, max_rounds: usize) -> usize {
     let mut total = 0;
     for round in 0..max_rounds {
@@ -248,13 +215,9 @@ pub fn kill_until_clean(var: &str, prefix: &str, max_rounds: usize) -> usize {
 }
 
 /// SIGKILL every process carrying a `var` token whose owning run is no
-/// longer alive. Returns how many were killed.
-///
-/// The startup reclamation: a previous run's seed file names *which* seed
-/// to sweep, but this does not need it — a dead owner is decidable from
-/// the token alone, so this also reclaims runs whose seed file was lost.
-/// A token whose owner is still running is left strictly alone, which is
-/// what keeps this away from a concurrently live instance's stack.
+/// longer alive. Needs no seed file — a dead owner is decidable from the
+/// token alone — and leaves a live owner's processes strictly alone.
+/// Returns how many were killed.
 pub fn kill_strays_of_dead_runs(var: &str) -> usize {
     let scan = Scan::load();
     let strays = scan.strays_of_dead_owners(var);

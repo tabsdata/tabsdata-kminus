@@ -85,11 +85,7 @@ impl std::fmt::Debug for Tracked {
 
 impl Tracked {
     /// Spawn `cmd` with its kill token in `var`, owned by a new monitor.
-    ///
-    /// Everything else about the command — stdio, working directory,
-    /// platform creation flags, whether it leads its own process group —
-    /// stays the caller's configuration. This adds the token and takes
-    /// ownership of the outcome.
+    /// Everything else about the command stays the caller's configuration.
     pub fn spawn(mut cmd: Command, var: &str, token: &Run) -> io::Result<Tracked> {
         cmd.env(var, token.as_str());
         let child = cmd.spawn()?;
@@ -111,9 +107,8 @@ impl Tracked {
         })
     }
 
-    /// The OS process id. A number, not an identity: valid to display
-    /// always, valid to signal only while [`Self::state`] says `Running`
-    /// — which is why signalling is the monitor's job, not the caller's.
+    /// The OS process id — valid to display always, valid to signal only
+    /// while the monitor says `Running`, which is why signalling is its job.
     pub fn pid(&self) -> u32 {
         self.pid
     }
@@ -134,10 +129,9 @@ impl Tracked {
         self.cell.get().is_some()
     }
 
-    /// Block until the child is gone. Settled: every call after the first
-    /// returns the same outcome. An async caller wraps this in its
-    /// runtime's blocking facility (`spawn_blocking`); cancelling that
-    /// cancels a read of the cell, never the monitoring itself.
+    /// Block until the child is gone; settled after the first return.
+    /// Async callers wrap this in `spawn_blocking` — cancelling that
+    /// cancels a read, never the monitoring itself.
     pub fn wait(&self) -> Exit {
         self.cell.wait()
     }
@@ -150,17 +144,11 @@ impl Tracked {
     /// Ask the child to stop, give it `grace`, then force-kill it; block
     /// until it is gone and return how it went.
     ///
-    /// A child that has already exited returns its settled outcome at
-    /// once — nothing is asked of it, nothing waited for, nothing
-    /// signalled: from the moment it was reaped its number belongs to
-    /// whatever the operating system hands it to next. A zero grace
-    /// skips the asking. Idempotent: repeated stops, from any view, do
-    /// not restart the clock.
-    ///
-    /// This stops the child and, on escalation, the process group it
-    /// leads. Descendants beyond that — escapees, reparented processes —
-    /// are the kill token's job ([`crate::scan`]), scoped by this child's
-    /// [`Self::token`].
+    /// A settled child returns its outcome at once with nothing signalled
+    /// — its number is no longer ours. Zero grace skips the asking;
+    /// repeated stops from any view share one clock. This reaches the
+    /// child and the group it leads; escapees beyond that are the kill
+    /// token's job ([`crate::scan`]).
     pub fn stop(&self, grace: Duration) -> Exit {
         // A send can only fail because the monitor has finished, and it
         // publishes before finishing — so falling through to wait() is
@@ -187,8 +175,7 @@ impl OutcomeCell {
         self.outcome.lock().expect("outcome lock").clone()
     }
 
-    /// First writer wins; later writes are ignored rather than tearing a
-    /// settled outcome.
+    /// First writer wins; a settled outcome is never torn.
     fn set(&self, exit: Exit) {
         let mut outcome = self.outcome.lock().expect("outcome lock");
         if outcome.is_none() {
@@ -227,9 +214,8 @@ impl OutcomeCell {
     }
 }
 
-/// Publishes `Unknown` if the monitor unwinds without having published —
-/// so even a panic in the monitor leaves waiters released rather than
-/// parked forever, and the child readable as gone rather than signable.
+/// Publishes `Unknown` if the monitor unwinds without having published,
+/// so even a panic releases waiters and leaves the child unsignable.
 struct PublishOnDrop(Arc<OutcomeCell>);
 
 impl Drop for PublishOnDrop {
@@ -260,9 +246,8 @@ fn monitor(mut child: Child, pid: u32, mailbox: Receiver<Cmd>, cell: Arc<Outcome
                 return;
             }
             Err(e) => {
-                // Unreadable is unrecoverable: nothing this loop does next
-                // could be trusted. Report and stand down; the kill token
-                // still names whatever is left.
+                // Unreadable is unrecoverable; the kill token still names
+                // whatever is left.
                 warn!(pid, error = %e, "Cannot read tracked child's state");
                 cell.set(Exit::Unknown);
                 drop(publish_guard);
@@ -271,9 +256,8 @@ fn monitor(mut child: Child, pid: u32, mailbox: Receiver<Cmd>, cell: Arc<Outcome
             Ok(None) => {}
         }
 
-        // A drained mailbox and a disconnected one read the same: with
-        // every view gone, monitoring continues anyway, so the child is
-        // reaped whenever it exits.
+        // Drained and disconnected read the same: monitoring continues
+        // even with every view gone, so the child is always reaped.
         while let Ok(Cmd::Stop { grace }) = mailbox.try_recv() {
             if deadline.is_none() {
                 if grace.is_zero() {
@@ -291,11 +275,9 @@ fn monitor(mut child: Child, pid: u32, mailbox: Receiver<Cmd>, cell: Arc<Outcome
             && Instant::now() >= d
         {
             warn!(pid, "Grace expired, killing tracked child");
-            // The handle first — it cannot miss or hit the wrong process —
-            // then the group it leads, for the children a handle cannot
-            // reach. The group signal is safe here because the child is
-            // not yet reaped (the reap attempt is this same loop's next
-            // iteration), so its number is still pinned.
+            // Handle first (cannot misfire), then the group it leads. The
+            // group signal is safe: the reap attempt is this loop's next
+            // iteration, so the child's number is still pinned.
             let _ = child.kill();
             if signal::leads_own_group(pid) {
                 signal::force_kill_group(pid);

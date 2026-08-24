@@ -68,17 +68,10 @@ const MAX_CONCURRENT_SCANS: usize = 1;
 /// Permits for [`MAX_CONCURRENT_SCANS`].
 static SCAN_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_SCANS);
 
-/// This pod-runner's token root: `<seed>/<pid>@<start-stamp>`.
-///
-/// A bare PID would not do as the owner. The startup sweep has to decide
-/// whether the runner named by a token is still running, and PIDs are
-/// recycled — a restarted pod-runner that landed on its predecessor's PID
-/// would read the previous run's orphans as its own and leave them
-/// running, which is the exact failure [`kill_dead_runner_orphans`]
-/// exists to prevent. The start time makes the identity unreusable.
-///
-/// Resolved once: the answer cannot change while this process runs, and
-/// every token it writes has to agree with every other.
+/// This pod-runner's token root: `<seed>/<pid>@<start-stamp>`. The start
+/// stamp is what keeps a restarted runner that landed on its
+/// predecessor's PID from reading that run's orphans as its own.
+/// Resolved once, so every token this process writes agrees.
 fn runner_run() -> &'static Run {
     static RUNNER: OnceLock<Run> = OnceLock::new();
     RUNNER.get_or_init(|| Run::of(&Seed::generate()))
@@ -177,15 +170,10 @@ impl Orphans {
         signalled
     }
 
-    /// SIGKILL whichever are still alive — after re-verifying, process by
-    /// process, that each PID still carries the token this set recorded
-    /// for it: the set is a grace period old by now, and in that time the
-    /// operating system may have handed any of these numbers to something
-    /// else. Returns how many were killed.
-    ///
-    /// Anything killed here outlived its container, so it is reported at
-    /// warning level: a container leaked a process, and that is worth
-    /// seeing rather than silently patching over.
+    /// SIGKILL whichever still carry the token this set recorded for them
+    /// — re-verified per process, the set being a grace period old by
+    /// now. Reported at warning level: a container leaked a process, and
+    /// that is worth seeing. Returns how many were killed.
     pub fn force_kill(&self) -> usize {
         let killed = kill_found(PR_KILL_TOKEN_VAR, &self.0);
         if killed > 0 {

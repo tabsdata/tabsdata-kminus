@@ -253,22 +253,7 @@ pub fn stop_recorded(dir: &Path, name: &str, grace: Duration) {
     }
 }
 
-/// Best-effort: force-kill every process still parented under `root`
-/// (transitively), without touching `root` itself. Each target's own
-/// process group is killed too, to catch isolated children that lead
-/// their own group.
-///
-/// macOS only, as a backstop for the one thing the kill-token sweep
-/// cannot see there: System Integrity Protection refuses to hand over an
-/// Apple platform binary's environment even to the same uid, so a
-/// `/bin/sh` wrapper around a command carries its token and reads back as
-/// carrying nothing. Only the restricted process itself is hidden — its
-/// children re-expose the token, and a simple command leaves no wrapper
-/// at all, since the shell execs — but while such a process is still
-/// parented here, a walk of the parent links reaches it and the sweep
-/// does not. Elsewhere the sweep sees everything this would, identifies
-/// what it kills, and additionally reaches processes reparented away —
-/// which no parent-link walk can.
+/// Every process parented (transitively) under `root`, by PPID walk.
 #[cfg(target_os = "macos")]
 fn collect_descendants(root: u32) -> Vec<u32> {
     use sysinfo::{Pid, ProcessesToUpdate, System};
@@ -289,6 +274,15 @@ fn collect_descendants(root: u32) -> Vec<u32> {
     descendants
 }
 
+/// Best-effort: force-kill every process still parented under `root`
+/// (transitively), and each target's own group, without touching `root`.
+///
+/// macOS only, as a backstop for the one thing the kill-token sweep
+/// cannot see there: SIP hides an Apple platform binary's environment, so
+/// a `/bin/sh` wrapper carries its token unreadably. The gap is one hop
+/// wide (children re-expose the token; a simple command leaves no wrapper
+/// since the shell execs). Elsewhere the sweep sees everything this would
+/// and also reaches reparented processes, which no parent walk can.
 #[cfg(target_os = "macos")]
 pub fn kill_descendants(root: u32) {
     let descendants = collect_descendants(root);

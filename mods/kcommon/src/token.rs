@@ -70,22 +70,13 @@ pub const KILL_TOKEN_VARS: &[&str] = &[KM_KILL_TOKEN_VAR, PR_KILL_TOKEN_VAR];
 pub const FIELD_SEP: char = '/';
 
 /// Re-apply the kill-token variables that must survive a deliberate
-/// environment clear.
+/// environment clear — a token that fails to reach a process makes it
+/// unreachable by the only mechanism that can still find it. An
+/// allowlist, not a `TD_` prefix, so nothing else rides along.
 ///
-/// Giving a child a clean environment is a legitimate thing to ask for,
-/// and it is honoured for everything except these: a kill token that
-/// fails to reach a process makes that process unreachable by the only
-/// mechanism that can still find it once it has left its process group.
-///
-/// An allowlist, not a prefix match, on purpose: a `TD_` prefix would
-/// carry every other such variable into a child that was meant to have
-/// none, quietly changing behaviour for anything that reads one.
-///
-/// `inherited` reads a variable from the spawning process's own
-/// environment (normally `|k| std::env::var(k).ok()`). Passed in rather
-/// than read here so the sequence can be exercised without mutating
-/// global state. Call between `env_clear()` and the caller's explicit
-/// variables, so an explicit value still wins.
+/// `inherited` reads from the spawner's environment (normally
+/// `|k| std::env::var(k).ok()`); injected so tests never mutate global
+/// state. Call between `env_clear()` and explicit variables.
 pub fn carry_kill_tokens(
     cmd: &mut std::process::Command,
     inherited: impl Fn(&str) -> Option<String>,
@@ -103,21 +94,15 @@ pub fn carry_kill_tokens(
 pub struct Seed(String);
 
 impl Seed {
-    /// Mint a fresh seed for this run: a millisecond UTC stamp plus this
-    /// process's pid. Readable in a process listing, unique per run
-    /// (one process cannot start twice in a millisecond), and free of the
-    /// token's separator characters by construction.
+    /// Mint a fresh seed: a millisecond UTC stamp plus this process's
+    /// pid — readable, unique per run, separator-free by construction.
     pub fn generate() -> Self {
         let now = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
         Seed(format!("{}-{}", now, std::process::id()))
     }
 
-    /// A seed from persisted or configured text.
-    ///
-    /// Rejects anything that could not have been minted here: an empty
-    /// string, whitespace or control characters, or the token separators —
-    /// a seed containing `/` would silently become two token fields, and
-    /// every prefix match after that would lie.
+    /// A seed from persisted text. Rejects separators and whitespace — a
+    /// seed containing `/` would silently become two token fields.
     pub fn parse(text: &str) -> io::Result<Self> {
         let text = text.trim();
         let valid = !text.is_empty()
@@ -133,12 +118,9 @@ impl Seed {
         Ok(Seed(text.to_string()))
     }
 
-    /// Read the seed a previous run persisted, if any.
-    ///
-    /// A missing file is `None` — the first run ever, or a cleaned
-    /// instance. An unreadable or invalid file is an error rather than
-    /// `None`: it means something wrote garbage where reclamation state
-    /// lives, which is worth surfacing over silently skipping cleanup.
+    /// Read the seed a previous run persisted. A missing file is `None`;
+    /// garbage is an error, not `None` — silently skipping reclamation
+    /// would be the wrong reading of it.
     pub fn load(path: &Path) -> io::Result<Option<Self>> {
         match fs::read_to_string(path) {
             Ok(text) => Ok(Some(Self::parse(&text)?)),
@@ -147,9 +129,8 @@ impl Seed {
         }
     }
 
-    /// Persist this seed for the *next* run to reclaim against. Call
-    /// before spawning anything under it, so a launcher that dies
-    /// mid-startup still left the trail behind.
+    /// Persist this seed for the next run to reclaim against. Call before
+    /// spawning anything under it.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -186,10 +167,8 @@ impl Run {
         Run(format!("{}{}{}", seed.0, FIELD_SEP, owner))
     }
 
-    /// A token one scope below this one: `<self>/<name>`.
-    ///
-    /// `name` must not contain the separator; a scope with a `/` in it
-    /// would select more than it names.
+    /// A token one scope below this one: `<self>/<name>`. `name` must not
+    /// contain the separator, or it would select more than it names.
     pub fn scope(&self, name: &str) -> Run {
         debug_assert!(!name.contains(FIELD_SEP), "scope must not contain '/'");
         Run(format!("{}{}{}", self.0, FIELD_SEP, name))

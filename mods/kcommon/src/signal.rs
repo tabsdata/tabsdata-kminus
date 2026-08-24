@@ -12,26 +12,15 @@
 //! That is the caller's job, and the reason kill tokens exist: a number is
 //! safe to signal only while something still guarantees it is yours.
 
-/// Whether a process with this PID exists.
+/// Whether a process with this PID exists — saying nothing about *which*
+/// process, so use it only where something else establishes identity.
 ///
-/// Says nothing about *which* process: a recycled number answers yes just
-/// as readily as the one the caller had in mind. Use it only where
-/// something else already establishes identity — a `Child` handle held
-/// open, a matching kill token, a verified image name.
-///
-/// On Unix an exited child that its parent has not yet reaped is still a
-/// zombie, and a zombie answers yes. That is not a flaw to work around:
-/// the zombie is what reserves the number, and reserving it is precisely
-/// what makes the PID safe to signal until the parent calls `wait`.
-///
-/// On Windows this asks the process object directly — `OpenProcess` plus
-/// `GetExitCodeProcess` — rather than spawning `tasklist`, which cost a
-/// full process launch per check and dominated the cost of every kill.
-/// Two consequences of asking that way: a process this user lacks rights
-/// to open (an elevated one, typically) reads as absent, which is the
-/// right answer for a supervisor that could not signal it anyway; and a
-/// process that exited *with* code 259 (`STILL_ACTIVE`) reads as running,
-/// a documented Windows wart shared by everything that uses this API.
+/// On Unix an unreaped zombie answers yes; that reservation is exactly
+/// what makes the PID safe to signal until the parent reaps. On Windows
+/// this asks the process object (`OpenProcess` + `GetExitCodeProcess`)
+/// rather than spawning `tasklist`; an unopenable (elevated) process
+/// reads as absent, and an exit code of 259 (`STILL_ACTIVE`) reads as
+/// running — the documented wart of this API.
 pub fn is_pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -56,12 +45,9 @@ pub fn is_pid_alive(pid: u32) -> bool {
     }
 }
 
-/// Send SIGKILL to a single process.
-///
-/// On Windows this opens the process object and calls `TerminateProcess`
-/// on it — no `taskkill` spawn, and between `OpenProcess` succeeding and
-/// the terminate call the handle pins the number, so this cannot land on
-/// a recycled PID.
+/// Send SIGKILL to a single process. On Windows the handle from
+/// `OpenProcess` pins the number until `TerminateProcess`, so this cannot
+/// land on a recycled PID.
 pub fn force_kill(pid: u32) {
     #[cfg(unix)]
     {
@@ -86,11 +72,8 @@ pub fn force_kill(pid: u32) {
     }
 }
 
-/// Ask a single process to shut down.
-///
-/// Unix: SIGTERM. Windows has no SIGTERM; `taskkill` without `/F` is the
-/// closest equivalent, and `/T` covers descendants that sanitised any
-/// token out of their own environment.
+/// Ask a single process to shut down: SIGTERM, or on Windows `taskkill`
+/// without `/F` (with `/T` for descendants that dropped their token).
 pub fn send_sigterm_pid(pid: u32) {
     #[cfg(unix)]
     {
@@ -107,17 +90,14 @@ pub fn send_sigterm_pid(pid: u32) {
     }
 }
 
-/// Ask a console-attached process group to shut down (Windows), or SIGTERM
-/// a single process (Unix).
+/// Ask a process to shut down: SIGTERM, or `CTRL_BREAK_EVENT` to its
+/// group on Windows.
 ///
-/// The Windows form sends `CTRL_BREAK_EVENT` to the process group led by
-/// `pid`, which is what a console application's shutdown handler listens
-/// for. Known caveat, unresolved: `GenerateConsoleCtrlEvent` only reaches
-/// groups attached to the *caller's* console, so a child created with
-/// `CREATE_NO_WINDOW` — its own console — never receives it and burns its
-/// whole grace period instead. Fixing delivery needs work on a Windows
-/// machine; until then this is best-effort and the force stage is what
-/// actually stops things there.
+/// Known caveat, unresolved: `GenerateConsoleCtrlEvent` only reaches
+/// groups on the *caller's* console, so a `CREATE_NO_WINDOW` child never
+/// receives it and burns its grace. Fixing delivery needs a Windows
+/// machine; until then the force stage is what actually stops things
+/// there.
 pub fn request_graceful(pid: u32) {
     #[cfg(unix)]
     {
@@ -135,11 +115,8 @@ pub fn request_graceful(pid: u32) {
     }
 }
 
-/// Send SIGTERM to the entire process group led by `pid`.
-///
-/// Only meaningful when `pid` leads its own group — see
-/// [`leads_own_group`]. Signaling the group reaches descendants that a
-/// single-process signal would miss.
+/// Send SIGTERM to the entire process group led by `pid` (see
+/// [`leads_own_group`]).
 pub fn send_sigterm_group(pid: u32) {
     #[cfg(unix)]
     {
@@ -174,12 +151,9 @@ pub fn force_kill_group(pid: u32) {
     }
 }
 
-/// Whether `pid` is the leader of its own process group, i.e. the group
-/// contains it and its descendants and nothing else.
-///
-/// Answers whether signalling the group is a proportionate way to reach a
-/// process's children, or whether it would spill into whatever else shares
-/// that group.
+/// Whether `pid` leads its own process group — i.e. whether a group
+/// signal reaches its descendants, or would spill into whatever else
+/// shares the group.
 pub fn leads_own_group(pid: u32) -> bool {
     #[cfg(unix)]
     {

@@ -2,20 +2,11 @@
 
 //! The components km has started, held as [`Tracked`] views.
 //!
-//! km spawns three components and has to answer two questions about them
-//! from two places: is this one still alive (the process watcher, on its
-//! own thread, while startup may still be gating on a later component),
-//! and tear down whatever is up so far (a readiness failure from the
-//! startup path, a signal from the km-signal thread). Both reach the same
-//! registry; [`Tracked`] views being cheap clones, nothing juggles
-//! handles.
-//!
-//! Liveness answered here comes from the monitor that owns each child —
-//! never from the process table, where a recycled number can impersonate
-//! a dead component — and carries the exit outcome, which for a component
-//! that died without logging is often the only account of what happened:
-//! on Windows an abnormal exit's code is the NTSTATUS that ended it, on
-//! Unix the signal that did.
+//! One registry serves both the process watcher and the teardown paths;
+//! views being cheap clones, nothing juggles handles. Liveness comes from
+//! the monitor that owns each child — never the process table, where a
+//! recycled number can impersonate a dead component — and carries the
+//! exit outcome, often the only account of a death that reached no log.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};

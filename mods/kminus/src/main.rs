@@ -676,10 +676,8 @@ fn shutdown_from_pids(paths: &Paths, ports: Option<&KmPorts>) {
     }
     let _ = fs::remove_file(seed_file(&paths.workdir));
 
-    // macOS only: SIP hides the environment of an Apple platform binary,
-    // so a `/bin/sh` wrapper is invisible to the sweep above while still
-    // being reachable through the parent links. One hop wide — its
-    // children re-expose the token — and closed by walking the tree.
+    // A SIP-hidden `/bin/sh` wrapper is invisible to the sweep but still
+    // parented here. See `kill_descendants`.
     #[cfg(target_os = "macos")]
     kill_descendants(std::process::id());
 

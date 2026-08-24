@@ -27,17 +27,12 @@ const STAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 /// acting on what might be a stranger.
 pub const UNKNOWN_STAMP: &str = "00000000T000000Z";
 
-/// Format a process start time (epoch seconds, as reported by `sysinfo`)
-/// as a fixed-width UTC stamp.
-///
-/// Both the writer of an identity and the code verifying one go through
-/// this function and compare the results as strings, so the two sides can
-/// never disagree about format or timezone.
+/// Format a process start time (epoch seconds) as a fixed-width UTC
+/// stamp. Writer and verifier both come through here, so the two sides
+/// can never disagree about format or timezone.
 pub fn owner_stamp(start_time_secs: u64) -> String {
-    // Converted rather than cast. `as i64` wraps, and a wrapped negative
-    // formats as a plausible stamp just before the epoch instead of
-    // falling back — an identity that looks valid and matches nothing is
-    // worse than one that declares itself unknown.
+    // Converted, not cast: `as i64` wraps, and a wrapped negative formats
+    // as a plausible pre-epoch stamp instead of the sentinel.
     let Ok(secs) = i64::try_from(start_time_secs) else {
         return UNKNOWN_STAMP.to_string();
     };
@@ -52,11 +47,9 @@ pub fn owner_identity(pid: u32, start_time_secs: u64) -> String {
     format!("{}{}{}", pid, OWNER_SEP, owner_stamp(start_time_secs))
 }
 
-/// Split an identity into its pid and start stamp.
-///
-/// `None` for anything that is not `<pid>@<stamp>`. Callers treat that as
-/// "cannot verify" — and an unverifiable identity must never be acted on
-/// as though it were confirmed.
+/// Split an identity into its pid and start stamp. `None` for anything
+/// that is not `<pid>@<stamp>` — unverifiable, which callers must never
+/// act on as though confirmed.
 pub fn parse_owner(owner: &str) -> Option<(u32, &str)> {
     let (pid, stamp) = owner.split_once(OWNER_SEP)?;
     Some((pid.parse().ok()?, stamp))
@@ -69,10 +62,8 @@ pub fn is_unknown_stamp(stamp: &str) -> bool {
 }
 
 /// Start time of `pid` in epoch seconds, if the process can be read.
-///
-/// Refreshed without any of the per-process detail sysinfo can gather —
-/// only the start time is wanted, and the environments and command lines
-/// are what make a process-table pass expensive.
+/// Refreshed without environments or command lines, which are what make
+/// a process-table read expensive.
 pub fn process_start_time(pid: u32) -> Option<u64> {
     let mut system = System::new();
     let pid = Pid::from_u32(pid);
@@ -85,12 +76,9 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
 }
 
 /// Whether a live process holds `pid` and started at `stamp` — the one
-/// question a bare liveness check cannot answer.
-///
-/// A zombie is not running: it has exited and merely awaits its reaper,
-/// yet the process table still lists it with its original start time. A
-/// caller asking this question wants to know whether there is anything
-/// left to wait for or signal, and for a zombie the answer is no.
+/// question a bare liveness check cannot answer. A zombie reads as gone:
+/// it is still listed with its original start time, but nothing can be
+/// asked of it or waited for.
 pub fn running_since(pid: u32, stamp: &str) -> bool {
     let mut system = System::new();
     let pid = Pid::from_u32(pid);

@@ -888,13 +888,10 @@ impl ExecutorHandle {
         let code = match (&mut self.wait_handle).await {
             Ok(code) => code,
             Err(e) => {
-                // The monitor task died without reporting; the child's real
-                // status is unknowable now. What must not happen is leaving
-                // the handle consumed with nothing cached: every later call
-                // would poll it again, which panics ("JoinHandle polled
-                // after completion") — and under the release profile's
-                // panic = "abort" that takes the whole pod-runner with it.
-                // Cache the failure first, then report it.
+                // The handle is consumed either way; leaving nothing cached
+                // means the next poll panics ("JoinHandle polled after
+                // completion") — an abort under panic = "abort". Cache the
+                // failure first, then report it.
                 self.cached_exit_code = Some(-1);
                 return Err(io::Error::other(format!(
                     "process monitor task failed: {}",
@@ -915,9 +912,7 @@ impl ExecutorHandle {
             return Some(code);
         }
         if self.wait_handle.is_finished() {
-            // is_finished() guarantees readiness, so the poll consumes the
-            // handle whatever it yields. An Err means the monitor task died
-            // without reporting — cache that as -1, because a consumed
+            // The poll consumes the handle whatever it yields; a consumed
             // handle with nothing cached panics on the next poll.
             let code = match now_or_never(&mut self.wait_handle) {
                 Some(Ok(code)) => code,
@@ -929,33 +924,19 @@ impl ExecutorHandle {
         None
     }
 
-    /// Whether the child has been reaped, judged from the handle this
-    /// struct owns rather than from the operating system's process table.
-    ///
-    /// The distinction is the whole safety of every kill below. A PID
-    /// lookup answers "does *some* process hold this number", and the
-    /// number stops being ours the moment the child is reaped: on Unix the
-    /// zombie that pinned it is gone, on Windows the process handle that
-    /// pinned it is closed. Both reservations end exactly here, so a
-    /// handle that reports exited must never be signalled by PID again —
-    /// under load a container's number is handed to an unrelated process
-    /// within seconds, and `kill(-pid, ...)` or `taskkill /T` aimed at it
-    /// takes that stranger and its whole tree down.
-    ///
-    /// Cheap and non-blocking: no process-table scan, and no `&mut self`.
-    ///
-    /// Errs towards leaking rather than misfiring. A monitor task that
-    /// panicked also reads as finished, which would skip a kill the
-    /// process still needs; that leaves a stray for the orphan sweep,
-    /// where signalling a stranger has no such backstop.
+    /// Whether the child has been reaped — judged from the handle, never
+    /// the process table. A reaped child's number is no longer ours to
+    /// signal: the reservation (Unix zombie, Windows handle) ends exactly
+    /// here, and a group kill aimed past it lands on a stranger's tree.
+    /// Errs towards leaking (a panicked monitor reads as exited; the
+    /// sweep reclaims the stray) rather than misfiring.
     pub fn has_exited(&self) -> bool {
         self.cached_exit_code.is_some() || self.wait_handle.is_finished()
     }
 
-    /// Abort the internal monitor task, so the next poll of it yields a
-    /// `JoinError` — the path a panicked or cancelled monitor leaves
-    /// behind. Test-only: it manufactures the state that killed pod-runner
-    /// in the field, without needing a panic inside the task.
+    /// Abort the internal monitor task so the next poll yields a
+    /// `JoinError` — manufacturing the state that killed pod-runner in
+    /// the field. Test-only.
     #[cfg(test)]
     pub(crate) fn abort_monitor(&self) {
         self.wait_handle.abort();
@@ -981,9 +962,8 @@ impl ExecutorHandle {
     pub async fn kill(&mut self, grace_period: Duration) {
         let kill_start = std::time::Instant::now();
 
-        // Asked of the handle, not of the process table: see
-        // [`Self::has_exited`]. An already-reaped child leaves nothing to
-        // signal, and its number may well belong to somebody else by now.
+        // Asked of the handle, not the process table: a reaped child's
+        // number may already be somebody else's. See [`Self::has_exited`].
         if let Some(code) = self.try_wait() {
             debug!(
                 pid = self.pid,
@@ -1081,25 +1061,12 @@ fn now_or_never(handle: &mut JoinHandle<i32>) -> Option<Result<i32, tokio::task:
 // ---------------------------------------------------------------------------
 
 /// Set up a child's environment: the optional clear, the kill tokens that
-/// must survive one, then the caller's explicit variables.
-///
-/// `propagate_env: false` asks for a clean environment and gets one, with
-/// the single exception of the kill tokens ([`kcommon::token`]'s
-/// allowlist — a list and not a `TD_` prefix on purpose, so no other
-/// variable rides along). Once a process has left its process group and
-/// been reparented, an inherited token is the only handle left on it; a
-/// container that loses km's token becomes unreachable by the very
-/// mechanism meant to find it. Clearing the environment should not be
-/// what decides that.
-///
-/// Only ancestor-set tokens need carrying. The token this pod-runner sets
-/// on a container goes through `env_vars`, which is applied after the
-/// clear and survives it unaided.
-///
-/// `inherited` reads a variable from the spawning process's own
-/// environment. Passed in rather than read here so the whole sequence —
-/// the ordering that decides which value wins included — can be exercised
-/// without mutating global state.
+/// must survive one, then the caller's explicit variables (which
+/// therefore win — pod-runner's own token goes through `env_vars` and
+/// needs no carve-out). A container that loses km's inherited token is
+/// unreachable by the only mechanism that can still find it, so a clear
+/// must not be what decides that. `inherited` is injected so tests never
+/// mutate global state.
 fn apply_env(
     cmd: &mut Command,
     propagate_env: bool,
