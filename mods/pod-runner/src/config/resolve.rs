@@ -110,11 +110,8 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
     let prconfig_path = configdir.join(PRCONFIG_FILENAME);
     if !prconfig_path.is_file() {
         let port = cli.port.unwrap_or(DEFAULT_PORT);
-        let metrics_port = cli
-            .metrics_port
-            .unwrap_or(crate::metrics::DEFAULT_METRICS_PORT);
-        info!(configdir = %configdir.display(), port, metrics_port, "Generating config files");
-        pki::generate_and_write_configs(&configdir, DEFAULT_ADDRESS, port, metrics_port)?;
+        info!(configdir = %configdir.display(), port, "Generating config files");
+        pki::generate_and_write_configs(&configdir, DEFAULT_ADDRESS, port)?;
     }
     let yaml = YamlPRConfig::from_file(&prconfig_path)?;
     yaml.validate()?;
@@ -131,6 +128,13 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
         sys
     } else {
         super::yaml_config::YamlSysConfig::default()
+    };
+
+    // Metrics URL: --metrics-port overrides prsysconfig.yaml's metricsUrl.
+    // Port 0 disables the metrics server.
+    let metrics_url = match cli.metrics_port {
+        Some(port) => format!("http://{DEFAULT_ADDRESS}:{port}"),
+        None => sys.metrics_url.clone(),
     };
 
     // 4. Parse URL
@@ -183,7 +187,7 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
     };
 
     // 10. Regenerate vk-prconfig.yaml (every startup)
-    regenerate_vk_prconfig(&configdir, url, &sys, &tls)?;
+    regenerate_vk_prconfig(&configdir, url, &sys, &tls, &metrics_url)?;
 
     // 11. Resolve images_dir: CLI > prsysconfig.yaml > DEFAULT_IMAGESDIR.
     //     Absolute path is used as-is; relative is joined against the cwd.
@@ -268,7 +272,7 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
         ttls,
         dir_size_scan_interval_secs: sys.dir_size_scan_interval_secs,
 
-        metrics_url: sys.metrics_url.clone(),
+        metrics_url,
     })
 }
 
@@ -365,6 +369,7 @@ fn regenerate_vk_prconfig(
     url: &str,
     sys: &super::yaml_config::YamlSysConfig,
     tls: &ServerTlsConfig,
+    metrics_url: &str,
 ) -> Result<(), String> {
     let ca_b64 = cert_source_to_b64(&tls.client_ca).unwrap_or_default();
 
@@ -395,7 +400,7 @@ fn regenerate_vk_prconfig(
         &ca_b64,
         &client_cert_b64,
         &client_key_b64,
-        &sys.metrics_url,
+        metrics_url,
     )
 }
 
@@ -581,6 +586,84 @@ podDataReapTtlOnPodSuccess: "5m"
         assert_eq!(config.capacity_pods, 100);
         assert!(!config.propagate_env);
         assert_eq!(config.ttls.reap_on_success.raw(), "5m");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn metrics_test_cli(configdir: &Path, tmp: &Path, metrics_port: Option<u16>) -> CliArgs {
+        CliArgs {
+            kubeconfig: None,
+            configdir: Some(configdir.to_string_lossy().into()),
+            workdir: Some(tmp.join("work").to_string_lossy().into()),
+            logdir: Some(tmp.join("log").to_string_lossy().into()),
+            imagesdir: None,
+            port: None,
+            metrics_port,
+            logmaxsizemb: 100,
+            logmaxfiles: 3,
+            loglevel: crate::config::loglevel::LogLevel::Debug,
+            heartbeat_file: None,
+            heartbeat_secs: crate::config::cli::DEFAULT_HEARTBEAT_SECS,
+        }
+    }
+
+    #[test]
+    fn resolve_config_metrics_port_flag_overrides_sysconfig() {
+        let tmp =
+            std::env::temp_dir().join(format!("pr-resolve-metrics-flag-{}", std::process::id(),));
+        let configdir = tmp.join("config");
+        std::fs::create_dir_all(&configdir).unwrap();
+        std::fs::write(
+            configdir.join(crate::config::template::PRSYSCONFIG_FILENAME),
+            "metricsUrl: \"http://127.0.0.1:9111\"\n",
+        )
+        .unwrap();
+
+        let cli = metrics_test_cli(&configdir, &tmp, Some(9099));
+        let config = resolve_config(&cli).unwrap();
+
+        assert_eq!(config.metrics_url, "http://127.0.0.1:9099");
+        assert_eq!(config.metrics_port(), 9099);
+        // vk-prconfig.yaml must scrape the same port the server binds.
+        let vk = std::fs::read_to_string(configdir.join(VK_PRCONFIG_FILENAME)).unwrap();
+        assert!(vk.contains("metricsUrl: \"http://127.0.0.1:9099\""), "{vk}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_config_metrics_url_from_sysconfig_without_flag() {
+        let tmp =
+            std::env::temp_dir().join(format!("pr-resolve-metrics-sys-{}", std::process::id(),));
+        let configdir = tmp.join("config");
+        std::fs::create_dir_all(&configdir).unwrap();
+        std::fs::write(
+            configdir.join(crate::config::template::PRSYSCONFIG_FILENAME),
+            "metricsUrl: \"http://127.0.0.1:9111\"\n",
+        )
+        .unwrap();
+
+        let cli = metrics_test_cli(&configdir, &tmp, None);
+        let config = resolve_config(&cli).unwrap();
+
+        assert_eq!(config.metrics_url, "http://127.0.0.1:9111");
+        assert_eq!(config.metrics_port(), 9111);
+        let vk = std::fs::read_to_string(configdir.join(VK_PRCONFIG_FILENAME)).unwrap();
+        assert!(vk.contains("metricsUrl: \"http://127.0.0.1:9111\""), "{vk}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_config_metrics_port_zero_disables() {
+        let tmp =
+            std::env::temp_dir().join(format!("pr-resolve-metrics-zero-{}", std::process::id(),));
+        let configdir = tmp.join("config");
+
+        let cli = metrics_test_cli(&configdir, &tmp, Some(0));
+        let config = resolve_config(&cli).unwrap();
+
+        assert_eq!(config.metrics_port(), 0);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

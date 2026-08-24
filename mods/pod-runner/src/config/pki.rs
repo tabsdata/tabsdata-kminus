@@ -140,7 +140,6 @@ pub fn generate_and_write_configs(
     configdir: &Path,
     address: &str,
     port: u16,
-    metrics_port: u16,
 ) -> Result<(), String> {
     fs::create_dir_all(configdir).map_err(|e| format!("Failed to create configdir: {e}"))?;
 
@@ -175,8 +174,9 @@ server:
             .map_err(|e| format!("Failed to write {}: {e}", syscfg_path.display()))?;
     }
 
-    // Write vk-prconfig.yaml
-    let metrics_url = format!("http://{address}:{metrics_port}");
+    // Write vk-prconfig.yaml. The metrics URL here is a placeholder:
+    // resolve_config regenerates this file on every start with the
+    // resolved value (--metrics-port, or prsysconfig.yaml's metricsUrl).
     vk_config::write_vk_prconfig(
         configdir,
         &url,
@@ -185,7 +185,7 @@ server:
         &ca_cert_b64,
         &client_cert_b64,
         &client_key_b64,
-        &metrics_url,
+        crate::metrics::DEFAULT_METRICS_URL,
     )?;
 
     info!(
@@ -241,7 +241,7 @@ mod tests {
     #[test]
     fn generate_and_write_creates_files() {
         let tmp = test_tmp();
-        generate_and_write_configs(&tmp, "127.0.0.1", 10300, 3001).unwrap();
+        generate_and_write_configs(&tmp, "127.0.0.1", 10300).unwrap();
 
         assert!(tmp.join(PRCONFIG_FILENAME).exists());
         assert!(
@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn generated_prconfig_has_valid_tls() {
         let tmp = test_tmp();
-        generate_and_write_configs(&tmp, "127.0.0.1", 10300, 3001).unwrap();
+        generate_and_write_configs(&tmp, "127.0.0.1", 10300).unwrap();
 
         // Load the generated config and verify TLS works end-to-end
         let yaml_config = YamlPRConfig::from_file(&tmp.join(PRCONFIG_FILENAME)).unwrap();

@@ -125,7 +125,7 @@ pod-runner [--kubeconfig <file>] [--configdir <dir>] [--workdir <dir>] [--logdir
 | `--workdir`      | `.`           | Working directory (`run/` created under this)                  |
 | `--logdir`       | `./log`       | Log directory                                                  |
 | `--port`         | `3000`        | Server port (only used when auto-generating `prconfig.yaml`)   |
-| `--metrics-port` | `3001`        | Metrics server port (`0` disables)                             |
+| `--metrics-port` | `metricsUrl`  | Metrics server port; overrides `metricsUrl` (`0` disables)     |
 | `--logmaxsizemb` | `100`         | Max size of a pod-runner log file (MB) before rotation         |
 | `--logmaxfiles`  | `3`           | Max number of rotated pod-runner log files to keep             |
 
@@ -172,7 +172,7 @@ podDataReapTtlOnPodFailure: "1h"                 # Data dirs of a failed pod, fr
 podDirDeleteTtlPodSuccessOnPodDelete: "1h"       # Pod dir of a succeeded pod, from removal from the runner
 podDirDeleteTtlPodFailureOnPodDelete: "24h"      # Pod dir of a failed pod, from removal from the runner
 
-metricsUrl: "http://127.0.0.1:3001"
+metricsUrl: "http://127.0.0.1:3001"       # Overridden by --metrics-port when passed
 
 secretResolver:
   type: "kube"                        # "file", "kube", or "none"
@@ -419,7 +419,7 @@ Pod Runner always uses mTLS with auto-generated certificates. Uses `rustls` (no 
 
 ## Metrics
 
-Prometheus metrics served on a separate port (configured via `--metrics-port`, default `3001`) at `/metrics`.
+Prometheus metrics served on a separate port at `/metrics`. The port comes from `--metrics-port` when passed, otherwise from `metricsUrl` in `prsysconfig.yaml` (default `3001`).
 
 ### Gauges
 

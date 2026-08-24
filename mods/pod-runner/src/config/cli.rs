@@ -76,8 +76,9 @@ pub struct CliArgs {
     #[arg(long)]
     pub port: Option<u16>,
 
-    /// Metrics server port (only used when auto-generating prconfig.yaml).
-    /// Set to 0 to disable metrics. Default: 3001
+    /// Metrics server port. Overrides `metricsUrl` from prsysconfig.yaml.
+    /// Set to 0 to disable metrics. Default: prsysconfig.yaml's metricsUrl
+    /// (3001)
     #[arg(long)]
     pub metrics_port: Option<u16>,
 
