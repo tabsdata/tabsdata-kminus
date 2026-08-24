@@ -137,12 +137,38 @@ fn monitor_counts_a_degraded_beat_as_missed() {
 #[test]
 fn a_failure_carries_the_last_observed_reason() {
     let dir = tempdir();
-    let path = write_beat(&dir, "degraded", "pod status sync stalled");
+    let path = dir.join("absent.json");
     let mut m = HeartbeatMonitor::new("test", path, Duration::from_secs(15), 2);
 
     assert_eq!(m.poll(), Beat::Missed { misses: 1 });
     let Beat::Failed { reason, .. } = m.poll() else {
         panic!("the second miss must fail");
+    };
+    assert!(
+        reason.contains("no readable heartbeat"),
+        "reason = {reason}, want what the poll observed"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_self_reported_degraded_beat_outlasts_a_silent_one() {
+    // A component publishing 'degraded' is running and able to report, so it
+    // gets DEGRADED_TOLERANCE_FACTOR times the patience of one saying nothing.
+    let dir = tempdir();
+    let path = write_beat(&dir, "degraded", "pod status sync stalled");
+    let mut m = HeartbeatMonitor::new("test", path, Duration::from_secs(15), 2);
+
+    let limit = 2 * DEGRADED_TOLERANCE_FACTOR;
+    for miss in 1..limit {
+        assert_eq!(
+            m.poll(),
+            Beat::Missed { misses: miss },
+            "a degraded component must not be failed at {miss} of {limit}"
+        );
+    }
+    let Beat::Failed { reason, .. } = m.poll() else {
+        panic!("the degraded limit must eventually fail");
     };
     assert!(
         reason.contains("pod status sync stalled"),

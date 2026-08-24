@@ -278,9 +278,13 @@ normalised before comparison. Both Go binaries cross-compile clean for
 - **No file** — never came up. Fails the readiness gate after the startup
   budget.
 - **Fresh, `degraded`** — the component reports its own trouble and `detail`
-  says what. Counts as a miss.
+  says what. Counts as a miss, but against a limit five times the configured
+  `maxMissed`: publishing the beat at all proves the component is running and
+  able to report, so it is given room to recover rather than torn down for
+  being slow.
 - **Stale, process alive** — wedged: alive but no longer serving. Counts as a
-  miss.
+  miss against `maxMissed`, with no extra tolerance — silence says nothing
+  about whether the component is still working.
 - **Process exited** — caught by the process check, typically within a
   second, and acted on at once: no staleness to wait for, no miss budget to
   spend.
@@ -293,7 +297,7 @@ for its children and exits 1, which km then observes.
 Note that the component km names is the one that failed a check, not
 necessarily the one at fault. A wedged pod-runner usually surfaces as a
 *virtual-kubelet* failure, because the virtual-kubelet self-reports its broken
-dependency (`pod status sync last completed a round over 3s ago`) a round
+dependency (`pod status sync last completed a round over 30s ago`) a round
 before the pod-runner's own beat has aged out. The reason travels with the
 failure, so the log and the console both name the real cause.
 
@@ -312,7 +316,7 @@ Tabsdata K- (K minus) stopping: pod-runner failed liveness
   process 26311 is gone
 
 Tabsdata K- (K minus) stopping: virtual-kubelet failed liveness
-  missed 3 consecutive heartbeats — reported 'degraded': pod status sync last
+  missed 20 consecutive heartbeats — reported 'degraded': pod status sync last
   completed a round over 3s ago
 ```
 

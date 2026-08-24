@@ -71,7 +71,13 @@ var (
 // Persisted in vksysconfig.yaml — created with defaults on first
 // startup, user-editable thereafter.
 type vkSysConfig struct {
-	SyncSec              int `yaml:"syncSec"`
+	SyncSec int `yaml:"syncSec"`
+	// SyncStaleSec is the age at which a missing sync round makes this
+	// kubelet report degraded. Held apart from SyncSec because the two
+	// answer different questions: how often to sync, and how long a node
+	// this size may take to get through a round. Zero falls back to
+	// syncStaleFactor*SyncSec, so existing config files keep working.
+	SyncStaleSec         int `yaml:"syncStaleSec"`
 	PodControllerWorkers int `yaml:"podControllerWorkers"`
 	PodControllerQPS     int `yaml:"podControllerQps"`
 	PodControllerBurst   int `yaml:"podControllerBurst"`
@@ -83,6 +89,7 @@ type vkSysConfig struct {
 func defaultVKSysConfig() vkSysConfig {
 	return vkSysConfig{
 		SyncSec:              1,
+		SyncStaleSec:         30,
 		PodControllerWorkers: 100,
 		PodControllerQPS:     500,
 		PodControllerBurst:   1000,
@@ -344,10 +351,14 @@ func runHeartbeat(
 	for {
 		// ctx cancellation surfaces as a lookup error first; the select
 		// below is what actually exits.
+		// Sampled before the lookup: the lookup is allowed to take
+		// nodeLookupTimeout, and charging that wait to the sync loop would
+		// let a slow API server read as a stalled sync.
+		syncAge := sinceLastSync()
 		lookupCtx, cancelLookup := context.WithTimeout(ctx, nodeLookupTimeout)
 		_, nodeErr := nodes.Get(lookupCtx, nodeName, metav1.GetOptions{})
 		cancelLookup()
-		detail := beatDetail(nodeName, nodeErr, sinceLastSync(), syncStale)
+		detail := beatDetail(nodeName, nodeErr, syncAge, syncStale)
 
 		if detail == "" {
 			if !everHealthy {
@@ -801,6 +812,10 @@ func main() {
 	if syncInterval <= 0 {
 		syncInterval = 2 * time.Second
 	}
+	syncStale := time.Duration(vkSys.SyncStaleSec) * time.Second
+	if syncStale <= 0 {
+		syncStale = syncStaleFactor * syncInterval
+	}
 	// -----------------------------------------------------------------------
 	// Pod status sync loop
 	//
@@ -849,12 +864,17 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				roundStart := time.Now()
 				// Step 1: One bulk call to get all pod statuses
 				// from pod-runner. This replaces both GetAllPodPhases
 				// and per-pod GetPodStatus — zero per-pod HTTP calls.
 				entries, err := provider.GetAllPodStatuses(ctx)
 				if err != nil {
-					logger.WithError(err).Debugf("Failed to get pod statuses for sync: %v", err)
+					// Warn, not debug: this path leaves the sync timestamp
+					// unstamped, so a persistent failure here is what the
+					// readiness beat reports as a stalled sync. Silent would
+					// mean diagnosing the watchdog instead of the cause.
+					logger.WithError(err).Warnf("Failed to get pod statuses for sync: %v", err)
 					continue
 				}
 				// The round is live from here: the loop is turning and the
@@ -982,8 +1002,24 @@ func main() {
 					cacheMu.Unlock()
 					synced++
 				}
+				// Round latency is logged unconditionally, and separately from
+				// the update count: a round that changed nothing still says
+				// whether the loop is keeping up, which is what the readiness
+				// beat is judging. A round at or past the staleness budget is
+				// the one that will trip it, so it is warned about by name.
+				roundLatency := time.Since(roundStart)
 				if synced > 0 {
-					logger.Infof("Synced %d pod status updates", synced)
+					logger.Infof("Synced %d pod status updates in %s (%d pods)",
+						synced, roundLatency, len(entries))
+				} else {
+					logger.Debugf("Sync round completed in %s (%d pods, no updates)",
+						roundLatency, len(entries))
+				}
+				if roundLatency >= syncStale {
+					logger.Warnf(
+						"Sync round took %s over %d pods, at or past the %s staleness budget; "+
+							"raise 'syncStaleSec' in vksysconfig.yaml if this node is simply this big",
+						roundLatency, len(entries), syncStale)
 				}
 			}
 		}
@@ -997,7 +1033,7 @@ func main() {
 			vkNodeName,
 			*heartbeatFile,
 			time.Duration(*heartbeatSecs)*time.Second,
-			syncStaleFactor*syncInterval,
+			syncStale,
 		)
 	} else {
 		logger.Info("No --heartbeat-file given; readiness heartbeat disabled")

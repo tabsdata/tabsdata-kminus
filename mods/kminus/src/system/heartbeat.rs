@@ -175,6 +175,39 @@ pub enum Beat {
     Failed { misses: u32, reason: String },
 }
 
+/// Why a poll counted as a miss, and how much patience it earns.
+///
+/// A component that publishes 'degraded' is running and able to report; one
+/// whose beat is absent or stale may be gone, and only its pid can say. The
+/// two are not the same failure and do not deserve the same response: a busy
+/// node that reports slow status propagation is still serving, and tearing
+/// the stack down over it costs far more than the lag it was reacting to.
+struct Miss {
+    reason: String,
+    self_reported: bool,
+}
+
+impl Miss {
+    fn silent(reason: String) -> Self {
+        Self {
+            reason,
+            self_reported: false,
+        }
+    }
+
+    fn degraded(reason: String) -> Self {
+        Self {
+            reason,
+            self_reported: true,
+        }
+    }
+}
+
+/// How many times more patiently a self-reported 'degraded' beat is treated
+/// than a silent one. A component saying it is behind gets room to catch up;
+/// a component saying nothing does not.
+const DEGRADED_TOLERANCE_FACTOR: u32 = 5;
+
 /// Consecutive-miss counter for one component, polled once per interval.
 pub struct HeartbeatMonitor {
     name: &'static str,
@@ -203,18 +236,26 @@ impl HeartbeatMonitor {
                 self.misses = 0;
                 Beat::Healthy
             }
-            Some(reason) => {
+            Some(Miss {
+                reason,
+                self_reported,
+            }) => {
                 self.misses += 1;
+                let limit = if self_reported {
+                    self.max_missed.saturating_mul(DEGRADED_TOLERANCE_FACTOR)
+                } else {
+                    self.max_missed
+                };
                 warn!(
                     component = self.name,
                     missed = self.misses,
-                    max_missed = self.max_missed,
+                    max_missed = limit,
                     "Missed heartbeat ({}/{}): {}",
                     self.misses,
-                    self.max_missed,
+                    limit,
                     reason
                 );
-                if self.misses >= self.max_missed {
+                if self.misses >= limit {
                     Beat::Failed {
                         misses: self.misses,
                         reason,
@@ -229,19 +270,27 @@ impl HeartbeatMonitor {
     }
 
     /// Why this poll is a miss, or `None` when the beat is good.
-    fn miss_reason(&self) -> Option<String> {
+    fn miss_reason(&self) -> Option<Miss> {
         let Some((age, beat)) = read(&self.path) else {
-            return Some(format!("no readable heartbeat at {}", self.path.display()));
+            return Some(Miss::silent(format!(
+                "no readable heartbeat at {}",
+                self.path.display()
+            )));
         };
         if beat.status != STATUS_READY {
-            return Some(format!("reported '{}': {}", beat.status, beat.detail));
+            // The component published this itself, so it is running and able
+            // to report. Whatever it is unhappy about, it is not gone.
+            return Some(Miss::degraded(format!(
+                "reported '{}': {}",
+                beat.status, beat.detail
+            )));
         }
         if age > self.stale_after {
-            return Some(format!(
+            return Some(Miss::silent(format!(
                 "last beat {}s ago, over the {}s limit",
                 age.as_secs(),
                 self.stale_after.as_secs()
-            ));
+            )));
         }
         None
     }
