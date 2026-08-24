@@ -59,7 +59,7 @@ pub struct CleanupConfig {
     /// and recorded in the pod dir at pod start.
     pub ttls: TtlConfig,
     /// Pods directory (`<workdir>/run/pods/`). Pod dirs live here; the
-    /// rotated `run.N/pods/` dirs beside it hold previous runs'.
+    /// `run_<stamp>/pods/` dirs beside it hold previous runs'.
     pub pods_dir: PathBuf,
 }
 
@@ -423,7 +423,7 @@ fn delete_pod_dir(pod_dir: &Path) -> bool {
 ///
 /// Left unhandled this stranded the pod dir holding nothing but that marker:
 /// nothing reclaims it later, because the walk took the outcome marker that
-/// [`reap_pod_dir`] needs and [`reap_rotated_pod_dirs`] skips a dir that is
+/// [`reap_pod_dir`] needs and [`reap_previous_run_pod_dirs`] skips a dir that is
 /// already marked reaped — and the marker it kept is a false record, claiming
 /// `log/` and `store/` were preserved when the walk had destroyed them.
 fn delete_pod_dir_with(pod_dir: &Path, remove: impl Fn(&Path) -> io::Result<()>) -> bool {
@@ -506,24 +506,24 @@ fn earliest(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTi
     }
 }
 
-/// Reap the data dirs of every pod in a just-rotated `run.N/pods/` dir.
+/// Reap the data dirs of every pod in a previous run's `pods/` dir.
 ///
-/// These pods belonged to the previous incarnation of the runner. Nothing
+/// These pods belonged to a previous incarnation of the runner. Nothing
 /// will resume them and nothing will read `work/` or `volumes/` again, so
-/// the bulk of the footprint goes at rotation rather than waiting out each
+/// the bulk of the footprint goes at startup rather than waiting out each
 /// pod's own reap deadline. This also covers pods the runner never got to
 /// finalize — a `SIGKILL`ed runner leaves dirs with no marker at all, and
 /// those would otherwise sit untouched.
 ///
 /// `log/` and `store/` stay: that record is what makes a crashed run
-/// diagnosable, and it goes when the rotated run dir does.
+/// diagnosable, and it goes when its run dir is purged.
 ///
 /// An explicit `never` reap deadline is honoured — it means someone asked to
 /// keep the data dirs for inspection, and a restart is no reason to overrule
 /// that.
 ///
 /// Returns how many pod dirs were reaped.
-pub fn reap_rotated_pod_dirs(pods_dir: &Path, now: DateTime<Utc>) -> u32 {
+pub fn reap_previous_run_pod_dirs(pods_dir: &Path, now: DateTime<Utc>) -> u32 {
     let Ok(entries) = fs::read_dir(pods_dir) else {
         return 0;
     };
@@ -584,7 +584,7 @@ pub enum ScheduledReap {
 /// The sleep is raced against `shutdown`, so a pending deadline never holds
 /// the runner's exit, and whatever it would have done is dropped. The
 /// runner keeps no pod state between runs: the next run reclaims the whole
-/// previous run at rotation via [`reap_rotated_pod_dirs`].
+/// previous run at startup via [`reap_previous_run_pod_dirs`].
 ///
 /// `shutdown` must be a receiver that already existed when shutdown was
 /// signalled — a `subscribe()` afterwards cannot observe it — which is why
@@ -1304,7 +1304,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // -- reap_rotated_pod_dirs --
+    // -- reap_previous_run_pod_dirs --
 
     #[test]
     fn rotation_reaps_finished_pods_and_keeps_the_record() {
@@ -1315,7 +1315,7 @@ mod tests {
         // Failed, so its own reap deadline is an hour out.
         finalize_pod(&pod_dir, Outcome::Failed, &TtlConfig::default(), at(T0));
 
-        assert_eq!(reap_rotated_pod_dirs(&pods, at(T0)), 1);
+        assert_eq!(reap_previous_run_pod_dirs(&pods, at(T0)), 1);
 
         assert!(
             !data_dirs_present(&pod_dir),
@@ -1335,7 +1335,7 @@ mod tests {
         // No marker at all: the runner was killed while this pod ran.
         plant_pod_dir(&pod_dir, &[]);
 
-        assert_eq!(reap_rotated_pod_dirs(&pods, at(T0)), 1);
+        assert_eq!(reap_previous_run_pod_dirs(&pods, at(T0)), 1);
 
         assert!(
             !data_dirs_present(&pod_dir),
@@ -1356,7 +1356,7 @@ mod tests {
         );
         finalize_pod(&pod_dir, Outcome::Failed, &TtlConfig::default(), at(T0));
 
-        assert_eq!(reap_rotated_pod_dirs(&pods, at(T0)), 0);
+        assert_eq!(reap_previous_run_pod_dirs(&pods, at(T0)), 0);
 
         assert!(
             data_dirs_present(&pod_dir),
@@ -1377,7 +1377,7 @@ mod tests {
         let reaped_at = fs::read_to_string(pod_dir.join(REAPED_MARKER)).unwrap();
 
         assert_eq!(
-            reap_rotated_pod_dirs(&pods, at("2026-08-04T12:00:00+00:00")),
+            reap_previous_run_pod_dirs(&pods, at("2026-08-04T12:00:00+00:00")),
             0,
         );
 
@@ -1392,7 +1392,10 @@ mod tests {
     #[test]
     fn rotation_tolerates_a_missing_pods_dir() {
         let root = tmp("rotate-missing");
-        assert_eq!(reap_rotated_pod_dirs(&root.join("run.0/pods"), at(T0)), 0);
+        assert_eq!(
+            reap_previous_run_pod_dirs(&root.join("run.0/pods"), at(T0)),
+            0
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

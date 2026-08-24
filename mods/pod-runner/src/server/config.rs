@@ -31,16 +31,22 @@ pub use crate::tls::{CertSource, ServerTlsConfig};
 //       FINISHED                 ← terminal sentinel
 //       archive.tgz             ← per-pod archive (created on cleanup)
 //     pids/                      ← process PID tracking files
-//   <workdir>/run.0/             ← previous run (auto-rotated)
-//   <workdir>/run.1/             ← two runs ago
+//   <workdir>/run_<stamp>/       ← previous runs (purged, newest kept)
 
-/// Top-level run directory (under workdir). Rotated on startup.
+/// Default top-level run directory (under workdir). At startup the real
+/// one is minted as `run_<YYYYMMDDThhmmssZ>` — created fresh rather than
+/// rotated by rename, because on Windows a rename fails while any handle
+/// inside is still open, and a swallowed failure meant the crashed run's
+/// tree was silently reused.
 pub const RUN_DIR: &str = "run";
+
+/// Prefix of the per-run directories minted at startup.
+pub const RUN_DIR_PREFIX: &str = "run_";
 /// Subdirectory of run/ for per-pod data.
 pub const PODS_SUBDIR: &str = "pods";
 /// Subdirectory of run/ for process PID tracking files.
 pub const PIDS_SUBDIR: &str = "pids";
-/// Number of previous run directories to keep (run.0 .. run.{N-1}).
+/// Number of previous run directories to keep beside the current one.
 pub const PREV_RUN_DIRS_TO_KEEP: usize = 2;
 
 /// Per-pod subdirectory for container working directories.
