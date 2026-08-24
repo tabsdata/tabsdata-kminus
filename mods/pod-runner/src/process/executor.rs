@@ -839,9 +839,6 @@ fn pump_stream(
 /// automatically — no leaked tasks.
 pub struct ExecutorHandle {
     pid: u32,
-    /// Creation time of the process `pid` referred to at spawn, used to
-    /// reject a recycled PID before signalling it.
-    start_time: Option<u64>,
     wait_handle: JoinHandle<i32>,
     cached_exit_code: Option<i32>,
     /// I/O pump tasks. Joined by [`wait`] to ensure all output is
@@ -887,9 +884,23 @@ impl ExecutorHandle {
             while self.io_tasks.join_next().await.is_some() {}
             return Ok(code);
         }
-        let code = (&mut self.wait_handle)
-            .await
-            .map_err(|e| io::Error::other(format!("process monitor task failed: {}", e)))?;
+        let code = match (&mut self.wait_handle).await {
+            Ok(code) => code,
+            Err(e) => {
+                // The monitor task died without reporting; the child's real
+                // status is unknowable now. What must not happen is leaving
+                // the handle consumed with nothing cached: every later call
+                // would poll it again, which panics ("JoinHandle polled
+                // after completion") — and under the release profile's
+                // panic = "abort" that takes the whole pod-runner with it.
+                // Cache the failure first, then report it.
+                self.cached_exit_code = Some(-1);
+                return Err(io::Error::other(format!(
+                    "process monitor task failed: {}",
+                    e
+                )));
+            }
+        };
         self.cached_exit_code = Some(code);
         // Drain I/O pump tasks so all output is flushed before returning.
         while self.io_tasks.join_next().await.is_some() {}
@@ -902,33 +913,61 @@ impl ExecutorHandle {
         if let Some(code) = self.cached_exit_code {
             return Some(code);
         }
-        if self.wait_handle.is_finished()
-            && let Some(Ok(code)) = now_or_never(&mut self.wait_handle)
-        {
+        if self.wait_handle.is_finished() {
+            // is_finished() guarantees readiness, so the poll consumes the
+            // handle whatever it yields. An Err means the monitor task died
+            // without reporting — cache that as -1, because a consumed
+            // handle with nothing cached panics on the next poll.
+            let code = match now_or_never(&mut self.wait_handle) {
+                Some(Ok(code)) => code,
+                Some(Err(_)) | None => -1,
+            };
             self.cached_exit_code = Some(code);
             return Some(code);
         }
         None
     }
 
-    /// Whether `pid` still refers to the process this handle was created
-    /// for, rather than to a later process that inherited the number.
-    fn owns_pid(&self) -> bool {
-        if !is_pid_alive(self.pid) {
-            return false;
-        }
-        match (self.start_time, process_start_time(self.pid)) {
-            (Some(spawned), Some(current)) => spawned == current,
-            _ => true,
-        }
+    /// Whether the child has been reaped, judged from the handle this
+    /// struct owns rather than from the operating system's process table.
+    ///
+    /// The distinction is the whole safety of every kill below. A PID
+    /// lookup answers "does *some* process hold this number", and the
+    /// number stops being ours the moment the child is reaped: on Unix the
+    /// zombie that pinned it is gone, on Windows the process handle that
+    /// pinned it is closed. Both reservations end exactly here, so a
+    /// handle that reports exited must never be signalled by PID again —
+    /// under load a container's number is handed to an unrelated process
+    /// within seconds, and `kill(-pid, ...)` or `taskkill /T` aimed at it
+    /// takes that stranger and its whole tree down.
+    ///
+    /// Cheap and non-blocking: no process-table scan, and no `&mut self`.
+    ///
+    /// Errs towards leaking rather than misfiring. A monitor task that
+    /// panicked also reads as finished, which would skip a kill the
+    /// process still needs; that leaves a stray for the orphan sweep,
+    /// where signalling a stranger has no such backstop.
+    pub fn has_exited(&self) -> bool {
+        self.cached_exit_code.is_some() || self.wait_handle.is_finished()
+    }
+
+    /// Abort the internal monitor task, so the next poll of it yields a
+    /// `JoinError` — the path a panicked or cancelled monitor leaves
+    /// behind. Test-only: it manufactures the state that killed pod-runner
+    /// in the field, without needing a panic inside the task.
+    #[cfg(test)]
+    pub(crate) fn abort_monitor(&self) {
+        self.wait_handle.abort();
     }
 
     /// Send SIGTERM to the process and all its descendants without waiting.
     pub fn send_sigterm(&self) {
-        if self.owns_pid() {
-            send_sigterm_group(self.pid);
-            debug!(pid = self.pid, "SIGTERM sent to process group");
+        if self.has_exited() {
+            debug!(pid = self.pid, "SIGTERM skipped: already exited");
+            return;
         }
+        send_sigterm_group(self.pid);
+        debug!(pid = self.pid, "SIGTERM sent to process group");
     }
 
     /// Send SIGTERM, wait for process exit or grace period, then SIGKILL
@@ -941,26 +980,13 @@ impl ExecutorHandle {
     pub async fn kill(&mut self, grace_period: Duration) {
         let kill_start = std::time::Instant::now();
 
-        // `wait_handle` is consumed the first time it completes, and polling a
-        // consumed JoinHandle panics. A cancelled `wait()` can cache the exit
-        // code and still be dropped before returning, so the cache — not the
-        // handle — is what says the process was already reaped.
-        if self.cached_exit_code.is_some() {
+        // Asked of the handle, not of the process table: see
+        // [`Self::has_exited`]. An already-reaped child leaves nothing to
+        // signal, and its number may well belong to somebody else by now.
+        if let Some(code) = self.try_wait() {
             debug!(
                 pid = self.pid,
-                elapsed_ms = kill_start.elapsed().as_millis(),
-                "Kill: already reaped"
-            );
-            return;
-        }
-
-        // `wait_handle` is consumed the first time it completes, and polling a
-        // consumed JoinHandle panics. A cancelled `wait()` can cache the exit
-        // code and still be dropped before returning, so the cache — not the
-        // handle — is what says the process was already reaped.
-        if !self.owns_pid() {
-            debug!(
-                pid = self.pid,
+                exit_code = code,
                 elapsed_ms = kill_start.elapsed().as_millis(),
                 "Kill: already dead"
             );
@@ -1000,7 +1026,7 @@ impl ExecutorHandle {
                     wait_ms = wait_elapsed.as_millis(),
                     "Kill: exited after SIGTERM",
                 );
-            } else if self.owns_pid() {
+            } else if self.try_wait().is_none() {
                 warn!(
                     pid,
                     grace_ms = wait_elapsed.as_millis(),
@@ -1052,52 +1078,6 @@ fn now_or_never(handle: &mut JoinHandle<i32>) -> Option<Result<i32, tokio::task:
 // ---------------------------------------------------------------------------
 // Process signal helpers
 // ---------------------------------------------------------------------------
-
-/// The process creation time, as an opaque value comparable only against
-/// another reading for the same PID.
-///
-/// A PID identifies a process only for as long as that process lives;
-/// Windows reissues it freely afterwards, and a runner spawning hundreds of
-/// short-lived containers turns that into a routine event rather than a
-/// curiosity. Pairing the PID with its creation time distinguishes the
-/// process a handle was opened for from a later tenant of the same number,
-/// so a stale PID is dropped instead of signalled.
-pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
-    #[cfg(unix)]
-    {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        let tail = stat.rsplit_once(") ")?.1;
-        tail.split_whitespace().nth(19)?.parse().ok()
-    }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
-        use windows_sys::Win32::System::Threading::{
-            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
-
-        unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if handle.is_null() {
-                return None;
-            }
-            let mut created = FILETIME {
-                dwLowDateTime: 0,
-                dwHighDateTime: 0,
-            };
-            let mut exited = created;
-            let mut kernel = created;
-            let mut user = created;
-            let queried =
-                GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user);
-            CloseHandle(handle);
-            if queried == 0 {
-                return None;
-            }
-            Some(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
-        }
-    }
-}
 
 pub(crate) fn is_pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
@@ -1445,7 +1425,19 @@ impl ProcessExecutor {
             e
         })?;
         let fork_us = t_fork.elapsed().as_micros();
-        let pid = child.id().unwrap_or(0);
+        // Never defaulted. Every kill path signals the process *group*
+        // led by this pid, and `kill(-0, ...)` is POSIX for "every process
+        // in the sender's own group" — pod-runner included, since km
+        // spawns it as its own group leader. A child we cannot address is
+        // a child we cannot manage, so it is dropped (and killed with the
+        // handle) rather than tracked under a number that would turn a
+        // container kill into a self-kill.
+        let pid = child.id().ok_or_else(|| {
+            io::Error::other(format!(
+                "spawned process has no pid, it was already reaped: {}",
+                program.display()
+            ))
+        })?;
 
         // Create a span that tags all logs from this process (spawn, exit,
         // pump errors, kill) with the program and pid. Child tasks inherit
@@ -1509,7 +1501,6 @@ impl ProcessExecutor {
 
         Ok(ExecutorHandle {
             pid,
-            start_time: process_start_time(pid),
             wait_handle,
             cached_exit_code: None,
             io_tasks,
@@ -1824,11 +1815,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_has_exited_follows_the_handle_not_the_pid() {
+        let mut handle = ProcessExecutor::new("sh")
+            .args(["-c", "sleep 0.3"])
+            .spawn(shutdown())
+            .await
+            .unwrap();
+
+        assert!(!handle.has_exited(), "a running child has not exited");
+        assert_eq!(handle.wait().await.unwrap(), 0);
+        // Reaped: from here the pid is the operating system's to reuse, so
+        // no kill path may address it again.
+        assert!(handle.has_exited(), "a reaped child has exited");
+    }
+
+    #[tokio::test]
+    async fn test_kill_after_reaping_signals_nothing() {
+        // The child leads a process group and leaves a member of it behind,
+        // so a group signal is observable after the child itself is gone.
+        // Once the handle is reaped the pid is no longer provably ours, and
+        // a `kill(-pid, ...)` aimed at it is exactly the misfire that can
+        // land on an unrelated process once the number is recycled. The
+        // survivor stands in for that stranger.
+        let dir = test_dir!("kill-after-reap");
+        let pidfile = dir.join("survivor.pid");
+        let mut handle = ProcessExecutor::new("sh")
+            .args(["-c", &format!("sleep 30 & echo $! > {}", pidfile.display())])
+            .spawn(shutdown())
+            .await
+            .unwrap();
+
+        assert_eq!(handle.wait().await.unwrap(), 0);
+        let survivor: u32 = fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(is_pid_alive(survivor), "the group member should be up");
+
+        handle.kill(Duration::from_millis(200)).await;
+        handle.send_sigterm();
+
+        assert!(
+            is_pid_alive(survivor),
+            "a reaped handle must signal nothing, not even its own old group",
+        );
+        force_kill(survivor);
+    }
+
+    #[tokio::test]
+    async fn test_kill_after_reaping_keeps_the_exit_code() {
+        let mut handle = ProcessExecutor::new("sh")
+            .args(["-c", "exit 7"])
+            .spawn(shutdown())
+            .await
+            .unwrap();
+
+        assert_eq!(handle.wait().await.unwrap(), 7);
+        handle.kill(Duration::from_secs(1)).await;
+        // The kill is a no-op, so what the child actually reported must
+        // survive it — callers report this code as the container's status.
+        assert_eq!(handle.try_wait(), Some(7));
+        assert_eq!(handle.wait().await.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn test_send_sigterm_reaches_a_live_process_group() {
+        // The mirror of the test above: gating on the handle must not stop
+        // a kill that is still owed.
+        let dir = test_dir!("sigterm-live-group");
+        let pidfile = dir.join("member.pid");
+        let mut handle = ProcessExecutor::new("sh")
+            .args([
+                "-c",
+                &format!("sleep 30 & echo $! > {}; sleep 30", pidfile.display()),
+            ])
+            .spawn(shutdown())
+            .await
+            .unwrap();
+
+        // Wait for the group member to exist before signalling.
+        let mut member = None;
+        for _ in 0..100 {
+            if let Ok(text) = fs::read_to_string(&pidfile)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                member = Some(pid);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let member = member.expect("group member should have recorded its pid");
+
+        handle.kill(Duration::ZERO).await;
+        let _ = handle.wait().await;
+
+        for _ in 0..100 {
+            if !is_pid_alive(member) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !is_pid_alive(member),
+            "a live handle must still take its whole process group down",
+        );
+    }
+
+    #[tokio::test]
     async fn test_kill_after_cancelled_wait_is_noop() {
         // `wait` caches the exit code before draining the I/O pumps, so a
         // cancellation in that window leaves the code cached and the join
-        // handle consumed. `kill` must read the cache: polling the consumed
-        // handle aborts the process under `panic = "abort"`.
+        // handle consumed — the exact state behind the field crashes. Both
+        // kill paths must read the cache instead of polling the handle.
+        // (Ported from upstream TDKM-139; the gating it exercises is ours.)
         let mut handle = ProcessExecutor::new("true")
             .spawn(shutdown())
             .await
@@ -1846,17 +1946,62 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        // Point the handle at a live process so the liveness early-outs do not
-        // hide the consumed join handle.
-        let live = ProcessExecutor::new("sleep")
-            .args(["30"])
+        handle.kill(Duration::from_secs(1)).await;
+        handle.send_sigterm();
+        assert_eq!(handle.try_wait(), Some(0));
+    }
+
+    // -- monitor failure (JoinError) -------------------------------------
+
+    #[tokio::test]
+    async fn test_try_wait_survives_a_dead_monitor() {
+        let mut handle = ProcessExecutor::new("sh")
+            .args(["-c", "sleep 30"])
             .spawn(shutdown())
             .await
             .unwrap();
-        handle.pid = live.pid();
-        handle.start_time = process_start_time(live.pid());
 
+        handle.abort_monitor();
+
+        // The first try_wait after the abort consumes the handle on the
+        // JoinError arm. Without caching there, the *second* call polls a
+        // consumed JoinHandle — the exact "JoinHandle polled after
+        // completion" panic that aborted pod-runner in the field.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let code = loop {
+            if let Some(code) = handle.try_wait() {
+                break code;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "aborted monitor should read as finished"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(code, -1, "an unreportable exit reads as -1");
+        assert_eq!(handle.try_wait(), Some(-1), "and stays settled");
+        assert!(handle.has_exited());
+    }
+
+    #[tokio::test]
+    async fn test_every_entry_point_settles_after_a_dead_monitor() {
+        let mut handle = ProcessExecutor::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn(shutdown())
+            .await
+            .unwrap();
+
+        handle.abort_monitor();
+
+        // The failure is reported once...
+        assert!(handle.wait().await.is_err());
+        // ...and from then on every path must resolve from the cache
+        // rather than touching the consumed handle: each of these lines
+        // would abort the process without the caching.
+        assert_eq!(handle.try_wait(), Some(-1));
         handle.kill(Duration::from_secs(1)).await;
+        handle.send_sigterm();
+        assert_eq!(handle.wait().await.unwrap(), -1);
     }
 
     // -- cancel-safe wait (select!) ------------------------------------------
