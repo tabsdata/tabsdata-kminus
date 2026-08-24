@@ -508,6 +508,7 @@ fn connection_error(base_url: &str, err: reqwest::Error) -> u8 {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    kcommon::panic::install("kpr");
     let mut cli = Cli::parse();
 
     // Resolve from env vars

@@ -1256,6 +1256,15 @@ fn command_start(args: StartArgs) {
     }
     info!(token = run.as_str(), "Kill token for this run");
 
+    // Installed once this run owns the token and the PID files, and still
+    // before the first spawn: a panic from here on abandons children that
+    // hold this instance's ports, and the teardown is only ever pointed at
+    // state this run minted.
+    let teardown_paths = paths.clone();
+    kcommon::panic::install_with_teardown(BIN_KM, move || {
+        shutdown_from_pids(&teardown_paths, None);
+    });
+
     let vk_kubeconfig = paths.configdir.join(control_plane::VK_KUBECONFIG_FILE);
     let vk_prconfig = paths.configdir.join(pod_runner::VK_PR_CONFIG_FILE);
     let kubeconfig = paths.configdir.join(control_plane::KUBECONFIG_FILE);

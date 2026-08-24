@@ -82,6 +82,25 @@ async fn main() {
         "Logging initialized (size-based rotation)",
     );
 
+    // Installed before the first container is spawned. A panic aborts
+    // without unwinding, and the container processes this runner started
+    // outlive it: they hold their pods' work dirs and, for an embedded
+    // server, a port. Killing by kill token reaches them all, including
+    // the ones that escaped their process group.
+    kcommon::panic::install_with_teardown("pod-runner", || {
+        let sweep = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        if let Ok(sweep) = sweep {
+            sweep.block_on(async {
+                pod_runner::process::sweep::kill_orphans(
+                    &pod_runner::process::sweep::runner_prefix(),
+                )
+                .await;
+            });
+        }
+    });
+
     // Install rustls crypto provider (needed by kube client in resolvers)
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
