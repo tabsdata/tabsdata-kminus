@@ -55,5 +55,8 @@ ignored = ["openssl"]
 
 [dependencies]
 
+chrono = { version = "0.4.44" }
+sysinfo = { version = "0.37.2" }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 openssl = { version = "0.10.76", features = ["vendored"] }

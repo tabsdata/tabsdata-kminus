@@ -37,8 +37,8 @@ use system::file::{CONFIG_DIR, LOG_DIR};
 use system::heartbeat::{self, Beat, HeartbeatMonitor, heartbeat_file};
 use system::messages;
 use system::pid::{
-    BIN_KM, cleanup_stale_pids, is_alive, kill_descendants, pids_dir, read_pid, remove_pid,
-    terminate_process, write_pid,
+    BIN_KM, Recorded, cleanup_stale_pids, is_alive, kill_descendants, pids_dir, recorded,
+    remove_pid, terminate_process, write_pid,
 };
 use system::port::{PortCheck, check_ports, port_failures, probe_ports};
 
@@ -619,7 +619,9 @@ fn shutdown_from_pids(paths: &Paths, ports: Option<&KmPorts>) {
     info!("Shutting down...");
 
     for name in [virtual_kubelet::BIN, pod_runner::BIN, control_plane::BIN] {
-        if let Some(pid) = read_pid(&paths.pids, name) {
+        // Stale means either gone or now somebody else's number; both
+        // make signalling it the wrong thing to do.
+        if let Recorded::Live(pid) = recorded(&paths.pids, name) {
             let grace = shutdown_grace_for(name);
             info!(
                 name,
@@ -801,8 +803,12 @@ fn monitor_round<C: ChildState>(watched: &mut [Watched<C>]) -> Option<(&'static 
 fn first_dead_component(pids: &Path) -> Option<(&'static str, u32)> {
     [control_plane::BIN, pod_runner::BIN, virtual_kubelet::BIN]
         .into_iter()
-        .find_map(|name| match read_pid(pids, name) {
-            Some(pid) if !is_alive(pid) => Some((name, pid)),
+        .find_map(|name| match recorded(pids, name) {
+            // Stale covers the case a bare liveness check cannot: the
+            // component died and its number was handed to something else.
+            // Without the identity check, that read as "still running" and
+            // the death went unnoticed until the heartbeat staled out.
+            Recorded::Stale(pid) => Some((name, pid)),
             _ => None,
         })
 }
@@ -1120,7 +1126,7 @@ fn command_start(args: StartArgs) {
     // Refuse to start over a live instance. `cleanup_stale_pids` (below)
     // would otherwise silently kill the running km and take over, which
     // reads as a no-op to the user. Report status and exit instead.
-    if read_pid(&paths.pids, BIN_KM).is_some_and(is_alive) {
+    if matches!(recorded(&paths.pids, BIN_KM), Recorded::Live(_)) {
         println!();
         println!("Tabsdata K- (K minus) is already running");
         println!("  workdir          {}", paths.workdir.display());
@@ -1330,14 +1336,17 @@ fn command_stop(args: StopArgs) {
         .map(|cfg| cfg.ports)
         .filter(|ports| ports.labeled().iter().all(|(port, _)| *port != 0));
 
-    let km_pid = read_pid(&paths.pids, BIN_KM);
-    match km_pid {
-        Some(pid) if is_alive(pid) => {
+    match recorded(&paths.pids, BIN_KM) {
+        Recorded::Live(pid) => {
             println!("Stopping Tabsdata K- (K minus) [km pid={pid}]...");
             // Signal the foreground `km start` and let its own shutdown
             // thread drive the orderly teardown, then wait for it to exit.
             terminate_process(pid, STOP_WAIT);
-            if is_alive(pid) {
+            // Asked of the PID file again rather than of the number: km
+            // removes its file on a clean exit, so a still-verifying entry
+            // is km itself refusing to go, where a bare liveness check
+            // would also fire for whatever inherited its number.
+            if matches!(recorded(&paths.pids, BIN_KM), Recorded::Live(_)) {
                 eprintln!(
                     "ERROR: km (pid={pid}) did not stop within {}s; forcing teardown.",
                     STOP_WAIT.as_secs()
@@ -1354,7 +1363,7 @@ fn command_stop(args: StopArgs) {
             // died leaving children behind. Clean up directly.
             let stale: Vec<&str> = [virtual_kubelet::BIN, pod_runner::BIN, control_plane::BIN]
                 .into_iter()
-                .filter(|name| read_pid(&paths.pids, name).is_some_and(is_alive))
+                .filter(|name| matches!(recorded(&paths.pids, name), Recorded::Live(_)))
                 .collect();
 
             if stale.is_empty() {
@@ -1399,10 +1408,10 @@ fn print_component_status(paths: &Paths, name: &str) {
         None if name == BIN_KM => String::new(),
         None => "  beat=none".to_string(),
     };
-    match read_pid(&paths.pids, name) {
-        Some(pid) if is_alive(pid) => println!("  {:<16} running   pid={}{}", name, pid, beat),
-        Some(pid) => println!("  {:<16} DEAD      pid={} (stale PID file)", name, pid),
-        None => println!("  {:<16} stopped", name),
+    match recorded(&paths.pids, name) {
+        Recorded::Live(pid) => println!("  {:<16} running   pid={}{}", name, pid, beat),
+        Recorded::Stale(pid) => println!("  {:<16} DEAD      pid={} (stale PID file)", name, pid),
+        Recorded::Absent => println!("  {:<16} stopped", name),
     }
 }
 
@@ -1411,11 +1420,15 @@ fn print_component_status(paths: &Paths, name: &str) {
 /// whether the km orchestrator itself is alive. Shared by `km status`
 /// and the "already running" guard in `km start`.
 fn print_instance_status(paths: &Paths) -> bool {
-    let km_running = read_pid(&paths.pids, BIN_KM).is_some_and(is_alive);
+    let km_running = matches!(recorded(&paths.pids, BIN_KM), Recorded::Live(_));
 
     print_component_status(paths, BIN_KM);
     print_component_status(paths, control_plane::BIN);
     for (name, pid) in control_plane::read_children(&paths.workdir) {
+        // A bare liveness check, unlike everything else here: these files
+        // are the control-plane's own and record a number without a start
+        // stamp, so there is nothing to verify against. It only decides a
+        // status line, never a signal.
         let alive = pid.parse::<u32>().map(is_alive).unwrap_or(false);
         let state = if alive { "running" } else { "DEAD   " };
         println!("    {:<14} {}   pid={}", name, state, pid);
@@ -1499,7 +1512,7 @@ impl InstanceState {
 /// Anything else would be a second opinion, free to disagree with the one
 /// actually driving the stack.
 fn instance_state(paths: &Paths, hb: &KmHeartbeat) -> InstanceState {
-    if !read_pid(&paths.pids, BIN_KM).is_some_and(is_alive) {
+    if !matches!(recorded(&paths.pids, BIN_KM), Recorded::Live(_)) {
         return InstanceState::NotRunning;
     }
     let stale_after = heartbeat::stale_after(hb.interval());

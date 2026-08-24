@@ -23,13 +23,23 @@ fn pids_dir_under_data_bin_pids() {
 }
 
 #[test]
-fn write_pid_creates_named_file() {
+fn write_pid_records_the_processs_identity() {
     let dir = tempdir();
-    write_pid(&dir, "alpha", 1234);
-    let path = dir.join("1234.alpha");
+    let own = std::process::id();
+    write_pid(&dir, "alpha", own);
+
+    let path = dir.join(format!("{own}.alpha"));
     assert!(path.exists());
+
+    // The number is in the filename; the content is what makes it
+    // verifiable later.
     let content = fs::read_to_string(&path).unwrap();
-    assert_eq!(content, "1234");
+    let (pid, stamp) = kcommon::identity::parse_owner(&content).expect("pid@stamp");
+    assert_eq!(pid, own);
+    assert!(
+        !kcommon::identity::is_unknown_stamp(stamp),
+        "a running process has a readable start time",
+    );
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -60,21 +70,73 @@ fn remove_pid_no_op_when_missing() {
 }
 
 #[test]
-fn read_pid_returns_recorded_pid() {
+fn recorded_confirms_a_process_that_is_still_itself() {
     let dir = tempdir();
-    write_pid(&dir, "alpha", 4321);
-    write_pid(&dir, "beta", 5678);
-    assert_eq!(read_pid(&dir, "alpha"), Some(4321));
-    assert_eq!(read_pid(&dir, "beta"), Some(5678));
+    let own = std::process::id();
+    write_pid(&dir, "alpha", own);
+    assert_eq!(recorded(&dir, "alpha"), Recorded::Live(own));
     fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn read_pid_none_when_missing_or_dir_absent() {
+fn recorded_absent_when_no_file_or_no_dir() {
     let dir = tempdir();
-    write_pid(&dir, "alpha", 1);
-    assert_eq!(read_pid(&dir, "nonexistent"), None);
-    assert_eq!(read_pid(Path::new("/nonexistent/km/pids"), "alpha"), None);
+    write_pid(&dir, "alpha", std::process::id());
+    assert_eq!(recorded(&dir, "nonexistent"), Recorded::Absent);
+    assert_eq!(
+        recorded(Path::new("/nonexistent/km/pids"), "alpha"),
+        Recorded::Absent
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn recorded_is_stale_when_the_subject_is_gone() {
+    let dir = tempdir();
+    let dead = u32::MAX - 1;
+    write_pid(&dir, "alpha", dead);
+    assert_eq!(recorded(&dir, "alpha"), Recorded::Stale(dead));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn recorded_is_stale_when_the_number_was_reused() {
+    // Our own PID, recorded against a start time that is not ours. This is
+    // the case a bare liveness check cannot see and the whole reason the
+    // stamp is written: `km stop` would otherwise signal a stranger, and
+    // `km start` would refuse to run because one was holding the number.
+    let dir = tempdir();
+    let own = std::process::id();
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!("{own}.alpha")),
+        format!("{own}@19700101T000000Z"),
+    )
+    .unwrap();
+    assert_eq!(recorded(&dir, "alpha"), Recorded::Stale(own));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn recorded_is_stale_for_content_it_cannot_verify() {
+    let dir = tempdir();
+    let own = std::process::id();
+    fs::create_dir_all(&dir).unwrap();
+    for content in [
+        // A file in the old format, carrying the number alone.
+        own.to_string(),
+        // Content disagreeing with the filename.
+        format!("{}@19700101T000000Z", own + 1),
+        String::new(),
+        "nonsense".to_string(),
+    ] {
+        fs::write(dir.join(format!("{own}.alpha")), &content).unwrap();
+        assert_eq!(
+            recorded(&dir, "alpha"),
+            Recorded::Stale(own),
+            "unverifiable content {content:?} must not read as running",
+        );
+    }
     fs::remove_dir_all(&dir).ok();
 }
 

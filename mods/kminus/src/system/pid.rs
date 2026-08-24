@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use kcommon::identity;
 use sysinfo::{Pid, ProcessStatus, ProcessesToUpdate, System};
 use tracing::{info, warn};
 
@@ -21,11 +22,86 @@ pub fn pids_dir(workdir: &Path, bin: &str) -> PathBuf {
     workdir.join(DATA_DIR).join(bin).join(PIDS_DIR)
 }
 
-/// Write a PID file at `<dir>/<pid>.<name>`.
+/// Write a PID file at `<dir>/<pid>.<name>` recording the identity of the
+/// process, not merely its number.
+///
+/// The content is `<pid>@<start-stamp>`, which is what lets a later reader
+/// tell "that process is still running" from "something now holds that
+/// number". These files outlive the run that wrote them — that is their
+/// purpose — so by the time anything reads one, the operating system has
+/// had every opportunity to hand the number to somebody else.
 pub fn write_pid(dir: &Path, name: &str, pid: u32) {
     let _ = fs::create_dir_all(dir);
     let path = dir.join(format!("{}.{}", pid, name));
-    let _ = fs::write(&path, pid.to_string());
+    let content = match identity::process_start_time(pid) {
+        Some(secs) => identity::owner_identity(pid, secs),
+        None => {
+            // Only reachable if the process went away between spawning and
+            // this call. Recorded unverifiably on purpose: a reader will
+            // treat it as stale, which for a process that is already gone
+            // is the right answer.
+            warn!(
+                name,
+                pid, "Cannot read start time; PID file will not be verifiable"
+            );
+            format!("{}{}{}", pid, identity::OWNER_SEP, identity::UNKNOWN_STAMP)
+        }
+    };
+    let _ = fs::write(&path, content);
+}
+
+/// What a PID file says about its subject.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Recorded {
+    /// No file for this name.
+    Absent,
+    /// A file, and the process it recorded is still that same process.
+    Live(u32),
+    /// A file, but its subject is gone — or the number now belongs to
+    /// something else, which reads the same way and must, since acting on
+    /// it either way would be acting on a stranger.
+    Stale(u32),
+}
+
+/// Read the PID file for `name` and say whether its subject is still
+/// there.
+///
+/// Verified against the recorded start stamp, not just the presence of
+/// *a* process with that number. Without that, `km stop` would eventually
+/// signal whatever inherited a dead km's PID, and `km start` would refuse
+/// to start because a stranger was holding it.
+///
+/// A file that predates this format, or that cannot be parsed, reads as
+/// [`Recorded::Stale`]: unverifiable is not the same as running, and
+/// nothing should be signalled on the strength of it.
+pub fn recorded(dir: &Path, name: &str) -> Recorded {
+    let suffix = format!(".{}", name);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Recorded::Absent;
+    };
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let fname = fname.to_string_lossy();
+        let Some(pid_str) = fname.strip_suffix(&suffix) else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        let verified = fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|content| {
+                let (recorded_pid, stamp) = identity::parse_owner(content.trim())?;
+                Some(recorded_pid == pid && identity::running_since(pid, stamp))
+            })
+            .unwrap_or(false);
+        return if verified {
+            Recorded::Live(pid)
+        } else {
+            Recorded::Stale(pid)
+        };
+    }
+    Recorded::Absent
 }
 
 /// Remove the PID file(s) for `name` from `dir`.
@@ -38,22 +114,6 @@ pub fn remove_pid(dir: &Path, name: &str) {
             }
         }
     }
-}
-
-/// Read the PID recorded in `<dir>/<pid>.<name>` for `name`, if present.
-/// Returns the first match (there is normally at most one).
-pub fn read_pid(dir: &Path, name: &str) -> Option<u32> {
-    let suffix = format!(".{}", name);
-    for entry in fs::read_dir(dir).ok()?.flatten() {
-        let fname = entry.file_name();
-        let fname = fname.to_string_lossy();
-        if let Some(pid_str) = fname.strip_suffix(&suffix)
-            && let Ok(pid) = pid_str.parse::<u32>()
-        {
-            return Some(pid);
-        }
-    }
-    None
 }
 
 /// Apply OS-specific creation flags so a spawned subprocess survives the
