@@ -837,7 +837,7 @@ struct ContainerConfig {
     restart_backoff_base: Duration,
     /// Grace period for container kills triggered by shutdown or phase failures.
     shutdown_grace_period: Duration,
-    /// Prefix of the [`sweep::KILL_TOKEN_VAR`] token injected into every
+    /// Prefix of the [`sweep::PR_KILL_TOKEN_VAR`] token injected into every
     /// container of this pod, from [`sweep::pod_prefix`].
     ///
     /// Every process in a container's tree inherits the token, which is
@@ -942,7 +942,7 @@ impl ContainerConfig {
         // not be able to shadow the token the orphan sweep matches on.
         if let Some(ref prefix) = self.kill_token_prefix {
             builder = builder.env(
-                sweep::KILL_TOKEN_VAR,
+                sweep::PR_KILL_TOKEN_VAR,
                 sweep::container_token(prefix, &container.name),
             );
         }
@@ -2538,7 +2538,7 @@ mod tests {
 
     async fn wait_dead(pid: u32) -> bool {
         for _ in 0..100 {
-            if !crate::process::executor::is_pid_alive(pid) {
+            if !kcommon::signal::is_pid_alive(pid) {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2571,7 +2571,7 @@ mod tests {
             vec![],
             vec![container(
                 "main",
-                &format!("echo ${} > {}", sweep::KILL_TOKEN_VAR, out.display()),
+                &format!("echo ${} > {}", sweep::PR_KILL_TOKEN_VAR, out.display()),
             )],
         );
         let expected = sweep::container_token(
@@ -2594,10 +2594,10 @@ mod tests {
         let out = dir.join("token.txt");
         let mut c = container(
             "main",
-            &format!("echo ${} > {}", sweep::KILL_TOKEN_VAR, out.display()),
+            &format!("echo ${} > {}", sweep::PR_KILL_TOKEN_VAR, out.display()),
         );
         c.env.push(EnvVar {
-            name: sweep::KILL_TOKEN_VAR.to_string(),
+            name: sweep::PR_KILL_TOKEN_VAR.to_string(),
             value: Some("hijacked".to_string()),
             value_from: None,
         });

@@ -51,6 +51,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use kcommon::signal::{force_kill, force_kill_group, is_pid_alive, send_sigterm_group};
 use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
@@ -1076,119 +1077,43 @@ fn now_or_never(handle: &mut JoinHandle<i32>) -> Option<Result<i32, tokio::task:
 }
 
 // ---------------------------------------------------------------------------
-// Process signal helpers
+// Env var handling
 // ---------------------------------------------------------------------------
 
-pub(crate) fn is_pid_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
-    }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-        use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
-
-        unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if handle.is_null() {
-                return false;
-            }
-            let mut code = 0u32;
-            let queried = GetExitCodeProcess(handle, &mut code);
-            CloseHandle(handle);
-            queried != 0 && code == STILL_ACTIVE as u32
-        }
-    }
-}
-
-/// Send SIGKILL to a single process (used by [`cleanup_stale_pids`] and
-/// by the orphan sweep, which signals by PID because an escaped process
-/// is by definition no longer in its container's process group).
-pub(crate) fn force_kill(pid: u32) {
-    #[cfg(unix)]
-    {
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid as i32),
-            nix::sys::signal::Signal::SIGKILL,
-        );
-    }
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/PID", &pid.to_string()])
-            .output();
-    }
-}
-
-/// Send SIGTERM to a single process (used by the orphan sweep, which
-/// gives an escaped process the same grace its container gets before
-/// escalating to [`force_kill`]).
+/// Set up a child's environment: the optional clear, the kill tokens that
+/// must survive one, then the caller's explicit variables.
 ///
-/// Windows has no SIGTERM: `taskkill` without `/F` is the closest
-/// equivalent, and `/T` covers descendants that sanitised the token out
-/// of their own environment.
-pub(crate) fn send_sigterm_pid(pid: u32) {
-    #[cfg(unix)]
-    {
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid as i32),
-            nix::sys::signal::Signal::SIGTERM,
-        );
-    }
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T"])
-            .output();
-    }
-}
-
-/// Send SIGTERM to the entire process group led by `pid`.
+/// `propagate_env: false` asks for a clean environment and gets one, with
+/// the single exception of the kill tokens ([`kcommon::token`]'s
+/// allowlist — a list and not a `TD_` prefix on purpose, so no other
+/// variable rides along). Once a process has left its process group and
+/// been reparented, an inherited token is the only handle left on it; a
+/// container that loses km's token becomes unreachable by the very
+/// mechanism meant to find it. Clearing the environment should not be
+/// what decides that.
 ///
-/// Every child spawned by [`ProcessExecutor`] is placed in its own
-/// process group (via `setpgid` or `setsid`), so `pid` equals the pgid.
-/// Signaling the group ensures all descendants (sub-shells, sleep, etc.)
-/// receive the signal instead of just the direct child.
-pub(crate) fn send_sigterm_group(pid: u32) {
-    #[cfg(unix)]
-    {
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(-(pid as i32)),
-            nix::sys::signal::Signal::SIGTERM,
-        );
+/// Only ancestor-set tokens need carrying. The token this pod-runner sets
+/// on a container goes through `env_vars`, which is applied after the
+/// clear and survives it unaided.
+///
+/// `inherited` reads a variable from the spawning process's own
+/// environment. Passed in rather than read here so the whole sequence —
+/// the ordering that decides which value wins included — can be exercised
+/// without mutating global state.
+fn apply_env(
+    cmd: &mut Command,
+    propagate_env: bool,
+    env_vars: &HashMap<String, String>,
+    inherited: impl Fn(&str) -> Option<String>,
+) {
+    if !propagate_env {
+        cmd.env_clear();
+        kcommon::token::carry_kill_tokens(cmd.as_std_mut(), inherited);
     }
-    #[cfg(windows)]
-    {
-        // Windows has no process groups; fall back to individual kill.
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T"])
-            .output();
-    }
-}
-
-/// Send SIGKILL to the entire process group led by `pid`.
-pub(crate) fn force_kill_group(pid: u32) {
-    #[cfg(unix)]
-    {
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(-(pid as i32)),
-            nix::sys::signal::Signal::SIGKILL,
-        );
-    }
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/PID", &pid.to_string(), "/T"])
-            .output();
+    if !env_vars.is_empty() {
+        cmd.envs(env_vars);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Env var validation
-// ---------------------------------------------------------------------------
 
 /// Validate environment variable names.
 ///
@@ -1375,12 +1300,9 @@ impl ProcessExecutor {
         let mut cmd = Command::new(&program);
         cmd.args(&self.args);
 
-        if !self.propagate_env {
-            cmd.env_clear();
-        }
-        if !self.env_vars.is_empty() {
-            cmd.envs(&self.env_vars);
-        }
+        apply_env(&mut cmd, self.propagate_env, &self.env_vars, |key| {
+            std::env::var(key).ok()
+        });
 
         if let Some(ref dir) = self.work_dir {
             cmd.current_dir(normalize_spawn_path(dir));
@@ -2023,6 +1945,116 @@ mod tests {
         // Handle is still valid — wait again
         let code = handle.wait().await.unwrap();
         assert_eq!(code, 3);
+    }
+
+    // -- env setup (no global state touched) ---------------------------------
+
+    /// A `TD_`-prefixed variable deliberately *not* on the allowlist, to
+    /// pin that the carve-out is the list and not the prefix.
+    const DECOY_VAR: &str = "TD_KM_NOT_A_TOKEN";
+
+    /// The variables `apply_env` set on a command, as owned strings.
+    fn envs_of(cmd: &Command) -> Vec<(String, Option<String>)> {
+        cmd.as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    /// A stand-in for the spawning process's environment.
+    fn fake_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |key| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn apply_env_carries_an_inherited_kill_token_through_a_clear() {
+        let mut cmd = Command::new("true");
+        apply_env(
+            &mut cmd,
+            false,
+            &HashMap::new(),
+            fake_env(&[(kcommon::token::KM_KILL_TOKEN_VAR, "s/4711@x/km")]),
+        );
+        assert_eq!(
+            envs_of(&cmd),
+            vec![(
+                kcommon::token::KM_KILL_TOKEN_VAR.to_string(),
+                Some("s/4711@x/km".to_string())
+            )],
+        );
+    }
+
+    #[test]
+    fn apply_env_carries_nothing_when_no_token_is_inherited() {
+        let mut cmd = Command::new("true");
+        apply_env(&mut cmd, false, &HashMap::new(), fake_env(&[]));
+        assert!(envs_of(&cmd).is_empty(), "{:?}", envs_of(&cmd));
+    }
+
+    #[test]
+    fn apply_env_does_not_carry_a_variable_outside_the_allowlist() {
+        let mut cmd = Command::new("true");
+        apply_env(
+            &mut cmd,
+            false,
+            &HashMap::new(),
+            fake_env(&[(DECOY_VAR, "should stay behind")]),
+        );
+        // `propagate_env: false` would stop meaning what it says if a
+        // neighbouring TD_ variable came along for the ride.
+        assert!(envs_of(&cmd).is_empty(), "{:?}", envs_of(&cmd));
+    }
+
+    #[test]
+    fn apply_env_lets_an_explicit_value_win_over_a_carried_token() {
+        let mut explicit = HashMap::new();
+        explicit.insert(
+            kcommon::token::PR_KILL_TOKEN_VAR.to_string(),
+            "mine/9999@y/pod/c".to_string(),
+        );
+
+        let mut cmd = Command::new("true");
+        apply_env(
+            &mut cmd,
+            false,
+            &explicit,
+            fake_env(&[(kcommon::token::PR_KILL_TOKEN_VAR, "inherited/1@z/pod/c")]),
+        );
+
+        // The carry is applied first precisely so the token pod-runner
+        // sets on a container is not overwritten by an inherited one.
+        let envs = envs_of(&cmd);
+        assert_eq!(
+            envs.iter()
+                .find(|(k, _)| k == kcommon::token::PR_KILL_TOKEN_VAR)
+                .unwrap()
+                .1,
+            Some("mine/9999@y/pod/c".to_string()),
+            "{:?}",
+            envs
+        );
+    }
+
+    #[test]
+    fn apply_env_carries_nothing_when_the_environment_is_propagated() {
+        let mut cmd = Command::new("true");
+        apply_env(
+            &mut cmd,
+            true,
+            &HashMap::new(),
+            fake_env(&[(kcommon::token::KM_KILL_TOKEN_VAR, "s/4711@x/km")]),
+        );
+        // Nothing to carry: the token arrives with everything else.
+        assert!(envs_of(&cmd).is_empty(), "{:?}", envs_of(&cmd));
     }
 
     // -- env vars ------------------------------------------------------------

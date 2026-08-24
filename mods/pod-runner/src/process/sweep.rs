@@ -19,64 +19,35 @@
 //!
 //! # How the sweep finds it
 //!
-//! Every container is spawned with [`KILL_TOKEN_VAR`] in its
-//! environment, naming the runner, the pod and the container. An
-//! environment is copied into the new process image on `exec` and
-//! inherited by every descendant: unlike a process group or a parent
-//! link, it survives `setsid`, `setpgid`, reparenting, and the death of
-//! every process in between. It is also exact, so — unlike a recycled
-//! PID or a command name — it can never match an unrelated process.
+//! Every container is spawned with [`PR_KILL_TOKEN_VAR`] in its
+//! environment. The grammar, the scan and the signalling are
+//! [`kcommon::token`] and [`kcommon::scan`]'s; what is pod-runner's is the
+//! scope layering below the owner — `<seed>/<runner>/<pod>/<container>` —
+//! and the async throttling around a scan, which exists because a mass
+//! teardown starts one sweep per pod and a runtime is on hand to keep
+//! them from all walking the process table at once.
 //!
-//! Three sweeps use it:
+//! The runner's seed is minted fresh per run and deliberately not
+//! persisted: reclamation after a dead pod-runner rides on the owner
+//! field alone ([`kill_dead_runner_orphans`]), which needs no file — a
+//! run is over exactly when no live process has its pid *and* start time.
+//!
+//! Three sweeps:
 //!
 //! - [`terminate_orphans`] when a pod kill starts, so an escapee shuts
 //!   down within the same grace period as its container.
 //! - [`kill_orphans`] once that grace has passed, and again when a pod
 //!   reaches a terminal phase however it got there.
 //! - [`kill_dead_runner_orphans`] at startup, for escapees left behind by
-//!   a previous pod-runner. The token names its owner, so an orphan whose
-//!   owner is no longer running is provably stale — which is what the PID
-//!   files behind [`crate::process::executor::cleanup_stale_pids`] cannot
-//!   tell us, since an escapee was never recorded in one.
-//!
-//! # Limits
-//!
-//! Reading another process's environment requires the same privilege as
-//! signalling it, so the sweep can never reach a process it would not be
-//! allowed to kill. Two cases are invisible to it:
-//!
-//! - macOS hides the environment of SIP platform binaries even from the
-//!   same uid: `/bin/sh` and `/bin/sleep` report no environment at all.
-//!   The binaries a container actually runs — tarball postgres, python,
-//!   anything cargo-built — are visible.
-//! - A process that sanitises its own environment (`env -i`) breaks the
-//!   chain for everything below it.
+//!   a previous pod-runner. An escapee was never recorded in a PID file,
+//!   so a dead owner's token is the only thing that still names it.
 
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use std::sync::OnceLock;
+
+use kcommon::scan::{Found, Scan, kill_found, kill_strays_of_dead_runs, terminate_found};
+pub use kcommon::token::PR_KILL_TOKEN_VAR;
+use kcommon::token::{Run, Seed};
 use tracing::{debug, warn};
-
-use crate::process::executor::{force_kill, force_kill_group, is_pid_alive, send_sigterm_pid};
-
-/// Environment variable carrying a container's kill token.
-///
-/// Value: `<runner-pid>@<runner-start>/<pod>/<container-name>`, e.g.
-/// `4711@20260822T143205Z/db-pod_8f3c1d2e-.../database`.
-pub const KILL_TOKEN_VAR: &str = "TD_PR_KILL_TOKEN";
-
-/// Separator between the token's owner, pod and container fields.
-const FIELD_SEP: char = '/';
-
-/// Separator between the owner's PID and its start stamp.
-const OWNER_SEP: char = '@';
-
-/// Fixed-width, filename-safe UTC stamp: `20260822T143205Z`. The
-/// trailing `Z` is a literal, correct only because it is always applied
-/// to a UTC timestamp. Lexicographic order is chronological order.
-const STAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
-
-/// Stamp used when a start time cannot be represented. It never equals a
-/// real stamp, so an owner carrying it can never be confirmed alive.
-const UNKNOWN_STAMP: &str = "00000000T000000Z";
 
 /// How many process-table scans may run at once.
 ///
@@ -97,57 +68,24 @@ const MAX_CONCURRENT_SCANS: usize = 1;
 /// Permits for [`MAX_CONCURRENT_SCANS`].
 static SCAN_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_SCANS);
 
-// ---------------------------------------------------------------------------
-// Token construction
-// ---------------------------------------------------------------------------
-
-/// Format a process start time (epoch seconds, as reported by `sysinfo`)
-/// as a fixed-width UTC stamp.
+/// This pod-runner's token root: `<seed>/<pid>@<start-stamp>`.
 ///
-/// Both the writer of a token and the code verifying one go through this
-/// function and compare the results as strings, so the two sides can
-/// never disagree about format or timezone.
-fn owner_stamp(start_time_secs: u64) -> String {
-    match chrono::DateTime::from_timestamp(start_time_secs as i64, 0) {
-        Some(t) => t.format(STAMP_FORMAT).to_string(),
-        None => UNKNOWN_STAMP.to_string(),
-    }
-}
-
-/// Identity of this pod-runner process: `<pid>@<start-stamp>`.
+/// A bare PID would not do as the owner. The startup sweep has to decide
+/// whether the runner named by a token is still running, and PIDs are
+/// recycled — a restarted pod-runner that landed on its predecessor's PID
+/// would read the previous run's orphans as its own and leave them
+/// running, which is the exact failure [`kill_dead_runner_orphans`]
+/// exists to prevent. The start time makes the identity unreusable.
 ///
-/// A bare PID would not do. The startup sweep has to decide whether the
-/// runner named by a token is still running, and PIDs are recycled — a
-/// restarted pod-runner that landed on its predecessor's PID would read
-/// the previous run's orphans as its own and leave them running, which is
-/// the exact failure [`kill_dead_runner_orphans`] exists to prevent. The
-/// start time makes the identity unreusable.
-pub fn runner_id() -> &'static str {
-    static RUNNER_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    RUNNER_ID.get_or_init(|| {
-        let pid = std::process::id();
-        let mut system = System::new();
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
-            false,
-            ProcessRefreshKind::nothing(),
-        );
-        let started = match system.process(Pid::from_u32(pid)) {
-            Some(process) => process.start_time(),
-            None => {
-                // Not fatal: tokens stay unique (the PID is ours for as
-                // long as we run), they just cannot be verified as ours
-                // by a later run's startup sweep.
-                warn!(pid, "Own start time unavailable — kill tokens unverifiable");
-                0
-            }
-        };
-        format!("{pid}{OWNER_SEP}{}", owner_stamp(started))
-    })
+/// Resolved once: the answer cannot change while this process runs, and
+/// every token it writes has to agree with every other.
+fn runner_run() -> &'static Run {
+    static RUNNER: OnceLock<Run> = OnceLock::new();
+    RUNNER.get_or_init(|| Run::of(&Seed::generate()))
 }
 
 /// Token prefix shared by every container of one pod:
-/// `<runner>/<pod-name>_<pod-uid>/`.
+/// `<runner-run>/<pod-name>_<pod-uid>/`.
 ///
 /// Matching on the prefix is what lets one sweep cover a whole pod: the
 /// process table is walked once per pod kill rather than once per
@@ -158,7 +96,7 @@ pub fn runner_id() -> &'static str {
 /// carries no uid into one prefix, which would let a sweep for one pod
 /// kill another's escapees.
 pub fn pod_prefix(pod_name: &str, pod_uid: &str) -> String {
-    format!("{}{FIELD_SEP}{pod_name}_{pod_uid}{FIELD_SEP}", runner_id())
+    format!("{}/{pod_name}_{pod_uid}/", runner_run().as_str())
 }
 
 /// The token for one container of the pod identified by `pod_prefix`.
@@ -167,122 +105,38 @@ pub fn container_token(pod_prefix: &str, container: &str) -> String {
 }
 
 /// Token prefix shared by every container of every pod this runner
-/// started: `<runner>/`.
+/// started: `<runner-run>/`.
 ///
 /// The token's fields nest, so a prefix at any level selects everything
 /// below it. That is what lets a runner-wide teardown sweep once instead
 /// of once per pod.
 pub fn runner_prefix() -> String {
-    format!("{}{FIELD_SEP}", runner_id())
+    format!("{}/", runner_run().as_str())
 }
 
-// ---------------------------------------------------------------------------
-// Process table
-// ---------------------------------------------------------------------------
-
-/// A process that carries a kill token.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Orphan {
-    pid: u32,
-    token: String,
-}
-
-/// A snapshot of the process table, with every readable environment.
+/// Run a blocking process-table operation off the runtime.
 ///
-/// Loading it costs one pass over the host's processes — 6–8 ms for ~950
-/// processes, of which reading the environments is well under a
-/// millisecond; the cost is ~950 sequential syscalls, so it tracks
-/// per-syscall latency rather than core count. That is paid only on a
-/// kill or at startup, never on a steady-state path, and never by more
-/// than [`MAX_CONCURRENT_SCANS`] callers at a time.
-struct ProcessTable(System);
-
-impl ProcessTable {
-    fn load() -> Self {
-        let mut system = System::new();
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing().with_environ(UpdateKind::Always),
-        );
-        Self(system)
-    }
-
-    /// Every token-carrying process whose token `accept` returns true
-    /// for, excluding this process.
-    ///
-    /// Excluding ourselves matters when pod-runner is itself run as a
-    /// container of an outer pod-runner: it then carries the outer
-    /// runner's token, and a startup sweep that found the outer runner
-    /// dead would otherwise kill the process performing the sweep.
-    fn orphans(&self, accept: impl Fn(&str) -> bool) -> Vec<Orphan> {
-        let entry_prefix = format!("{KILL_TOKEN_VAR}=");
-        let own_pid = std::process::id();
-        self.0
-            .processes()
-            .iter()
-            .filter(|(pid, _)| pid.as_u32() != own_pid)
-            .filter_map(|(pid, process)| {
-                let token = process
-                    .environ()
-                    .iter()
-                    .find_map(|entry| entry.to_str()?.strip_prefix(entry_prefix.as_str()))?;
-                accept(token).then(|| Orphan {
-                    pid: pid.as_u32(),
-                    token: token.to_string(),
-                })
-            })
-            .collect()
-    }
-
-    /// Whether the pod-runner named by `token`'s owner field is still
-    /// running.
-    ///
-    /// A token that cannot be parsed, or whose owner cannot be checked,
-    /// counts as alive: the startup sweep kills only what it can
-    /// positively prove is orphaned.
-    fn owner_alive(&self, token: &str) -> bool {
-        let owner = token.split(FIELD_SEP).next().unwrap_or(token);
-        let Some((pid, stamp)) = owner.split_once(OWNER_SEP) else {
-            return true;
-        };
-        let Ok(pid) = pid.parse::<u32>() else {
-            return true;
-        };
-        match self.0.process(Pid::from_u32(pid)) {
-            Some(process) => owner_stamp(process.start_time()) == stamp,
-            None => false,
-        }
-    }
-}
-
-/// Load the process table off the runtime and select orphans from it.
-///
-/// The scan is a blocking, syscall-bound walk of every process, so it
-/// runs on the blocking pool rather than stalling a runtime worker: the
-/// calling task yields for the duration instead of holding a worker.
-/// Concurrency is capped at [`MAX_CONCURRENT_SCANS`].
-async fn scan<F>(select: F) -> Vec<Orphan>
+/// The scan is a syscall-bound walk of every process, so it runs on the
+/// blocking pool rather than stalling a runtime worker; concurrency is
+/// capped at [`MAX_CONCURRENT_SCANS`].
+async fn on_scan_slot<T, F>(op: F) -> Option<T>
 where
-    F: FnOnce(&ProcessTable) -> Vec<Orphan> + Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
 {
     // A closed semaphore is impossible for a static that is never
     // closed; if it somehow were, scanning unthrottled beats not
     // sweeping at all.
     let _slot = SCAN_SLOTS.acquire().await.ok();
 
-    match tokio::task::spawn_blocking(move || select(&ProcessTable::load())).await {
-        Ok(orphans) => orphans,
+    match tokio::task::spawn_blocking(op).await {
+        Ok(result) => Some(result),
         Err(e) => {
             warn!(error = %e, "Orphan sweep scan failed");
-            Vec::new()
+            None
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Sweeps
-// ---------------------------------------------------------------------------
 
 /// The escaped processes selected by one scan.
 ///
@@ -291,7 +145,7 @@ where
 /// than rescanned. A process that escapes *during* the grace is missed
 /// here and caught by the sweep at the end of the pod's orchestrator,
 /// which scans afresh.
-pub struct Orphans(Vec<Orphan>);
+pub struct Orphans(Vec<Found>);
 
 impl Orphans {
     /// Scan for every escaped process whose token starts with `prefix` —
@@ -299,7 +153,11 @@ impl Orphans {
     /// them.
     pub async fn find(prefix: &str) -> Self {
         let prefix = prefix.to_string();
-        Self(scan(move |table| table.orphans(|token| token.starts_with(&prefix))).await)
+        Self(
+            on_scan_slot(move || Scan::load().under(PR_KILL_TOKEN_VAR, &prefix))
+                .await
+                .unwrap_or_default(),
+        )
     }
 
     pub fn is_empty(&self) -> bool {
@@ -309,7 +167,7 @@ impl Orphans {
     /// SIGTERM each one, so it shuts down inside the same grace period
     /// its container gets. Returns how many were signalled.
     pub fn terminate(&self) -> usize {
-        let signalled = signal_orphans(&self.0, Escalation::Graceful);
+        let signalled = terminate_found(&self.0);
         if signalled > 0 {
             debug!(
                 signalled,
@@ -319,13 +177,17 @@ impl Orphans {
         signalled
     }
 
-    /// SIGKILL whichever are still alive. Returns how many were killed.
+    /// SIGKILL whichever are still alive — after re-verifying, process by
+    /// process, that each PID still carries the token this set recorded
+    /// for it: the set is a grace period old by now, and in that time the
+    /// operating system may have handed any of these numbers to something
+    /// else. Returns how many were killed.
     ///
-    /// Anything still here outlived its container, so it is reported at
+    /// Anything killed here outlived its container, so it is reported at
     /// warning level: a container leaked a process, and that is worth
     /// seeing rather than silently patching over.
     pub fn force_kill(&self) -> usize {
-        let killed = signal_orphans(&self.0, Escalation::Force);
+        let killed = kill_found(PR_KILL_TOKEN_VAR, &self.0);
         if killed > 0 {
             warn!(
                 killed,
@@ -362,15 +224,9 @@ pub async fn kill_orphans(prefix: &str) -> usize {
 /// started it exited — including the case where that pod-runner was
 /// itself SIGKILLed mid-drain and never got to clean up.
 pub async fn kill_dead_runner_orphans() -> usize {
-    let orphans = Orphans(scan(|table| table.orphans(|token| !table.owner_alive(token))).await);
-    let killed = signal_orphans(&orphans.0, Escalation::Force);
-    if killed > 0 {
-        warn!(
-            killed,
-            "SIGKILLed escaped container processes left by a previous run",
-        );
-    }
-    killed
+    on_scan_slot(|| kill_strays_of_dead_runs(PR_KILL_TOKEN_VAR))
+        .await
+        .unwrap_or(0)
 }
 
 /// PIDs currently carrying a token under `pod_prefix`.
@@ -383,87 +239,8 @@ pub(crate) async fn orphan_pids(pod_prefix: &str) -> Vec<u32> {
         .await
         .0
         .into_iter()
-        .map(|orphan| orphan.pid)
+        .map(|found| found.pid)
         .collect()
-}
-
-/// Which signal a sweep sends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Escalation {
-    /// SIGTERM: let the process shut itself down within the grace period.
-    Graceful,
-    /// SIGKILL: the grace period is over, or the owner is long gone.
-    Force,
-}
-
-/// Signal each orphan. Returns how many were signalled.
-///
-/// The two stages address different things on purpose.
-///
-/// The graceful stage signals the **process only**. A process that
-/// escaped by calling `setsid` is normally the top of its own tree — a
-/// postgres postmaster, not one of its backends — and it knows how to
-/// stop what it started. Sending SIGTERM to the whole group instead would
-/// tear its children out from under it, which for postgres turns an
-/// orderly shutdown into what looks like a crash, with recovery on the
-/// next start.
-///
-/// The force stage signals the **process group** it leads, if it leads
-/// one. POSIX does not propagate a signal from a parent to its children,
-/// and a child forked after the scan was never in the orphan set at all;
-/// but `setsid` made the escapee a group leader, and everything it forked
-/// afterwards inherited that group. Signalling the group therefore
-/// reaches the children the scan never saw — postgres backends started
-/// while the grace period ran, for instance — without relying on the
-/// application noticing its parent is gone. Past the grace there is no
-/// orderly shutdown left to preserve, so the bluntness costs nothing.
-///
-/// A process that leads no group is signalled alone: the group it sits in
-/// belongs to something else, most likely the container that is already
-/// being killed through its own path.
-fn signal_orphans(orphans: &[Orphan], escalation: Escalation) -> usize {
-    let mut signalled = 0;
-    for orphan in orphans {
-        if !is_pid_alive(orphan.pid) {
-            continue;
-        }
-        warn!(
-            pid = orphan.pid,
-            token = orphan.token.as_str(),
-            signal = ?escalation,
-            "Container process escaped its process group",
-        );
-        match escalation {
-            Escalation::Graceful => send_sigterm_pid(orphan.pid),
-            // Racy in principle — the escapee could exit between the
-            // liveness check above and here, and something else could
-            // claim its PID and lead a group by then — but the window is
-            // microseconds, against a leak that lasts until reboot.
-            Escalation::Force if leads_own_group(orphan.pid) => force_kill_group(orphan.pid),
-            Escalation::Force => force_kill(orphan.pid),
-        }
-        signalled += 1;
-    }
-    signalled
-}
-
-/// Whether `pid` is the leader of its own process group, i.e. the group
-/// contains it and its descendants and nothing else.
-fn leads_own_group(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        matches!(
-            nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid as i32))),
-            Ok(pgid) if pgid.as_raw() as u32 == pid,
-        )
-    }
-    #[cfg(windows)]
-    {
-        // Windows has no process groups; `force_kill` already terminates
-        // the tree via `taskkill /T`.
-        let _ = pid;
-        false
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +253,8 @@ mod tests {
 
     use std::time::Duration;
 
+    use kcommon::identity::{OWNER_SEP, UNKNOWN_STAMP};
+    use kcommon::signal::{force_kill, is_pid_alive};
     use serial_test::serial;
     use tokio::sync::watch;
 
@@ -489,6 +268,12 @@ mod tests {
     /// A PID far above any platform's `pid_max`, so its owner can never
     /// be found alive.
     const UNUSED_PID: u32 = 2_000_000_000;
+
+    /// A full container token under an owner that can never be found
+    /// running — the shape a previous, dead run's token has.
+    fn dead_runner_token(pod: &str, container: &str) -> String {
+        format!("dead-seed/{UNUSED_PID}{OWNER_SEP}20260822T143205Z/{pod}/{container}")
+    }
 
     /// Shutdown receiver for spawns that never need to signal shutdown.
     /// The sender is leaked so `changed()` never fires.
@@ -507,7 +292,7 @@ mod tests {
         ProcessExecutor::new(&argv[0])
             .args(&argv[1..])
             .env(HELPER_VAR, mode)
-            .env(KILL_TOKEN_VAR, token)
+            .env(PR_KILL_TOKEN_VAR, token)
             .die_with_parent(false)
             .output(DevNullOutput)
             .spawn(shutdown())
@@ -539,27 +324,19 @@ mod tests {
     // -- token construction --------------------------------------------------
 
     #[test]
-    fn owner_stamp_is_fixed_width_utc() {
-        // 2026-08-22T14:32:05Z
-        assert_eq!(owner_stamp(1_787_409_125), "20260822T143205Z");
-        assert_eq!(owner_stamp(0), "19700101T000000Z");
-        assert_eq!(owner_stamp(0).len(), UNKNOWN_STAMP.len());
-    }
-
-    #[test]
-    fn owner_stamp_sorts_chronologically() {
-        assert!(owner_stamp(1_787_409_125) > owner_stamp(1_787_409_124));
-        assert!(owner_stamp(0) < owner_stamp(1));
-    }
-
-    #[test]
-    fn runner_id_is_stable_and_names_this_process() {
-        let id = runner_id();
-        assert_eq!(id, runner_id(), "runner id must not change");
-        let (pid, stamp) = id.split_once(OWNER_SEP).expect("pid@stamp");
-        assert_eq!(pid, std::process::id().to_string());
-        assert_eq!(stamp.len(), UNKNOWN_STAMP.len());
-        assert_ne!(stamp, UNKNOWN_STAMP, "own start time must be readable");
+    fn runner_run_is_stable_and_names_this_process() {
+        // The grammar itself is kcommon's contract and is tested there;
+        // what matters here is that a runner's tokens all carry one
+        // identity, and that it is this process's.
+        let run = runner_run();
+        assert_eq!(run.as_str(), runner_run().as_str(), "must not change");
+        let owner = kcommon::token::owner_of(run.as_str()).expect("owner field");
+        let (pid, stamp) = kcommon::identity::parse_owner(owner).expect("pid@stamp");
+        assert_eq!(pid, std::process::id());
+        assert!(
+            !kcommon::identity::is_unknown_stamp(stamp),
+            "own start time must be readable"
+        );
     }
 
     #[test]
@@ -567,7 +344,10 @@ mod tests {
         let prefix = pod_prefix("db", "uid-1");
         let token = container_token(&prefix, "postgres");
         assert!(token.starts_with(&prefix), "{token} must extend {prefix}");
-        assert_eq!(token, format!("{}/db_uid-1/postgres", runner_id()));
+        assert_eq!(
+            token,
+            format!("{}/db_uid-1/postgres", runner_run().as_str())
+        );
     }
 
     #[test]
@@ -595,37 +375,17 @@ mod tests {
     // -- owner liveness ------------------------------------------------------
 
     #[test]
-    fn owner_alive_recognises_this_runner() {
-        let table = ProcessTable::load();
-        assert!(table.owner_alive(&container_token(&pod_prefix("p", "u"), "c")));
-    }
-
-    #[test]
-    fn owner_alive_rejects_a_vanished_runner() {
-        let table = ProcessTable::load();
-        let token = format!("{UNUSED_PID}{OWNER_SEP}20260822T143205Z{FIELD_SEP}p_u{FIELD_SEP}c");
-        assert!(!table.owner_alive(&token));
-    }
-
-    #[test]
-    fn owner_alive_rejects_a_recycled_pid() {
+    fn owner_alive_recognises_this_runner_and_rejects_dead_ones() {
+        let scan = Scan::load();
+        assert!(scan.owner_alive(&container_token(&pod_prefix("p", "u"), "c")));
+        assert!(!scan.owner_alive(&dead_runner_token("p_u", "c")));
         // Our own PID, but not our start time: exactly what a restarted
         // pod-runner that landed on its predecessor's PID looks like.
-        let table = ProcessTable::load();
-        let token = format!(
-            "{}{OWNER_SEP}{UNKNOWN_STAMP}{FIELD_SEP}p_u{FIELD_SEP}c",
+        let recycled = format!(
+            "stale-seed/{}{OWNER_SEP}{UNKNOWN_STAMP}/p_u/c",
             std::process::id()
         );
-        assert!(!table.owner_alive(&token));
-    }
-
-    #[test]
-    fn owner_alive_keeps_unverifiable_tokens() {
-        // The sweep kills only what it can prove is orphaned.
-        let table = ProcessTable::load();
-        for token in ["no-owner-separator/p_u/c", "notapid@20260822T143205Z/p_u/c"] {
-            assert!(table.owner_alive(token), "{token} must be kept");
-        }
+        assert!(!scan.owner_alive(&recycled));
     }
 
     // -- sweeps --------------------------------------------------------------
@@ -737,7 +497,7 @@ mod tests {
             .args(&argv[1..])
             .env(HELPER_VAR, HELPER_FORK_CHILD)
             .env(HELPER_PID_FILE_VAR, pid_file.display().to_string())
-            .env(KILL_TOKEN_VAR, &token)
+            .env(PR_KILL_TOKEN_VAR, &token)
             .die_with_parent(false)
             .output(DevNullOutput)
             .spawn(shutdown())
@@ -813,19 +573,42 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
+    async fn stale_snapshot_entries_are_reverified_not_signalled() {
+        // The force stage acts on a set found a grace period earlier. A
+        // process that exited in between may have handed its number to
+        // something else, so an entry that no longer carries its token
+        // must be left alone, whoever holds the number now.
+        let prefix = pod_prefix("stale-pod", "uid-1");
+        let handle = spawn_helper(&container_token(&prefix, "main"), HELPER_SLEEP).await;
+        let pid = handle.pid();
+        assert!(wait_visible(&prefix).await, "token must be visible");
+
+        let snapshot = Orphans::find(&prefix).await;
+        assert!(!snapshot.is_empty());
+
+        // The escapee dies between the snapshot and the kill.
+        force_kill(pid);
+        assert!(wait_dead(pid).await);
+
+        assert_eq!(
+            snapshot.force_kill(),
+            0,
+            "a snapshot entry that no longer verifies must not be signalled",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
     async fn boot_sweep_kills_orphans_of_dead_runners_only() {
         // Sweeps the whole host, so it also reclaims escapees left by
         // earlier runs — which is the point of it.
         let live_prefix = pod_prefix("live-pod", "uid-1");
         let live = spawn_helper(&container_token(&live_prefix, "main"), HELPER_SLEEP).await;
-        let vanished = spawn_helper(
-            &format!("{UNUSED_PID}{OWNER_SEP}20260822T143205Z{FIELD_SEP}gone_uid{FIELD_SEP}main"),
-            HELPER_SLEEP,
-        )
-        .await;
+        let vanished = spawn_helper(&dead_runner_token("gone_uid", "main"), HELPER_SLEEP).await;
         let recycled = spawn_helper(
             &format!(
-                "{}{OWNER_SEP}{UNKNOWN_STAMP}{FIELD_SEP}stale_uid{FIELD_SEP}main",
+                "stale-seed/{}{OWNER_SEP}{UNKNOWN_STAMP}/stale_uid/main",
                 std::process::id()
             ),
             HELPER_SLEEP,

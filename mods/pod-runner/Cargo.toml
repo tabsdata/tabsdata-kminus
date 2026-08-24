@@ -79,6 +79,7 @@ flate2 = { version = "1" }
 futures-util = { version = "0.3.32" }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
 k8s-openapi = { version = "0.27" }
+kcommon = { path = "../kcommon" }
 kube = { version = "3.1", features = ["runtime", "derive", "client"] }
 memory-stats = { version = "1" }
 prometheus = { version = "0.14" }
@@ -124,4 +125,4 @@ nix = { version = "0.31.2", features = ["signal", "process"] }
 openssl = { version = "0.10.76", features = ["vendored"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
