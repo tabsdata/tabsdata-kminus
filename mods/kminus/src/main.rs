@@ -14,7 +14,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Child;
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
@@ -32,13 +31,19 @@ use loglevel::LogLevel;
 
 use config::{KM_SYSCONFIG_FILE, KmHeartbeat, KmPorts, KmSysConfig};
 use exit::ExitReason;
+use kcommon::scan::{kill_strays_of_dead_runs, kill_until_clean};
+use kcommon::token::{KM_KILL_TOKEN_VAR, Run, Seed};
+use kcommon::tracked::Exit;
 use process::{control_plane, pod_runner, virtual_kubelet};
+use system::components::Components;
 use system::file::{CONFIG_DIR, LOG_DIR};
 use system::heartbeat::{self, Beat, HeartbeatMonitor, heartbeat_file};
 use system::messages;
+#[cfg(target_os = "macos")]
+use system::pid::kill_descendants;
 use system::pid::{
-    BIN_KM, Recorded, cleanup_stale_pids, is_alive, kill_descendants, pids_dir, recorded,
-    remove_pid, terminate_process, write_pid,
+    BIN_KM, Recorded, cleanup_stale_pids, is_alive, pids_dir, recorded, remove_pid,
+    terminate_process, write_pid,
 };
 use system::port::{PortCheck, check_ports, port_failures, probe_ports};
 
@@ -403,14 +408,15 @@ fn step_done(step: Step) {
 // already has, so bundling them into a struct moves the list rather
 // than shortening it.
 #[allow(clippy::too_many_arguments)]
-fn print_status(
-    paths: &Paths,
-    cp: &Child,
-    pr: &Child,
-    vk: &Child,
-    ports: &KmPorts,
-    kubeconfig: &Path,
-) {
+fn print_status(paths: &Paths, components: &Components, ports: &KmPorts, kubeconfig: &Path) {
+    /// A registered component's PID, or a placeholder if it somehow is not
+    /// there — a banner is not worth failing a started stack over.
+    fn pid_of(components: &Components, name: &str) -> String {
+        components
+            .pid(name)
+            .map_or_else(|| "?".to_string(), |pid| pid.to_string())
+    }
+
     let cp_children = control_plane::read_children(&paths.workdir);
     let (cap_cpu, cap_mem, cap_pods) = pod_runner::read_capacity(&paths.configdir);
 
@@ -420,7 +426,7 @@ fn print_status(
     println!(
         "    {}               pid={:<7}port={}  kcm-port={}",
         control_plane::BIN,
-        cp.id(),
+        pid_of(components, control_plane::BIN),
         ports.api,
         ports.kcm
     );
@@ -437,14 +443,14 @@ fn print_status(
     println!(
         "    {}                  pid={:<7}port={}  metrics-port={}",
         pod_runner::BIN,
-        pr.id(),
+        pid_of(components, pod_runner::BIN),
         ports.pr,
         ports.pr_metrics
     );
     println!(
         "    {}             pid={:<7}port={}",
         virtual_kubelet::BIN,
-        vk.id(),
+        pid_of(components, virtual_kubelet::BIN),
         ports.vk
     );
     println!(
@@ -544,6 +550,24 @@ fn install_signal_shutdown(paths: Paths, ports: KmPorts) {
 const POD_RUNNER_SHUTDOWN_GRACE: Duration = Duration::from_secs(90);
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// Filename of the seed file under `<workdir>/data/km/`, next to the PID
+/// files: the one piece of kill-token state that crosses restarts, so the
+/// next run can reclaim whatever this one leaves behind.
+const KM_SEED_FILE: &str = "seed";
+
+/// How many fresh-scan sweep rounds a teardown gives stragglers. Round two
+/// exists for processes forked between a scan and its signals; round three
+/// is margin. An adversarial forker exhausts this and is reported.
+const SWEEP_ROUNDS: usize = 3;
+
+/// Path of the kill-token seed file for the instance at `workdir`.
+fn seed_file(workdir: &Path) -> PathBuf {
+    workdir
+        .join(system::pid::DATA_DIR)
+        .join(BIN_KM)
+        .join(KM_SEED_FILE)
+}
+
 fn shutdown_grace_for(name: &str) -> Duration {
     if name == pod_runner::BIN {
         POD_RUNNER_SHUTDOWN_GRACE
@@ -618,9 +642,22 @@ fn wait_for_ports_released(ports: &KmPorts) {
 fn shutdown_from_pids(paths: &Paths, ports: Option<&KmPorts>) {
     info!("Shutting down...");
 
+    // Prefer the components this run owns: their monitors answer the
+    // question a PID file cannot — has this one already exited? — which
+    // is what keeps km from spending a grace period asking a corpse to
+    // stop. `km stop` runs in another process and owns none, so it falls
+    // through to the PID files, signalling only entries that still verify.
+    let handled = Components::current()
+        .map(|components| components.teardown(&paths.pids))
+        .unwrap_or_default();
+
     for name in [virtual_kubelet::BIN, pod_runner::BIN, control_plane::BIN] {
+        if handled.contains(&name) {
+            continue;
+        }
         // Stale means either gone or now somebody else's number; both
-        // make signalling it the wrong thing to do.
+        // make signalling it the wrong thing to do — whatever really is
+        // still running is the sweep's to find, by identity.
         if let Recorded::Live(pid) = recorded(&paths.pids, name) {
             let grace = shutdown_grace_for(name);
             info!(
@@ -634,8 +671,27 @@ fn shutdown_from_pids(paths: &Paths, ports: Option<&KmPorts>) {
         remove_pid(&paths.pids, name);
     }
 
-    // Backstop: SIGKILL anything still parented under km that the named
-    // teardown missed (e.g. spawned just before the signal arrived).
+    // Everything the named teardown could not reach: a component that died
+    // abruptly leaves its own children running, reparented away from the
+    // tree above, and a process spawned just before the signal arrived may
+    // never have made a PID file. They still carry this instance's token,
+    // which is the only thing that still names them. The seed file covers
+    // km's own shutdown (it holds this run's seed) and a `km stop` that is
+    // cleaning up after a dead km (it holds that run's).
+    match Seed::load(&seed_file(&paths.workdir)) {
+        Ok(Some(seed)) => {
+            kill_until_clean(KM_KILL_TOKEN_VAR, &seed.as_prefix(), SWEEP_ROUNDS);
+        }
+        Ok(None) => {}
+        Err(e) => warn!(error = %e, "Cannot read seed; strays wait for the next start's sweep"),
+    }
+    let _ = fs::remove_file(seed_file(&paths.workdir));
+
+    // macOS only: SIP hides the environment of an Apple platform binary,
+    // so a `/bin/sh` wrapper is invisible to the sweep above while still
+    // being reachable through the parent links. One hop wide — its
+    // children re-expose the token — and closed by walking the tree.
+    #[cfg(target_os = "macos")]
     kill_descendants(std::process::id());
 
     let _ = fs::remove_dir_all(control_plane::pids_dir_in(&paths.workdir));
@@ -723,18 +779,6 @@ fn sleep_unless_shutdown(total: Duration) -> bool {
     !exit::in_progress()
 }
 
-/// What a supervision round observed about a child process, kept separate
-/// from [`Child`] so the decision below can be exercised without spawning
-/// one.
-#[derive(Debug, PartialEq, Eq)]
-enum ProcessState {
-    Running,
-    /// The child is gone; the string describes how.
-    Exited(String),
-    /// Its state could not be read at all, which is itself a failure.
-    Unknown(String),
-}
-
 /// One component's fate for one round.
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
@@ -742,75 +786,58 @@ enum Verdict {
     Failed(String),
 }
 
-/// A supervised child: its process handle and its heartbeat counter.
-struct Watched<C> {
+/// A supervised component's heartbeat counter.
+///
+/// Process liveness is not here: that is judged from the [`Components`]
+/// registry, whose answers come from the monitor that owns each child —
+/// never from a number the process table could have recycled. This side
+/// owns the beats, which is the case a live-but-unresponsive component
+/// falls into.
+struct Watched {
     name: &'static str,
-    child: C,
     monitor: HeartbeatMonitor,
 }
 
-/// Read a child's process state without blocking.
-trait ChildState {
-    fn state(&mut self) -> ProcessState;
-}
-
-impl ChildState for Child {
-    fn state(&mut self) -> ProcessState {
-        match self.try_wait() {
-            Ok(Some(status)) => ProcessState::Exited(format!("process exited ({status})")),
-            Ok(None) => ProcessState::Running,
-            Err(e) => ProcessState::Unknown(format!("cannot check process state: {e}")),
+/// Judge one component from its heartbeat.
+///
+/// A single miss is not yet a failure: that is what the consecutive-miss
+/// budget is for.
+fn assess(monitor: &mut HeartbeatMonitor) -> Verdict {
+    match monitor.poll() {
+        Beat::Healthy | Beat::Missed { .. } => Verdict::Ok,
+        Beat::Failed { misses, reason } => {
+            Verdict::Failed(format!("missed {misses} consecutive heartbeats — {reason}"))
         }
     }
 }
 
-/// Judge one component from its process state and its heartbeat.
-///
-/// An exit is failure immediately — there is no point waiting for beats to
-/// go stale once the process is gone. A live process is judged only by its
-/// heartbeat, and a single miss is not yet a failure: that is what the
-/// consecutive-miss budget is for.
-fn assess(process: ProcessState, monitor: &mut HeartbeatMonitor) -> Verdict {
-    match process {
-        ProcessState::Exited(how) | ProcessState::Unknown(how) => Verdict::Failed(how),
-        ProcessState::Running => match monitor.poll() {
-            Beat::Healthy | Beat::Missed { .. } => Verdict::Ok,
-            Beat::Failed { misses, reason } => {
-                Verdict::Failed(format!("missed {misses} consecutive heartbeats — {reason}"))
-            }
-        },
-    }
-}
-
-/// One supervision round over every component. Returns the first failure,
+/// One heartbeat round over every component. Returns the first failure,
 /// having polled the components before it — so their miss counters stay
 /// current and their warnings are logged even when a later one fails.
-fn monitor_round<C: ChildState>(watched: &mut [Watched<C>]) -> Option<(&'static str, String)> {
+fn monitor_round(watched: &mut [Watched]) -> Option<(&'static str, String)> {
     let mut failure = None;
     for w in watched.iter_mut() {
-        if let Verdict::Failed(reason) = assess(w.child.state(), &mut w.monitor) {
+        if let Verdict::Failed(reason) = assess(&mut w.monitor) {
             failure = failure.or(Some((w.name, reason)));
         }
     }
     failure
 }
 
-/// The first component whose recorded process is no longer alive.
+/// A component's exit, said plainly enough to act on.
 ///
-/// Reads the PID files km writes immediately after each spawn — so the list
-/// grows as the stack comes up, and a component not started yet is simply
-/// absent rather than reported dead.
-fn first_dead_component(pids: &Path) -> Option<(&'static str, u32)> {
-    [control_plane::BIN, pod_runner::BIN, virtual_kubelet::BIN]
-        .into_iter()
-        .find_map(|name| match recorded(pids, name) {
-            // Stale covers the case a bare liveness check cannot: the
-            // component died and its number was handed to something else.
-            // Without the identity check, that read as "still running" and
-            // the death went unnoticed until the heartbeat staled out.
-            Recorded::Stale(pid) => Some((name, pid)),
-            _ => None,
-        })
+/// The hex matters on Windows, where an abnormal exit's code is the
+/// NTSTATUS that ended the process — `0xC0000409` names an abort where a
+/// decimal rendering names nothing.
+fn exit_detail(exit: &Exit) -> String {
+    match exit {
+        Exit::Code(code) if *code < 0 || *code > 0xFF => {
+            format!("process exited (code {code}, {:#010x})", *code as u32)
+        }
+        Exit::Code(code) => format!("process exited (code {code})"),
+        Exit::Signal(sig) => format!("process exited (signal {sig})"),
+        Exit::Unknown => "process state became unreadable".to_string(),
+    }
 }
 
 /// What a component last reported in its heartbeat, when that was trouble.
@@ -827,15 +854,20 @@ fn last_reported(paths: &Paths, name: &str) -> Option<String> {
     Some(beat.detail)
 }
 
-/// Watch every component km has spawned for its process disappearing, from
-/// the first spawn until shutdown.
+/// Watch every component km has spawned for its process exiting, from the
+/// first spawn until shutdown.
 ///
 /// This runs alongside — and ahead of — the heartbeat monitor, which only
 /// starts once the whole stack is ready. Without it, a component dying while
 /// km is still gating on a later one goes unnoticed until that gate times
 /// out: the full startup budget spent waiting, and then the failure reported
 /// against the wrong component.
-fn watch_spawned_processes(paths: Paths, ports: KmPorts) {
+///
+/// Judged from each component's own monitor rather than from PID files:
+/// the answer cannot be fooled by a recycled number, and it carries the
+/// exit outcome — for a component that died without logging, often the
+/// only account of what happened.
+fn watch_components(paths: Paths, ports: KmPorts, components: Components) {
     std::thread::Builder::new()
         .name("km-procwatch".into())
         .spawn(move || {
@@ -844,10 +876,11 @@ fn watch_spawned_processes(paths: Paths, ports: KmPorts) {
                 if exit::in_progress() {
                     return;
                 }
-                if let Some((name, pid)) = first_dead_component(&paths.pids) {
+                if let Some((name, exit)) = components.first_failed() {
+                    let how = exit_detail(&exit);
                     let reason = match last_reported(&paths, name) {
-                        Some(detail) => format!("process {pid} is gone (last reported: {detail})"),
-                        None => format!("process {pid} is gone"),
+                        Some(detail) => format!("{how} (last reported: {detail})"),
+                        None => how,
                     };
                     fail_stack(&paths, &ports, name, &reason);
                 }
@@ -856,28 +889,25 @@ fn watch_spawned_processes(paths: Paths, ports: KmPorts) {
         .expect("spawn km-procwatch thread");
 }
 
-/// Supervise the stack until a component fails or a signal arrives.
+/// Supervise the stack's heartbeats until a component fails or a signal
+/// arrives.
 ///
-/// Each round checks both channels: the child process itself, which makes an
-/// outright exit immediate rather than waiting for heartbeats to go stale,
-/// and the component's heartbeat file, which catches a process that is alive
-/// but no longer serving. Never returns: a component failure exits 1 here, a
-/// signal exits from the km-signal thread.
-fn monitor_stack(
-    paths: &Paths,
-    ports: &KmPorts,
-    hb: &KmHeartbeat,
-    children: Vec<(&'static str, Child)>,
-) -> ! {
+/// This catches the component that is alive but no longer serving. The
+/// other half — a process that has outright exited — belongs to
+/// [`watch_components`], which asks each component's own monitor and runs
+/// at a far tighter tick. One owner per question.
+///
+/// Never returns: a component failure exits 1 here, a signal exits from the
+/// km-signal thread.
+fn monitor_stack(paths: &Paths, ports: &KmPorts, hb: &KmHeartbeat) -> ! {
     let interval = hb.interval();
     let max_missed = hb.max_missed();
     let stale_after = heartbeat::stale_after(interval);
 
-    let mut watched: Vec<Watched<Child>> = children
+    let mut watched: Vec<Watched> = [control_plane::BIN, pod_runner::BIN, virtual_kubelet::BIN]
         .into_iter()
-        .map(|(name, child)| Watched {
+        .map(|name| Watched {
             name,
-            child,
             monitor: HeartbeatMonitor::new(
                 name,
                 heartbeat_file(&paths.workdir, name),
@@ -894,10 +924,6 @@ fn monitor_stack(
         "Monitoring component heartbeats"
     );
 
-    // Process liveness is the watcher thread's job, at its own tighter tick;
-    // this loop owns the heartbeat rounds. `monitor_round` still checks the
-    // child handles, which is what turns a race the monitor wins into an
-    // "exited (status)" message rather than a bare "process is gone".
     loop {
         if !sleep_unless_shutdown(interval) {
             stand_down();
@@ -1192,6 +1218,34 @@ fn command_start(args: StartArgs) {
     fs::create_dir_all(&paths.pids).ok();
     write_pid(&paths.pids, BIN_KM, std::process::id());
 
+    // Reclaim the previous life. Its seed file names everything it ever
+    // started — including processes that escaped their groups and were
+    // reparented, which no PID file or parent link can reach — and the
+    // dead-owner sweep behind it covers runs whose seed file was lost.
+    // Safe next to a *concurrent* instance because the single-instance
+    // guard above is identity-verified, and because a dead owner is
+    // decidable from a token alone.
+    let seed_path = seed_file(&paths.workdir);
+    match Seed::load(&seed_path) {
+        Ok(Some(previous)) => {
+            kill_until_clean(KM_KILL_TOKEN_VAR, &previous.as_prefix(), SWEEP_ROUNDS);
+        }
+        Ok(None) => {}
+        Err(e) => warn!(error = %e, "Cannot read previous seed; relying on the dead-owner sweep"),
+    }
+    kill_strays_of_dead_runs(KM_KILL_TOKEN_VAR);
+
+    // Mint and persist this run's seed before anything is spawned, so a
+    // km that dies mid-startup still left the trail the next run needs.
+    let seed = Seed::generate();
+    if let Err(e) = seed.save(&seed_path) {
+        // Startable, but the next run cannot reclaim by seed — only by
+        // dead owner. Worth a loud line, not a refusal to boot.
+        warn!(error = %e, path = %seed_path.display(), "Cannot persist kill-token seed");
+    }
+    let run = Run::of(&seed);
+    info!(token = run.as_str(), "Kill token for this run");
+
     let vk_kubeconfig = paths.configdir.join(control_plane::VK_KUBECONFIG_FILE);
     let vk_prconfig = paths.configdir.join(pod_runner::VK_PR_CONFIG_FILE);
     let kubeconfig = paths.configdir.join(control_plane::KUBECONFIG_FILE);
@@ -1209,8 +1263,12 @@ fn command_start(args: StartArgs) {
     // stack down in order rather than orphaning it.
     install_signal_shutdown(paths.clone(), sys_cfg.ports.clone());
     // Started before anything is spawned, so a component dying mid-startup is
-    // caught while km is still gating on a later one.
-    watch_spawned_processes(paths.clone(), sys_cfg.ports.clone());
+    // caught while km is still gating on a later one. Published so both
+    // teardown paths — a signal and a component failure — reach the
+    // tracked components rather than PID files.
+    let components = Components::new();
+    components.install();
+    watch_components(paths.clone(), sys_cfg.ports.clone(), components.clone());
 
     // Start subprocesses in dependency order, reporting each phase to stdout
     // so the (multi-second) startup shows live progress instead of a silent
@@ -1218,7 +1276,7 @@ fn command_start(args: StartArgs) {
     let started = Instant::now();
 
     let mut phase = step("Starting control-plane");
-    let mut cp = control_plane::start(
+    control_plane::start(
         &paths.workdir,
         &paths.configdir,
         &paths.logdir,
@@ -1226,11 +1284,13 @@ fn command_start(args: StartArgs) {
         &sys_cfg,
         &port_api,
         &port_kcm,
+        &run,
+        &components,
     );
     step_done(phase);
 
     phase = step("Starting pod-runner");
-    let mut pr = pod_runner::start(
+    pod_runner::start(
         &paths.workdir,
         &paths.configdir,
         &paths.logdir,
@@ -1241,7 +1301,8 @@ fn command_start(args: StartArgs) {
         &kubeconfig,
         args.imagesdir.as_deref(),
         args.loglevel,
-        &mut cp,
+        &run,
+        &components,
     );
     step_done(phase);
 
@@ -1250,7 +1311,7 @@ fn command_start(args: StartArgs) {
     step_done(phase);
 
     phase = step("Starting virtual-kubelet");
-    let vk = virtual_kubelet::start(
+    virtual_kubelet::start(
         &paths.workdir,
         &paths.configdir,
         &paths.logdir,
@@ -1259,8 +1320,8 @@ fn command_start(args: StartArgs) {
         &port_vk,
         &vk_kubeconfig,
         &vk_prconfig,
-        &mut cp,
-        &mut pr,
+        &run,
+        &components,
     );
     step_done(phase);
 
@@ -1274,7 +1335,7 @@ fn command_start(args: StartArgs) {
     // so rather than "not reported yet".
     heartbeat::touch_ready(&paths.workdir);
 
-    print_status(&paths, &cp, &pr, &vk, &sys_cfg.ports, &kubeconfig);
+    print_status(&paths, &components, &sys_cfg.ports, &kubeconfig);
 
     println!(
         "  liveness/readiness check every {}ms/{}s, readiness tolerance {} misses",
@@ -1293,17 +1354,9 @@ fn command_start(args: StartArgs) {
 
     // Supervise from here on. Teardown on signal is still owned by the
     // km-signal thread installed above; the monitor stands down when it
-    // fires. The Child handles move into the monitor, which reaps them.
-    monitor_stack(
-        &paths,
-        &sys_cfg.ports,
-        &sys_cfg.heartbeat,
-        vec![
-            (control_plane::BIN, cp),
-            (pod_runner::BIN, pr),
-            (virtual_kubelet::BIN, vk),
-        ],
-    )
+    // fires. The components stay in the registry, where each one's own
+    // monitor reaps it.
+    monitor_stack(&paths, &sys_cfg.ports, &sys_cfg.heartbeat)
 }
 
 /// Grace period km's own signal-driven teardown may need before `stop`
@@ -1904,21 +1957,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    // -- monitor round ------------------------------------------------------
-
-    /// Scripted process states, so the round can be driven without
-    /// spawning children.
-    struct FakeChild(ProcessState);
-
-    impl ChildState for FakeChild {
-        fn state(&mut self) -> ProcessState {
-            match &self.0 {
-                ProcessState::Running => ProcessState::Running,
-                ProcessState::Exited(how) => ProcessState::Exited(how.clone()),
-                ProcessState::Unknown(how) => ProcessState::Unknown(how.clone()),
-            }
-        }
-    }
+    // -- heartbeat round ----------------------------------------------------
 
     fn ready_beat(dir: &Path) -> PathBuf {
         let path = dir.join(system::heartbeat::HEARTBEAT_FILE);
@@ -1926,52 +1965,19 @@ mod tests {
         path
     }
 
-    fn watched(
-        name: &'static str,
-        state: ProcessState,
-        beat: PathBuf,
-        max_missed: u32,
-    ) -> Watched<FakeChild> {
+    fn watched(name: &'static str, beat: PathBuf, max_missed: u32) -> Watched {
         Watched {
             name,
-            child: FakeChild(state),
             monitor: HeartbeatMonitor::new(name, beat, Duration::from_secs(15), max_missed),
         }
     }
 
     #[test]
-    fn assess_fails_immediately_on_an_exited_process() {
+    fn assess_accepts_a_fresh_beat() {
         let dir = tempdir();
         let mut monitor =
             HeartbeatMonitor::new("test", ready_beat(&dir), Duration::from_secs(15), 4);
-        // A fresh, ready beat must not save a process that is already gone.
-        let verdict = assess(
-            ProcessState::Exited("process exited (0)".into()),
-            &mut monitor,
-        );
-        assert_eq!(verdict, Verdict::Failed("process exited (0)".into()));
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn assess_fails_when_the_process_state_is_unreadable() {
-        let dir = tempdir();
-        let mut monitor =
-            HeartbeatMonitor::new("test", ready_beat(&dir), Duration::from_secs(15), 4);
-        let verdict = assess(
-            ProcessState::Unknown("permission denied".into()),
-            &mut monitor,
-        );
-        assert_eq!(verdict, Verdict::Failed("permission denied".into()));
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn assess_accepts_a_live_process_with_a_fresh_beat() {
-        let dir = tempdir();
-        let mut monitor =
-            HeartbeatMonitor::new("test", ready_beat(&dir), Duration::from_secs(15), 4);
-        assert_eq!(assess(ProcessState::Running, &mut monitor), Verdict::Ok);
+        assert_eq!(assess(&mut monitor), Verdict::Ok);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1985,9 +1991,9 @@ mod tests {
             Duration::from_secs(15),
             3,
         );
-        assert_eq!(assess(ProcessState::Running, &mut monitor), Verdict::Ok);
-        assert_eq!(assess(ProcessState::Running, &mut monitor), Verdict::Ok);
-        let Verdict::Failed(reason) = assess(ProcessState::Running, &mut monitor) else {
+        assert_eq!(assess(&mut monitor), Verdict::Ok);
+        assert_eq!(assess(&mut monitor), Verdict::Ok);
+        let Verdict::Failed(reason) = assess(&mut monitor) else {
             panic!("the third miss must fail the component");
         };
         assert!(reason.starts_with("missed 3 consecutive heartbeats"));
@@ -1996,13 +2002,13 @@ mod tests {
     }
 
     #[test]
-    fn monitor_round_passes_when_every_component_is_healthy() {
+    fn monitor_round_passes_when_every_component_beats() {
         let dir = tempdir();
         let beat = ready_beat(&dir);
         let mut all = vec![
-            watched("cp", ProcessState::Running, beat.clone(), 4),
-            watched("pr", ProcessState::Running, beat.clone(), 4),
-            watched("vk", ProcessState::Running, beat, 4),
+            watched("cp", beat.clone(), 4),
+            watched("pr", beat.clone(), 4),
+            watched("vk", beat, 4),
         ];
         assert_eq!(monitor_round(&mut all), None);
         fs::remove_dir_all(&dir).ok();
@@ -2012,24 +2018,16 @@ mod tests {
     fn monitor_round_reports_the_first_failure() {
         let dir = tempdir();
         let beat = ready_beat(&dir);
+        let missing = dir.join("absent.json");
         let mut all = vec![
-            watched("cp", ProcessState::Running, beat.clone(), 4),
-            watched(
-                "pr",
-                ProcessState::Exited("process exited (1)".into()),
-                beat.clone(),
-                4,
-            ),
-            watched(
-                "vk",
-                ProcessState::Exited("process exited (2)".into()),
-                beat,
-                4,
-            ),
+            watched("cp", beat, 4),
+            // Budget of one: a single missing beat fails it outright.
+            watched("pr", missing.clone(), 1),
+            watched("vk", missing, 1),
         ];
         let (name, reason) = monitor_round(&mut all).unwrap();
         assert_eq!(name, "pr");
-        assert_eq!(reason, "process exited (1)");
+        assert!(reason.starts_with("missed 1 consecutive heartbeats"));
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -2037,23 +2035,38 @@ mod tests {
     fn monitor_round_keeps_counting_components_after_a_failure() {
         let dir = tempdir();
         let missing = dir.join(system::heartbeat::HEARTBEAT_FILE);
-        let mut all = vec![
-            watched(
-                "cp",
-                ProcessState::Exited("process exited (1)".into()),
-                missing.clone(),
-                4,
-            ),
-            watched("pr", ProcessState::Running, missing, 2),
-        ];
+        let mut all = vec![watched("cp", missing.clone(), 1), watched("pr", missing, 2)];
         // cp fails on round one, but pr must still be polled: its miss
         // counter has to be current if the stack somehow keeps running.
         assert_eq!(monitor_round(&mut all).unwrap().0, "cp");
         assert_eq!(monitor_round(&mut all).unwrap().0, "cp");
         // pr has now missed twice, so it would fail on its own merits.
-        let pr_verdict = assess(ProcessState::Running, &mut all[1].monitor);
-        assert!(matches!(pr_verdict, Verdict::Failed(_)));
+        assert!(matches!(assess(&mut all[1].monitor), Verdict::Failed(_)));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- exit detail ---------------------------------------------------------
+
+    #[test]
+    fn exit_detail_says_ordinary_codes_plainly() {
+        assert_eq!(exit_detail(&Exit::Code(0)), "process exited (code 0)");
+        assert_eq!(exit_detail(&Exit::Code(15)), "process exited (code 15)");
+        assert_eq!(exit_detail(&Exit::Signal(9)), "process exited (signal 9)");
+        assert_eq!(
+            exit_detail(&Exit::Unknown),
+            "process state became unreadable"
+        );
+    }
+
+    #[test]
+    fn exit_detail_names_an_ntstatus_in_hex() {
+        // 0xC0000409 arrives as a negative i32; the hex rendering is what
+        // lets a Windows abort be recognised on sight.
+        let status = 0xC0000409u32 as i32;
+        assert_eq!(
+            exit_detail(&Exit::Code(status)),
+            "process exited (code -1073740791, 0xc0000409)",
+        );
     }
 
     #[test]
@@ -2070,51 +2083,6 @@ mod tests {
         assert_eq!(child_ports(control_plane::KCM, &ports), "port=20001");
         // An unknown child must not have a port invented for it.
         assert_eq!(child_ports("kube-scheduler", &ports), "");
-    }
-
-    // -- process watcher ---------------------------------------------------
-
-    #[test]
-    fn first_dead_component_ignores_components_not_started_yet() {
-        let dir = tempdir();
-        // No PID files at all: the stack has not started, nothing is dead.
-        assert_eq!(first_dead_component(&dir), None);
-
-        // A component that is up must not be reported either.
-        write_pid(&dir, control_plane::BIN, std::process::id());
-        assert_eq!(first_dead_component(&dir), None);
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn first_dead_component_reports_a_recorded_process_that_is_gone() {
-        let dir = tempdir();
-        // A pid this high cannot belong to a live process.
-        let dead_pid = u32::MAX - 1;
-        write_pid(&dir, control_plane::BIN, std::process::id());
-        write_pid(&dir, pod_runner::BIN, dead_pid);
-
-        assert_eq!(
-            first_dead_component(&dir),
-            Some((pod_runner::BIN, dead_pid))
-        );
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn first_dead_component_reports_in_start_order() {
-        let dir = tempdir();
-        let dead_pid = u32::MAX - 1;
-        // Both gone: the control-plane is named, being the one started first
-        // and the one the others depend on.
-        write_pid(&dir, control_plane::BIN, dead_pid);
-        write_pid(&dir, virtual_kubelet::BIN, dead_pid);
-
-        assert_eq!(
-            first_dead_component(&dir),
-            Some((control_plane::BIN, dead_pid))
-        );
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

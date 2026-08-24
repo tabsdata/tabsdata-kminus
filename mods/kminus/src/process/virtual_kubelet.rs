@@ -3,16 +3,17 @@
 //! Virtual-kubelet subprocess: startup, readiness, status gathering.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 
 use tracing::info;
 
+use kcommon::token::{KM_KILL_TOKEN_VAR, Run};
+use kcommon::tracked::Tracked;
+
 use crate::config::KmSysConfig;
-use crate::process::{control_plane, pod_runner};
+use crate::system::components::Components;
 use crate::system::heartbeat::{self, heartbeat_file};
-use crate::system::pid::{
-    apply_subprocess_flags, capture_stderr, kill_child, pids_dir, remove_pid, write_pid,
-};
+use crate::system::pid::{apply_subprocess_flags, capture_stderr, pids_dir, write_pid};
 use crate::system::proc::resolve_binary;
 
 /// Binary name for the virtual-kubelet subprocess.
@@ -36,9 +37,9 @@ pub fn start(
     port_vk: &str,
     vk_kubeconfig: &Path,
     vk_prconfig: &Path,
-    cp: &mut Child,
-    pr: &mut Child,
-) -> Child {
+    run: &Run,
+    components: &Components,
+) {
     info!("Starting {}...", BIN);
     let vk_bin = resolve_binary(BIN);
     let log_max_size = sys_cfg.log.max_size_mb.to_string();
@@ -70,11 +71,12 @@ pub fn start(
         ]);
     capture_stderr(&mut command, logdir, BIN);
     apply_subprocess_flags(&mut command);
-    let mut vk = command
-        .spawn()
+    let vk = Tracked::spawn(command, KM_KILL_TOKEN_VAR, &run.scope(BIN))
         .unwrap_or_else(|e| panic!("Failed to start {}: {}", BIN, e));
 
-    write_pid(pids, BIN, vk.id());
+    let pid = vk.pid();
+    write_pid(pids, BIN, pid);
+    components.register(BIN, vk);
 
     if !heartbeat::wait_until_ready(BIN, &heartbeat, sys_cfg.heartbeat.startup_timeout()) {
         // Claimed before the children are killed below, so the process
@@ -90,16 +92,10 @@ pub fn start(
                 heartbeat.display()
             ),
         });
-        kill_child(&mut vk, BIN);
-        kill_child(pr, pod_runner::BIN);
-        kill_child(cp, control_plane::BIN);
-        for name in [BIN, pod_runner::BIN, control_plane::BIN] {
-            remove_pid(pids, name);
-        }
+        components.teardown(pids);
         std::process::exit(1);
     }
-    info!(pid = vk.id(), "{} ready", BIN);
-    vk
+    info!(pid, "{} ready", BIN);
 }
 
 /// The virtual-kubelet's pids directory under `<workdir>/data/<BIN>/pids`.

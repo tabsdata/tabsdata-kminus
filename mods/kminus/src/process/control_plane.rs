@@ -4,16 +4,19 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 use tracing::info;
 
 use crate::config::KmSysConfig;
 use crate::system::heartbeat::{self, heartbeat_file};
+use kcommon::token::{KM_KILL_TOKEN_VAR, Run};
+use kcommon::tracked::Tracked;
+
+use crate::system::components::Components;
 use crate::system::pid::{
-    DATA_DIR, apply_detached_flags, apply_subprocess_flags, capture_stderr, kill_child, pids_dir,
-    remove_pid, write_pid,
+    DATA_DIR, apply_detached_flags, apply_subprocess_flags, capture_stderr, pids_dir, write_pid,
 };
 use crate::system::proc::resolve_binary;
 
@@ -134,7 +137,9 @@ pub fn start(
     sys_cfg: &KmSysConfig,
     port_api: &str,
     port_kcm: &str,
-) -> Child {
+    run: &Run,
+    components: &Components,
+) {
     info!("Starting {}...", BIN);
     let cp_bin = resolve_binary(BIN);
     let log_max_size = sys_cfg.log.max_size_mb.to_string();
@@ -180,11 +185,14 @@ pub fn start(
     ]);
     capture_stderr(&mut command, logdir, BIN);
     apply_subprocess_flags(&mut command);
-    let mut cp = command
-        .spawn()
+    let cp = Tracked::spawn(command, KM_KILL_TOKEN_VAR, &run.scope(BIN))
         .unwrap_or_else(|e| panic!("Failed to start {}: {}", BIN, e));
 
-    write_pid(pids, BIN, cp.id());
+    let pid = cp.pid();
+    write_pid(pids, BIN, pid);
+    // Registered before the readiness gate, so the watcher covers it while
+    // km is still waiting for it to report.
+    components.register(BIN, cp);
 
     if !heartbeat::wait_until_ready(BIN, &heartbeat, sys_cfg.heartbeat.startup_timeout()) {
         // Claimed before the children are killed below, so the process
@@ -200,12 +208,10 @@ pub fn start(
                 heartbeat.display()
             ),
         });
-        kill_child(&mut cp, BIN);
-        remove_pid(pids, BIN);
+        components.teardown(pids);
         std::process::exit(1);
     }
-    info!(pid = cp.id(), "{} ready", BIN);
-    cp
+    info!(pid, "{} ready", BIN);
 }
 
 /// The control-plane's pids directory under

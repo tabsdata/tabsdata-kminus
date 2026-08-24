@@ -357,8 +357,11 @@ name = "kcommon"
 version = "2.0.1"
 dependencies = [
  "chrono",
+ "nix",
  "openssl",
  "sysinfo",
+ "tracing",
+ "windows-sys",
 ]
 
 [[package]]

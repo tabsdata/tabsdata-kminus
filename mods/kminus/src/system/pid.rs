@@ -5,12 +5,12 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use kcommon::identity;
 use sysinfo::{Pid, ProcessStatus, ProcessesToUpdate, System};
-use tracing::{info, warn};
+use tracing::warn;
 
 pub const DATA_DIR: &str = "data";
 pub const PIDS_DIR: &str = "pids";
@@ -316,11 +316,22 @@ fn force_kill_tree(root: u32, descendants: &[u32]) {
 }
 
 /// Best-effort: force-kill every process still parented under `root`
-/// (transitively), without touching `root` itself. Used as a teardown
-/// backstop for subprocesses that were spawned but whose PID files may
-/// not have been written yet (e.g. a Ctrl+C in the middle of startup).
-/// Each target's own process group is killed too, to catch isolated
-/// children that lead their own group.
+/// (transitively), without touching `root` itself. Each target's own
+/// process group is killed too, to catch isolated children that lead
+/// their own group.
+///
+/// macOS only, as a backstop for the one thing the kill-token sweep
+/// cannot see there: System Integrity Protection refuses to hand over an
+/// Apple platform binary's environment even to the same uid, so a
+/// `/bin/sh` wrapper around a command carries its token and reads back as
+/// carrying nothing. Only the restricted process itself is hidden — its
+/// children re-expose the token, and a simple command leaves no wrapper
+/// at all, since the shell execs — but while such a process is still
+/// parented here, a walk of the parent links reaches it and the sweep
+/// does not. Elsewhere the sweep sees everything this would, identifies
+/// what it kills, and additionally reaches processes reparented away —
+/// which no parent-link walk can.
+#[cfg(target_os = "macos")]
 pub fn kill_descendants(root: u32) {
     let descendants = collect_descendants(root);
     #[cfg(unix)]
@@ -372,15 +383,6 @@ pub fn cleanup_stale_pids(dir: &Path) {
         }
         let _ = fs::remove_file(entry.path());
     }
-}
-
-/// Send a graceful shutdown request to a child process and wait up to
-/// 5 seconds for exit; if it does not exit, force-kill the whole tree.
-pub fn kill_child(child: &mut Child, name: &str) {
-    let pid = child.id();
-    info!(name, pid, "Requesting graceful shutdown");
-    terminate_process(pid, Duration::from_secs(5));
-    let _ = child.wait();
 }
 
 #[cfg(test)]

@@ -140,7 +140,7 @@ fn recorded_is_stale_for_content_it_cannot_verify() {
     fs::remove_dir_all(&dir).ok();
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 #[test]
 fn kill_descendants_kills_a_child() {
     use std::process::{Command, Stdio};
@@ -172,6 +172,7 @@ fn kill_descendants_kills_a_child() {
     assert!(dead, "child should have been killed by kill_descendants");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn kill_descendants_no_op_without_children() {
     // A PID very unlikely to have children; must not panic.

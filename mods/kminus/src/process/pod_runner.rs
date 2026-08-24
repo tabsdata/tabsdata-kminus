@@ -4,17 +4,18 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::Command;
 
 use tracing::info;
 
 use crate::config::KmSysConfig;
 use crate::loglevel::LogLevel;
-use crate::process::control_plane;
+use kcommon::token::{KM_KILL_TOKEN_VAR, Run};
+use kcommon::tracked::Tracked;
+
+use crate::system::components::Components;
 use crate::system::heartbeat::{self, heartbeat_file};
-use crate::system::pid::{
-    apply_subprocess_flags, capture_stderr, kill_child, remove_pid, write_pid,
-};
+use crate::system::pid::{apply_subprocess_flags, capture_stderr, write_pid};
 use crate::system::proc::resolve_binary;
 
 /// Binary name for the pod-runner subprocess.
@@ -62,8 +63,9 @@ pub fn start(
     kubeconfig: &Path,
     imagesdir: Option<&str>,
     loglevel: LogLevel,
-    cp: &mut Child,
-) -> Child {
+    run: &Run,
+    components: &Components,
+) {
     info!("Starting {}...", BIN);
     let pr_bin = resolve_binary(BIN);
     let log_max_size = sys_cfg.log.max_size_mb.to_string();
@@ -102,11 +104,12 @@ pub fn start(
     }
     capture_stderr(&mut command, logdir, BIN);
     apply_subprocess_flags(&mut command);
-    let mut pr = command
-        .spawn()
+    let pr = Tracked::spawn(command, KM_KILL_TOKEN_VAR, &run.scope(BIN))
         .unwrap_or_else(|e| panic!("Failed to start {}: {}", BIN, e));
 
-    write_pid(pids, BIN, pr.id());
+    let pid = pr.pid();
+    write_pid(pids, BIN, pid);
+    components.register(BIN, pr);
 
     if !heartbeat::wait_until_ready(BIN, &heartbeat, sys_cfg.heartbeat.startup_timeout()) {
         // Claimed before the children are killed below, so the process
@@ -122,14 +125,10 @@ pub fn start(
                 heartbeat.display()
             ),
         });
-        kill_child(&mut pr, BIN);
-        kill_child(cp, control_plane::BIN);
-        remove_pid(pids, BIN);
-        remove_pid(pids, control_plane::BIN);
+        components.teardown(pids);
         std::process::exit(1);
     }
-    info!(pid = pr.id(), "{} ready", BIN);
-    pr
+    info!(pid, "{} ready", BIN);
 }
 
 /// Read the pod-runner's reported capacity (cpu, memoryGB, pods)

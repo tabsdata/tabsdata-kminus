@@ -3,6 +3,7 @@
 //! Cross-platform system primitives used by `km`: ports, files, PIDs,
 //! component heartbeats and the messages components report through.
 
+pub mod components;
 pub mod file;
 pub mod heartbeat;
 pub mod messages;
