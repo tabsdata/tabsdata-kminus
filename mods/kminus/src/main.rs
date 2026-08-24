@@ -1662,6 +1662,9 @@ async fn arm_and_wait_for_shutdown(armed: std::sync::mpsc::Sender<()>) -> String
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // Before Cli::parse: a re-exec'd graceful-shutdown helper must never
+    // reach the normal CLI (see kcommon::signal::ctrl_break_helper_hook).
+    kcommon::signal::ctrl_break_helper_hook();
     let cli = Cli::parse();
     match cli.command {
         Command::Create(args) => command_create(args),

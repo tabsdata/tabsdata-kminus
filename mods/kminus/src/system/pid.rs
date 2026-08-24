@@ -144,13 +144,16 @@ pub fn remove_dir_all_best_effort(path: &Path, what: &str) {
 
 /// Apply OS-specific creation flags so a spawned subprocess survives the
 /// parent's console/terminal closing. On Windows this sets
-/// `CREATE_NO_WINDOW`; on Unix this is a no-op.
+/// `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` — its own hidden console
+/// plus group leadership, keeping the invariant that everything this
+/// stack spawns on Windows can be addressed by a group CTRL_BREAK and is
+/// deaf to console events aimed at anyone else. On Unix this is a no-op.
 pub fn apply_detached_flags(command: &mut Command) {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
-        command.creation_flags(CREATE_NO_WINDOW);
+        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+        command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
     #[cfg(not(target_os = "windows"))]
     {

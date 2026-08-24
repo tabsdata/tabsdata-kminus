@@ -112,6 +112,73 @@ fn leads_own_group_rejects_a_mere_group_member() {
 #[cfg(windows)]
 #[test]
 fn leads_own_group_is_always_false_on_windows() {
-    // Windows has no process groups; the tree kill covers descendants.
+    // No leadership query exists on Windows; the tree kill covers
+    // descendants on the force path instead.
     assert!(!leads_own_group(std::process::id()));
+}
+
+/// A sleeper that owns a hidden console and leads its own process group —
+/// the shape of every process this stack spawns on Windows.
+#[cfg(windows)]
+fn own_console_group_sleeper() -> std::process::Child {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+
+    let mut c = Command::new("cmd");
+    c.args(["/C", "ping -n 31 127.0.0.1"]);
+    c.stdout(Stdio::null()).stderr(Stdio::null());
+    c.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    c.spawn().expect("spawn sleeper")
+}
+
+/// When the env var is set, this test *is* the console-event helper.
+/// libtest owns a test binary's `main`, so `ctrl_break_helper_hook` can
+/// never run here; the re-exec hop goes through a test filter instead
+/// (see `ctrl_break_reaches_a_no_window_process_group`). Without the env
+/// var it asserts nothing and passes.
+#[cfg(windows)]
+#[test]
+fn helper_reexec_entry() {
+    if let Ok(pid) = std::env::var("KCOMMON_TEST_CTRL_BREAK_PID") {
+        let pid: u32 = pid.parse().expect("pid in env var");
+        std::process::exit(ctrl_break_group(pid));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn ctrl_break_reaches_a_no_window_process_group() {
+    let mut child = own_console_group_sleeper();
+    let pid = child.id();
+    assert!(is_pid_alive(pid));
+
+    // The graceful ask, delivered the way request_graceful delivers it:
+    // a separate console-less process attaches to the target's console
+    // and raises CTRL_BREAK for its group.
+    let exe = std::env::current_exe().expect("test exe");
+    let status = Command::new(exe)
+        .args(["signal::tests::helper_reexec_entry", "--exact"])
+        .env("KCOMMON_TEST_CTRL_BREAK_PID", pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run helper");
+    assert!(
+        status.success(),
+        "helper could not attach and raise CTRL_BREAK: exit {status:?}",
+    );
+
+    // CTRL_BREAK's default handler exits the process.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if child.try_wait().expect("try_wait").is_some() {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            force_kill(pid);
+            let _ = child.wait();
+            panic!("CTRL_BREAK did not stop the target within 10s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }

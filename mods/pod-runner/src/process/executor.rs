@@ -1300,6 +1300,20 @@ impl ProcessExecutor {
             }
         }
 
+        #[cfg(windows)]
+        {
+            // The Windows shape of the setsid/setpgid block above: each
+            // container tree gets its own hidden console and leads its own
+            // process group. The group is what a graceful CTRL_BREAK (see
+            // kcommon::signal) can be aimed at; the private console keeps
+            // that event from spilling into the runner or sibling
+            // containers, which sharing our console would allow.
+            use windows_sys::Win32::System::Threading::{
+                CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+            };
+            cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+        }
+
         cmd.kill_on_drop(self.die_with_parent);
 
         let t_fork = std::time::Instant::now();

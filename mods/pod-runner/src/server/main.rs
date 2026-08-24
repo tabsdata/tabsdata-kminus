@@ -22,6 +22,10 @@ use pod_runner::store::multiplex::MultiplexStore;
 
 #[tokio::main]
 async fn main() {
+    // Before CliArgs::parse: a re-exec'd graceful-shutdown helper must
+    // never reach the normal CLI (see
+    // kcommon::signal::ctrl_break_helper_hook).
+    kcommon::signal::ctrl_break_helper_hook();
     // Parse CLI arguments and resolve configuration first so we know
     // the log directory. Logging is initialised below once we've
     // decided where to write.
