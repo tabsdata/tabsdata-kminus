@@ -1380,8 +1380,12 @@ impl ProcessExecutor {
                 }
                 // Remove PID file on exit
                 if let Some(ref path) = pid_file {
-                    let _ = std::fs::remove_file(path);
-                    debug!("PID file removed");
+                    match std::fs::remove_file(path) {
+                        Ok(()) => debug!("PID file removed"),
+                        Err(e) => {
+                            warn!(path = %path.display(), error = %e, "Cannot remove PID file")
+                        }
+                    }
                 }
                 exit_code
             }
@@ -1514,7 +1518,11 @@ pub fn cleanup_stale_pids(pid_dir: &Path) -> u32 {
         let expected_program = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(_) => {
-                let _ = std::fs::remove_file(&path);
+                // Unreadable content: drop the file; nothing can be verified
+                // against it.
+                if let Err(e) = std::fs::remove_file(&path) {
+                    warn!(path = %path.display(), error = %e, "Cannot remove unreadable PID file");
+                }
                 continue;
             }
         };
@@ -1550,8 +1558,12 @@ pub fn cleanup_stale_pids(pid_dir: &Path) -> u32 {
             }
         }
 
-        let _ = std::fs::remove_file(&path);
-        debug!(pid, "Stale PID file removed");
+        match std::fs::remove_file(&path) {
+            Ok(()) => debug!(pid, "Stale PID file removed"),
+            Err(e) => {
+                warn!(pid, path = %path.display(), error = %e, "Cannot remove stale PID file")
+            }
+        }
     }
 
     killed

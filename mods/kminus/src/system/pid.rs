@@ -30,7 +30,9 @@ pub fn pids_dir(workdir: &Path, bin: &str) -> PathBuf {
 /// purpose — so by the time anything reads one, the operating system has
 /// had every opportunity to hand the number to somebody else.
 pub fn write_pid(dir: &Path, name: &str, pid: u32) {
-    let _ = fs::create_dir_all(dir);
+    if let Err(e) = fs::create_dir_all(dir) {
+        warn!(dir = %dir.display(), error = %e, "Cannot create PID directory");
+    }
     let path = dir.join(format!("{}.{}", pid, name));
     let content = match identity::process_start_time(pid) {
         Some(secs) => identity::owner_identity(pid, secs),
@@ -46,7 +48,12 @@ pub fn write_pid(dir: &Path, name: &str, pid: u32) {
             format!("{}{}{}", pid, identity::OWNER_SEP, identity::UNKNOWN_STAMP)
         }
     };
-    let _ = fs::write(&path, content);
+    if let Err(e) = fs::write(&path, content) {
+        // This file is what `recorded` — the single-instance guard and the
+        // status/stop commands — reads. Running without it is running
+        // unobserved, which must not happen silently.
+        warn!(name, pid, path = %path.display(), error = %e, "Cannot write PID file");
+    }
 }
 
 /// What a PID file says about its subject.
@@ -109,9 +116,29 @@ pub fn remove_pid(dir: &Path, name: &str) {
         for entry in entries.flatten() {
             let fname = entry.file_name();
             if fname.to_string_lossy().ends_with(&format!(".{}", name)) {
-                let _ = fs::remove_file(entry.path());
+                remove_file_best_effort(&entry.path(), "PID file");
             }
         }
+    }
+}
+
+/// Remove a file, warning on any failure except the file already being
+/// gone — for hygiene removals where absence is the goal, so best-effort
+/// is the right semantics but a persistent failure must not be invisible.
+pub fn remove_file_best_effort(path: &Path, what: &str) {
+    if let Err(e) = fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(path = %path.display(), error = %e, "Cannot remove {what}");
+    }
+}
+
+/// [`remove_file_best_effort`], for a directory tree.
+pub fn remove_dir_all_best_effort(path: &Path, what: &str) {
+    if let Err(e) = fs::remove_dir_all(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(path = %path.display(), error = %e, "Cannot remove {what}");
     }
 }
 
@@ -334,7 +361,7 @@ pub fn cleanup_stale_pids(dir: &Path) {
         }
         let name = parts[1];
         stop_recorded(dir, name, Duration::from_secs(2));
-        let _ = fs::remove_file(entry.path());
+        remove_file_best_effort(&entry.path(), "stale PID file");
     }
 }
 

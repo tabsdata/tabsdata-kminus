@@ -326,7 +326,13 @@ fn provision_run_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
     for old in previous.iter().skip(PREV_RUN_DIRS_TO_KEEP) {
         // Best effort: on Windows a held handle can refuse the delete, and
         // that is fine — the directory is inert and a later start retries.
-        let _ = fs::remove_dir_all(old);
+        // Warned, not swallowed: a purge that fails on *every* start is
+        // unbounded disk growth, and this line is its only signal.
+        if let Err(e) = fs::remove_dir_all(old)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(dir = %old.display(), error = %e, "Cannot purge old run directory");
+        }
     }
     for kept in previous.iter().take(PREV_RUN_DIRS_TO_KEEP) {
         // Every pod in a previous run belonged to a previous incarnation of

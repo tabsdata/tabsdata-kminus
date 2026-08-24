@@ -439,3 +439,29 @@ fn cleanup_stale_pids_stops_a_verified_survivor() {
     assert!(!dir.join(format!("{}.sleeper", child.id())).exists());
     fs::remove_dir_all(&dir).ok();
 }
+
+// --- best-effort removals ------------------------------------------------------
+
+#[test]
+fn best_effort_removals_are_silent_only_about_absence() {
+    // Absence is the goal, so a missing target is success, not a failure
+    // to report — and crucially, not a panic on any platform.
+    remove_file_best_effort(Path::new("/nonexistent/km/pids/1.alpha"), "PID file");
+    remove_dir_all_best_effort(Path::new("/nonexistent/km/pids"), "PID directory");
+}
+
+#[test]
+fn write_pid_survives_an_unwritable_destination() {
+    // The parent is a file, so neither the directory nor the PID file can
+    // be created. The write is best-effort — a warn, never a panic — and
+    // leaves nothing behind that `recorded` could misread.
+    let dir = tempdir();
+    let blocker = dir.join("not-a-dir");
+    fs::write(&blocker, "x").unwrap();
+    let pids = blocker.join("pids");
+
+    write_pid(&pids, "alpha", std::process::id());
+
+    assert_eq!(recorded(&pids, "alpha"), Recorded::Absent);
+    fs::remove_dir_all(&dir).ok();
+}

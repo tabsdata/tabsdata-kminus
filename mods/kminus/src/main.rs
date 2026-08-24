@@ -42,7 +42,8 @@ use system::messages;
 #[cfg(target_os = "macos")]
 use system::pid::kill_descendants;
 use system::pid::{
-    BIN_KM, Recorded, cleanup_stale_pids, pids_dir, recorded, remove_pid, stop_recorded, write_pid,
+    BIN_KM, Recorded, cleanup_stale_pids, pids_dir, recorded, remove_dir_all_best_effort,
+    remove_file_best_effort, remove_pid, stop_recorded, write_pid,
 };
 use system::port::{PortCheck, check_ports, port_failures, probe_ports};
 
@@ -674,17 +675,22 @@ fn shutdown_from_pids(paths: &Paths, ports: Option<&KmPorts>) {
         Ok(None) => {}
         Err(e) => warn!(error = %e, "Cannot read seed; strays wait for the next start's sweep"),
     }
-    let _ = fs::remove_file(seed_file(&paths.workdir));
+    remove_file_best_effort(&seed_file(&paths.workdir), "seed file");
 
     // A SIP-hidden `/bin/sh` wrapper is invisible to the sweep but still
     // parented here. See `kill_descendants`.
     #[cfg(target_os = "macos")]
     kill_descendants(std::process::id());
 
-    let _ = fs::remove_dir_all(control_plane::pids_dir_in(&paths.workdir));
-    let _ = fs::remove_dir_all(virtual_kubelet::pids_dir_in(&paths.workdir));
+    remove_dir_all_best_effort(&control_plane::pids_dir_in(&paths.workdir), "PID directory");
+    remove_dir_all_best_effort(
+        &virtual_kubelet::pids_dir_in(&paths.workdir),
+        "PID directory",
+    );
 
     remove_pid(&paths.pids, BIN_KM);
+    // Opportunistic by design: fails whenever anything is still in the
+    // directory, which is not an error worth reporting.
     let _ = fs::remove_dir(&paths.pids);
     // A stopped instance must not read as ready; the km pid is gone too, so
     // this only guards against the marker outliving the directory sweep.
@@ -964,7 +970,7 @@ fn clear_regenerated_configs(configdir: &Path) {
         let p = configdir.join(name);
         if p.exists() {
             info!(file = %p.display(), "Removing stale config file");
-            let _ = fs::remove_file(&p);
+            remove_file_best_effort(&p, "stale config file");
         }
     }
 }
