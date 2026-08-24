@@ -3,14 +3,16 @@
 //! Virtual-kubelet subprocess: startup, readiness, status gathering.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 
 use tracing::info;
 
 use crate::config::KmSysConfig;
 use crate::process::{control_plane, pod_runner};
 use crate::system::heartbeat::{self, heartbeat_file};
-use crate::system::pid::{apply_subprocess_flags, kill_child, pids_dir, remove_pid, write_pid};
+use crate::system::pid::{
+    apply_subprocess_flags, capture_stderr, kill_child, pids_dir, remove_pid, write_pid,
+};
 use crate::system::proc::resolve_binary;
 
 /// Binary name for the virtual-kubelet subprocess.
@@ -65,9 +67,8 @@ pub fn start(
             heartbeat.to_str().unwrap(),
             "--heartbeat-secs",
             &heartbeat_secs,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        ]);
+    capture_stderr(&mut command, logdir, BIN);
     apply_subprocess_flags(&mut command);
     let mut vk = command
         .spawn()

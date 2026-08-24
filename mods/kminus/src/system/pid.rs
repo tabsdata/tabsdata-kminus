@@ -1,11 +1,11 @@
 // Copyright 2026 Tabsdata Inc.
 
 //! Process and PID-file helpers: PID files, liveness, cross-platform
-//! spawn flags, graceful and forceful termination.
+//! spawn flags, stderr capture, graceful and forceful termination.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use sysinfo::{Pid, ProcessStatus, ProcessesToUpdate, System};
@@ -102,6 +102,53 @@ pub fn apply_subprocess_flags(command: &mut Command) {
     #[cfg(not(any(target_os = "windows", unix)))]
     {
         let _ = command;
+    }
+}
+
+/// Filename extension of a component's captured standard error, giving
+/// `<logdir>/<bin>.err`.
+const STDERR_LOG_EXT: &str = "err";
+
+/// Path [`capture_stderr`] redirects `bin`'s standard error to.
+pub fn stderr_log(logdir: &Path, bin: &str) -> PathBuf {
+    logdir.join(format!("{}.{}", bin, STDERR_LOG_EXT))
+}
+
+/// Redirect a subprocess's standard error to [`stderr_log`], discarding
+/// its standard output.
+///
+/// Every component logs through its own rotating file, so its standard
+/// error is normally empty — which is precisely why it must not be thrown
+/// away. A process that dies without logging says why on that stream and
+/// nowhere else: a Rust abort prints `memory allocation of N bytes
+/// failed`, a panic prints its location and message, a Go runtime failure
+/// prints its stack. Discarded, such a death reaches km as a component
+/// log that simply stops mid-run, with nothing to say what ended it.
+///
+/// Truncated on every spawn, so the file describes the current run only.
+/// A component failure stops the whole stack rather than restarting it,
+/// so the file outlives the failure it recorded.
+///
+/// Best effort: a file that cannot be opened leaves the stream discarded
+/// instead of failing the start, since losing a diagnostic is a smaller
+/// harm than refusing to boot over one.
+pub fn capture_stderr(command: &mut Command, logdir: &Path, bin: &str) {
+    command.stdout(Stdio::null());
+    let path = stderr_log(logdir, bin);
+    let _ = fs::create_dir_all(logdir);
+    match fs::File::create(&path) {
+        Ok(file) => {
+            command.stderr(Stdio::from(file));
+        }
+        Err(e) => {
+            warn!(
+                bin,
+                path = %path.display(),
+                error = %e,
+                "Cannot capture stderr; discarding it",
+            );
+            command.stderr(Stdio::null());
+        }
     }
 }
 

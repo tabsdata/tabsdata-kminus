@@ -184,3 +184,94 @@ fn apply_subprocess_flags_puts_child_in_own_group() {
     let _ = signal::kill(NixPid::from_raw(pid as i32), Signal::SIGKILL);
     let _ = child.wait();
 }
+
+// --- stderr capture ---------------------------------------------------------
+
+/// A command that writes `text` to its standard error and exits.
+fn stderr_writer(text: &str) -> Command {
+    #[cfg(unix)]
+    {
+        let mut c = Command::new("sh");
+        c.args(["-c", &format!("echo {} 1>&2", text)]);
+        c
+    }
+    #[cfg(windows)]
+    {
+        let mut c = Command::new("cmd");
+        c.args(["/C", &format!("echo {} 1>&2", text)]);
+        c
+    }
+}
+
+#[test]
+fn stderr_log_names_file_after_bin() {
+    let p = stderr_log(Path::new("/tmp/logs"), "pod-runner");
+    assert_eq!(p, PathBuf::from("/tmp/logs/pod-runner.err"));
+}
+
+#[test]
+fn capture_stderr_writes_child_stderr_to_file() {
+    let logdir = tempdir();
+    let mut command = stderr_writer("boom");
+    capture_stderr(&mut command, &logdir, "alpha");
+    let mut child = command.spawn().expect("spawn");
+    assert!(child.wait().expect("wait").success());
+
+    let captured = fs::read_to_string(stderr_log(&logdir, "alpha")).expect("read capture");
+    assert!(
+        captured.contains("boom"),
+        "stderr should reach the file, got {:?}",
+        captured
+    );
+    fs::remove_dir_all(&logdir).ok();
+}
+
+#[test]
+fn capture_stderr_creates_missing_logdir() {
+    let logdir = tempdir().join("nested").join("deeper");
+    let mut command = stderr_writer("hello");
+    capture_stderr(&mut command, &logdir, "beta");
+    let mut child = command.spawn().expect("spawn");
+    let _ = child.wait();
+
+    assert!(stderr_log(&logdir, "beta").exists());
+    fs::remove_dir_all(&logdir).ok();
+}
+
+#[test]
+fn capture_stderr_truncates_previous_run() {
+    let logdir = tempdir();
+    let path = stderr_log(&logdir, "gamma");
+    fs::create_dir_all(&logdir).unwrap();
+    fs::write(&path, "stale output from an earlier run\n").unwrap();
+
+    // The file describes one run, so a fresh spawn must not append to
+    // whatever the previous one left behind.
+    let mut command = stderr_writer("fresh");
+    capture_stderr(&mut command, &logdir, "gamma");
+    let mut child = command.spawn().expect("spawn");
+    let _ = child.wait();
+
+    let captured = fs::read_to_string(&path).expect("read capture");
+    assert!(!captured.contains("stale"), "got {:?}", captured);
+    assert!(captured.contains("fresh"), "got {:?}", captured);
+    fs::remove_dir_all(&logdir).ok();
+}
+
+#[test]
+fn capture_stderr_falls_back_when_logdir_unusable() {
+    // A path whose parent is a regular file can be neither created nor
+    // opened, which must leave the spawn working rather than failing it.
+    let dir = tempdir();
+    let blocker = dir.join("not-a-dir");
+    fs::write(&blocker, "x").unwrap();
+    let logdir = blocker.join("logs");
+
+    let mut command = stderr_writer("ignored");
+    capture_stderr(&mut command, &logdir, "delta");
+    let mut child = command.spawn().expect("spawn must still succeed");
+    let _ = child.wait();
+
+    assert!(!stderr_log(&logdir, "delta").exists());
+    fs::remove_dir_all(&dir).ok();
+}

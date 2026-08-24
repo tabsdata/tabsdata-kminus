@@ -4,7 +4,7 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 
 use tracing::info;
 
@@ -12,7 +12,9 @@ use crate::config::KmSysConfig;
 use crate::loglevel::LogLevel;
 use crate::process::control_plane;
 use crate::system::heartbeat::{self, heartbeat_file};
-use crate::system::pid::{apply_subprocess_flags, kill_child, remove_pid, write_pid};
+use crate::system::pid::{
+    apply_subprocess_flags, capture_stderr, kill_child, remove_pid, write_pid,
+};
 use crate::system::proc::resolve_binary;
 
 /// Binary name for the pod-runner subprocess.
@@ -71,36 +73,34 @@ pub fn start(
     let heartbeat_secs = sys_cfg.heartbeat.interval().as_secs().to_string();
     heartbeat::clear(&heartbeat);
     let mut command = Command::new(&pr_bin);
-    command
-        .args([
-            "--kubeconfig",
-            kubeconfig.to_str().unwrap(),
-            "--configdir",
-            configdir.to_str().unwrap(),
-            "--workdir",
-            workdir.to_str().unwrap(),
-            "--logdir",
-            logdir.to_str().unwrap(),
-            "--logmaxsizemb",
-            &log_max_size,
-            "--logmaxfiles",
-            &log_max_files,
-            "--loglevel",
-            &loglevel,
-            "--port",
-            port_pr,
-            "--metrics-port",
-            port_pr_metrics,
-            "--heartbeat-file",
-            heartbeat.to_str().unwrap(),
-            "--heartbeat-secs",
-            &heartbeat_secs,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    command.args([
+        "--kubeconfig",
+        kubeconfig.to_str().unwrap(),
+        "--configdir",
+        configdir.to_str().unwrap(),
+        "--workdir",
+        workdir.to_str().unwrap(),
+        "--logdir",
+        logdir.to_str().unwrap(),
+        "--logmaxsizemb",
+        &log_max_size,
+        "--logmaxfiles",
+        &log_max_files,
+        "--loglevel",
+        &loglevel,
+        "--port",
+        port_pr,
+        "--metrics-port",
+        port_pr_metrics,
+        "--heartbeat-file",
+        heartbeat.to_str().unwrap(),
+        "--heartbeat-secs",
+        &heartbeat_secs,
+    ]);
     if let Some(dir) = imagesdir {
         command.args(["--imagesdir", dir]);
     }
+    capture_stderr(&mut command, logdir, BIN);
     apply_subprocess_flags(&mut command);
     let mut pr = command
         .spawn()

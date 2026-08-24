@@ -12,8 +12,8 @@ use tracing::info;
 use crate::config::KmSysConfig;
 use crate::system::heartbeat::{self, heartbeat_file};
 use crate::system::pid::{
-    DATA_DIR, apply_detached_flags, apply_subprocess_flags, kill_child, pids_dir, remove_pid,
-    write_pid,
+    DATA_DIR, apply_detached_flags, apply_subprocess_flags, capture_stderr, kill_child, pids_dir,
+    remove_pid, write_pid,
 };
 use crate::system::proc::resolve_binary;
 
@@ -147,40 +147,38 @@ pub fn start(
     let startup_secs = sys_cfg.heartbeat.startup_timeout().as_secs().to_string();
     heartbeat::clear(&heartbeat);
     let mut command = Command::new(&cp_bin);
-    command
-        .args([
-            "-workdir",
-            workdir.to_str().unwrap(),
-            "-configdir",
-            configdir.to_str().unwrap(),
-            "-logdir",
-            logdir.to_str().unwrap(),
-            "-logmaxsizemb",
-            &log_max_size,
-            "-logmaxfiles",
-            &log_max_files,
-            "-port",
-            port_api,
-            "-kcm-port",
-            port_kcm,
-            "-etcd-port",
-            &port_etcd,
-            "-etcd-peer-port",
-            &port_etcd_peer,
-            "-heartbeat-file",
-            heartbeat.to_str().unwrap(),
-            "-heartbeat-secs",
-            &heartbeat_secs,
-            "-max-missed-heartbeats",
-            &max_missed,
-            // Its own budget, not the steady-state one: the control-plane
-            // applies it to etcd, the API server and kube-controller-manager
-            // all answering their health probes.
-            "-startup-secs",
-            &startup_secs,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    command.args([
+        "-workdir",
+        workdir.to_str().unwrap(),
+        "-configdir",
+        configdir.to_str().unwrap(),
+        "-logdir",
+        logdir.to_str().unwrap(),
+        "-logmaxsizemb",
+        &log_max_size,
+        "-logmaxfiles",
+        &log_max_files,
+        "-port",
+        port_api,
+        "-kcm-port",
+        port_kcm,
+        "-etcd-port",
+        &port_etcd,
+        "-etcd-peer-port",
+        &port_etcd_peer,
+        "-heartbeat-file",
+        heartbeat.to_str().unwrap(),
+        "-heartbeat-secs",
+        &heartbeat_secs,
+        "-max-missed-heartbeats",
+        &max_missed,
+        // Its own budget, not the steady-state one: the control-plane
+        // applies it to etcd, the API server and kube-controller-manager
+        // all answering their health probes.
+        "-startup-secs",
+        &startup_secs,
+    ]);
+    capture_stderr(&mut command, logdir, BIN);
     apply_subprocess_flags(&mut command);
     let mut cp = command
         .spawn()
