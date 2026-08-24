@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use serial_test::serial;
 
 use super::*;
-use crate::token::{KM_KILL_TOKEN_VAR, Run, Seed};
+use crate::token::{KM_KILL_TOKEN_VAR, Run};
 
 /// Environment variable selecting [`scan_test_helper_process`] when the
 /// test binary is re-executed.
@@ -82,12 +82,12 @@ fn killed(child: &mut Child) -> bool {
 
 /// A run token rooted in a live owner — this process.
 fn own_run() -> Run {
-    Run::of(&Seed::parse("scan-test-seed").unwrap())
+    Run::current()
 }
 
 /// A token whose owner can never be found running.
 fn dead_owner_token(scope: &str) -> String {
-    format!("dead-seed/{UNUSED_PID}@20260823T173004Z/{scope}")
+    format!("{UNUSED_PID}@20260823T173004Z.000/{scope}")
 }
 
 // The sweeps read and signal across the whole host, so tests spawning

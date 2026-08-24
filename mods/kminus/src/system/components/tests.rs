@@ -3,7 +3,7 @@
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use kcommon::token::{KM_KILL_TOKEN_VAR, Run, Seed};
+use kcommon::token::{KM_KILL_TOKEN_VAR, Run};
 use kcommon::tracked::{Exit, Tracked};
 
 use super::*;
@@ -13,7 +13,9 @@ use crate::system::pid::write_pid;
 // (the SIP readback limitation only affects scans).
 
 fn run() -> Run {
-    Run::of(&Seed::parse("components-test-seed").unwrap())
+    // Rooted in this live process, so host-wide dead-owner sweeps in other
+    // tests can never mistake these children for strays.
+    Run::current()
 }
 
 fn track(script: &str, scope: &str) -> Tracked {

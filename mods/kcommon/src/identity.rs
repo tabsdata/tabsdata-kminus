@@ -48,10 +48,17 @@ pub fn owner_identity(pid: u32, start_time_secs: u64) -> String {
 }
 
 /// Split an identity into its pid and start stamp. `None` for anything
-/// that is not `<pid>@<stamp>` — unverifiable, which callers must never
-/// act on as though confirmed.
+/// that is not `<pid>@<stamp>[.<suffix>]` — unverifiable, which callers
+/// must never act on as though confirmed.
+///
+/// A `.<suffix>` after the stamp is uniqueness data a minter appended
+/// (mint-time milliseconds, typically) and is not part of the verifiable
+/// identity: the stamp is compared against the OS-reported start time,
+/// which has seconds only — and mint-time can even disagree with the OS
+/// second, so folding the suffix in would fail live owners.
 pub fn parse_owner(owner: &str) -> Option<(u32, &str)> {
     let (pid, stamp) = owner.split_once(OWNER_SEP)?;
+    let stamp = stamp.split('.').next().unwrap_or(stamp);
     Some((pid.parse().ok()?, stamp))
 }
 

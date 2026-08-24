@@ -20,21 +20,24 @@
 //! # Shape
 //!
 //! ```text
-//! <seed>/<pid>@<start-stamp>[/<scope>...]
+//! <pid>@<start-stamp>.<millis>[/<scope>...]
 //! ```
 //!
-//! The **seed** is minted once per run of a launcher and persisted by it,
-//! so the *next* run can read it back and reclaim whatever the previous
-//! one left behind — that is the only state that crosses restarts. The
-//! **owner** field is the launching process's identity, which is what
-//! makes a token verifiable rather than trusted: the run it names is over
+//! The **root** is the launching process's identity, which is what makes
+//! a token verifiable rather than trusted: the run it names is over
 //! exactly when no live process has both that pid and that start time, a
 //! question [`crate::identity::running_since`] answers with no file in
-//! sight. It is also what protects a live stack if two launchers ever
-//! overlap — their tokens differ even if a seed file was misread.
+//! sight. The fixed-width **millis** are mint-time, uniqueness only —
+//! never verified (the OS reports start times in seconds, and mint time
+//! can even disagree with the OS second) — and exist so two runs landing
+//! on the same pid within the same second still have distinct prefixes.
 //! **Scopes** nest below, one path segment per level, so a prefix at any
 //! depth selects everything under it: one process-table pass can cover a
 //! single container, a whole pod, or everything a runner ever started.
+//!
+//! A launcher that must reclaim across restarts persists its root to a
+//! file ([`Run::save`]/[`Run::load`]) and prefix-sweeps it next start;
+//! the dead-owner sweep needs no file at all.
 //!
 //! # Limits
 //!
@@ -88,37 +91,48 @@ pub fn carry_kill_tokens(
     }
 }
 
-/// A launcher run's seed: the one piece of token state that crosses
-/// restarts, by being written to a file the next run reads.
+/// This run's token root: `<pid>@<stamp>.<millis>`, extended per child
+/// with [`Run::scope`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Seed(String);
+pub struct Run(String);
 
-impl Seed {
-    /// Mint a fresh seed: a millisecond UTC stamp plus this process's
-    /// pid — readable, unique per run, separator-free by construction.
-    pub fn generate() -> Self {
-        let now = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
-        Seed(format!("{}-{}", now, std::process::id()))
+impl Run {
+    /// Mint this process's run root: its verifiable identity plus
+    /// fixed-width mint-time milliseconds for uniqueness.
+    pub fn current() -> Self {
+        let pid = std::process::id();
+        let owner = match identity::process_start_time(pid) {
+            Some(secs) => identity::owner_identity(pid, secs),
+            // Unverifiable on purpose: a token nobody can confirm alive is
+            // reclaimed by the next run's sweep, which for an identity
+            // that could not even be read is the safe direction.
+            None => format!("{}{}{}", pid, identity::OWNER_SEP, identity::UNKNOWN_STAMP),
+        };
+        let millis = chrono::Utc::now().timestamp_subsec_millis();
+        Run(format!("{owner}.{millis:03}"))
     }
 
-    /// A seed from persisted text. Rejects separators and whitespace — a
-    /// seed containing `/` would silently become two token fields.
+    /// A run root from persisted text. Rejects anything that could not
+    /// have been minted here: no owner separator, whitespace or control
+    /// characters, or a scope separator — a persisted root carries no
+    /// scopes, and one with a `/` would sweep more than it names.
     pub fn parse(text: &str) -> io::Result<Self> {
         let text = text.trim();
-        let valid = !text.is_empty()
+        let valid = text.contains(identity::OWNER_SEP)
+            && !text.is_empty()
             && text
                 .chars()
-                .all(|c| !c.is_whitespace() && !c.is_control() && c != FIELD_SEP && c != '@');
+                .all(|c| !c.is_whitespace() && !c.is_control() && c != FIELD_SEP);
         if !valid {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("not a valid kill-token seed: {text:?}"),
+                format!("not a valid run token root: {text:?}"),
             ));
         }
-        Ok(Seed(text.to_string()))
+        Ok(Run(text.to_string()))
     }
 
-    /// Read the seed a previous run persisted. A missing file is `None`;
+    /// Read the root a previous run persisted. A missing file is `None`;
     /// garbage is an error, not `None` — silently skipping reclamation
     /// would be the wrong reading of it.
     pub fn load(path: &Path) -> io::Result<Option<Self>> {
@@ -129,42 +143,13 @@ impl Seed {
         }
     }
 
-    /// Persist this seed for the next run to reclaim against. Call before
+    /// Persist this root for the next run to reclaim against. Call before
     /// spawning anything under it.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         fs::write(path, &self.0)
-    }
-
-    /// Token prefix selecting everything any run of this seed started.
-    pub fn as_prefix(&self) -> String {
-        format!("{}{}", self.0, FIELD_SEP)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// This run's token root: `<seed>/<pid>@<stamp>`, extended per child with
-/// [`Run::scope`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Run(String);
-
-impl Run {
-    /// Root a run under `seed` with this process's identity.
-    pub fn of(seed: &Seed) -> Self {
-        let pid = std::process::id();
-        let owner = match identity::process_start_time(pid) {
-            Some(secs) => identity::owner_identity(pid, secs),
-            // Unverifiable on purpose: a token nobody can confirm alive is
-            // reclaimed by the next run's sweep, which for an identity
-            // that could not even be read is the safe direction.
-            None => format!("{}{}{}", pid, identity::OWNER_SEP, identity::UNKNOWN_STAMP),
-        };
-        Run(format!("{}{}{}", seed.0, FIELD_SEP, owner))
     }
 
     /// A token one scope below this one: `<self>/<name>`. `name` must not
@@ -184,10 +169,9 @@ impl Run {
     }
 }
 
-/// The owner field of a token: the `<pid>@<stamp>` between the seed and
-/// the scopes. `None` for text that does not have one.
-pub fn owner_of(token: &str) -> Option<&str> {
-    token.split(FIELD_SEP).nth(1)
+/// The owner field of a token: the root before any scopes.
+pub fn owner_of(token: &str) -> &str {
+    token.split(FIELD_SEP).next().unwrap_or(token)
 }
 
 #[cfg(test)]

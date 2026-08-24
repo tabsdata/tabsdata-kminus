@@ -22,15 +22,15 @@
 //! Every container is spawned with [`PR_KILL_TOKEN_VAR`] in its
 //! environment. The grammar, the scan and the signalling are
 //! [`kcommon::token`] and [`kcommon::scan`]'s; what is pod-runner's is the
-//! scope layering below the owner — `<seed>/<runner>/<pod>/<container>` —
+//! scope layering below the owner — `<runner>/<pod>/<container>` —
 //! and the async throttling around a scan, which exists because a mass
 //! teardown starts one sweep per pod and a runtime is on hand to keep
 //! them from all walking the process table at once.
 //!
-//! The runner's seed is minted fresh per run and deliberately not
-//! persisted: reclamation after a dead pod-runner rides on the owner
-//! field alone ([`kill_dead_runner_orphans`]), which needs no file — a
-//! run is over exactly when no live process has its pid *and* start time.
+//! No run-token file is persisted: reclamation after a dead pod-runner
+//! rides on the owner field alone ([`kill_dead_runner_orphans`]), which
+//! needs no file — a run is over exactly when no live process has its pid
+//! *and* start time.
 //!
 //! Three sweeps:
 //!
@@ -46,7 +46,7 @@ use std::sync::OnceLock;
 
 use kcommon::scan::{Found, Scan, kill_found, kill_strays_of_dead_runs, terminate_found};
 pub use kcommon::token::PR_KILL_TOKEN_VAR;
-use kcommon::token::{Run, Seed};
+use kcommon::token::Run;
 use tracing::{debug, warn};
 
 /// How many process-table scans may run at once.
@@ -68,13 +68,13 @@ const MAX_CONCURRENT_SCANS: usize = 1;
 /// Permits for [`MAX_CONCURRENT_SCANS`].
 static SCAN_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_SCANS);
 
-/// This pod-runner's token root: `<seed>/<pid>@<start-stamp>`. The start
-/// stamp is what keeps a restarted runner that landed on its
+/// This pod-runner's token root: `<pid>@<start-stamp>.<millis>`. The
+/// start stamp is what keeps a restarted runner that landed on its
 /// predecessor's PID from reading that run's orphans as its own.
 /// Resolved once, so every token this process writes agrees.
 fn runner_run() -> &'static Run {
     static RUNNER: OnceLock<Run> = OnceLock::new();
-    RUNNER.get_or_init(|| Run::of(&Seed::generate()))
+    RUNNER.get_or_init(Run::current)
 }
 
 /// Token prefix shared by every container of one pod:
@@ -260,7 +260,7 @@ mod tests {
     /// A full container token under an owner that can never be found
     /// running — the shape a previous, dead run's token has.
     fn dead_runner_token(pod: &str, container: &str) -> String {
-        format!("dead-seed/{UNUSED_PID}{OWNER_SEP}20260822T143205Z/{pod}/{container}")
+        format!("{UNUSED_PID}{OWNER_SEP}20260822T143205Z.000/{pod}/{container}")
     }
 
     /// Shutdown receiver for spawns that never need to signal shutdown.
@@ -318,7 +318,7 @@ mod tests {
         // identity, and that it is this process's.
         let run = runner_run();
         assert_eq!(run.as_str(), runner_run().as_str(), "must not change");
-        let owner = kcommon::token::owner_of(run.as_str()).expect("owner field");
+        let owner = kcommon::token::owner_of(run.as_str());
         let (pid, stamp) = kcommon::identity::parse_owner(owner).expect("pid@stamp");
         assert_eq!(pid, std::process::id());
         assert!(
@@ -369,10 +369,7 @@ mod tests {
         assert!(!scan.owner_alive(&dead_runner_token("p_u", "c")));
         // Our own PID, but not our start time: exactly what a restarted
         // pod-runner that landed on its predecessor's PID looks like.
-        let recycled = format!(
-            "stale-seed/{}{OWNER_SEP}{UNKNOWN_STAMP}/p_u/c",
-            std::process::id()
-        );
+        let recycled = format!("{}{OWNER_SEP}{UNKNOWN_STAMP}.000/p_u/c", std::process::id());
         assert!(!scan.owner_alive(&recycled));
     }
 
@@ -596,7 +593,7 @@ mod tests {
         let vanished = spawn_helper(&dead_runner_token("gone_uid", "main"), HELPER_SLEEP).await;
         let recycled = spawn_helper(
             &format!(
-                "stale-seed/{}{OWNER_SEP}{UNKNOWN_STAMP}/stale_uid/main",
+                "{}{OWNER_SEP}{UNKNOWN_STAMP}.000/stale_uid/main",
                 std::process::id()
             ),
             HELPER_SLEEP,

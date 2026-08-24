@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::token::{KM_KILL_TOKEN_VAR, Run, Seed};
+use crate::token::{KM_KILL_TOKEN_VAR, Run};
 
 /// Environment variable selecting [`tracked_test_helper_process`] when the
 /// test binary is re-executed. A cargo-built helper rather than a shell,
@@ -78,7 +78,9 @@ fn helper_command(mode: &str) -> Command {
 }
 
 fn run() -> Run {
-    Run::of(&Seed::parse("tracked-test-seed").unwrap())
+    // Rooted in this live process, so the host-wide dead-owner sweeps in
+    // other tests can never mistake these children for strays.
+    Run::current()
 }
 
 fn spawn(mode: &str, scope: &str) -> Tracked {

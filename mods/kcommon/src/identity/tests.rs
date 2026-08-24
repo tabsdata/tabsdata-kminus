@@ -107,3 +107,17 @@ fn running_since_rejects_a_zombie() {
 
     let _ = child.wait();
 }
+
+#[test]
+fn parse_owner_ignores_a_uniqueness_suffix() {
+    // The suffix is mint-time millis, not identity: verification must see
+    // the bare stamp or it would never match the OS-reported start time.
+    assert_eq!(
+        parse_owner("4711@20260823T173004Z.718"),
+        Some((4711, "20260823T173004Z"))
+    );
+    assert_eq!(
+        parse_owner("4711@20260823T173004Z"),
+        Some((4711, "20260823T173004Z"))
+    );
+}

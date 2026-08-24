@@ -32,7 +32,7 @@ use loglevel::LogLevel;
 use config::{KM_SYSCONFIG_FILE, KmHeartbeat, KmPorts, KmSysConfig};
 use exit::ExitReason;
 use kcommon::scan::{kill_strays_of_dead_runs, kill_until_clean};
-use kcommon::token::{KM_KILL_TOKEN_VAR, Run, Seed};
+use kcommon::token::{KM_KILL_TOKEN_VAR, Run};
 use kcommon::tracked::Exit;
 use process::{control_plane, pod_runner, virtual_kubelet};
 use system::components::Components;
@@ -557,19 +557,19 @@ const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Filename of the seed file under `<workdir>/data/km/`, next to the PID
 /// files: the one piece of kill-token state that crosses restarts, so the
 /// next run can reclaim whatever this one leaves behind.
-const KM_SEED_FILE: &str = "seed";
+const KM_RUN_TOKEN_FILE: &str = "run-token";
 
 /// How many fresh-scan sweep rounds a teardown gives stragglers. Round two
 /// exists for processes forked between a scan and its signals; round three
 /// is margin. An adversarial forker exhausts this and is reported.
 const SWEEP_ROUNDS: usize = 3;
 
-/// Path of the kill-token seed file for the instance at `workdir`.
-fn seed_file(workdir: &Path) -> PathBuf {
+/// Path of the run-token file for the instance at `workdir`.
+fn run_token_file(workdir: &Path) -> PathBuf {
     workdir
         .join(system::pid::DATA_DIR)
         .join(BIN_KM)
-        .join(KM_SEED_FILE)
+        .join(KM_RUN_TOKEN_FILE)
 }
 
 fn shutdown_grace_for(name: &str) -> Duration {
@@ -665,21 +665,20 @@ fn shutdown_from_pids(paths: &Paths, ports: Option<&KmPorts>) {
         remove_pid(&paths.pids, name);
     }
 
-    // Everything the named teardown could not reach: a component that died
-    // abruptly leaves its own children running, reparented away from the
-    // tree above, and a process spawned just before the signal arrived may
-    // never have made a PID file. They still carry this instance's token,
-    // which is the only thing that still names them. The seed file covers
-    // km's own shutdown (it holds this run's seed) and a `km stop` that is
-    // cleaning up after a dead km (it holds that run's).
-    match Seed::load(&seed_file(&paths.workdir)) {
-        Ok(Some(seed)) => {
-            kill_until_clean(KM_KILL_TOKEN_VAR, &seed.as_prefix(), SWEEP_ROUNDS);
+    // Everything the named teardown could not reach — children reparented
+    // away, spawns that never made a PID file — still carries this
+    // instance's token. The run-token file serves both km's own shutdown
+    // and a `km stop` cleaning up after a dead km.
+    match Run::load(&run_token_file(&paths.workdir)) {
+        Ok(Some(run)) => {
+            kill_until_clean(KM_KILL_TOKEN_VAR, run.as_prefix(), SWEEP_ROUNDS);
         }
         Ok(None) => {}
-        Err(e) => warn!(error = %e, "Cannot read seed; strays wait for the next start's sweep"),
+        Err(e) => {
+            warn!(error = %e, "Cannot read run token; strays wait for the next start's sweep")
+        }
     }
-    remove_file_best_effort(&seed_file(&paths.workdir), "seed file");
+    remove_file_best_effort(&run_token_file(&paths.workdir), "run-token file");
 
     // A SIP-hidden `/bin/sh` wrapper is invisible to the sweep but still
     // parented here. See `kill_descendants`.
@@ -1215,32 +1214,34 @@ fn command_start(args: StartArgs) {
     fs::create_dir_all(&paths.pids).ok();
     write_pid(&paths.pids, BIN_KM, std::process::id());
 
-    // Reclaim the previous life. Its seed file names everything it ever
-    // started — including processes that escaped their groups and were
-    // reparented, which no PID file or parent link can reach — and the
-    // dead-owner sweep behind it covers runs whose seed file was lost.
+    // Reclaim the previous life. Its run-token file names everything it
+    // ever started — including processes that escaped their groups and
+    // were reparented, which no PID file or parent link can reach — and
+    // the dead-owner sweep behind it covers runs whose file was lost.
     // Safe next to a *concurrent* instance because the single-instance
     // guard above is identity-verified, and because a dead owner is
     // decidable from a token alone.
-    let seed_path = seed_file(&paths.workdir);
-    match Seed::load(&seed_path) {
+    let token_path = run_token_file(&paths.workdir);
+    match Run::load(&token_path) {
         Ok(Some(previous)) => {
-            kill_until_clean(KM_KILL_TOKEN_VAR, &previous.as_prefix(), SWEEP_ROUNDS);
+            kill_until_clean(KM_KILL_TOKEN_VAR, previous.as_prefix(), SWEEP_ROUNDS);
         }
         Ok(None) => {}
-        Err(e) => warn!(error = %e, "Cannot read previous seed; relying on the dead-owner sweep"),
+        Err(e) => {
+            warn!(error = %e, "Cannot read previous run token; relying on the dead-owner sweep")
+        }
     }
     kill_strays_of_dead_runs(KM_KILL_TOKEN_VAR);
 
-    // Mint and persist this run's seed before anything is spawned, so a
-    // km that dies mid-startup still left the trail the next run needs.
-    let seed = Seed::generate();
-    if let Err(e) = seed.save(&seed_path) {
-        // Startable, but the next run cannot reclaim by seed — only by
+    // Mint and persist this run's token root before anything is spawned,
+    // so a km that dies mid-startup still left the trail the next run
+    // needs.
+    let run = Run::current();
+    if let Err(e) = run.save(&token_path) {
+        // Startable, but the next run cannot reclaim by prefix — only by
         // dead owner. Worth a loud line, not a refusal to boot.
-        warn!(error = %e, path = %seed_path.display(), "Cannot persist kill-token seed");
+        warn!(error = %e, path = %token_path.display(), "Cannot persist run token");
     }
-    let run = Run::of(&seed);
     info!(token = run.as_str(), "Kill token for this run");
 
     let vk_kubeconfig = paths.configdir.join(control_plane::VK_KUBECONFIG_FILE);

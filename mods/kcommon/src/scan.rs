@@ -72,7 +72,7 @@ impl Scan {
     /// Whether the run named by `token`'s owner field is still running,
     /// judged against this snapshot.
     pub fn owner_alive(&self, token: &str) -> bool {
-        let Some((pid, stamp)) = token::owner_of(token).and_then(identity::parse_owner) else {
+        let Some((pid, stamp)) = identity::parse_owner(token::owner_of(token)) else {
             return true;
         };
         match self.0.process(Pid::from_u32(pid)) {
