@@ -182,6 +182,14 @@ struct StartArgs {
     /// pod-runner's. Independent of `RUST_LOG`, which is ignored.
     #[arg(long, value_enum, default_value_t = LogLevel::Debug)]
     loglevel: LogLevel,
+
+    /// Delete every workload a previous run left in the cluster —
+    /// cronjobs, deployments, replicasets, jobs, and their pods — after
+    /// the control-plane is up and before the virtual-kubelet starts, so
+    /// nothing stale is dispatched only to be killed. Secrets, configmaps
+    /// and every other non-workload resource are left untouched.
+    #[arg(long)]
+    purge: bool,
 }
 
 /// Stop-time arguments. Terminates a running instance.
@@ -1307,6 +1315,12 @@ fn command_start(args: StartArgs) {
     phase = step("Cleaning up stale node resources");
     control_plane::cleanup_stale_node_resources(&kubeconfig);
     step_done(phase);
+
+    if args.purge {
+        phase = step("Purging previous-run workloads");
+        control_plane::purge_workloads(&kubeconfig);
+        step_done(phase);
+    }
 
     phase = step("Starting virtual-kubelet");
     virtual_kubelet::start(

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::KmSysConfig;
 use crate::system::heartbeat::{self, heartbeat_file};
@@ -285,6 +285,85 @@ pub fn cleanup_stale_node_resources(kubeconfig: &Path) {
     let _ = delete_leases.status();
 }
 
+/// Delete every workload a previous run left in the cluster: pod owners
+/// first (cronjobs, deployments, replicasets, jobs), then the pods
+/// themselves. Secrets, configmaps and every other non-workload resource
+/// are left untouched.
+///
+/// Runs after the control-plane is up and before the virtual-kubelet
+/// starts, so stale pods are never dispatched only to be killed. That
+/// same absence is why the pod pass must force-delete: a normal delete
+/// waits for a kubelet — not there — to confirm a termination that
+/// already happened, since the processes those pods described died with
+/// the run that owned them.
+///
+/// Owners go first because the controller-manager is already running: an
+/// owner marked for deletion stops reproducing, so by the time the pod
+/// pass lists its victims nothing recreates them.
+pub fn purge_workloads(kubeconfig: &Path) {
+    let kmc = resolve_binary(BIN_KMC);
+    if !kmc.exists() {
+        warn!(kmc = %kmc.display(), "kmc not found; cannot purge workloads");
+        return;
+    }
+    info!("Purging previous-run workloads...");
+    purge(
+        &kmc,
+        kubeconfig,
+        &[
+            "delete",
+            "cronjobs,deployments,replicasets,jobs",
+            "--all",
+            "--all-namespaces",
+            "--ignore-not-found",
+            "--wait=false",
+        ],
+        "workload owners",
+    );
+    purge(
+        &kmc,
+        kubeconfig,
+        &[
+            "delete",
+            "pods",
+            "--all",
+            "--all-namespaces",
+            "--force",
+            "--grace-period=0",
+            "--ignore-not-found",
+            "--wait=false",
+        ],
+        "pods",
+    );
+}
+
+/// One `kmc delete` pass, reporting how many objects fell.
+fn purge(kmc: &Path, kubeconfig: &Path, args: &[&str], what: &str) {
+    let mut command = Command::new(kmc);
+    command
+        .arg("--kubeconfig")
+        .arg(kubeconfig)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    apply_detached_flags(&mut command);
+    match command.output() {
+        Ok(out) => {
+            // kubectl prints one line per deleted object.
+            let deleted = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .count();
+            if out.status.success() {
+                info!(deleted, what, "Purged");
+            } else {
+                warn!(deleted, what, status = %out.status, "Purge did not complete cleanly");
+            }
+        }
+        Err(e) => warn!(what, error = %e, "Cannot run kmc to purge"),
+    }
+}
+
 /// Query K8s for pods scheduled on `node_name`. Returns the raw
 /// `kmc get pods --no-headers` lines, or empty on any failure.
 pub fn list_pods_on_node(kubeconfig: &Path, node_name: &str) -> Vec<String> {
@@ -451,6 +530,13 @@ mod tests {
     fn cleanup_stale_node_resources_no_kmc_no_op() {
         let dir = tempdir();
         cleanup_stale_node_resources(&dir.join("kubeconfig"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn purge_workloads_no_kmc_no_op() {
+        let dir = tempdir();
+        purge_workloads(&dir.join("kubeconfig"));
         fs::remove_dir_all(&dir).ok();
     }
 
