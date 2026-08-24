@@ -839,6 +839,9 @@ fn pump_stream(
 /// automatically — no leaked tasks.
 pub struct ExecutorHandle {
     pid: u32,
+    /// Creation time of the process `pid` referred to at spawn, used to
+    /// reject a recycled PID before signalling it.
+    start_time: Option<u64>,
     wait_handle: JoinHandle<i32>,
     cached_exit_code: Option<i32>,
     /// I/O pump tasks. Joined by [`wait`] to ensure all output is
@@ -908,9 +911,21 @@ impl ExecutorHandle {
         None
     }
 
+    /// Whether `pid` still refers to the process this handle was created
+    /// for, rather than to a later process that inherited the number.
+    fn owns_pid(&self) -> bool {
+        if !is_pid_alive(self.pid) {
+            return false;
+        }
+        match (self.start_time, process_start_time(self.pid)) {
+            (Some(spawned), Some(current)) => spawned == current,
+            _ => true,
+        }
+    }
+
     /// Send SIGTERM to the process and all its descendants without waiting.
     pub fn send_sigterm(&self) {
-        if is_pid_alive(self.pid) {
+        if self.owns_pid() {
             send_sigterm_group(self.pid);
             debug!(pid = self.pid, "SIGTERM sent to process group");
         }
@@ -926,7 +941,24 @@ impl ExecutorHandle {
     pub async fn kill(&mut self, grace_period: Duration) {
         let kill_start = std::time::Instant::now();
 
-        if !is_pid_alive(self.pid) {
+        // `wait_handle` is consumed the first time it completes, and polling a
+        // consumed JoinHandle panics. A cancelled `wait()` can cache the exit
+        // code and still be dropped before returning, so the cache — not the
+        // handle — is what says the process was already reaped.
+        if self.cached_exit_code.is_some() {
+            debug!(
+                pid = self.pid,
+                elapsed_ms = kill_start.elapsed().as_millis(),
+                "Kill: already reaped"
+            );
+            return;
+        }
+
+        // `wait_handle` is consumed the first time it completes, and polling a
+        // consumed JoinHandle panics. A cancelled `wait()` can cache the exit
+        // code and still be dropped before returning, so the cache — not the
+        // handle — is what says the process was already reaped.
+        if !self.owns_pid() {
             debug!(
                 pid = self.pid,
                 elapsed_ms = kill_start.elapsed().as_millis(),
@@ -968,7 +1000,7 @@ impl ExecutorHandle {
                     wait_ms = wait_elapsed.as_millis(),
                     "Kill: exited after SIGTERM",
                 );
-            } else if is_pid_alive(pid) {
+            } else if self.owns_pid() {
                 warn!(
                     pid,
                     grace_ms = wait_elapsed.as_millis(),
@@ -1021,6 +1053,52 @@ fn now_or_never(handle: &mut JoinHandle<i32>) -> Option<Result<i32, tokio::task:
 // Process signal helpers
 // ---------------------------------------------------------------------------
 
+/// The process creation time, as an opaque value comparable only against
+/// another reading for the same PID.
+///
+/// A PID identifies a process only for as long as that process lives;
+/// Windows reissues it freely afterwards, and a runner spawning hundreds of
+/// short-lived containers turns that into a routine event rather than a
+/// curiosity. Pairing the PID with its creation time distinguishes the
+/// process a handle was opened for from a later tenant of the same number,
+/// so a stale PID is dropped instead of signalled.
+pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let tail = stat.rsplit_once(") ")?.1;
+        tail.split_whitespace().nth(19)?.parse().ok()
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+        use windows_sys::Win32::System::Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return None;
+            }
+            let mut created = FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            };
+            let mut exited = created;
+            let mut kernel = created;
+            let mut user = created;
+            let queried =
+                GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user);
+            CloseHandle(handle);
+            if queried == 0 {
+                return None;
+            }
+            Some(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
+        }
+    }
+}
+
 pub(crate) fn is_pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -1028,11 +1106,21 @@ pub(crate) fn is_pid_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
-            .unwrap_or(false)
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let mut code = 0u32;
+            let queried = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            queried != 0 && code == STILL_ACTIVE as u32
+        }
     }
 }
 
@@ -1421,6 +1509,7 @@ impl ProcessExecutor {
 
         Ok(ExecutorHandle {
             pid,
+            start_time: process_start_time(pid),
             wait_handle,
             cached_exit_code: None,
             io_tasks,
@@ -1731,6 +1820,42 @@ mod tests {
 
         let _ = handle.wait().await;
         // Should not panic or error
+        handle.kill(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn test_kill_after_cancelled_wait_is_noop() {
+        // `wait` caches the exit code before draining the I/O pumps, so a
+        // cancellation in that window leaves the code cached and the join
+        // handle consumed. `kill` must read the cache: polling the consumed
+        // handle aborts the process under `panic = "abort"`.
+        let mut handle = ProcessExecutor::new("true")
+            .spawn(shutdown())
+            .await
+            .unwrap();
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = handle.wait() => {}
+                _ = std::future::ready(()) => {}
+            }
+            if handle.cached_exit_code.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Point the handle at a live process so the liveness early-outs do not
+        // hide the consumed join handle.
+        let live = ProcessExecutor::new("sleep")
+            .args(["30"])
+            .spawn(shutdown())
+            .await
+            .unwrap();
+        handle.pid = live.pid();
+        handle.start_time = process_start_time(live.pid());
+
         handle.kill(Duration::from_secs(1)).await;
     }
 

@@ -124,4 +124,4 @@ nix = { version = "0.31.2", features = ["signal", "process"] }
 openssl = { version = "0.10.76", features = ["vendored"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
