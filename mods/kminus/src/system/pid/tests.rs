@@ -383,8 +383,18 @@ fn stop_recorded_stops_a_live_verified_subject() {
     let mut child = sleeper();
     write_pid(&dir, "sleeper", child.id());
 
+    // The graceful ask is delivered on Windows by re-exec'ing the current
+    // binary as a console-event helper (see kcommon::signal). libtest owns a
+    // test binary's main, so the hook never runs here and the stop can only
+    // reach the force stage: the grace is burned by design, not by a
+    // regression. Leave none to burn.
+    #[cfg(windows)]
+    let grace = Duration::ZERO;
+    #[cfg(not(windows))]
+    let grace = Duration::from_secs(30);
+
     let started = std::time::Instant::now();
-    stop_recorded(&dir, "sleeper", Duration::from_secs(30));
+    stop_recorded(&dir, "sleeper", grace);
 
     // Died to the graceful request, not to the grace expiring.
     assert!(

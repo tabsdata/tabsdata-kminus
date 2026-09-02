@@ -679,7 +679,9 @@ async fn execute_tcp_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::pod::{ExecAction, HttpGetAction, TcpSocketAction};
+    #[cfg(unix)]
+    use crate::spec::pod::ExecAction;
+    use crate::spec::pod::{HttpGetAction, TcpSocketAction};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 

@@ -22,7 +22,9 @@
 //! ```
 
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -122,6 +124,7 @@ pub fn make_test_dir(path: &str) -> PathBuf {
 /// let logs = subdir(&dir, "logs");
 /// let nested = subdir(&dir, "a/b/c");
 /// ```
+#[cfg(unix)]
 pub fn subdir(base: &Path, name: &str) -> PathBuf {
     let d = base.join(name);
     fs::create_dir_all(&d).unwrap();
@@ -163,14 +166,17 @@ pub fn unique_name(prefix: &str) -> String {
 pub const HELPER_VAR: &str = "TD_TEST_HELPER";
 
 /// Helper mode: sleep, and die on SIGTERM like any ordinary process.
+#[cfg(unix)]
 pub const HELPER_SLEEP: &str = "sleep";
 
 /// Helper mode: ignore SIGTERM, so that only SIGKILL ends it.
+#[cfg(unix)]
 pub const HELPER_IGNORE_SIGTERM: &str = "ignore-sigterm";
 
 /// Helper mode: spawn a detached copy of itself in [`HELPER_SLEEP`] mode,
 /// then exit immediately — the full `pg_ctl` shape, where the launcher is
 /// gone and the daemon is reparented away. Unix only.
+#[cfg(unix)]
 pub const HELPER_DAEMONIZE_AND_EXIT: &str = "daemonize-and-exit";
 
 /// Helper mode: spawn a plain (non-detached) copy of itself in
@@ -179,10 +185,12 @@ pub const HELPER_DAEMONIZE_AND_EXIT: &str = "daemonize-and-exit";
 /// The copy inherits this process's group, which is the shape a server
 /// that has daemonised itself takes: a postgres postmaster in its own
 /// group, with its backends forked into that same group. Unix only.
+#[cfg(unix)]
 pub const HELPER_FORK_CHILD: &str = "fork-child";
 
 /// Path a daemonising or forking helper writes its child's PID to, so a
 /// test can identify a process it did not spawn itself.
+#[cfg(unix)]
 pub const HELPER_PID_FILE_VAR: &str = "TD_TEST_HELPER_PID_FILE";
 
 /// Helper mode: spawn a detached copy of itself in [`HELPER_SLEEP`] mode,
@@ -193,10 +201,12 @@ pub const HELPER_PID_FILE_VAR: &str = "TD_TEST_HELPER_PID_FILE";
 /// group, so no signal aimed at this process's group can reach it, and it
 /// inherits this process's environment — including any kill token. Unix
 /// only; elsewhere the mode just sleeps.
+#[cfg(unix)]
 pub const HELPER_DAEMONIZE: &str = "daemonize";
 
 /// Substring that selects [`test_helper_process`] when the test binary is
 /// re-executed with it as a filter argument.
+#[cfg(unix)]
 pub const HELPER_FILTER: &str = "test_helper_process";
 
 /// How long a helper lives if the test that spawned it fails to kill it.
@@ -204,6 +214,7 @@ pub const HELPER_TTL: Duration = Duration::from_secs(30);
 
 /// Argv that re-executes this test binary as a helper process. Pair it
 /// with [`HELPER_VAR`] set to one of the modes above.
+#[cfg(unix)]
 pub fn helper_command() -> Vec<String> {
     vec![
         std::env::current_exe()
@@ -220,6 +231,7 @@ pub fn helper_command() -> Vec<String> {
 /// passes through it instantly.
 #[test]
 fn test_helper_process() {
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let Ok(mode) = std::env::var(HELPER_VAR) else {
         return;
     };

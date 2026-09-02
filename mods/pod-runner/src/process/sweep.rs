@@ -221,7 +221,7 @@ pub async fn kill_dead_runner_orphans() -> usize {
 ///
 /// Test-only: the sweeps act on exactly this set, and an end-to-end test
 /// has to observe an escapee before the sweep reaps it.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) async fn orphan_pids(pod_prefix: &str) -> Vec<u32> {
     Orphans::find(pod_prefix)
         .await
@@ -239,18 +239,26 @@ pub(crate) async fn orphan_pids(pod_prefix: &str) -> Vec<u32> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     use std::time::Duration;
 
     use kcommon::identity::{OWNER_SEP, UNKNOWN_STAMP};
+    #[cfg(unix)]
     use kcommon::signal::{force_kill, is_pid_alive};
+    #[cfg(unix)]
     use serial_test::serial;
+    #[cfg(unix)]
     use tokio::sync::watch;
 
+    #[cfg(unix)]
     use crate::process::executor::{DevNullOutput, ExecutorHandle, ProcessExecutor};
+    #[cfg(unix)]
     use crate::testutils::{HELPER_IGNORE_SIGTERM, HELPER_SLEEP, HELPER_VAR, helper_command};
 
     /// Bounded polling for a process appearing in, or leaving, the table.
+    #[cfg(unix)]
     const POLL_INTERVAL: Duration = Duration::from_millis(50);
+    #[cfg(unix)]
     const POLL_ATTEMPTS: u32 = 100;
 
     /// A PID far above any platform's `pid_max`, so its owner can never
@@ -265,6 +273,7 @@ mod tests {
 
     /// Shutdown receiver for spawns that never need to signal shutdown.
     /// The sender is leaked so `changed()` never fires.
+    #[cfg(unix)]
     fn shutdown() -> watch::Receiver<()> {
         let (tx, rx) = watch::channel(());
         std::mem::forget(tx);
@@ -275,6 +284,7 @@ mod tests {
     /// the same position a daemonised process reaches by calling
     /// `setsid()`, and therefore outside any process group pod-runner
     /// would signal.
+    #[cfg(unix)]
     async fn spawn_helper(token: &str, mode: &str) -> ExecutorHandle {
         let argv = helper_command();
         ProcessExecutor::new(&argv[0])
@@ -289,6 +299,7 @@ mod tests {
     }
 
     /// Wait until the sweep can see a token under `prefix`.
+    #[cfg(unix)]
     async fn wait_visible(prefix: &str) -> bool {
         for _ in 0..POLL_ATTEMPTS {
             if !Orphans::find(prefix).await.is_empty() {
@@ -299,6 +310,7 @@ mod tests {
         false
     }
 
+    #[cfg(unix)]
     async fn wait_dead(pid: u32) -> bool {
         for _ in 0..POLL_ATTEMPTS {
             if !is_pid_alive(pid) {

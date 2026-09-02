@@ -136,6 +136,7 @@ env_scripts = [
     if eq ${os_family} "windows"
         set_env RUSTFLAGS "-Clink-arg=/STACK:16777216"
     end
+    profile = get_env profile
     td-profile = set ${profile}
     if is_empty ${profile}
         build-folder = set "debug"

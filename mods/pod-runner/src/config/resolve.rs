@@ -735,9 +735,14 @@ podDataReapTtlOnPodSuccess: "5m"
             "url: \"https://127.0.0.1:3000\"\nserver:\n  tls:\n    certificate-data: \"Y2VydA==\"\n    certificate-key-data: \"a2V5\"\n    certificate-authority-data: \"Y2E=\"\n",
         )
         .unwrap();
+        #[cfg(windows)]
+        const ABSOLUTE_IMAGES_DIR: &str = "C:/var/lib/kminus/images";
+        #[cfg(not(windows))]
+        const ABSOLUTE_IMAGES_DIR: &str = "/var/lib/kminus/images";
+
         std::fs::write(
             configdir.join(crate::config::template::PRSYSCONFIG_FILENAME),
-            "imagesDir: \"/var/lib/kminus/images\"\n",
+            format!("imagesDir: \"{ABSOLUTE_IMAGES_DIR}\"\n"),
         )
         .unwrap();
 
@@ -757,10 +762,7 @@ podDataReapTtlOnPodSuccess: "5m"
         };
 
         let c = resolve_config(&cli).unwrap();
-        assert_eq!(
-            c.images_dir,
-            std::path::PathBuf::from("/var/lib/kminus/images")
-        );
+        assert_eq!(c.images_dir, std::path::PathBuf::from(ABSOLUTE_IMAGES_DIR));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -825,6 +827,11 @@ podDataReapTtlOnPodSuccess: "5m"
             "url: \"https://127.0.0.1:3000\"\nserver:\n  tls:\n    certificate-data: \"Y2VydA==\"\n    certificate-key-data: \"a2V5\"\n    certificate-authority-data: \"Y2E=\"\n",
         )
         .unwrap();
+        #[cfg(windows)]
+        const FROM_CLI: &str = "C:/from/cli";
+        #[cfg(not(windows))]
+        const FROM_CLI: &str = "/from/cli";
+
         std::fs::write(
             configdir.join(crate::config::template::PRSYSCONFIG_FILENAME),
             "imagesDir: \"/from/yaml\"\n",
@@ -836,7 +843,7 @@ podDataReapTtlOnPodSuccess: "5m"
             configdir: Some(configdir.to_string_lossy().into()),
             workdir: Some(workdir.to_string_lossy().into()),
             logdir: Some(logdir.to_string_lossy().into()),
-            imagesdir: Some("/from/cli".into()),
+            imagesdir: Some(FROM_CLI.into()),
             port: None,
             metrics_port: None,
             logmaxsizemb: 100,
@@ -847,7 +854,7 @@ podDataReapTtlOnPodSuccess: "5m"
         };
 
         let c = resolve_config(&cli).unwrap();
-        assert_eq!(c.images_dir, std::path::PathBuf::from("/from/cli"));
+        assert_eq!(c.images_dir, std::path::PathBuf::from(FROM_CLI));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

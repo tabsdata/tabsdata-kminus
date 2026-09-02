@@ -18,11 +18,30 @@ fn run() -> Run {
     Run::current()
 }
 
+#[cfg(windows)]
+fn sleep_script(seconds: u32) -> String {
+    format!("ping -n {} 127.0.0.1 > NUL", seconds + 1)
+}
+
+#[cfg(not(windows))]
+fn sleep_script(seconds: u32) -> String {
+    format!("sleep {seconds}")
+}
+
 fn track(script: &str, scope: &str) -> Tracked {
-    let mut cmd = Command::new("sh");
-    cmd.args(["-c", script])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut command = Command::new("cmd");
+        command.args(["/C", script]);
+        command
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut command = Command::new("sh");
+        command.args(["-c", script]);
+        command
+    };
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
     Tracked::spawn(cmd, KM_KILL_TOKEN_VAR, &run().scope(scope)).expect("spawn tracked")
 }
 
@@ -53,7 +72,7 @@ fn nothing_registered_reports_nothing() {
 #[test]
 fn no_failure_while_registered_components_run() {
     let components = Components::new();
-    components.register("alpha", track("sleep 30", "alpha"));
+    components.register("alpha", track(&sleep_script(30), "alpha"));
     assert_eq!(components.first_failed(), None);
     components.teardown(std::path::Path::new("/nonexistent/km/pids"));
 }
@@ -98,7 +117,7 @@ fn the_first_dead_component_in_start_order_is_reported() {
 #[test]
 fn pid_names_the_registered_component() {
     let components = Components::new();
-    let tracked = track("sleep 30", "gamma");
+    let tracked = track(&sleep_script(30), "gamma");
     let pid = tracked.pid();
     components.register("gamma", tracked);
 
@@ -112,8 +131,8 @@ fn pid_names_the_registered_component() {
 fn teardown_stops_everything_reports_names_and_empties_the_registry() {
     let dir = tempdir();
     let components = Components::new();
-    let one = track("sleep 30", "one");
-    let two = track("sleep 30", "two");
+    let one = track(&sleep_script(30), "one");
+    let two = track(&sleep_script(30), "two");
     write_pid(&dir, "one", one.pid());
     write_pid(&dir, "two", two.pid());
     components.register("one", one.clone());

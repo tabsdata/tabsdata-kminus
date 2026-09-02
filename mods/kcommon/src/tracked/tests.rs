@@ -130,6 +130,14 @@ fn the_token_reaches_the_child_environment() {
 #[test]
 fn stop_asks_first_and_a_cooperative_child_goes_gracefully() {
     let tracked = spawn(MODE_SLEEP, "graceful");
+    // The graceful ask is delivered on Windows by re-exec'ing the current
+    // binary as a console-event helper (see signal::ctrl_break_helper_hook).
+    // libtest owns a test binary's main, so the hook never runs here and the
+    // stop can only reach the force stage: the grace is burned by design, not
+    // by a regression. Leave none to burn.
+    #[cfg(windows)]
+    let grace = Duration::ZERO;
+    #[cfg(not(windows))]
     let grace = Duration::from_secs(30);
 
     let started = Instant::now();

@@ -649,7 +649,12 @@ mod tests {
         let prepared = rewrite_pod_paths(&pod, Path::new("/data/pods/mypod")).unwrap();
         assert_eq!(
             prepared.spec.containers[0].working_dir,
-            "/data/pods/mypod/work/app/usr/src/app"
+            Path::new("/data/pods/mypod")
+                .join("work")
+                .join("app")
+                .join("usr/src/app")
+                .to_string_lossy()
+                .to_string()
         );
     }
 
@@ -659,7 +664,11 @@ mod tests {
         let prepared = rewrite_pod_paths(&pod, Path::new("/data/pods/mypod")).unwrap();
         assert_eq!(
             prepared.spec.containers[0].working_dir,
-            "/data/pods/mypod/work/app"
+            Path::new("/data/pods/mypod")
+                .join("work")
+                .join("app")
+                .to_string_lossy()
+                .to_string()
         );
     }
 
@@ -674,13 +683,17 @@ mod tests {
             vec![],
         );
         let prepared = rewrite_pod_paths(&pod, Path::new("/pods/p1")).unwrap();
+        let container_root = Path::new("/pods/p1").join("work").join("app");
         assert_eq!(
             prepared.spec.containers[0].volume_mounts[0].mount_path,
-            "/pods/p1/work/app/mnt/data"
+            container_root.join("mnt/data").to_string_lossy().to_string()
         );
         assert_eq!(
             prepared.spec.containers[0].volume_mounts[1].mount_path,
-            "/pods/p1/work/app/etc/config"
+            container_root
+                .join("etc/config")
+                .to_string_lossy()
+                .to_string()
         );
     }
 
@@ -693,7 +706,12 @@ mod tests {
         let prepared = rewrite_pod_paths(&pod, Path::new("/pods/p1")).unwrap();
         assert_eq!(
             prepared.spec.init_containers[0].working_dir,
-            "/pods/p1/work/init/setup"
+            Path::new("/pods/p1")
+                .join("work")
+                .join("init")
+                .join("setup")
+                .to_string_lossy()
+                .to_string()
         );
     }
 
@@ -731,13 +749,22 @@ mod tests {
             vec![],
         );
         let prepared = rewrite_pod_paths(&pod, Path::new("/pods/p1")).unwrap();
+        let pod_dir = Path::new("/pods/p1").join("work");
         assert_eq!(
             prepared.spec.containers[0].working_dir,
-            "/pods/p1/work/web/var/www"
+            pod_dir
+                .join("web")
+                .join("var/www")
+                .to_string_lossy()
+                .to_string()
         );
         assert_eq!(
             prepared.spec.containers[1].working_dir,
-            "/pods/p1/work/worker/opt/worker"
+            pod_dir
+                .join("worker")
+                .join("opt/worker")
+                .to_string_lossy()
+                .to_string()
         );
     }
 
@@ -1072,7 +1099,11 @@ mod tests {
         assert!(dir.join("work/app/app").is_dir());
         assert_eq!(
             prepared.spec.containers[0].working_dir,
-            format!("{}/work/app/app", dir.display())
+            dir.join("work")
+                .join("app")
+                .join("app")
+                .to_string_lossy()
+                .to_string()
         );
     }
 
@@ -1120,7 +1151,7 @@ mod tests {
         .await
         .unwrap();
 
-        let mount = dir.join("work/app/etc/app");
+        let mount = dir.join("work").join("app").join("etc/app");
         assert_eq!(
             prepared.spec.containers[0].volume_mounts[0].mount_path,
             mount.to_string_lossy().to_string()

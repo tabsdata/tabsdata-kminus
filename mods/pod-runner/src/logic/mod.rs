@@ -1751,6 +1751,10 @@ mod tests {
         use super::*;
         use crate::server::config::POD_WORK_SUBDIR;
         use crate::testutils::shell_cmd;
+        #[cfg(windows)]
+        const SLEEP_60: &str = "ping -n 61 127.0.0.1 > NUL";
+        #[cfg(not(windows))]
+        const SLEEP_60: &str = "sleep 60";
 
         fn make_pod_spec(name: &str, cmd: &str) -> PodSpec {
             PodSpec {
@@ -2120,8 +2124,11 @@ mod tests {
         // -- monitor: data dir reaping --
 
         /// Wait until `path` disappears, with timeout. Returns whether it did.
+        // Matches wait_for_presence: this waits on a directory tree being
+        // removed, which on a loaded Windows box is slower still than a file
+        // appearing.
         async fn wait_for_absence(path: &std::path::Path) -> bool {
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
                     if !path.exists() {
                         return;
@@ -2134,8 +2141,12 @@ mod tests {
         }
 
         /// Wait until `path` appears, with timeout. Returns whether it did.
+        // Longer than the phase waits: this one polls the filesystem rather
+        // than in-memory state, and a loaded Windows box running the whole
+        // suite in parallel has been seen to take more than ten seconds to
+        // make the marker visible.
         async fn wait_for_presence(path: &std::path::Path) -> bool {
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
                     if path.exists() {
                         return;
@@ -2145,6 +2156,28 @@ mod tests {
             })
             .await
             .is_ok()
+        }
+
+        /// Wait until the cleanup TTLs file carries `raw` as its failure TTL.
+        ///
+        /// The file is written more than once — the config defaults first,
+        /// then again once the pod's annotation is applied — so waiting only
+        /// for the path to exist can read the earlier version and see the
+        /// default where the test expects the override.
+        async fn wait_for_cleanup_ttls(
+            pod_dir: &std::path::Path,
+            raw: &str,
+        ) -> Option<ttl::CleanupTtls> {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match ttl::read_cleanup_ttls(pod_dir) {
+                        Some(ttls) if ttls.reap_ttl_on_failure.raw == raw => return ttls,
+                        _ => tokio::time::sleep(Duration::from_millis(50)).await,
+                    }
+                }
+            })
+            .await
+            .ok()
         }
 
         #[tokio::test]
@@ -2286,9 +2319,9 @@ mod tests {
             let id = PodId::new("default", "app", "uid-app");
 
             let pod_dir = logic.executor_provider.work_dir(&id);
-            assert!(wait_for_presence(&pod_dir.join(CLEANUP_TTLS_FILE)).await);
-
-            let ttls = ttl::read_cleanup_ttls(&pod_dir).expect("cleanup TTLs readable");
+            let ttls = wait_for_cleanup_ttls(&pod_dir, "45m")
+                .await
+                .expect("cleanup TTLs must record the annotated value");
             assert_eq!(ttls.reap_ttl_on_failure.raw, "45m");
             assert_eq!(ttls.reap_ttl_on_failure.secs, Some(2700));
             assert_eq!(ttls.reap_ttl_on_failure.source, ttl::TtlSource::Annotation);
@@ -2694,7 +2727,7 @@ mod tests {
                 .await
                 .unwrap();
             logic
-                .create_pod(make_pod_spec("slow", "sleep 60"))
+                .create_pod(make_pod_spec("slow", SLEEP_60))
                 .await
                 .unwrap();
             logic
@@ -2783,12 +2816,14 @@ mod tests {
         #[tokio::test]
         async fn stream_logs_with_tail_lines() {
             let (logic, _, _) = make_logic_with_store();
-            // Print 10 lines
+            // Print 10 lines.
+            #[cfg(windows)]
+            const TEN_LINES: &str = "for %i in (1 2 3 4 5 6 7 8 9 10) do @echo line-%i";
+            #[cfg(not(windows))]
+            const TEN_LINES: &str = "for i in 1 2 3 4 5 6 7 8 9 10; do echo line-$i; done";
+
             logic
-                .create_pod(make_pod_spec(
-                    "tailer",
-                    "for i in 1 2 3 4 5 6 7 8 9 10; do echo line-$i; done",
-                ))
+                .create_pod(make_pod_spec("tailer", TEN_LINES))
                 .await
                 .unwrap();
 

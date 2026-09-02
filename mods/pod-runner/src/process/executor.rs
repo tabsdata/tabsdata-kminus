@@ -938,6 +938,7 @@ impl ExecutorHandle {
     /// `JoinError` — manufacturing the state that killed pod-runner in
     /// the field. Test-only.
     #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn abort_monitor(&self) {
         self.wait_handle.abort();
     }
@@ -1263,7 +1264,7 @@ impl ProcessExecutor {
         let (stdout_stdio, stderr_stdio) = redirector.setup()?;
         let setup_us = t_setup.elapsed().as_micros();
 
-        let program = normalize_spawn_path(Path::new(&self.program));
+        let program = normalize_program_path(Path::new(&self.program))?;
         let mut cmd = Command::new(&program);
         cmd.args(&self.args);
 
@@ -1439,6 +1440,127 @@ fn normalize_spawn_path(path: &Path) -> PathBuf {
     let resolved = dunce::simplified(path).to_path_buf();
     debug!(input = %path.display(), output = %resolved.display(), "Normalized spawn path.");
     resolved
+}
+
+/// `CreateProcess` takes the program in `lpApplicationName`, which is capped at
+/// `MAX_PATH` — 260 including the terminating null — no matter what the
+/// system-wide long-path setting or the caller's manifest says. A pod path
+/// stacks the instance name, the run directory, the pod name with its
+/// ReplicaSet hash and UID, the container directory and the interpreter prefix,
+/// and crosses that routinely; the spawn then fails with `ERROR_PATH_NOT_FOUND`
+/// (os error 3), which reads as a missing binary rather than a length problem.
+#[cfg(windows)]
+const MAX_PATH_LIMIT: usize = 260;
+
+#[cfg(windows)]
+const VERBATIM_PREFIX: &str = r"\\?\";
+
+/// Prepare a program path for `CreateProcess`.
+///
+/// A `\\?\` verbatim prefix lifts the cap, and is applied to every absolute
+/// path rather than only the long ones: it behaves identically for a short
+/// path, and a single code path cannot develop a length-dependent bug. A
+/// missing `.exe` is still completed behind the prefix.
+///
+/// It cannot be applied to a relative path or a bare program name — `\\?\`
+/// means "no parsing", so nothing resolves behind it: no `.`, no `..`, no
+/// walking `PATH`. Those are left untouched, which is correct as long as they
+/// fit; over the cap they would fail deep inside `CreateProcess` with the same
+/// misleading os error 3, so they are rejected here instead, naming the length
+/// as the cause.
+///
+/// The working directory is deliberately not given the same treatment:
+/// `lpCurrentDirectory` rejects a verbatim path, and a process's current
+/// directory is bounded by `MAX_PATH` with no way around it.
+#[cfg(windows)]
+fn normalize_program_path(path: &Path) -> io::Result<PathBuf> {
+    let native = normalize_spawn_path(path);
+    if native.as_os_str().len() >= MAX_PATH_LIMIT && !native.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cannot spawn '{}': the program path is {} characters, over the \
+                 {MAX_PATH_LIMIT}-character CreateProcess limit, and a relative \
+                 path cannot carry the '{VERBATIM_PREFIX}' prefix that would \
+                 lift it — make the path absolute or shorten it",
+                native.display(),
+                native.as_os_str().len(),
+            ),
+        ));
+    }
+    if !native.is_absolute() || native.to_string_lossy().starts_with(VERBATIM_PREFIX) {
+        return Ok(native);
+    }
+    let verbatim = PathBuf::from(format!("{VERBATIM_PREFIX}{}", native.display()));
+    debug!(
+        input = %native.display(),
+        output = %verbatim.display(),
+        "Applied verbatim prefix to the program path.",
+    );
+    Ok(verbatim)
+}
+
+#[cfg(not(windows))]
+fn normalize_program_path(path: &Path) -> io::Result<PathBuf> {
+    Ok(normalize_spawn_path(path))
+}
+
+#[cfg(all(test, windows))]
+mod program_path_tests {
+    use super::*;
+
+    /// An absolute path of `len` characters, forward slashes included so the
+    /// separator conversion is exercised too.
+    fn absolute(len: usize) -> String {
+        let head = "C:/pods/";
+        let tail = "/x.exe";
+        let filler = "a".repeat(len - head.len() - tail.len());
+        format!("{head}{filler}{tail}")
+    }
+
+    #[test]
+    fn a_short_absolute_path_still_gets_the_prefix() {
+        let out = normalize_program_path(Path::new(&absolute(80))).unwrap();
+        assert!(out.to_string_lossy().starts_with(VERBATIM_PREFIX));
+        assert!(!out.to_string_lossy().contains('/'), "separators normalized");
+    }
+
+    #[test]
+    fn a_long_absolute_path_gets_the_prefix() {
+        let path = absolute(MAX_PATH_LIMIT + 20);
+        let out = normalize_program_path(Path::new(&path)).unwrap();
+        assert!(out.to_string_lossy().starts_with(VERBATIM_PREFIX));
+    }
+
+    #[test]
+    fn an_already_verbatim_path_is_not_prefixed_twice() {
+        let once = normalize_program_path(Path::new(&absolute(80))).unwrap();
+        let twice = normalize_program_path(&once).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn a_bare_program_name_is_left_alone() {
+        // It has to keep resolving through PATH, which the prefix would stop.
+        let out = normalize_program_path(Path::new("cmd.exe")).unwrap();
+        assert_eq!(out, PathBuf::from("cmd.exe"));
+    }
+
+    #[test]
+    fn a_short_relative_path_is_left_alone() {
+        let out = normalize_program_path(Path::new("bin/tool.exe")).unwrap();
+        assert_eq!(out, PathBuf::from(r"bin\tool.exe"));
+    }
+
+    #[test]
+    fn a_long_relative_path_is_rejected_naming_the_length() {
+        let relative = format!("bin/{}/x.exe", "a".repeat(MAX_PATH_LIMIT));
+        let err = normalize_program_path(Path::new(&relative)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let message = err.to_string();
+        assert!(message.contains("over the"), "explains the cause: {message}");
+        assert!(message.contains("relative"), "names why it cannot be fixed: {message}");
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -2261,7 +2261,10 @@ mod tests {
             CreateTargets::resolve(&workdir.to_string_lossy(), Some(&cdir.to_string_lossy()))
                 .unwrap();
         let paths = Paths::for_create(&targets).unwrap();
-        assert_eq!(paths.configdir, cdir.canonicalize().unwrap());
+        assert_eq!(
+            paths.configdir.canonicalize().unwrap(),
+            cdir.canonicalize().unwrap()
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -2282,7 +2285,10 @@ mod tests {
         let workdir = dir.join("wd");
         fs::create_dir_all(&workdir).unwrap();
         let paths = Paths::for_start(&workdir.to_string_lossy(), None, None).unwrap();
-        assert_eq!(paths.workdir, workdir.canonicalize().unwrap());
+        assert_eq!(
+            paths.workdir.canonicalize().unwrap(),
+            workdir.canonicalize().unwrap()
+        );
         assert!(paths.configdir.exists());
         assert!(paths.logdir.exists());
         fs::remove_dir_all(&dir).ok();
@@ -2301,8 +2307,14 @@ mod tests {
             Some(&ldir.to_string_lossy()),
         )
         .unwrap();
-        assert_eq!(paths.configdir, cdir.canonicalize().unwrap());
-        assert_eq!(paths.logdir, ldir.canonicalize().unwrap());
+        assert_eq!(
+            paths.configdir.canonicalize().unwrap(),
+            cdir.canonicalize().unwrap()
+        );
+        assert_eq!(
+            paths.logdir.canonicalize().unwrap(),
+            ldir.canonicalize().unwrap()
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -2323,7 +2335,10 @@ mod tests {
         let workdir = dir.join("wd");
         fs::create_dir_all(&workdir).unwrap();
         let paths = Paths::for_existing(&workdir.to_string_lossy()).unwrap();
-        assert_eq!(paths.workdir, workdir.canonicalize().unwrap());
+        assert_eq!(
+            paths.workdir.canonicalize().unwrap(),
+            workdir.canonicalize().unwrap()
+        );
         assert!(
             paths.pids.ends_with(
                 PathBuf::from(system::pid::DATA_DIR)
