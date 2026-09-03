@@ -43,8 +43,10 @@
 //!   so a dead owner's token is the only thing that still names it.
 
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use kcommon::scan::{Found, Scan, kill_found, kill_strays_of_dead_runs, terminate_found};
+use kcommon::signal::is_pid_alive;
 pub use kcommon::token::PR_KILL_TOKEN_VAR;
 use kcommon::token::Run;
 use tracing::{debug, warn};
@@ -64,6 +66,9 @@ use tracing::{debug, warn};
 /// under a second. Each caller still gets its own fresh snapshot, so no
 /// staleness is introduced.
 const MAX_CONCURRENT_SCANS: usize = 1;
+
+/// How often [`Orphans::await_exit`] rechecks the set it is waiting on.
+const ORPHAN_EXIT_POLL: Duration = Duration::from_millis(50);
 
 /// Permits for [`MAX_CONCURRENT_SCANS`].
 static SCAN_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_SCANS);
@@ -138,7 +143,12 @@ where
 /// than rescanned. A process that escapes *during* the grace is missed
 /// here and caught by the sweep at the end of the pod's orchestrator,
 /// which scans afresh.
-pub struct Orphans(Vec<Found>);
+pub struct Orphans {
+    found: Vec<Found>,
+    /// When [`Self::terminate`] signalled the set, so [`Self::await_exit`]
+    /// can count the grace from there rather than from its own call.
+    terminated_at: Option<tokio::time::Instant>,
+}
 
 impl Orphans {
     /// Scan for every escaped process whose token starts with `prefix` —
@@ -146,21 +156,50 @@ impl Orphans {
     /// them.
     pub async fn find(prefix: &str) -> Self {
         let prefix = prefix.to_string();
-        Self(
-            on_scan_slot(move || Scan::load().under(PR_KILL_TOKEN_VAR, &prefix))
+        Self {
+            found: on_scan_slot(move || Scan::load().under(PR_KILL_TOKEN_VAR, &prefix))
                 .await
                 .unwrap_or_default(),
-        )
+            terminated_at: None,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.found.is_empty()
+    }
+
+    /// Wait until every process in the set is gone, or its `grace` since
+    /// [`Self::terminate`] runs out.
+    ///
+    /// The stage between [`Self::terminate`] and [`Self::force_kill`]: an
+    /// escapee is not the container's main process, so nothing else waits
+    /// for it. A server that detaches to own its own shutdown — `pg_ctl`
+    /// daemonizing an embedded postgres — needs that wait to finish, or
+    /// the force stage arrives before it has released anything.
+    ///
+    /// The grace is counted from the SIGTERM, not from this call: the
+    /// containers are killed in between, and an escapee that has already
+    /// outlived its grace while that happened does not get a second one.
+    pub async fn await_exit(&self, grace: Duration) {
+        if self.found.is_empty() {
+            return;
+        }
+        let Some(deadline) = self.terminated_at.map(|at| at + grace) else {
+            return;
+        };
+        while self.found.iter().any(|found| is_pid_alive(found.pid)) {
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(ORPHAN_EXIT_POLL).await;
+        }
     }
 
     /// SIGTERM each one, so it shuts down inside the same grace period
     /// its container gets. Returns how many were signalled.
-    pub fn terminate(&self) -> usize {
-        let signalled = terminate_found(&self.0);
+    pub fn terminate(&mut self) -> usize {
+        self.terminated_at = Some(tokio::time::Instant::now());
+        let signalled = terminate_found(&self.found);
         if signalled > 0 {
             debug!(
                 signalled,
@@ -175,7 +214,7 @@ impl Orphans {
     /// now. Reported at warning level: a container leaked a process, and
     /// that is worth seeing. Returns how many were killed.
     pub fn force_kill(&self) -> usize {
-        let killed = kill_found(PR_KILL_TOKEN_VAR, &self.0);
+        let killed = kill_found(PR_KILL_TOKEN_VAR, &self.found);
         if killed > 0 {
             warn!(
                 killed,
@@ -225,7 +264,7 @@ pub async fn kill_dead_runner_orphans() -> usize {
 pub(crate) async fn orphan_pids(pod_prefix: &str) -> Vec<u32> {
     Orphans::find(pod_prefix)
         .await
-        .0
+        .found
         .into_iter()
         .map(|found| found.pid)
         .collect()
@@ -461,7 +500,7 @@ mod tests {
         assert!(wait_visible(&prefix).await, "tokens must be visible");
 
         let orphans = Orphans::find(&prefix).await;
-        let mut found: Vec<u32> = orphans.0.iter().map(|o| o.pid).collect();
+        let mut found: Vec<u32> = orphans.found.iter().map(|o| o.pid).collect();
         found.sort_unstable();
         let mut expected = vec![first.pid(), second.pid()];
         expected.sort_unstable();
@@ -517,11 +556,14 @@ mod tests {
         // the fork would have.
         let found = Orphans::find(&prefix).await;
         let escaped = found
-            .0
+            .found
             .into_iter()
             .find(|orphan| orphan.pid == escapee.pid())
             .expect("escapee must carry the token");
-        let only_the_parent = Orphans(vec![escaped]);
+        let only_the_parent = Orphans {
+            found: vec![escaped],
+            terminated_at: None,
+        };
 
         assert_eq!(only_the_parent.force_kill(), 1);
         assert!(wait_dead(escapee.pid()).await, "escapee");

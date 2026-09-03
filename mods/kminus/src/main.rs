@@ -519,6 +519,7 @@ fn print_status(paths: &Paths, components: &Components, ports: &KmPorts, kubecon
 /// early signal would hit the default disposition.
 fn install_signal_shutdown(paths: Paths, ports: KmPorts) {
     let (armed_tx, armed_rx) = std::sync::mpsc::channel::<()>();
+    let workdir = paths.workdir.clone();
     std::thread::Builder::new()
         .name("km-signal".into())
         .spawn(move || {
@@ -526,7 +527,7 @@ fn install_signal_shutdown(paths: Paths, ports: KmPorts) {
                 .enable_all()
                 .build()
                 .unwrap();
-            let signal = rt.block_on(arm_and_wait_for_shutdown(armed_tx));
+            let signal = rt.block_on(arm_and_wait_for_shutdown(armed_tx, workdir));
             if !exit::claim() {
                 // A component failure already owns the exit; let it finish
                 // rather than reporting a second reason over the top.
@@ -1661,7 +1662,10 @@ fn command_restart(args: StartArgs) {
 /// requests graceful shutdown via `GenerateConsoleCtrlEvent(
 /// CTRL_BREAK_EVENT, ...)`, which only fires `ctrl_break`.
 #[cfg(unix)]
-async fn arm_and_wait_for_shutdown(armed: std::sync::mpsc::Sender<()>) -> String {
+async fn arm_and_wait_for_shutdown(
+    armed: std::sync::mpsc::Sender<()>,
+    _workdir: PathBuf,
+) -> String {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
@@ -1673,14 +1677,24 @@ async fn arm_and_wait_for_shutdown(armed: std::sync::mpsc::Sender<()>) -> String
 }
 
 #[cfg(windows)]
-async fn arm_and_wait_for_shutdown(armed: std::sync::mpsc::Sender<()>) -> String {
+async fn arm_and_wait_for_shutdown(armed: std::sync::mpsc::Sender<()>, workdir: PathBuf) -> String {
     use tokio::signal::windows::{ctrl_break, ctrl_c};
     let mut ctrlc = ctrl_c().expect("install Ctrl+C handler");
     let mut ctrlbreak = ctrl_break().expect("install Ctrl+Break handler");
+    let stop_event = kcommon::stopevent::StopEvent::create(&workdir.to_string_lossy());
+    let stopped = tokio::task::spawn_blocking(move || {
+        if let Some(event) = stop_event {
+            event.wait();
+            true
+        } else {
+            false
+        }
+    });
     let _ = armed.send(());
     tokio::select! {
         _ = ctrlc.recv() => "Ctrl+C".to_string(),
         _ = ctrlbreak.recv() => "Ctrl+Break".to_string(),
+        Ok(true) = stopped => "stop request".to_string(),
     }
 }
 

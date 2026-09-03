@@ -51,7 +51,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use kcommon::signal::{force_kill, force_kill_group, is_pid_alive, send_sigterm_group};
+use kcommon::signal::{
+    force_kill, force_kill_group, is_pid_alive, send_sigterm_group, send_sigterm_pid,
+};
 use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
@@ -943,18 +945,31 @@ impl ExecutorHandle {
         self.wait_handle.abort();
     }
 
-    /// Send SIGTERM to the process and all its descendants without waiting.
+    /// Ask the container's main process to shut down, without waiting.
+    ///
+    /// Addressed to that process alone, as a container runtime does: a
+    /// server that coordinates its own children — an embedded postgres
+    /// stopping through `pg_ctl`, say — cannot complete that handshake if
+    /// the same signal reaches the children directly, and dies leaving
+    /// whatever it owns behind. Descendants are the force stage's job.
     pub fn send_sigterm(&self) {
         if self.has_exited() {
             debug!(pid = self.pid, "SIGTERM skipped: already exited");
             return;
         }
-        send_sigterm_group(self.pid);
-        debug!(pid = self.pid, "SIGTERM sent to process group");
+        send_sigterm_pid(self.pid);
+        debug!(pid = self.pid, "SIGTERM sent to process");
     }
 
-    /// Send SIGTERM, wait for process exit or grace period, then SIGKILL
-    /// if still alive.
+    /// Stop the process, escalating only as far as it has to: SIGTERM to
+    /// the main process, then SIGTERM to its group, then SIGKILL to the
+    /// group. Each stage gets the full `grace_period`.
+    ///
+    /// The main process is asked alone first so a server that stops its
+    /// own children — an embedded postgres going through `pg_ctl` — can
+    /// finish that handshake; signalling the group up front kills the
+    /// children underneath it and strands whatever it owns. The group
+    /// stage then covers a root that never forwarded the signal.
     ///
     /// If `grace_period` is zero, sends SIGKILL immediately (no SIGTERM).
     ///
@@ -984,12 +999,12 @@ impl ExecutorHandle {
             );
         } else {
             let pid = self.pid;
-            send_sigterm_group(pid);
+            send_sigterm_pid(pid);
             let sigterm_elapsed = kill_start.elapsed();
             debug!(
                 pid,
                 sigterm_ms = sigterm_elapsed.as_millis(),
-                "Kill: SIGTERM sent to group"
+                "Kill: SIGTERM sent to process"
             );
 
             let exit_code = tokio::select! {
@@ -1009,17 +1024,51 @@ impl ExecutorHandle {
                     "Kill: exited after SIGTERM",
                 );
             } else if self.try_wait().is_none() {
+                // The main process did not stop on its own. Widen to the
+                // group before forcing: a root that never forwarded the
+                // signal leaves children that have still had no chance to
+                // shut down cleanly, and SIGKILL gives them none.
                 warn!(
                     pid,
                     grace_ms = wait_elapsed.as_millis(),
-                    "Kill: grace period expired, sending SIGKILL to group",
+                    "Kill: grace period expired, sending SIGTERM to group",
                 );
-                force_kill_group(pid);
-                debug!(
-                    pid,
-                    total_ms = kill_start.elapsed().as_millis(),
-                    "Kill: SIGKILL sent after grace expiry",
-                );
+                send_sigterm_group(pid);
+
+                let exit_code = tokio::select! {
+                    result = &mut self.wait_handle => {
+                        Some(result.unwrap_or(-1))
+                    }
+                    _ = tokio::time::sleep(grace_period) => None,
+                };
+
+                if let Some(code) = exit_code {
+                    self.cached_exit_code = Some(code);
+                    debug!(
+                        pid,
+                        exit_code = code,
+                        total_ms = kill_start.elapsed().as_millis(),
+                        "Kill: exited after SIGTERM to group",
+                    );
+                } else if self.try_wait().is_none() {
+                    warn!(
+                        pid,
+                        total_ms = kill_start.elapsed().as_millis(),
+                        "Kill: group grace period expired, sending SIGKILL to group",
+                    );
+                    force_kill_group(pid);
+                    debug!(
+                        pid,
+                        total_ms = kill_start.elapsed().as_millis(),
+                        "Kill: SIGKILL sent after grace expiry",
+                    );
+                } else {
+                    debug!(
+                        pid,
+                        total_ms = kill_start.elapsed().as_millis(),
+                        "Kill: died during group grace period (race)",
+                    );
+                }
             } else {
                 debug!(
                     pid,
@@ -1522,7 +1571,10 @@ mod program_path_tests {
     fn a_short_absolute_path_still_gets_the_prefix() {
         let out = normalize_program_path(Path::new(&absolute(80))).unwrap();
         assert!(out.to_string_lossy().starts_with(VERBATIM_PREFIX));
-        assert!(!out.to_string_lossy().contains('/'), "separators normalized");
+        assert!(
+            !out.to_string_lossy().contains('/'),
+            "separators normalized"
+        );
     }
 
     #[test]
@@ -1558,8 +1610,14 @@ mod program_path_tests {
         let err = normalize_program_path(Path::new(&relative)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         let message = err.to_string();
-        assert!(message.contains("over the"), "explains the cause: {message}");
-        assert!(message.contains("relative"), "names why it cannot be fixed: {message}");
+        assert!(
+            message.contains("over the"),
+            "explains the cause: {message}"
+        );
+        assert!(
+            message.contains("relative"),
+            "names why it cannot be fixed: {message}"
+        );
     }
 }
 

@@ -1441,7 +1441,7 @@ async fn kill_all_in_state(
 ) {
     let orphans = match token_prefix {
         Some(prefix) => {
-            let orphans = sweep::Orphans::find(prefix).await;
+            let mut orphans = sweep::Orphans::find(prefix).await;
             orphans.terminate();
             Some(orphans)
         }
@@ -1460,6 +1460,11 @@ async fn kill_all_in_state(
     }
 
     if let Some(orphans) = orphans {
+        // The containers are down, but an escapee shuts itself down on its
+        // own clock and nothing above waited for it — least of all when the
+        // main process was waiting on that escapee, so its exit ended the
+        // container's kill early rather than late.
+        orphans.await_exit(grace_period).await;
         orphans.force_kill();
     }
 }

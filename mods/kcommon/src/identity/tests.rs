@@ -77,23 +77,28 @@ fn running_since_confirms_this_process_and_rejects_impostors() {
 
 #[cfg(unix)]
 #[test]
-fn running_since_rejects_a_zombie() {
-    // Exited but deliberately not reaped: the process table still lists
-    // it, with its original start time. It is not running — nothing can
-    // be asked of it or waited for — and must not read as though it were.
-    let mut child = std::process::Command::new("true")
+fn running_since_rejects_an_exited_child() {
+    // Exited but deliberately not reaped. Linux keeps it in the process
+    // table as a zombie, carrying its original start time; macOS drops it
+    // outright. Either way it is not running — nothing can be asked of it
+    // or waited for — and must not read as though it were.
+    //
+    // The child outlives the stamp read on purpose: with a command that
+    // exits at once there is no window in which to read a start time, and
+    // nothing to compare against afterwards.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
         .stdout(std::process::Stdio::null())
         .spawn()
         .expect("spawn");
     let pid = child.id();
-    let stamp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let stamp = loop {
-        if let Some(secs) = process_start_time(pid) {
-            break owner_stamp(secs);
-        }
-        assert!(std::time::Instant::now() < stamp_deadline);
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    };
+    let stamp = owner_stamp(process_start_time(pid).expect("start time of a running child"));
+    assert!(
+        running_since(pid, &stamp),
+        "a live child must read as running",
+    );
+
+    child.kill().expect("kill");
 
     // Poll until the exit has landed in the process table.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

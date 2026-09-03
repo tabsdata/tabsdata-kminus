@@ -8,5 +8,6 @@ pub mod identity;
 pub mod panic;
 pub mod scan;
 pub mod signal;
+pub mod stopevent;
 pub mod token;
 pub mod tracked;
