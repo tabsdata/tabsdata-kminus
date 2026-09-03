@@ -305,6 +305,16 @@ const nodeLookupTimeout = 5 * time.Second
 // interval.
 const heartbeatStartupRetry = 250 * time.Millisecond
 
+// nodeRegistrationTimeout bounds the wait for the node controller to register
+// this kubelet's node. Startup continues on expiry: registration is not a
+// precondition for serving, only for being scheduled onto.
+const nodeRegistrationTimeout = 5 * time.Second
+
+// nodeRegistrationPoll spaces the registration lookups. Registration usually
+// lands well inside the first few beats, and km's cluster-start gate is
+// waiting on this.
+const nodeRegistrationPoll = 100 * time.Millisecond
+
 // beatDetail reports why this kubelet is not ready, or "" when it is. Split
 // from the loop so the decision is testable without an API server: nodeErr is
 // the node lookup's result, syncAge the age of the last completed sync round.
@@ -759,16 +769,26 @@ func main() {
 		}
 	}()
 
-	// Give the node time to register
+	// Wait for the node to register, polling so startup costs only what
+	// registration actually takes.
 	logger.Info("Waiting for node to be registered...")
-	time.Sleep(5 * time.Second)
-
-	// Verify node exists
-	_, err = clientset.CoreV1().Nodes().Get(ctx, vkNodeName, metav1.GetOptions{})
-	if err != nil {
-		logger.WithError(err).Warn("Node not yet registered, but continuing...")
-	} else {
-		logger.Info("Node registered successfully")
+	registrationDeadline := time.Now().Add(nodeRegistrationTimeout)
+	for {
+		_, err = clientset.CoreV1().Nodes().Get(ctx, vkNodeName, metav1.GetOptions{})
+		if err == nil {
+			logger.Info("Node registered successfully")
+			break
+		}
+		if time.Now().After(registrationDeadline) {
+			logger.WithError(err).Warn("Node not yet registered, but continuing...")
+			break
+		}
+		select {
+		case <-ctx.Done():
+			logger.Warn("Cancelled while waiting for node registration")
+			return
+		case <-time.After(nodeRegistrationPoll):
+		}
 	}
 
 	// Start kubelet API server (serves kubectl logs)
