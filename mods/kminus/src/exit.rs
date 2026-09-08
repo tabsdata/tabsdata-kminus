@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{error, info};
 
+use crate::system::startup;
+
 /// Product name as printed in the console banners.
 const PRODUCT: &str = "Tabsdata K- (K minus)";
 
@@ -84,6 +86,8 @@ impl ExitReason {
 pub fn report(reason: &ExitReason) {
     let headline = reason.headline();
     let detail = reason.detail();
+
+    startup::announce(startup::Outcome::Failed);
 
     println!();
     println!("{PRODUCT} stopping: {headline}");

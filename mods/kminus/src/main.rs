@@ -46,6 +46,7 @@ use system::pid::{
     remove_file_best_effort, remove_pid, stop_recorded, write_pid,
 };
 use system::port::{PortCheck, check_ports, port_failures, probe_ports};
+use system::startup;
 
 /// Filename of km's own log file under `<logdir>/`.
 const KM_LOG_FILE: &str = "km.log";
@@ -1377,6 +1378,8 @@ fn command_start(args: StartArgs) {
 
     println!();
     println!("Press Ctrl+C to stop");
+
+    startup::announce(startup::Outcome::Ready);
 
     // Supervise from here on. Teardown on signal is still owned by the
     // km-signal thread installed above; the monitor stands down when it
