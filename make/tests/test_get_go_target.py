@@ -25,9 +25,8 @@ spec.loader.exec_module(go_target)
 # Minimal stand-in for `rustc --print cfg`, keyed by target triple. The empty
 # string key represents the host build (rustc invoked without --target).
 RUST_CFG_BY_TRIPLE = {
-    "x86_64-unknown-linux-musl": {"target_os": "linux", "target_arch": "x86_64"},
     "x86_64-unknown-linux-gnu": {"target_os": "linux", "target_arch": "x86_64"},
-    "aarch64-unknown-linux-musl": {"target_os": "linux", "target_arch": "aarch64"},
+    "aarch64-unknown-linux-gnu": {"target_os": "linux", "target_arch": "aarch64"},
     "aarch64-apple-darwin": {"target_os": "macos", "target_arch": "aarch64"},
     "x86_64-apple-darwin": {"target_os": "macos", "target_arch": "x86_64"},
     "x86_64-pc-windows-msvc": {"target_os": "windows", "target_arch": "x86_64"},
@@ -50,10 +49,10 @@ class TestSelectTriple:
 
     def test_prefers_td_target(self):
         environment = {
-            "TD_TARGET": "x86_64-unknown-linux-musl",
+            "TD_TARGET": "aarch64-unknown-linux-gnu",
             "RUST_TARGET": "x86_64-unknown-linux-gnu",
         }
-        assert go_target.select_triple(environment) == "x86_64-unknown-linux-musl"
+        assert go_target.select_triple(environment) == "aarch64-unknown-linux-gnu"
 
     def test_falls_back_to_rust_target(self):
         environment = {"RUST_TARGET": "aarch64-apple-darwin"}
@@ -70,12 +69,12 @@ class TestSelectTriple:
 class TestResolve:
     """Rust triple -> (GOOS, GOARCH, extension)."""
 
-    def test_linux_musl_cross(self):
-        environment = {"TD_TARGET": "x86_64-unknown-linux-musl"}
+    def test_linux_x86_64(self):
+        environment = {"TD_TARGET": "x86_64-unknown-linux-gnu"}
         assert go_target.resolve(environment) == ("linux", "amd64", "")
 
     def test_linux_arm(self):
-        environment = {"RUST_TARGET": "aarch64-unknown-linux-musl"}
+        environment = {"RUST_TARGET": "aarch64-unknown-linux-gnu"}
         assert go_target.resolve(environment) == ("linux", "arm64", "")
 
     def test_macos_arm(self):

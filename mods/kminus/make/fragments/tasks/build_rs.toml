@@ -11,8 +11,8 @@ script_runner = "@duckscript"
 script = '''
     !include_files ./make/libraries/log.ds
 
-    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} build %{td-rust-quiet} --locked %{td-target-token} %{td-target} --profile ${td-profile} --manifest-path ${PROJECT_RS_KMINUS_CARGO_TOML} --all-features --bins --examples"
-    exec --fail-on-error ${td-cargo} %{td-toolchain-token}%{td-toolchain} build %{td-rust-quiet} --locked %{td-target-token} %{td-target} --profile ${td-profile} --manifest-path ${PROJECT_RS_KMINUS_CARGO_TOML} --all-features --bins --examples
+    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} %{td-cargo-build-verb} %{td-rust-quiet} --locked %{td-build-target-token} %{td-build-target} --profile ${td-profile} --manifest-path ${PROJECT_RS_KMINUS_CARGO_TOML} --all-features --bins --examples"
+    exec --fail-on-error ${td-cargo} %{td-toolchain-token}%{td-toolchain} %{td-cargo-build-verb} %{td-rust-quiet} --locked %{td-build-target-token} %{td-build-target} --profile ${td-profile} --manifest-path ${PROJECT_RS_KMINUS_CARGO_TOML} --all-features --bins --examples
 
     td_check_build_folder = set ${td-profile}
     is_dev = eq ${td_check_build_folder} "dev"

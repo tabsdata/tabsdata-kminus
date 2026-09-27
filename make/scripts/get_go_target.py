@@ -9,8 +9,8 @@
 The target is decided from the same environment variables the rest of the
 build uses to pin a specific target, in this order:
 
-  1. TD_TARGET   - the artifact target (e.g. the linux musl cross target);
-                   authoritative when present.
+  1. TD_TARGET   - the artifact target (e.g. the portable linux gnu
+                   target); authoritative when present.
   2. RUST_TARGET - the native target, always set in the CI matrix.
   3. host        - neither set (local development): let the toolchain decide.
 

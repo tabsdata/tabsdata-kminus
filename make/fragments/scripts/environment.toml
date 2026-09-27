@@ -24,7 +24,6 @@ env_scripts = [
     fi
     ''',
 
-
     # Set up project root folder
     '''
     #!@duckscript
@@ -91,10 +90,12 @@ env_scripts = [
     if not is_empty ${td-target}
         set_env td-target ${td-target}
         set_env td-target-token "--target"
+        set_env td-build-target-token "--target"
         td-target-token = set "--target"
     else
         unset_env td-target
         unset_env td-target-token
+        unset_env td-build-target-token
         td-target-token = set ""
     end
     debug "🔅 Using td target: '${td-target}'"
@@ -110,26 +111,45 @@ env_scripts = [
     debug "🔅 Using td toolchain: '${td-toolchain}'"
     debug "🔅 Using td toolchain (token): '${td-toolchain-token}'"
 
-    if not is_empty ${td-cross}
-        use_cross = eq ${td-cross} "true"
-        if ${use_cross}
-            set_env td-cargo "cross"
+    if not is_empty ${td-portable-linux}
+        portable = eq ${td-portable-linux} "true"
+    else
+        portable = set false
+    end
+
+    set_env td-cargo "cargo"
+    td-cargo = get_env td-cargo
+    if ${portable}
+        set_env td-cargo-build-verb "zigbuild"
+    else
+        set_env td-cargo-build-verb "build"
+    end
+    td-cargo-build-verb = get_env td-cargo-build-verb
+    debug "🔅 Using Cargo tool: '${td-cargo}'"
+    debug "🔅 Using Cargo build verb: '${td-cargo-build-verb}'"
+
+    td-glibc-floor = get_env TABSDATA_GLIBC_FLOOR
+    debug "🔅 Using glibc floor: '${td-glibc-floor}'"
+
+    if not is_empty ${td-target}
+        if ${portable}
+            set_env td-build-target "${td-target}.${td-glibc-floor}"
         else
-            set_env td-cargo "cargo"
+            set_env td-build-target ${td-target}
         end
     else
-        set_env td-cargo "cargo"
+        unset_env td-build-target
     end
-    td-cargo = get_env td-cargo
-    debug "🔅 Using Cargo tool: '${td-cargo}'"
+    td-build-target = get_env td-build-target
+    debug "🔅 Using build target: '${td-build-target}'"
 
-    if eq ${td-cargo} "cross"
-        set_env TD_BUILD_ON_CROSS "true"
+    if ${portable}
+        set_env TD_PORTABLE_LINUX "true"
     else
-        set_env TD_BUILD_ON_CROSS "false"
+        set_env TD_PORTABLE_LINUX "false"
     end
-    td_build_on_cross = get_env TD_BUILD_ON_CROSS
-    debug "🤞 Building on cross: '${td_build_on_cross}'"
+    td_portable_linux = get_env TD_PORTABLE_LINUX
+    debug "🤞 Building portable Linux artifacts: '${td_portable_linux}'"
 
     set_env RUSTFLAGS ""
     os_family = os_family
@@ -196,13 +216,8 @@ env_scripts = [
     if ${td_nextest_test_threads_is_empty}
         td_nextest_test_threads = set "32"
     end
-    td_cross_test_jobs = get_env TD_CROSS_TEST_JOBS
-    td_cross_test_jobs_is_empty = is_empty ${td_cross_test_jobs}
-    if ${td_cross_test_jobs_is_empty}
-        td_cross_test_jobs = set "16"
-    end
     os_family = os_family
-    info "👾 Current os family: ${os_family}"
+    debug "👾 Current os family: ${os_family}"
     is_mac = eq ${os_family} "mac"
     is_windows = eq ${os_family} "windows"
     if ${on_ga_true}
@@ -226,12 +241,11 @@ env_scripts = [
     td_cargo_build_jobs_is_empty = not is_empty ${td_cargo_build_jobs}
     if ${td_cargo_build_jobs_is_empty}
         set_env CARGO_BUILD_JOBS ${td_cargo_build_jobs}
-        info "🔧 Setting CARGO_BUILD_JOBS to ${td_cargo_build_jobs} from TD_CARGO_BUILD_JOBS."
+        debug "🔧 Setting CARGO_BUILD_JOBS to ${td_cargo_build_jobs} from TD_CARGO_BUILD_JOBS."
     end
 
     set_env td-nextest-build-jobs ${td_nextest_build_jobs}
     set_env td-nextest-test-threads ${td_nextest_test_threads}
-    set_env td-cross-test-jobs ${td_cross_test_jobs}
 
     enable_sccache = set false
     if ${on_ga_true}
@@ -252,6 +266,7 @@ env_scripts = [
         else
             set_env RUSTC_WRAPPER ${sccache_path}
             set_env SCCACHE_CACHE_SIZE "32G"
+            set_env SCCACHE_IDLE_TIMEOUT "0"
             info "🧰 Enabled sccache wrapper '${sccache_path}' with 32G cache."
         end
     end
@@ -264,7 +279,8 @@ env_scripts = [
     for connector in ${connectors}
         is_connector = is_dir ${connector}
         if ${is_connector}
-            new_path_item = concat ${connector}/target/${build-folder} ${separator} ${connector}/target/pytest/build
+            # new_path_item = concat ${connector}/target/${build-folder} ${separator} ${connector}/target/pytest/build
+            new_path_item = set ${connector}/target/pytest/build
             new_path = concat ${new_path_item} ${separator} ${new_path}
         end
     end
@@ -281,12 +297,16 @@ env_scripts = [
         for connector in ${connectors}
             is_connector = is_dir ${connector}
             if ${is_connector}
-                new_path_item = concat ${connector}/target/${build-folder} ${separator} ${connector}/target/pytest/build
+                # new_path_item = concat ${connector}/target/${build-folder} ${separator} ${connector}/target/pytest/build
+                new_path_item = set ${connector}/target/pytest/build
                 new_path = concat ${new_path_item} ${separator} ${new_path}
             end
         end
     end
 
+    new_path_item = concat ${project_tabsdata_base_folder}/target/${build-folder} ${separator} ${project_tabsdata_base_folder}/target/pytest/build
+    new_path = concat ${new_path_item} ${separator} ${new_path}
+    
     PROJECT_RS_KCOMMON_CARGO_TOML = get_env PROJECT_RS_KCOMMON_CARGO_TOML
     PROJECT_RS_KMINUS_CARGO_TOML = get_env PROJECT_RS_KMINUS_CARGO_TOML
     PROJECT_RS_POD_RUNNER_CARGO_TOML = get_env PROJECT_RS_POD_RUNNER_CARGO_TOML
@@ -329,7 +349,7 @@ env_scripts = [
     !include_files ./make/libraries/log.ds
 
     os = os_family
-    info "📺 Current os: ${os}"
+    debug "📺 Current os: ${os}"
 
     is_linux = eq ${os} "linux"
     is_mac = eq ${os} "mac"
@@ -343,23 +363,27 @@ env_scripts = [
 
     python_venv  = exec --fail-on-error python -c "import sys; print(sys.prefix)"
     python_venv = trim ${python_venv.stdout}
-    info "🐍 Using Python environment: '${python_venv}'"
+    debug "🐍 Using Python environment: '${python_venv}'"
 
     if ${is_windows}
         lib_path_var = set "PATH"
         old_lib_path = get_env PATH
+        python_base = exec --fail-on-error python -c "import sys; print(sys.base_prefix)"
+        python_base = trim ${python_base.stdout}
+        python_lib = concat ${python_venv}/Scripts ${separator} ${python_base}
     elseif ${is_mac}
         lib_path_var = set "DYLD_LIBRARY_PATH"
         old_lib_path = get_env DYLD_LIBRARY_PATH
+        python_lib = set ${python_venv}/lib
     elseif ${is_linux}
         lib_path_var = set "LD_LIBRARY_PATH"
         old_lib_path = get_env LD_LIBRARY_PATH
+        python_lib = set ${python_venv}/lib
     else
         trigger_error "Unsupported OS: ${os}. Only windows, mac, and linux are supported."
     end
 
-    new_lib_path = set ${old_lib_path}
-    new_lib_path = concat ${python_venv}/lib ${separator} ${old_lib_path}
+    new_lib_path = concat ${python_lib} ${separator} ${old_lib_path}
 
     debug "📚 Using library path (${lib_path_var}): '${new_lib_path}'"
 

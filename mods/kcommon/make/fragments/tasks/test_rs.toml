@@ -11,16 +11,10 @@ script_runner = "@duckscript"
 script = '''
     !include_files ./make/libraries/log.ds
 
-    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} build %{td-rust-quiet} --locked %{td-target-token} %{td-target} --profile ${td-profile} --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML} --all-targets --tests"
-    exec --fail-on-error ${td-cargo} %{td-toolchain-token}%{td-toolchain} build %{td-rust-quiet} --locked %{td-target-token} %{td-target} --profile ${td-profile} --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML} --all-targets --tests
-
-    if eq ${td-cargo} "cross"
-        debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} test --locked --no-fail-fast %{td-target-token} %{td-target} --jobs ${td-cross-test-jobs} --all-targets --profile ${td-profile} --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML} --features ${kcommon-test-features}"
-        exit_code = exec --get-exit-code ${td-cargo} %{td-toolchain-token}%{td-toolchain} test --locked --no-fail-fast %{td-target-token} %{td-target} --jobs ${td-cross-test-jobs} --all-targets --profile ${td-profile} --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML} --features ${kcommon-test-features}
-    else
-        debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} nextest run %{td-rust-cargo-quiet} --build-jobs ${td-nextest-build-jobs} --locked --no-fail-fast %{td-target-token} %{td-target} --test-threads ${td-nextest-test-threads} --cargo-profile ${td-profile} --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML} --all-targets"
-        exit_code = exec --get-exit-code ${td-cargo} %{td-toolchain-token}%{td-toolchain} nextest run %{td-rust-cargo-quiet} --build-jobs ${td-nextest-build-jobs} --locked --no-fail-fast %{td-target-token} %{td-target} --test-threads ${td-nextest-test-threads} --cargo-profile ${td-profile} --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML} --all-targets
-    end
+    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} %{td-cargo-build-verb} %{td-rust-quiet} --locked %{td-build-target-token} %{td-build-target} --profile ${td-profile} --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML} --all-targets --tests"
+    exec --fail-on-error ${td-cargo} %{td-toolchain-token}%{td-toolchain} %{td-cargo-build-verb} %{td-rust-quiet} --locked %{td-build-target-token} %{td-build-target} --profile ${td-profile} --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML} --all-targets --tests
+    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} nextest run %{td-rust-cargo-quiet} --build-jobs ${td-nextest-build-jobs} --locked --no-fail-fast %{td-target-token} %{td-target} --test-threads ${td-nextest-test-threads} --cargo-profile ${td-profile} --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML} --all-targets"
+    exit_code = exec --get-exit-code ${td-cargo} %{td-toolchain-token}%{td-toolchain} nextest run %{td-rust-cargo-quiet} --build-jobs ${td-nextest-build-jobs} --locked --no-fail-fast %{td-target-token} %{td-target} --test-threads ${td-nextest-test-threads} --cargo-profile ${td-profile} --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML} --all-targets
 
     is_zero = eq ${exit_code} "0"
     if ${is_zero}
