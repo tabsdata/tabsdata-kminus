@@ -54,7 +54,7 @@ strip = "debuginfo"
 [lib]
 
 [package.metadata.cargo-machete]
-ignored = ["openssl"]
+ignored = []
 
 [dependencies]
 
@@ -72,5 +72,3 @@ nix = { version = "0.31.2", features = ["signal", "process"] }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Threading"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-openssl = { version = "0.10.76", features = ["vendored"] }
