@@ -6,10 +6,11 @@
 plugin = "td-task-tracker"
 category = "05 - Inspect"
 description = "Task 'outdated' for kcommon project"
-cwd = "${KM_ROOT}/mods/kcommon"
+cwd = "${KM_ROOT}"
 script_runner = "@duckscript"
 script = '''
     !include_files ./make/libraries/log.ds
 
-    debug "🚧 Task 'outdated' for kcommon is not implemented yet."
+    debug "🚀 ${td-cargo} upgrade --dry-run --compatible allow --incompatible allow --pinned allow --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML}"
+    exec --fail-on-error ${td-cargo} upgrade --dry-run --compatible allow --incompatible allow --pinned allow --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML}
 '''

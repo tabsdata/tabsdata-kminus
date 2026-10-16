@@ -6,10 +6,11 @@
 plugin = "td-task-tracker"
 category = "05 - Inspect"
 description = "Task 'outdated' for kminus project"
-cwd = "${KM_ROOT}/mods/kminus"
+cwd = "${KM_ROOT}"
 script_runner = "@duckscript"
 script = '''
     !include_files ./make/libraries/log.ds
 
-    debug "🚧 Task 'outdated' for kminus is not implemented yet."
+    debug "🚀 ${td-cargo} upgrade --dry-run --compatible allow --incompatible allow --pinned allow --manifest-path ${PROJECT_RS_KMINUS_CARGO_TOML}"
+    exec --fail-on-error ${td-cargo} upgrade --dry-run --compatible allow --incompatible allow --pinned allow --manifest-path ${PROJECT_RS_KMINUS_CARGO_TOML}
 '''

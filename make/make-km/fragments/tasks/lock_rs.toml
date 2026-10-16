@@ -1,0 +1,63 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__lock_rs]
+plugin = "td-task-tracker"
+category = "02 - Tidy"
+private = true
+run_task = [
+    { name = [
+        "__km__lock_rs_kcommon",
+        "__km__lock_rs_kminus",
+        "__km__lock_rs_pod_runner"
+    ] }
+]
+
+[tasks.__km__lock_rs_kcommon]
+plugin = "td-task-tracker"
+category = "02 - Tidy"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    cd "${PROJECT_RS_KM_KCOMMON_FOLDER}"
+
+    debug "🚀 cargo generate-lockfile"
+    exec --fail-on-error cargo generate-lockfile
+    ''']
+
+[tasks.__km__lock_rs_kminus]
+plugin = "td-task-tracker"
+category = "02 - Tidy"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    cd "${PROJECT_RS_KM_KMINUS_FOLDER}"
+
+    debug "🚀 cargo generate-lockfile"
+    exec --fail-on-error cargo generate-lockfile
+    ''']
+
+[tasks.__km__lock_rs_pod_runner]
+plugin = "td-task-tracker"
+category = "02 - Tidy"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    cd "${PROJECT_RS_KM_POD_RUNNER_FOLDER}"
+
+    debug "🚀 cargo generate-lockfile"
+    exec --fail-on-error cargo generate-lockfile
+    ''']

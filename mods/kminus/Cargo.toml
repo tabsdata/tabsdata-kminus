@@ -60,20 +60,20 @@ ignored = []
 
 [dependencies]
 
-clap = { version = "4.6.0", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 dunce = { version = "1.0.5" }
-file-rotate = { version = "0.7" }
+file-rotate = { version = "0.8" }
 kcommon = { path = "../kcommon" }
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_yaml = { version = "0.9.34" }
 strum = { version = "0.28.0", features = ["derive"] }
-sysinfo = { version = "0.37.2" }
-tokio = { version = "1.50.0", features = ["full"] }
+sysinfo = { version = "0.39.6" }
+tokio = { version = "1.53.3", features = ["full"] }
 tracing = { version = "0.1.44" }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.2", features = ["signal", "process"] }
+nix = { version = "0.31.3", features = ["signal", "process"] }
 
 
 [target.'cfg(target_os = "windows")'.dependencies]
