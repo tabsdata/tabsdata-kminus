@@ -6,7 +6,7 @@
 description = "Tabsdata common components between Tabsdata and Tabsdata Kubernetes."
 name = "kcommon"
 edition = "2024"
-version = "2.2.0"
+version = "2.2.1"
 
 authors = [
     "Aleix Lascorz Guiu    (tabsleix)      <aleix@tabsdata.com>",
