@@ -98,7 +98,7 @@ sysinfo = { version = "0.39.6" }
 tar = { version = "0.4" }
 thiserror = { version = "2" }
 time = { version = "0.3" }
-tokio = { version = "1.53.3", features = ["full"] }
+tokio = { version = "1.54.0", features = ["full"] }
 tokio-rustls = { version = "0.26" }
 tokio-stream = { version = "0.1" }
 tracing = { version = "0.1.44" }
@@ -113,13 +113,13 @@ filetime = { version = "0.2.29" }
 http-body-util = { version = "0.1" }
 hyper = { version = "1" }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
-libc = { version = "0.2.190" }
-rstest = { version = "0.27" }
+libc = { version = "0.2.191" }
+rstest = { version = "0.28" }
 serial_test = { version = "4" }
 # `test-util` enables `tokio::time::pause()` / `#[tokio::test(start_paused
 # = true)]` used by the resolver backoff tests so they can validate
 # multi-minute waits in milliseconds.
-tokio = { version = "1.53.3", features = ["test-util"] }
+tokio = { version = "1.54.0", features = ["test-util"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["signal", "process"] }
