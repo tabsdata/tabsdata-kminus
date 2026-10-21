@@ -686,7 +686,10 @@ mod tests {
         let container_root = Path::new("/pods/p1").join("work").join("app");
         assert_eq!(
             prepared.spec.containers[0].volume_mounts[0].mount_path,
-            container_root.join("mnt/data").to_string_lossy().to_string()
+            container_root
+                .join("mnt/data")
+                .to_string_lossy()
+                .to_string()
         );
         assert_eq!(
             prepared.spec.containers[0].volume_mounts[1].mount_path,
