@@ -20,7 +20,7 @@ use crate::server::config::*;
 use crate::spec::constants::{
     DEFAULT_POD_DATA_REAP_TTL_ON_POD_FAILURE, DEFAULT_POD_DATA_REAP_TTL_ON_POD_SUCCESS,
     DEFAULT_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE,
-    DEFAULT_POD_DIR_DELETE_TTL_POD_SUCCESS_ON_POD_DELETE,
+    DEFAULT_POD_DIR_DELETE_TTL_POD_SUCCESS_ON_POD_DELETE, DEFAULT_POD_LOG_ID_LABEL,
 };
 
 // ---------------------------------------------------------------------------
@@ -212,6 +212,12 @@ pub struct YamlSysConfig {
     #[serde(alias = "podDirDeleteTtlPodFailureOnPodDelete")]
     pub pod_dir_delete_ttl_pod_failure_on_pod_delete: String,
 
+    /// Pod label whose value, when it is a valid Kubernetes name, files the
+    /// pod's logs under that log pod id instead of the pod name. Empty
+    /// disables it: every pod is filed under its name.
+    #[serde(alias = "podLogIdLabel")]
+    pub pod_log_id_label: String,
+
     /// Cadence between disk-usage scans for both per-pod and pod-runner
     /// trackers (seconds).
     #[serde(alias = "dirSizeScanIntervalSecs")]
@@ -259,6 +265,7 @@ impl Default for YamlSysConfig {
                 DEFAULT_POD_DIR_DELETE_TTL_POD_SUCCESS_ON_POD_DELETE.to_string(),
             pod_dir_delete_ttl_pod_failure_on_pod_delete:
                 DEFAULT_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE.to_string(),
+            pod_log_id_label: DEFAULT_POD_LOG_ID_LABEL.to_string(),
             dir_size_scan_interval_secs: 60,
             metrics_url: crate::metrics::DEFAULT_METRICS_URL.to_string(),
             secret_resolver: YamlResolverConfig {
@@ -529,6 +536,18 @@ secretResolver:
         let yaml = "podDirDeleteTtlPodFailureOnPodDelete: \"never\"\n";
         let c = YamlSysConfig::from_str(yaml).unwrap();
         assert_eq!(c.pod_dir_delete_ttl_pod_failure_on_pod_delete, "never");
+    }
+
+    #[test]
+    fn syscfg_pod_log_id_label_defaults_and_parses() {
+        assert_eq!(
+            YamlSysConfig::default().pod_log_id_label,
+            DEFAULT_POD_LOG_ID_LABEL
+        );
+        let c = YamlSysConfig::from_str("podLogIdLabel: \"tabsdata.com/log-id\"\n").unwrap();
+        assert_eq!(c.pod_log_id_label, "tabsdata.com/log-id");
+        let c = YamlSysConfig::from_str("podLogIdLabel: \"\"\n").unwrap();
+        assert_eq!(c.pod_log_id_label, "", "empty disables the label");
     }
 
     // -- removed settings --

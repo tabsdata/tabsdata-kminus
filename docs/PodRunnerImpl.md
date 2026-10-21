@@ -104,11 +104,12 @@ have to poll for.
 
 ## Configuration
 
-Two YAML files live in the config directory:
+Two YAML files configure the server, and pod-runner writes a third for its clients:
 
 | File               | Lifetime                                                                     |
 |--------------------|------------------------------------------------------------------------------|
-| `prconfig.yaml`    | Endpoint URL + TLS material. Regenerated on every start by the orchestrator (km). |
+| `prconfig.yaml`    | Endpoint URL + the server's TLS material. Server-only: it has no client certificate, so no client can use it. Regenerated on every start by the orchestrator (km). |
+| `vk-prconfig.yaml` | Client config: URL, server CA and the `vk` client certificate. What every client uses (virtual-kubelet, `kpr --prconfig`, Tabsdata's log archive). Regenerated with `prconfig.yaml`. |
 | `prsysconfig.yaml` | Node identity, pod limits, executor, cleanup, capacity, resolvers. Persistent and user-editable; auto-created with defaults on first start. The resolved `capacity` is reported to km at startup and printed with its banner — see [KmComponentMessages.md](KmComponentMessages.md). |
 
 ### CLI Arguments
@@ -221,6 +222,7 @@ All endpoints use query parameters for GET/DELETE and JSON body for POST.
 | **GET**    | `/getPods`            | List all pods           | `namespace` (optional)                                                            |
 | **GET**    | `/getAllPodStatuses`  | Bulk status dump for sync loop — returns `[{namespace, name, uid, phase, status}]` |                                                                                   |
 | **GET**    | `/getContainerLogs`   | Stream container logs   | `podName` (req), `namespace`, `containerName`, `follow`, `tailLines`, `previous`, `timestamps` |
+| **GET**    | `/getPodLogs`         | Stream the logs of every pod filed under a log pod id, from disk | `logPodId` (req), `podName`, `namespace`, `containerName`, `tailLines`, `previous`, `timestamps` |
 
 ### Node Information
 
@@ -450,7 +452,7 @@ Prometheus metrics served on a separate port at `/metrics`. The port comes from 
 Follows K8s log naming conventions:
 
 ```
-<workdir>/data/pod-state/<bucket>/<pod_name>/<stamp>/
+<workdir>/data/pod-state/<bucket>/<log_pod_id>/<stamp>_<pod_name>/
   log/<container-name>/
     0.log               # Current log (restart_count=0)
     0.log.1             # Rotated (most recent)
@@ -481,6 +483,56 @@ supports:
 - `timestamps` -- prefix each line with its CRI timestamp (matches
   `kubectl logs --timestamps`)
 
+The `/getPodLogs` endpoint serves the logs of every pod filed under a log
+pod id: the value of the pod's `pod.log.id` label, or its name when it has
+none (see Reaping). It reads the pod-state dirs, so it works whether or not
+the pods still exist. virtual-kubelet does not call it; `kubectl logs` goes
+through `/getContainerLogs`. Apart from `logPodId`, it takes the query
+string of `/getContainerLogs`:
+
+```
+GET /getPodLogs?logPodId=nightly[&podName=<pod>][&containerName=web][&tailLines=100][&previous=true][&timestamps=true]
+```
+
+Set `pod.log.id` on a CronJob's, Job's or Deployment's pod template and
+every pod it creates is filed under that id: all the runs of a CronJob,
+all the retries of a Job, all the replicas and rollouts of a Deployment.
+Pods (incarnations) come oldest first, each opening with a separator that
+names its creation time and pod:
+
+```
+------------------------------------------------------------
+POD STARTED 2026-10-19T14:30:05Z nightly-29001230-x7k2p
+------------------------------------------------------------
+--- container setup ---
+...
+--- container web ---
+...
+```
+
+- Containers come in spec order, init containers first, one after the
+  other (how `kubectl logs --all-containers` joins them). Each opens with
+  a `--- container <name> ---` line unless `containerName` picks one.
+- Lines are formatted as `/getContainerLogs` formats them. Restarts come
+  oldest first and, within a restart, rotated files (`N.log.4` ...
+  `N.log.1`) before `N.log`, so the whole history is there, not just the
+  current file. Probe logs are left out.
+- `podName` -- only that pod among those filed under the id, written
+  without its `POD STARTED` separator (container headers stay unless
+  `containerName` picks one). It is for a caller that reads one pod at a
+  time and writes its own separators, such as Tabsdata's log
+  multiplexer. A bare pod recreated under its name matches every
+  incarnation, oldest first.
+- `tailLines` -- the last N lines of each container, per pod.
+- `previous` -- leave out the newest pod.
+- `namespace` -- accepted; a pod runner serves a single namespace.
+- `follow` -- refused with 400: this is a record, not a live stream.
+
+A log pod id with nothing on disk, a `podName` not filed under it,
+`previous` with only one pod, or a `containerName` no pod has logs for is
+a 404. A log pod id, pod name or container name that is not a Kubernetes
+name is a 400.
+
 ---
 
 ## Storage
@@ -503,26 +555,34 @@ A pod's footprint is split across two dirs with independent clocks:
 - **data dir** -- `<workdir>/data/pod-run/<pod_id>/`: `work/` and `volumes/`. Everything the
   containers produced, usually the bulk of the footprint, and nothing reads it once the pod is
   done. It is **reaped** on a clock that runs from **pod completion**.
-- **state dir** -- `<workdir>/data/pod-state/<bucket>/<pod_name>/<stamp>/`: the `log/` and
-  `store/` that are one incarnation's only record of what it did and why it ended. It is
+- **state dir** -- `<workdir>/data/pod-state/<bucket>/<log_pod_id>/<stamp>_<pod_name>/`: the
+  `log/` and `store/` that are one pod's only record of what it did and why it ended. It is
   **deleted** on a clock that runs from the moment the pod is **removed from the pod runner**,
   because until then the runner still answers queries about it.
 
-`<pod_id>` is `<namespace>_<name>_<uid>`: the data dir is per uid, so a new incarnation never
-touches the data an earlier one is still keeping for inspection. The state path leaves the uid
-out. A pod runner serves a single namespace, so the pod name identifies a pod across its
-incarnations; they share `<pod_name>/`, each in a `<stamp>/` of its own -- the pod's
-`metadata.creationTimestamp` in compact UTC (`20261019T143005Z`; RFC3339's `:` is not valid in a
-Windows path). Admission sets the creation time to the admission time on a pod that has none
-(`kpr` submissions), so every incarnation has a stamp. A pod replayed after a restart keeps its
-creation time and lands back in its own stamp dir. Two incarnations created within the same second
-share one -- accepted, since the logs rotate rather than collide.
+`<pod_id>` is `<namespace>_<name>_<uid>`: the data dir is per uid, so a new pod never touches the
+data an earlier one is still keeping for inspection.
 
-`<bucket>` is two lowercase hex digits: FNV-1a 64 of the pod name, xor-folded to 8 bits (256
+The state path is keyed by the **log pod id**: the value of the pod's `pod.log.id` label when it
+carries one that is a valid Kubernetes name, and the pod name otherwise. The label is the
+`podLogIdLabel` setting in `prsysconfig.yaml`; empty disables it. A label value that is not a valid
+name is ignored with a warning at admission, and the pod is filed under its name. The uid is never
+part of the state path, and a pod runner serves a single namespace, so the id is unique as given.
+
+Every pod filed under an id gets an incarnation dir of its own, `<stamp>_<pod_name>`:
+- `<stamp>` is the pod's `metadata.creationTimestamp` in compact UTC (`20261019T143005Z`;
+  RFC3339's `:` is not valid in a Windows path). Admission sets it to the admission time on a pod
+  that has none (`kpr` submissions).
+- The pod name keeps apart pods created in the same second: replicas, parallel Job pods.
+  Kubernetes names never contain `_`, so the two halves split back unambiguously.
+- Sorting the dir names sorts the pods by creation time.
+- A pod replayed after a restart keeps its creation time and name, so it lands back in its own
+  dir.
+
+`<bucket>` is two lowercase hex digits: FNV-1a 64 of the log pod id, xor-folded to 8 bits (256
 buckets). State dirs outlive their pods and accumulate far more entries than data dirs, so the
-bucket keeps any one directory from growing unbounded -- and since every part of the path is
-computed from the pod name and creation time, a pod's records can be found whether or not the
-runner still knows the pod.
+bucket keeps any one directory from growing unbounded -- and since the path is computed from the
+id, a pod's records can be found whether or not the runner still knows the pod.
 
 Each clock has a TTL per outcome, so four settings in total:
 
@@ -530,8 +590,8 @@ Each clock has a TTL per outcome, so four settings in total:
 |----------------------------------------|---------|----------------------------------|
 | `podDataReapTtlOnPodSuccess`           | `0s`    | data dir of a succeeded pod      |
 | `podDataReapTtlOnPodFailure`           | `1h`    | data dir of a failed pod         |
-| `podDirDeleteTtlPodSuccessOnPodDelete` | `1h`    | state dir of a succeeded incarnation |
-| `podDirDeleteTtlPodFailureOnPodDelete` | `24h`   | state dir of a failed incarnation    |
+| `podDirDeleteTtlPodSuccessOnPodDelete` | `1h`    | state dir of a succeeded pod     |
+| `podDirDeleteTtlPodFailureOnPodDelete` | `24h`   | state dir of a failed pod        |
 
 A value is `<number><unit>` with unit `s`, `m` or `h`, or `never` to keep the files indefinitely.
 There is no `d` unit -- `24h` says the same thing without a second spelling. An invalid value in
@@ -547,8 +607,9 @@ warning and the configured value is used.
 Each dir carries everything its own clock needs, so the two never consult each other. At pod
 admission the resolved values are written to a `_cleanup_ttls.json` in each dir, recording where
 each one came from: the reap TTLs in the data dir, the delete TTLs in the incarnation's state dir.
-Incarnations of one name can carry different annotations and end differently, so each has its own
-policy, outcome marker and deadline; the `<pod_name>/` dir above them holds nothing but them. Nothing on
+The pods filed under one id can carry different annotations and end differently, so each has its
+own policy, outcome marker and deadline; the `<log_pod_id>/` dir above them holds nothing but
+them. Nothing on
 the reaping path re-derives them from config, so each dir carries its own retention policy and
 stays correct across a config edit or a runner restart.
 
@@ -560,8 +621,8 @@ see exactly when a dir is due -- no TTL arithmetic, and "never expires" is disti
 
 - **Inline**: whenever a pod is finalized or evicted, the deadline is applied immediately, so a
   `0s` TTL acts at once. A deadline that can't be parsed is never acted on. Removing an
-  incarnation's state dir also removes its `<pod_name>/` dir once that is empty -- with a plain
-  `rmdir`, never a recursive delete, so a new incarnation being admitted at the same moment
+  incarnation's state dir also removes its `<log_pod_id>/` dir once that is empty -- with a plain
+  `rmdir`, never a recursive delete, so a new pod being admitted under the id at the same moment
   either keeps it from going or recreates it.
 - **Timers**: a deadline still ahead gets one task that sleeps until it comes due. There is no
   scanning daemon: a deadline is known the moment it is written, so the runner waits on it
@@ -610,8 +671,8 @@ but the record itself.
       _succeeded | _failed                       # Outcome marker, content = completion time
       _reap_on                                   # Reap deadline, or "never"
       _size                                      # Cached disk usage
-    pod-state/<bucket>/<pod_name>/               # Shared by the name's incarnations; removed with the last
-      <stamp>/                                   # One incarnation's state dir -- removed on the delete deadline
+    pod-state/<bucket>/<log_pod_id>/             # pod.log.id label value, or pod name; removed with the last pod
+      <stamp>_<pod_name>/                        # One pod's state dir -- removed on the delete deadline
         log/<container>/
           0.log                                  # Container stdout/stderr
           0.log.1                                # Rolled log

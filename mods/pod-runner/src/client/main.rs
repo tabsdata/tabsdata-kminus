@@ -3,7 +3,7 @@
 //! `kpr` — HTTP client CLI for a running Pod Runner server.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -38,6 +38,7 @@ const ENDPOINT_GET_POD: &str = "/getPod";
 const ENDPOINT_GET_POD_STATUS: &str = "/getPodStatus";
 const ENDPOINT_GET_PODS: &str = "/getPods";
 const ENDPOINT_GET_CONTAINER_LOGS: &str = "/getContainerLogs";
+const ENDPOINT_GET_POD_LOGS: &str = "/getPodLogs";
 const ENDPOINT_CAPACITY: &str = "/capacity";
 const ENDPOINT_NODE_CONDITIONS: &str = "/nodeConditions";
 const ENDPOINT_NODE_ADDRESSES: &str = "/nodeAddresses";
@@ -54,6 +55,8 @@ const PARAM_CONTAINER_NAME: &str = "containerName";
 const PARAM_FOLLOW: &str = "follow";
 const PARAM_TAIL_LINES: &str = "tailLines";
 const PARAM_PREVIOUS: &str = "previous";
+const PARAM_TIMESTAMPS: &str = "timestamps";
+const PARAM_LOG_POD_ID: &str = "logPodId";
 
 // ---------------------------------------------------------------------------
 // JSON field names
@@ -79,6 +82,33 @@ const VALUE_TRUE: &str = "true";
 
 const DEFAULT_NAMESPACE: &str = "default";
 const HTTP_SCHEME_PREFIX: &str = "http://";
+const HTTPS_SCHEME_PREFIX: &str = "https://";
+
+// ---------------------------------------------------------------------------
+// Config files and TLS failures
+// ---------------------------------------------------------------------------
+
+/// pod-runner's client config: what `--prconfig` takes.
+const CLIENT_CONFIG_FILENAME: &str = "vk-prconfig.yaml";
+/// pod-runner's own server config, in the same dir: the usual wrong pick.
+const SERVER_CONFIG_FILENAME: &str = "prconfig.yaml";
+
+/// Lowercased fragments of an `https` error chain that mean the TLS session
+/// failed. A client certificate pod-runner refuses rarely shows as such:
+/// the server drops the session after the client's side of the handshake is
+/// done, and hyper reports only "connection was not ready" or a closed one.
+const TLS_ERROR_MARKERS: &[&str] = &[
+    "certificate",
+    "handshake",
+    "tls",
+    "alert",
+    "not ready",
+    "connection closed",
+    "reset by peer",
+];
+const TLS_ERROR_HINT: &str = "\n  pod-runner most likely refused the TLS session. --prconfig must \
+    be the vk-prconfig.yaml of the pod-runner running now: its CA and client certificate \
+    are regenerated on every km start, so a copy from an earlier run is rejected.";
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -98,11 +128,14 @@ const HTTP_SCHEME_PREFIX: &str = "http://";
 )]
 struct Cli {
     /// Path to kubeconfig file. Falls back to KUBECONFIG env var.
+    /// No command reads it: kpr talks to pod-runner only.
     #[arg(long)]
     kubeconfig: Option<String>,
 
-    /// Path to the client config YAML file (vk-prconfig.yaml).
-    /// Falls back to PRCONFIG env var.
+    /// Path to pod-runner's client config, vk-prconfig.yaml (on km:
+    /// <km workdir>/config/vk-prconfig.yaml). Not prconfig.yaml, the
+    /// server's own config: it has no client certificate, and pod-runner
+    /// accepts only mutual-TLS connections. Falls back to PRCONFIG env var.
     #[arg(long)]
     prconfig: Option<String>,
 
@@ -180,6 +213,38 @@ enum Command {
         /// Show logs from previous container instance.
         #[arg(long, default_value_t = false)]
         previous: bool,
+    },
+
+    /// Logs of every pod filed under a log pod id (the pod's `pod.log.id`
+    /// label, or its name), oldest first, read from disk — whether or not
+    /// the pods still exist.
+    #[command(name = "pod-logs")]
+    PodLogs {
+        /// Log pod id: the `pod.log.id` label value, or the pod name.
+        #[arg(short = 'i', long)]
+        log_pod_id: String,
+
+        /// Only this pod among those filed under the id, without its
+        /// separator. Default: every pod.
+        #[arg(short = 'p', long)]
+        pod: Option<String>,
+
+        /// Only this container. Default: all containers.
+        #[arg(short = 'c', long)]
+        container: Option<String>,
+
+        /// Number of lines from the end to show, per container per
+        /// incarnation. Default: all.
+        #[arg(long)]
+        tail: Option<u64>,
+
+        /// Leave out the newest incarnation.
+        #[arg(long, default_value_t = false)]
+        previous: bool,
+
+        /// Prefix each line with its timestamp.
+        #[arg(long, default_value_t = false)]
+        timestamps: bool,
     },
 
     /// Node capacity.
@@ -353,6 +418,70 @@ async fn cmd_list(client: &reqwest::Client, base_url: &str) -> u8 {
     handle_response(resp).await
 }
 
+/// Stream the logs of every pod filed under a log pod id to stdout. Always streamed:
+/// the whole history can be large.
+// Launcher-style, like cmd_logs: every parameter is an independent value
+// the caller already has.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_pod_logs(
+    client: &reqwest::Client,
+    base_url: &str,
+    log_pod_id: &str,
+    pod: Option<&str>,
+    container: Option<&str>,
+    tail: Option<u64>,
+    previous: bool,
+    timestamps: bool,
+) -> u8 {
+    let mut params: Vec<(&str, String)> = vec![(PARAM_LOG_POD_ID, log_pod_id.to_string())];
+    if let Some(p) = pod {
+        params.push((PARAM_POD_NAME, p.to_string()));
+    }
+    if let Some(c) = container {
+        params.push((PARAM_CONTAINER_NAME, c.to_string()));
+    }
+    if let Some(n) = tail {
+        params.push((PARAM_TAIL_LINES, n.to_string()));
+    }
+    if previous {
+        params.push((PARAM_PREVIOUS, VALUE_TRUE.to_string()));
+    }
+    if timestamps {
+        params.push((PARAM_TIMESTAMPS, VALUE_TRUE.to_string()));
+    }
+
+    let resp = match client
+        .get(format!("{base_url}{ENDPOINT_GET_POD_LOGS}"))
+        .query(&params)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return connection_error(base_url, e),
+    };
+    if !resp.status().is_success() {
+        return handle_response(resp).await;
+    }
+
+    let mut byte_stream = resp.bytes_stream();
+    let mut stdout = std::io::stdout();
+    while let Some(chunk) = byte_stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                if stdout.write_all(&bytes).is_err() {
+                    break;
+                }
+            }
+            Err(e) => {
+                eprintln!("Error: stream interrupted: {e}");
+                return EXIT_SERVER_ERROR;
+            }
+        }
+    }
+    let _ = stdout.flush();
+    EXIT_OK
+}
+
 // Launcher-style: every parameter is an independent value the caller
 // already has, so bundling them into a struct moves the list rather
 // than shortening it.
@@ -494,12 +623,64 @@ async fn cmd_metrics(metrics_url: &str) -> u8 {
 }
 
 fn connection_error(base_url: &str, err: reqwest::Error) -> u8 {
-    if err.is_connect() {
-        eprintln!("Error: cannot connect to {base_url}");
-    } else {
-        eprintln!("Error: {err}");
-    }
+    eprintln!("Error: {}", connection_error_message(base_url, &err));
     EXIT_CONNECTION
+}
+
+/// The error and every cause under it. reqwest's own message is only
+/// "error sending request for url (...)"; what went wrong — a refused
+/// connection, a TLS alert — is in the source chain.
+fn connection_error_message(base_url: &str, err: &reqwest::Error) -> String {
+    let mut msg = if err.is_connect() {
+        format!("cannot connect to {base_url}")
+    } else {
+        err.to_string()
+    };
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !msg.contains(&text) {
+            msg.push_str(": ");
+            msg.push_str(&text);
+        }
+        source = cause.source();
+    }
+    let lower = msg.to_lowercase();
+    if base_url.starts_with(HTTPS_SCHEME_PREFIX)
+        && TLS_ERROR_MARKERS.iter().any(|m| lower.contains(m))
+    {
+        msg.push_str(TLS_ERROR_HINT);
+    }
+    msg
+}
+
+/// Why an `https` config without a client certificate is refused before
+/// any request, and which file to pass instead.
+fn missing_client_identity_message(path: &Path) -> String {
+    let mut msg = format!(
+        "{} has no client certificate and key, and pod-runner accepts only \
+         mutual-TLS connections.",
+        path.display()
+    );
+    if path
+        .file_name()
+        .is_some_and(|n| n == SERVER_CONFIG_FILENAME)
+    {
+        msg.push_str(&format!(
+            "\n  {SERVER_CONFIG_FILENAME} is pod-runner's own server config; --prconfig \
+             takes its client config, {CLIENT_CONFIG_FILENAME}."
+        ));
+    } else {
+        msg.push_str(&format!(
+            "\n  --prconfig takes pod-runner's client config, {CLIENT_CONFIG_FILENAME}, \
+             which has a `client:` section."
+        ));
+    }
+    let sibling = path.with_file_name(CLIENT_CONFIG_FILENAME);
+    if sibling != path && sibling.is_file() {
+        msg.push_str(&format!("\n  Use: --prconfig {}", sibling.display()));
+    }
+    msg
 }
 
 // ---------------------------------------------------------------------------
@@ -535,10 +716,28 @@ async fn main() -> ExitCode {
     let base_url = match &config {
         Some(cfg) if !cfg.url.is_empty() => cfg.url.trim_end_matches('/').to_string(),
         _ => {
-            eprintln!("Error: --prconfig or PRCONFIG env var is required.");
+            eprintln!(
+                "Error: --prconfig or PRCONFIG env var is required: pod-runner's client \
+                 config, {CLIENT_CONFIG_FILENAME}, in km's config dir \
+                 (<km workdir>/config/{CLIENT_CONFIG_FILENAME})."
+            );
             return ExitCode::from(EXIT_VALIDATION);
         }
     };
+
+    // pod-runner refuses a TLS session without a client certificate, and
+    // reqwest reports that only as "error sending request": catch the wrong
+    // file here, where its name is still known.
+    if let (Some(cfg), Some(path)) = (&config, &cli.prconfig)
+        && base_url.starts_with(HTTPS_SCHEME_PREFIX)
+        && !cfg.has_client_identity()
+    {
+        eprintln!(
+            "Error: {}",
+            missing_client_identity_message(Path::new(path))
+        );
+        return ExitCode::from(EXIT_VALIDATION);
+    }
 
     // Build HTTP client
     let client = match build_client(&config) {
@@ -575,6 +774,26 @@ async fn main() -> ExitCode {
         } => {
             cmd_logs(
                 &client, &base_url, name, namespace, container, stream, tail, previous,
+            )
+            .await
+        }
+        Command::PodLogs {
+            ref log_pod_id,
+            ref pod,
+            ref container,
+            tail,
+            previous,
+            timestamps,
+        } => {
+            cmd_pod_logs(
+                &client,
+                &base_url,
+                log_pod_id,
+                pod.as_deref(),
+                container.as_deref(),
+                tail,
+                previous,
+                timestamps,
             )
             .await
         }
@@ -941,6 +1160,40 @@ spec:
     }
 
     #[tokio::test]
+    async fn test_pod_logs() {
+        let (url, _tx) = start_test_server().await;
+        let client = test_client();
+        let dir = std::env::temp_dir().join(format!("td-prc-pod-logs-{}", std::process::id()));
+        let file = write_pod_yaml(&dir, "kpr-pod-logs", "echo hello-history");
+
+        cmd_create(&client, &url, &file).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let code = cmd_pod_logs(
+            &client,
+            &url,
+            "kpr-pod-logs",
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(code, EXIT_OK);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_pod_logs_not_found() {
+        let (url, _tx) = start_test_server().await;
+        let client = test_client();
+        let code = cmd_pod_logs(&client, &url, "kpr-nope", None, None, None, false, false).await;
+        assert_eq!(code, EXIT_SERVER_ERROR);
+    }
+
+    #[tokio::test]
     async fn test_logs_not_found() {
         let (url, _tx) = start_test_server().await;
         let client = test_client();
@@ -1102,6 +1355,47 @@ spec:
     }
 
     // -- connection error --
+
+    #[tokio::test]
+    async fn test_connection_error_message_carries_cause() {
+        let err = test_client()
+            .get("http://127.0.0.1:1/capacity")
+            .send()
+            .await
+            .unwrap_err();
+        let msg = connection_error_message("http://127.0.0.1:1", &err);
+        let prefix = "cannot connect to http://127.0.0.1:1: ";
+        assert!(msg.starts_with(prefix), "{msg}");
+        assert!(msg.len() > prefix.len(), "{msg}");
+        assert!(!msg.contains(TLS_ERROR_HINT), "{msg}");
+    }
+
+    #[test]
+    fn test_missing_identity_on_server_config_names_client_config() {
+        let tmp = std::env::temp_dir().join(format!("kpr-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let server = tmp.join(SERVER_CONFIG_FILENAME);
+        let client = tmp.join(CLIENT_CONFIG_FILENAME);
+        std::fs::write(&server, "url: \"https://127.0.0.1:1\"\n").unwrap();
+        std::fs::write(&client, "url: \"https://127.0.0.1:1\"\n").unwrap();
+
+        let msg = missing_client_identity_message(&server);
+        assert!(msg.contains("pod-runner's own server config"), "{msg}");
+        assert!(
+            msg.ends_with(&format!("Use: --prconfig {}", client.display())),
+            "{msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_missing_identity_without_sibling() {
+        let path = Path::new("/nonexistent/other.yaml");
+        let msg = missing_client_identity_message(path);
+        assert!(msg.contains("which has a `client:` section"), "{msg}");
+        assert!(!msg.contains("Use: --prconfig"), "{msg}");
+    }
 
     #[tokio::test]
     async fn test_connection_error() {

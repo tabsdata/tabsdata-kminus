@@ -12,6 +12,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 
+use crate::logic::pod_logs::{PodLogsError, PodLogsOptions};
 use crate::logic::{ContainerLogOptions, LogicError, PodLogic};
 use crate::spec::api::{CreatePodResponse, DeletePodResponse, ErrorResponse, PodObject};
 use crate::spec::pod::PodSpec;
@@ -46,6 +47,7 @@ pub fn create_router(state: SharedState, metrics: Option<Arc<crate::metrics::Met
         .route("/getPods", get(handle_get_pods))
         .route("/getAllPodStatuses", get(handle_get_all_pod_statuses))
         .route("/getContainerLogs", get(handle_get_container_logs))
+        .route("/getPodLogs", get(handle_get_pod_logs))
         .route("/capacity", get(handle_capacity))
         .route("/nodeConditions", get(handle_node_conditions))
         .route("/nodeAddresses", get(handle_node_addresses))
@@ -86,6 +88,24 @@ struct LogQuery {
     pod_name: Option<String>,
     #[serde(default = "default_namespace")]
     namespace: String,
+    #[serde(rename = "containerName")]
+    container_name: Option<String>,
+    #[serde(default)]
+    follow: bool,
+    #[serde(rename = "tailLines")]
+    tail_lines: Option<u64>,
+    #[serde(default)]
+    previous: bool,
+    #[serde(default)]
+    timestamps: bool,
+}
+
+#[derive(Deserialize)]
+struct PodLogQuery {
+    #[serde(rename = "logPodId")]
+    log_pod_id: Option<String>,
+    #[serde(rename = "podName")]
+    pod_name: Option<String>,
     #[serde(rename = "containerName")]
     container_name: Option<String>,
     #[serde(default)]
@@ -290,6 +310,67 @@ async fn handle_get_container_logs(
     Response::builder()
         .header("content-type", "text/plain")
         .body(body)
+        .unwrap()
+}
+
+/// GET /getPodLogs?logPodId=...&podName=...&namespace=...&containerName=...&tailLines=...&previous=...&timestamps=...
+///
+/// Streams the logs of every pod filed under a log pod id — the value of a
+/// pod's `pod.log.id` label, or its name when it has none — oldest first,
+/// each opening with a `POD STARTED <creation time> <pod name>` separator.
+/// Read from the pod-state dirs, whether or not the pods still exist. Not
+/// called by virtual-kubelet, which serves `kubectl logs` through
+/// `/getContainerLogs`. The other parameters are those of
+/// `/getContainerLogs`, read as:
+///
+/// - `podName` — only that pod among those filed under the id, without its
+///   separator, for a caller that reads one pod at a time.
+/// - `containerName` — only that container; all containers when absent.
+/// - `tailLines` — last N lines of each container, per pod.
+/// - `previous` — leave out the newest pod.
+/// - `namespace` — accepted; a pod runner serves a single namespace.
+/// - `follow` — refused: this is a record, not a live stream. Follow a
+///   running pod with `/getContainerLogs`.
+async fn handle_get_pod_logs(
+    State(state): State<SharedState>,
+    Query(params): Query<PodLogQuery>,
+) -> Response {
+    let log_pod_id = match params.log_pod_id {
+        Some(id) => id,
+        None => return missing_param("logPodId"),
+    };
+    if params.follow {
+        return bad_request(
+            "follow is not supported by getPodLogs; use getContainerLogs to follow a running pod"
+                .to_string(),
+        );
+    }
+
+    let options = PodLogsOptions {
+        pod: params.pod_name,
+        container: params.container_name,
+        tail_lines: params.tail_lines,
+        previous: params.previous,
+        timestamps: params.timestamps,
+    };
+    let rx = match state.logic.stream_pod_logs(&log_pod_id, options) {
+        Ok(rx) => rx,
+        Err(e @ PodLogsError::InvalidName { .. }) => return bad_request(e.to_string()),
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    Response::builder()
+        .header("content-type", "text/plain")
+        .body(axum::body::Body::from_stream(stream))
         .unwrap()
 }
 
@@ -645,6 +726,147 @@ mod tests {
 
         let (status, _) = request(&addr, "GET", "/getContainerLogs", None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // -- getPodLogs --
+
+    /// Send a GET and return the status and the body as text.
+    async fn request_text(addr: &std::net::SocketAddr, path: &str) -> (StatusCode, String) {
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build_http();
+        let req = hyper::Request::builder()
+            .method("GET")
+            .uri(format!("http://{}{}", addr, path))
+            .body(String::new())
+            .unwrap();
+        let resp = client.request(req).await.unwrap();
+        let status = StatusCode::from_u16(resp.status().as_u16()).unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    async fn wait_for_phase(addr: &std::net::SocketAddr, name: &str, phase: &str) {
+        for _ in 0..100 {
+            let (_, body) = request(addr, "GET", &format!("/getPodStatus?name={name}"), None).await;
+            if body["phase"] == phase {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("{name} never reached {phase}");
+    }
+
+    #[tokio::test]
+    async fn get_pod_logs_outlives_the_pod_and_orders_incarnations() {
+        let (addr, _) = start_server().await;
+        // The test server's dirs are shared per process: a name of its own.
+        let name = "podlogs-history";
+
+        for (uid, created, out) in [
+            ("uid-1", "2026-10-19T14:00:00Z", "first-run"),
+            ("uid-2", "2026-10-19T15:00:00Z", "second-run"),
+        ] {
+            let mut spec = pod_spec_json_uid(name, uid, &format!("echo {out}"));
+            spec["metadata"]["creationTimestamp"] = serde_json::json!(created);
+            request(&addr, "POST", "/createPod", Some(spec)).await;
+            wait_for_phase(&addr, name, "Succeeded").await;
+            let (status, _) =
+                request(&addr, "DELETE", &format!("/deletePod?name={name}"), None).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let (status, body) = request_text(&addr, &format!("/getPodLogs?logPodId={name}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let first = body.find("POD STARTED 2026-10-19T14:00:00Z").expect(&body);
+        let first_out = body.find("first-run").expect(&body);
+        let second = body.find("POD STARTED 2026-10-19T15:00:00Z").expect(&body);
+        let second_out = body.find("second-run").expect(&body);
+        assert!(
+            first < first_out && first_out < second && second < second_out,
+            "{body}"
+        );
+
+        let (status, body) =
+            request_text(&addr, &format!("/getPodLogs?logPodId={name}&previous=true")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("first-run") && !body.contains("second-run"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_pod_logs_groups_pods_by_their_log_id_label() {
+        let (addr, _) = start_server().await;
+
+        // Two runs of a CronJob: generated pod names, one log pod id.
+        for (name, created, out) in [
+            ("podlogs-cron-111-aaaaa", "2026-10-19T00:00:03Z", "run-one"),
+            ("podlogs-cron-222-bbbbb", "2026-10-20T00:00:02Z", "run-two"),
+        ] {
+            let mut spec = pod_spec_json(name, &format!("echo {out}"));
+            spec["metadata"]["creationTimestamp"] = serde_json::json!(created);
+            spec["metadata"]["labels"] = serde_json::json!({"pod.log.id": "podlogs-cron"});
+            request(&addr, "POST", "/createPod", Some(spec)).await;
+            wait_for_phase(&addr, name, "Succeeded").await;
+            request(&addr, "DELETE", &format!("/deletePod?name={name}"), None).await;
+        }
+
+        let (status, body) = request_text(&addr, "/getPodLogs?logPodId=podlogs-cron").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let one = body
+            .find("POD STARTED 2026-10-19T00:00:03Z podlogs-cron-111-aaaaa")
+            .expect(&body);
+        let two = body
+            .find("POD STARTED 2026-10-20T00:00:02Z podlogs-cron-222-bbbbb")
+            .expect(&body);
+        assert!(one < body.find("run-one").unwrap(), "{body}");
+        assert!(two < body.find("run-two").unwrap() && one < two, "{body}");
+
+        let (status, body) = request_text(
+            &addr,
+            "/getPodLogs?logPodId=podlogs-cron&podName=podlogs-cron-222-bbbbb&containerName=main",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, "run-two\n", "one pod, no separator");
+
+        let (status, _) = request(
+            &addr,
+            "GET",
+            "/getPodLogs?logPodId=podlogs-cron-111-aaaaa",
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a labeled pod is filed under the label, not its name"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_pod_logs_errors() {
+        let (addr, _) = start_server().await;
+
+        let (status, _) = request(&addr, "GET", "/getPodLogs", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "podName is required");
+
+        let (status, _) = request(&addr, "GET", "/getPodLogs?logPodId=podlogs-none", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = request(
+            &addr,
+            "GET",
+            "/getPodLogs?logPodId=podlogs-none&follow=true",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "follow is refused");
+
+        let (status, _) = request(&addr, "GET", "/getPodLogs?logPodId=..", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "not a pod name");
     }
 
     // -- capacity --

@@ -325,6 +325,8 @@ pub struct PodMetadata {
     /// admitted pod carries one: it names the pod's incarnation dir.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub creation_timestamp: Option<String>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub labels: HashMap<String, String>,
     pub annotations: HashMap<String, String>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,

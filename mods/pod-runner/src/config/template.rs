@@ -86,6 +86,18 @@ podDirDeleteTtlPodSuccessOnPodDelete: "1h"
 podDirDeleteTtlPodFailureOnPodDelete: "24h"
 
 # ---------------------------------------------------------------------------
+# Pod log id
+# ---------------------------------------------------------------------------
+#
+# A pod's logs are filed under its name, or under the value of this label
+# when the pod carries it and the value is a valid Kubernetes name. Set the
+# label on a CronJob's, Job's or Deployment's pod template and all of its
+# pods are filed under one log pod id, read with /getPodLogs?logPodId=<id>.
+# Empty disables the label.
+
+podLogIdLabel: "pod.log.id"
+
+# ---------------------------------------------------------------------------
 # Node capacity
 # ---------------------------------------------------------------------------
 

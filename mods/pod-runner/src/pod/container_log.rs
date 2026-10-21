@@ -313,13 +313,13 @@ async fn drain_to_end(
 /// Input arrives in arbitrary chunks; a line straddling a chunk boundary
 /// is buffered until its newline arrives. Lines that don't parse as CRI
 /// pass through unchanged.
-struct CriFormatter {
+pub(crate) struct CriFormatter {
     timestamps: bool,
     partial: Vec<u8>,
 }
 
 impl CriFormatter {
-    fn new(timestamps: bool) -> Self {
+    pub(crate) fn new(timestamps: bool) -> Self {
         Self {
             timestamps,
             partial: Vec::new(),
@@ -328,7 +328,7 @@ impl CriFormatter {
 
     /// Feed a chunk, returning the reformatted bytes of every line the
     /// chunk completes.
-    fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
         self.partial.extend_from_slice(chunk);
         let mut out = Vec::with_capacity(self.partial.len());
         let mut start = 0;
@@ -343,7 +343,7 @@ impl CriFormatter {
     }
 
     /// Flush a trailing line that never got its newline (stream end).
-    fn finish(&mut self) -> Vec<u8> {
+    pub(crate) fn finish(&mut self) -> Vec<u8> {
         if self.partial.is_empty() {
             return Vec::new();
         }

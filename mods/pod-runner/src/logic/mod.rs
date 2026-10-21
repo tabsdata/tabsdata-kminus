@@ -21,6 +21,7 @@
 //! - **Get / List**: thin wrappers over the store.
 
 pub mod disk_usage;
+pub mod pod_logs;
 pub mod reaper;
 pub mod ttl;
 
@@ -577,6 +578,21 @@ impl PodLogic {
             });
         }
 
+        // A log id label that is not a Kubernetes name cannot be a path
+        // component; the pod is filed under its own name instead. Said once,
+        // here, rather than failing the pod over where its logs go.
+        let log_id_label = &self.executor_provider.layout().log_id_label;
+        if let Some(value) = spec.metadata.labels.get(log_id_label)
+            && !crate::store::layout::is_kube_name(value)
+        {
+            warn!(
+                pod = %id,
+                label = %log_id_label,
+                value = %value,
+                "Log id label is not a valid Kubernetes name; filing the pod's logs under its name",
+            );
+        }
+
         // Claim the pod's dirs and record its retention policy before the
         // store writes its first status into the state dir — a pod replayed
         // under this id after a restart finds its previous attempt's dirs.
@@ -990,6 +1006,17 @@ impl PodLogic {
                 .stream(container, options)
                 .map_err(|e| LogicError::Internal(e.to_string())),
         }
+    }
+
+    /// Stream the logs of every pod filed under a log pod id, oldest first,
+    /// from the pod-state dirs — whether or not the runner still knows the
+    /// pods. See [`pod_logs`] and [`crate::store::layout`].
+    pub fn stream_pod_logs(
+        &self,
+        log_pod_id: &str,
+        options: pod_logs::PodLogsOptions,
+    ) -> Result<mpsc::Receiver<Result<Bytes, std::io::Error>>, pod_logs::PodLogsError> {
+        pod_logs::stream_pod_logs(self.executor_provider.layout(), log_pod_id, options)
     }
 
     /// Node capacity from configuration.
@@ -1531,7 +1558,7 @@ mod tests {
 
     /// The state dir of the only incarnation of pod `name`.
     fn only_state_dir(provider: &dyn ExecutorProvider, name: &str) -> PathBuf {
-        let name_dir = provider.layout().name_dir(name);
+        let name_dir = provider.layout().log_pod_dir(name);
         let mut dirs: Vec<PathBuf> = std::fs::read_dir(&name_dir)
             .unwrap_or_else(|e| panic!("{}: {e}", name_dir.display()))
             .filter_map(|e| e.ok())
@@ -1761,7 +1788,7 @@ mod tests {
         assert!(
             log_dir.ends_with(
                 std::path::Path::new("app")
-                    .join("20261019T143005Z")
+                    .join("20261019T143005Z_app")
                     .join("log")
             ),
             "{log_dir:?}"
@@ -2264,8 +2291,8 @@ mod tests {
             assert_eq!(wait_for_terminal(&logic, "app").await, PodPhase::Succeeded);
 
             assert_eq!(first_state.parent(), second_state.parent());
-            assert_eq!(first_state.file_name().unwrap(), "20261019T140000Z");
-            assert_eq!(second_state.file_name().unwrap(), "20261019T150000Z");
+            assert_eq!(first_state.file_name().unwrap(), "20261019T140000Z_app");
+            assert_eq!(second_state.file_name().unwrap(), "20261019T150000Z_app");
             for (dir, out) in [(&first_state, "first"), (&second_state, "second")] {
                 let log = dir
                     .join(crate::server::config::POD_LOG_SUBDIR)
@@ -2302,7 +2329,7 @@ mod tests {
                 logic
                     .executor_provider
                     .layout()
-                    .state_dir_at("app", &stamp)
+                    .state_dir_at("app", &format!("{stamp}_app"))
                     .join(CLEANUP_TTLS_FILE)
                     .exists(),
                 "the incarnation dir is named by the stamp"

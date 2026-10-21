@@ -162,7 +162,8 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
     //    crashed run left are what the startup scan looks for.
     let data_dir = workdir.join("data");
     let pid_dir = data_dir.join(POD_PID_DIR);
-    let pod_layout = crate::store::layout::PodLayout::new(&data_dir);
+    let pod_layout = crate::store::layout::PodLayout::new(&data_dir)
+        .with_log_id_label(sys.pod_log_id_label.clone());
 
     for dir in [
         &data_dir,
@@ -934,6 +935,18 @@ server:
         let result = resolve_config(&cli);
         let _ = std::fs::remove_dir_all(&tmp);
         result
+    }
+
+    #[test]
+    fn resolve_config_sets_the_layouts_log_id_label() {
+        let c = resolve_with_syscfg("log-id-default", "nodename: \"n\"\n").unwrap();
+        assert_eq!(
+            c.pod_layout.log_id_label,
+            crate::spec::constants::DEFAULT_POD_LOG_ID_LABEL
+        );
+        let c = resolve_with_syscfg("log-id-custom", "podLogIdLabel: \"tabsdata.com/log-id\"\n")
+            .unwrap();
+        assert_eq!(c.pod_layout.log_id_label, "tabsdata.com/log-id");
     }
 
     #[test]

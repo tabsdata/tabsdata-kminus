@@ -55,6 +55,18 @@ impl VKPRConfig {
     pub fn from_str(yaml: &str) -> Result<Self, String> {
         serde_yaml_ng::from_str(yaml).map_err(|e| format!("Failed to parse YAML: {e}"))
     }
+
+    /// Whether the config names a client certificate and key, by path or
+    /// inline. pod-runner's server demands one on every TLS connection, so an
+    /// `https` config without it can never get a response. Pod-runner's own
+    /// `prconfig.yaml` parses as a client config too (its server keys are
+    /// ignored), which is how it ends up passed here by mistake.
+    pub fn has_client_identity(&self) -> bool {
+        self.client.as_ref().is_some_and(|c| {
+            (!c.certificate.is_empty() || !c.certificate_data.is_empty())
+                && (!c.certificate_key.is_empty() || !c.certificate_key_data.is_empty())
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +206,47 @@ url: "http://localhost:3000"
 "#;
         let config = VKPRConfig::from_str(yaml).unwrap();
         assert!(config.client.is_none());
+    }
+
+    #[test]
+    fn client_identity_inline_or_paths() {
+        let inline = r#"
+client:
+  certificate-data: "Y2VydA=="
+  certificate-key-data: "a2V5"
+"#;
+        assert!(VKPRConfig::from_str(inline).unwrap().has_client_identity());
+        let paths = r#"
+client:
+  certificate: "/c.pem"
+  certificate-key: "/k.pem"
+"#;
+        assert!(VKPRConfig::from_str(paths).unwrap().has_client_identity());
+    }
+
+    #[test]
+    fn client_identity_missing_key_or_section() {
+        let no_key = r#"
+client:
+  certificate-data: "Y2VydA=="
+"#;
+        assert!(!VKPRConfig::from_str(no_key).unwrap().has_client_identity());
+        assert!(!VKPRConfig::from_str("").unwrap().has_client_identity());
+    }
+
+    #[test]
+    fn server_prconfig_has_no_client_identity() {
+        // pod-runner's own prconfig.yaml: the server's cert and key sit under
+        // server.tls, where a client config has only the CA.
+        let yaml = r#"
+url: "https://127.0.0.1:10300"
+server:
+  tls:
+    certificate-data: "Y2VydA=="
+    certificate-key-data: "a2V5"
+    certificate-authority-data: "Y2E="
+"#;
+        assert!(!VKPRConfig::from_str(yaml).unwrap().has_client_identity());
     }
 
     #[test]

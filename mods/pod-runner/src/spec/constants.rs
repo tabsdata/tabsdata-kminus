@@ -181,6 +181,16 @@ pub const DEFAULT_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE: &str = "24h";
 pub const TTL_NEVER: &str = "never";
 
 // ---------------------------------------------------------------------------
+// Pod log id
+// ---------------------------------------------------------------------------
+
+/// Default pod label whose value files a pod's record (logs, store) under
+/// a log pod id of the workload's choosing instead of the pod name, so the
+/// pods of a CronJob, Job or Deployment can share one. See
+/// `crate::store::layout`.
+pub const DEFAULT_POD_LOG_ID_LABEL: &str = "pod.log.id";
+
+// ---------------------------------------------------------------------------
 // Pod dir marker and deadline files
 // ---------------------------------------------------------------------------
 

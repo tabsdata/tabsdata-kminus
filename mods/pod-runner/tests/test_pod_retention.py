@@ -7,8 +7,9 @@
 A pod's footprint is two dirs with a clock each. The data dir
 (`data/pod-run/<pod_id>/`: `work/`, `volumes/`) goes on the reap deadline,
 which runs from pod completion. The state dir
-(`data/pod-state/<bucket>/<pod_name>/<stamp>/`: the `log/` and `store/` that
-are one incarnation's only record) goes on the delete deadline, which runs
+(`data/pod-state/<bucket>/<log_pod_id>/<stamp>_<pod_name>/`: the `log/` and
+`store/` that are one pod's only record; the log pod id is the pod's
+`pod.log.id` label, or its name) goes on the delete deadline, which runs
 from the moment the pod is removed from the pod runner. Both clocks survive
 a restart.
 
@@ -69,10 +70,10 @@ def data_dir(pod_runner, ns, name, uid):
     return os.path.join(data_root(pod_runner), "pod-run", f"{ns}_{name}_{uid}")
 
 
-def name_dir(pod_runner, name):
-    """The dir every incarnation of a pod name shares."""
+def name_dir(pod_runner, log_pod_id):
+    """The dir every pod filed under a log pod id shares."""
     return os.path.join(
-        data_root(pod_runner), "pod-state", state_bucket(name), name
+        data_root(pod_runner), "pod-state", state_bucket(log_pod_id), log_pod_id
     )
 
 
@@ -84,11 +85,13 @@ def state_dir(pod_runner, ns, name, uid):
     """
     parent = name_dir(pod_runner, name)
     assert wait_for_path(parent), f"no pod name dir {parent}"
-    stamps = [d for d in os.listdir(parent)
-              if os.path.isdir(os.path.join(parent, d))]
-    assert len(stamps) == 1, f"one incarnation expected in {parent}: {stamps}"
-    assert re.fullmatch(r"\d{8}T\d{6}Z", stamps[0]), stamps[0]
-    return os.path.join(parent, stamps[0])
+    incarnations = [d for d in os.listdir(parent)
+                    if os.path.isdir(os.path.join(parent, d))]
+    assert len(incarnations) == 1, \
+        f"one incarnation expected in {parent}: {incarnations}"
+    assert re.fullmatch(rf"\d{{8}}T\d{{6}}Z_{re.escape(name)}", incarnations[0]), \
+        incarnations[0]
+    return os.path.join(parent, incarnations[0])
 
 
 def wait_for_path(path, present=True, timeout=15):
@@ -338,11 +341,11 @@ class TestIncarnations:
                 f"{pod_runner.url}/deletePod?namespace={ns}&name={name}"
             )
             assert st == 200
-            stamps.append(stamp)
+            stamps.append(f"{stamp}_{name}")
 
         parent = name_dir(pod_runner, name)
         assert sorted(os.listdir(parent)) == stamps, \
-            "the uid is not part of the path; the creation time is"
+            "the uid is not part of the path; the creation time and name are"
         for stamp in stamps:
             d = os.path.join(parent, stamp)
             assert os.path.isdir(os.path.join(d, "log"))
@@ -351,6 +354,69 @@ class TestIncarnations:
                 assert "deleteTtlOnSuccess" in json.load(f), \
                     "each incarnation carries its own delete TTLs"
             assert os.path.exists(os.path.join(d, DELETE_ON_FILE))
+
+        # Both incarnations are deleted; their logs are still served, oldest
+        # first, each after its separator.
+        st, body = mtls_client.get_text(
+            f"{pod_runner.url}/getPodLogs?logPodId={name}"
+        )
+        assert st == 200, body
+        first = body.index(f"POD STARTED 2026-10-19T14:00:00Z {name}")
+        second = body.index(f"POD STARTED 2026-10-19T15:00:00Z {name}")
+        assert first < second, body
+        assert body.count("POD STARTED") == 2, body
+
+        st, body = mtls_client.get_text(
+            f"{pod_runner.url}/getPodLogs?logPodId={name}&previous=true"
+        )
+        assert st == 200
+        assert body.count("POD STARTED") == 1
+        assert "2026-10-19T14:00:00Z" in body
+
+    def test_a_log_id_label_files_every_run_under_it(
+        self, pod_runner, mtls_client
+    ):
+        """As a CronJob's runs would: generated pod names, one label value."""
+        log_id = unique_name("cron")
+        pods = []
+        for created in ["2026-10-19T00:00:03Z", "2026-10-20T00:00:02Z"]:
+            pod = load_pod_def("single-container")
+            pod["metadata"]["name"] = unique_name(log_id)
+            pod["metadata"]["uid"] = unique_name("uid")
+            pod["metadata"]["creationTimestamp"] = created
+            pod["metadata"].setdefault("labels", {})["pod.log.id"] = log_id
+            name, ns = submit_pod(mtls_client, pod_runner, pod)
+            wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Succeeded"})
+            mtls_client.delete(
+                f"{pod_runner.url}/deletePod?namespace={ns}&name={name}"
+            )
+            pods.append(name)
+
+        parent = name_dir(pod_runner, log_id)
+        assert sorted(os.listdir(parent)) == [
+            f"20261019T000003Z_{pods[0]}",
+            f"20261020T000002Z_{pods[1]}",
+        ]
+        st, body = mtls_client.get_text(
+            f"{pod_runner.url}/getPodLogs?logPodId={log_id}"
+        )
+        assert st == 200, body
+        assert body.index(f"POD STARTED 2026-10-19T00:00:03Z {pods[0]}") < \
+            body.index(f"POD STARTED 2026-10-20T00:00:02Z {pods[1]}"), body
+
+        # One pod, no separator: how Tabsdata's multiplexer reads it.
+        st, one = mtls_client.get_text(
+            f"{pod_runner.url}/getPodLogs?logPodId={log_id}&podName={pods[1]}"
+        )
+        assert st == 200, one
+        assert "POD STARTED" not in one, one
+        assert "hello from single-container" in one, one
+
+    def test_logs_of_an_unknown_pod_are_not_found(self, pod_runner, mtls_client):
+        st, _ = mtls_client.get_text(
+            f"{pod_runner.url}/getPodLogs?logPodId={unique_name('ghost')}"
+        )
+        assert st == 404
 
 
 class TestRestart:
@@ -394,7 +460,7 @@ class TestRestart:
             assert wait_for_path(gone_state, present=False, timeout=15), \
                 "a delete deadline pending at shutdown is picked up again"
             assert not os.path.exists(os.path.dirname(gone_state)), \
-                "the pod name dir goes with its last incarnation"
+                "the log pod id dir goes with its last incarnation"
             assert wait_for_path(os.path.join(kept_state, DELETE_ON_FILE)), \
                 "a pod the restarted runner no longer knows starts its delete clock"
             assert os.path.exists(os.path.join(kept_state, "log")), \

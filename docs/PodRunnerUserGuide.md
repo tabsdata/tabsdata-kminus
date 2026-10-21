@@ -472,14 +472,30 @@ kubectl logs <pod-name> --previous    # Logs from previous restart
 # Direct via the pod-runner client
 kpr logs <pod-name>
 kpr logs <pod-name> --container <name> --follow --tail 50
+
+# Every pod filed under a log pod id, oldest first, even after the pods are gone
+kpr pod-logs -i <log-pod-id>
+kpr pod-logs -i <log-pod-id> --container <name> --tail 100 --previous
+kpr pod-logs -i <log-pod-id> --pod <pod-name>     # one pod only, no separator
 ```
+
+`kpr pod-logs` (endpoint `/getPodLogs`) reads the logs kept on disk, so it works for pods that are finished and
+deleted, until their delete TTL runs out.
+
+- **Log pod id:** the value of the pod's `pod.log.id` label, or its name when it has none.
+- **Grouping:** set the label on a CronJob's, Job's or Deployment's pod template and all of its pods (every run,
+  retry or replica) are read back together.
+- **Output:** each pod opens with a `POD STARTED <creation time> <pod name>` separator, and its containers follow
+  one another, init containers first.
+- **Configuration:** the label is the `podLogIdLabel` setting in `prsysconfig.yaml`. Its value must be a valid
+  Kubernetes name; otherwise the pod is filed under its name.
 
 ### Log Files on Disk
 
 Container logs are stored under the pod's log directory:
 
 ```
-<workdir>/data/pod-state/<bucket>/<pod_name>/<creation_time>/log/<container-name>/
+<workdir>/data/pod-state/<bucket>/<log_pod_id>/<creation_time>_<pod_name>/log/<container-name>/
   0.log               # Current log (restart 0)
   0.log.1             # Most recent rotation
   0.log.2             # Older rotation
@@ -541,10 +557,17 @@ secretResolver:
 
 ## pod-runner Client (`kpr`)
 
-Direct interaction with the pod-runner, bypassing kubectl:
+Direct interaction with the pod-runner, bypassing kubectl.
+
+`kpr` needs pod-runner's **client** config, `vk-prconfig.yaml`, through `--prconfig` or `PRCONFIG`. pod-runner accepts
+only mutual-TLS connections, and this is the file with a client certificate (CN `vk`, the virtual-kubelet's). Its
+neighbour `prconfig.yaml` is pod-runner's own server config: it has no client certificate, and `kpr` refuses it and
+names the right file. Both are regenerated on every km start, so use the one in the running instance's config dir, not
+a copy (on a `tdk` instance: `~/.tabsdata/instances/<instance>/cluster/config/vk-prconfig.yaml`). `--kubeconfig` is not
+needed; `kpr` talks to pod-runner only.
 
 ```bash
-# Connection setup
+# Connection setup: the client config, never prconfig.yaml
 export PRCONFIG=./config/vk-prconfig.yaml
 
 # Pod operations
@@ -608,7 +631,7 @@ Key metrics:
     virtual-kubelet/             # virtual-kubelet runtime data
     km/                          # kminus PID files
     pod-run/<pod_id>/            # pod-runner: per-pod data (work/, volumes/)
-    pod-state/<bucket>/<pod_name>/<creation_time>/  # pod-runner: per-incarnation record (log/, store/)
+    pod-state/<bucket>/<log_pod_id>/<creation_time>_<pod_name>/  # pod-runner: per-pod record (log/, store/)
     pod-pid/                     # pod-runner: process PID tracking
 ```
 
@@ -661,8 +684,8 @@ A failed pod keeps its working directory for an hour, and its logs and specs for
 
 ```bash
 ls data/pod-run/<namespace>_<name>_<uid>/               # work/, volumes/
-ls data/pod-state/*/<name>/                              # one dir per incarnation, by creation time
-ls data/pod-state/*/<name>/<creation_time>/              # log/, store/
+ls data/pod-state/*/<log_pod_id>/                        # one dir per pod, by creation time
+ls data/pod-state/*/<log_pod_id>/<creation_time>_<name>/ # log/, store/
 ```
 
 Two clocks govern how long that lasts. The **reap** deadline (`podDataReapTtlOnPodFailure`, default `1h`) covers
@@ -689,7 +712,7 @@ If a pod failed before any container started — a missing hostPath volume, an u
 container logs to read, because nothing ever ran. The reason is in the status snapshots:
 
 ```bash
-cat data/pod-state/*/<name>/<creation_time>/store/status/*.json | grep message
+cat data/pod-state/*/<log_pod_id>/<creation_time>_<name>/store/status/*.json | grep message
 ```
 
 ### Connection Refused
@@ -701,6 +724,14 @@ tdk status
 ```
 
 Check TLS configuration matches between `prconfig.yaml` and `vk-prconfig.yaml`.
+
+### `kpr` Errors on TLS
+
+| `kpr` says | Cause | Fix |
+|---|---|---|
+| `... has no client certificate and key ...` | `--prconfig` is `prconfig.yaml`, the server's config, or another file with no `client:` section | Pass `vk-prconfig.yaml` from the same dir; `kpr` prints its path when it is there |
+| `... pod-runner most likely refused the TLS session ...` | The client certificate is not signed by the running pod-runner's CA, usually a `vk-prconfig.yaml` copied from an earlier km run | Pass the instance's current `vk-prconfig.yaml` |
+| `cannot connect to https://...: ... Connection refused` | Nothing listens on the file's `url`: pod-runner is down, or the file belongs to another instance | `tdk status`; check the `url` port |
 
 ### Stack Won't Start
 
