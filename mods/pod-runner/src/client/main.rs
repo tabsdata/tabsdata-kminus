@@ -626,7 +626,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let base = std::env::temp_dir().join(format!("td-prc-test-{}", std::process::id(),));
         let provider = Arc::new(DefaultExecutorProvider {
-            pods_dir: base.join("pods"),
+            layout: pod_runner::store::layout::PodLayout::new(&base),
             pid_dir: base.join("pids"),
             propagate_env: true,
             die_with_parent: true,
@@ -634,11 +634,7 @@ mod tests {
             restart_backoff_base: Duration::from_secs(2),
             shutdown_grace_period: Duration::from_secs(30),
         });
-        let cleanup = CleanupConfig {
-            pods_dir: base.join("pods"),
-
-            ..CleanupConfig::default()
-        };
+        let cleanup = CleanupConfig::default();
         let (shutdown_tx, _) = tokio::sync::watch::channel(());
         let logic = PodLogic::new(
             pod_runner::logic::LogicConfig::default(),

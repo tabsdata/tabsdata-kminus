@@ -157,15 +157,20 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
     let log_dir = cli.logdir.as_deref().unwrap_or(DEFAULT_LOGDIR);
     let log_dir = canonicalize("logdir", Path::new(log_dir));
 
-    // 8. Rotate and create data/run/ directory structure
+    // 8. Create the data/ directory structure. Every dir is fixed across
+    //    restarts: pod dirs carry their own deadlines, and the PID files a
+    //    crashed run left are what the startup scan looks for.
     let data_dir = workdir.join("data");
-    std::fs::create_dir_all(&data_dir)
-        .map_err(|e| format!("Failed to create {}: {e}", data_dir.display()))?;
-    let run_dir = provision_run_dir(&data_dir);
-    let pods_dir = run_dir.join(PODS_SUBDIR);
-    let pid_dir = run_dir.join(PIDS_SUBDIR);
+    let pid_dir = data_dir.join(POD_PID_DIR);
+    let pod_layout = crate::store::layout::PodLayout::new(&data_dir);
 
-    for dir in [&run_dir, &pods_dir, &pid_dir, &log_dir] {
+    for dir in [
+        &data_dir,
+        &pid_dir,
+        &pod_layout.run_root,
+        &pod_layout.state_root,
+        &log_dir,
+    ] {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("Failed to create {}: {e}", dir.display()))?;
     }
@@ -245,8 +250,8 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
 
         config_dir: configdir.clone(),
         work_dir: workdir.clone(),
-        run_dir,
-        pods_dir,
+        data_dir,
+        pod_layout,
         log_dir,
         pid_dir,
 
@@ -274,80 +279,6 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
 
         metrics_url,
     })
-}
-
-/// Mint this run's directory (`run_<YYYYMMDDThhmmssZ>`), purge old run
-/// directories down to [`PREV_RUN_DIRS_TO_KEEP`], and reap the kept ones'
-/// pod data.
-///
-/// A fresh directory per run, never a rename of the previous one. The old
-/// scheme renamed `run/` to `run.0/` at startup, and on Windows that
-/// rename fails while any handle inside is still open — a crashed run's
-/// containers hold plenty — so the failure was swallowed and the old tree
-/// silently reused, colliding replayed pods with the previous attempt's
-/// leftovers ("response file already exists"). Creating a new name cannot
-/// fail into reuse; the worst a held handle can now do is delay a purge to
-/// a later start.
-///
-/// The stamp is fixed-width UTC, so lexicographic order is chronological
-/// — which is also what ranks legacy `run`/`run.N` names below every
-/// stamped one, making them the first purged.
-fn provision_run_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
-    use std::fs;
-
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-    let mut run_dir = data_dir.join(format!("{RUN_DIR_PREFIX}{stamp}"));
-    // A restart within the stamp's second disambiguates rather than reuses.
-    let mut n = 1;
-    while run_dir.exists() {
-        run_dir = data_dir.join(format!("{RUN_DIR_PREFIX}{stamp}.{n}"));
-        n += 1;
-    }
-
-    // Previous runs, newest first: stamped names sort chronologically, and
-    // legacy `run`/`run.N` names sort below them all.
-    let mut previous: Vec<std::path::PathBuf> = fs::read_dir(data_dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| e.path().is_dir())
-                .filter(|e| {
-                    let name = e.file_name();
-                    let name = name.to_string_lossy();
-                    name.starts_with(RUN_DIR_PREFIX)
-                        || name == RUN_DIR
-                        || name
-                            .strip_prefix(&format!("{RUN_DIR}."))
-                            .is_some_and(|i| i.parse::<u32>().is_ok())
-                })
-                .map(|e| e.path())
-                .collect()
-        })
-        .unwrap_or_default();
-    previous.sort();
-    previous.reverse();
-
-    for old in previous.iter().skip(PREV_RUN_DIRS_TO_KEEP) {
-        // Best effort: on Windows a held handle can refuse the delete, and
-        // that is fine — the directory is inert and a later start retries.
-        // Warned, not swallowed: a purge that fails on *every* start is
-        // unbounded disk growth, and this line is its only signal.
-        if let Err(e) = fs::remove_dir_all(old)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(dir = %old.display(), error = %e, "Cannot purge old run directory");
-        }
-    }
-    for kept in previous.iter().take(PREV_RUN_DIRS_TO_KEEP) {
-        // Every pod in a previous run belonged to a previous incarnation of
-        // the runner, so its data dirs are dead weight from this moment on.
-        crate::logic::reaper::reap_previous_run_pod_dirs(
-            &kept.join(PODS_SUBDIR),
-            chrono::Utc::now(),
-        );
-    }
-
-    run_dir
 }
 
 // ---------------------------------------------------------------------------
@@ -512,10 +443,15 @@ mod tests {
         assert!(configdir.join(PRCONFIG_FILENAME).exists());
         assert!(configdir.join(VK_PRCONFIG_FILENAME).exists());
 
-        assert!(config.run_dir.exists());
-        assert!(config.pods_dir.exists());
+        assert!(config.pod_layout.run_root.exists());
+        assert!(config.pod_layout.state_root.exists());
         assert!(config.log_dir.exists());
         assert!(config.pid_dir.exists());
+        assert_eq!(
+            config.pod_layout,
+            crate::store::layout::PodLayout::new(&config.data_dir)
+        );
+        assert_eq!(config.pid_dir, config.data_dir.join(POD_PID_DIR));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1004,117 +940,6 @@ server:
     fn resolve_config_defaults_cleanup_ttls_when_absent() {
         let c = resolve_with_syscfg("ttl-default", "nodename: \"n\"\n").unwrap();
         assert_eq!(c.ttls, crate::logic::ttl::TtlConfig::default());
-    }
-
-    fn provision_tmp(label: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let tmp = std::env::temp_dir().join(format!(
-            "pr-provision-{label}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed),
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
-        tmp
-    }
-
-    #[test]
-    fn provision_mints_a_fresh_stamped_dir_and_never_reuses() {
-        let tmp = provision_tmp("fresh");
-
-        let first = provision_run_dir(&tmp);
-        assert!(
-            first
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with(RUN_DIR_PREFIX),
-        );
-        assert!(
-            !first.exists(),
-            "minted, not created — the caller creates it"
-        );
-
-        // A restart within the same second must get its own directory, not
-        // the previous run's — reuse is the Windows failure this replaces.
-        std::fs::create_dir_all(&first).unwrap();
-        let second = provision_run_dir(&tmp);
-        assert_ne!(first, second);
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn provision_purges_down_to_the_kept_count_oldest_first() {
-        let tmp = provision_tmp("purge");
-        for stamp in [
-            "run_20260820T000000Z",
-            "run_20260821T000000Z",
-            "run_20260822T000000Z",
-            "run_20260823T000000Z",
-        ] {
-            std::fs::create_dir_all(tmp.join(stamp).join(PODS_SUBDIR)).unwrap();
-        }
-
-        provision_run_dir(&tmp);
-
-        assert!(!tmp.join("run_20260820T000000Z").exists(), "oldest purged");
-        assert!(!tmp.join("run_20260821T000000Z").exists());
-        assert!(tmp.join("run_20260822T000000Z").exists(), "newest kept");
-        assert!(tmp.join("run_20260823T000000Z").exists());
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn provision_treats_legacy_run_dirs_as_oldest() {
-        let tmp = provision_tmp("legacy");
-        // The pre-stamp layout: a live `run/` (possibly reused, on Windows)
-        // and its rename-rotated predecessors.
-        for legacy in ["run", "run.0", "run.1"] {
-            std::fs::create_dir_all(tmp.join(legacy)).unwrap();
-        }
-        std::fs::create_dir_all(tmp.join("run_20260823T000000Z")).unwrap();
-        // Not a run dir; must be left alone.
-        std::fs::create_dir_all(tmp.join("runway")).unwrap();
-
-        provision_run_dir(&tmp);
-
-        assert!(!tmp.join("run").exists(), "legacy dirs purge first");
-        assert!(!tmp.join("run.0").exists());
-        assert!(tmp.join("run.1").exists(), "kept: still within the count");
-        assert!(tmp.join("run_20260823T000000Z").exists());
-        assert!(tmp.join("runway").exists(), "not a run dir");
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn provision_reaps_the_kept_previous_runs_pod_dirs() {
-        use crate::server::config::POD_LOG_SUBDIR;
-        let tmp = provision_tmp("reap");
-
-        // A pod dir as a previous incarnation left it.
-        let pod_dir = tmp
-            .join("run_20260823T000000Z")
-            .join(PODS_SUBDIR)
-            .join("default_app_uid-1");
-        std::fs::create_dir_all(pod_dir.join(POD_WORK_SUBDIR).join("main")).unwrap();
-        std::fs::create_dir_all(pod_dir.join(POD_LOG_SUBDIR).join("main")).unwrap();
-
-        provision_run_dir(&tmp);
-
-        assert!(pod_dir.exists(), "the pod dir stays where it was");
-        assert!(
-            !pod_dir.join(POD_WORK_SUBDIR).exists(),
-            "work/ of a previous run is dead weight and is reaped at startup",
-        );
-        assert!(
-            pod_dir.join(POD_LOG_SUBDIR).exists(),
-            "logs survive so a crashed run stays diagnosable",
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// `PRConfig` holds TLS key material and deliberately has no `Debug`,

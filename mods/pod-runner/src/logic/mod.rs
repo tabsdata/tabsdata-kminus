@@ -48,6 +48,7 @@ use crate::spec::constants::*;
 use crate::spec::node::{NodeAddress, NodeCapacity, NodeCondition};
 use crate::spec::pod::PodSpec;
 use crate::spec::status::{ContainerStatus, PodStatus};
+use crate::store::layout::PodLayout;
 use crate::store::{PodId, PodSnapshot, PodStore, SpecView};
 
 pub use reaper::CleanupConfig;
@@ -64,20 +65,35 @@ pub trait ExecutorProvider: Send + Sync {
     /// Create a [`PodExecutor`] configured for the given pod.
     fn create(&self, pod: Arc<PodSpec>, id: &PodId) -> PodExecutor;
 
-    /// Working directory for a pod.
-    fn work_dir(&self, id: &PodId) -> PathBuf;
+    /// The on-disk pod layout.
+    fn layout(&self) -> &PodLayout;
 
-    /// Log directory for a pod's containers, if logging is configured.
-    fn log_dir(&self, id: &PodId) -> Option<PathBuf>;
+    /// Working directory for a pod — its data dir.
+    fn work_dir(&self, id: &PodId) -> PathBuf {
+        self.layout().run_dir(id)
+    }
+
+    /// State directory for the pod incarnation `spec` describes — its logs
+    /// and store.
+    fn state_dir(&self, spec: &PodSpec) -> PathBuf {
+        self.layout().state_dir(spec)
+    }
+
+    /// Log directory for a pod incarnation's containers, if logging is
+    /// configured.
+    fn log_dir(&self, spec: &PodSpec) -> Option<PathBuf> {
+        Some(self.layout().log_dir(spec))
+    }
 }
 
 /// Default executor provider with configurable base directories.
 ///
-/// Per-pod layout: `<pods_dir>/<pod_id>/{work/<container>/, log/<container>/}`.
+/// Per-pod layout: `work/<container>/` under the pod's data dir,
+/// `log/<container>/` under its state dir (see [`PodLayout`]).
 pub struct DefaultExecutorProvider {
-    /// Base directory for all pods: `<workdir>/run/pods/`.
-    /// Each pod gets `<pods_dir>/<pod_full_id>/`.
-    pub pods_dir: PathBuf,
+    /// Pod layout: data dirs under `pod-run/`, state dirs under
+    /// `pod-state/`.
+    pub layout: PodLayout,
     /// Directory for process PID tracking files.
     pub pid_dir: PathBuf,
     /// Whether to propagate the parent process environment.
@@ -93,13 +109,13 @@ pub struct DefaultExecutorProvider {
 }
 
 impl ExecutorProvider for DefaultExecutorProvider {
-    fn work_dir(&self, id: &PodId) -> PathBuf {
-        self.pods_dir.join(id.full())
+    fn layout(&self) -> &PodLayout {
+        &self.layout
     }
 
     fn create(&self, pod: Arc<PodSpec>, id: &PodId) -> PodExecutor {
-        let pod_dir = self.pods_dir.join(id.full());
-        let log_dir = pod_dir.join(crate::server::config::POD_LOG_SUBDIR);
+        let pod_dir = self.layout.run_dir(id);
+        let log_dir = self.layout.log_dir(&pod);
 
         // Ensure directories exist before the executor tries to use them
         if let Err(e) = std::fs::create_dir_all(&pod_dir) {
@@ -118,14 +134,6 @@ impl ExecutorProvider for DefaultExecutorProvider {
             .max_restarts(self.max_restarts)
             .restart_backoff_base(self.restart_backoff_base)
             .shutdown_grace_period(self.shutdown_grace_period)
-    }
-
-    fn log_dir(&self, id: &PodId) -> Option<PathBuf> {
-        Some(
-            self.pods_dir
-                .join(id.full())
-                .join(crate::server::config::POD_LOG_SUBDIR),
-        )
     }
 }
 
@@ -496,9 +504,10 @@ impl PodLogic {
     /// background preparer task. Returns the initial Pending snapshot.
     /// The executor is spawned only after the preparer finishes — see
     /// [`prepare_and_run`] for the full flow.
-    pub async fn create_pod(&self, spec: PodSpec) -> Result<PodSnapshot, LogicError> {
+    pub async fn create_pod(&self, mut spec: PodSpec) -> Result<PodSnapshot, LogicError> {
         let create_start = std::time::Instant::now();
         let id = PodId::from_spec(&spec);
+        stamp_creation_time(&mut spec, chrono::Utc::now());
 
         // Admission — reject unsupported features (e.g. `optional: true`
         // on configmap/secret references). See pod::admission for the
@@ -567,6 +576,17 @@ impl PodLogic {
                 max: self.config.max_pods,
             });
         }
+
+        // Claim the pod's dirs and record its retention policy before the
+        // store writes its first status into the state dir — a pod replayed
+        // under this id after a restart finds its previous attempt's dirs.
+        reaper::claim_pod_dirs(
+            &self.executor_provider.work_dir(&id),
+            &self.executor_provider.state_dir(&spec),
+            &self.cleanup_config.ttls,
+            &spec.metadata.annotations,
+            chrono::Utc::now(),
+        );
 
         // Store the pod in Pending. The running_spec starts equal to the
         // original; the preparer overwrites it with the rewritten spec
@@ -711,7 +731,7 @@ impl PodLogic {
             // and its handles are dropped. The sweep is the only thing
             // that can act here.
             sweep::kill_orphans(&sweep::pod_prefix(&snap.id.name, &snap.id.uid)).await;
-            self.evict_pod(&snap.id).await;
+            self.evict_pod(&snap).await;
             // Mark deleted so if the monitor is still finishing, it skips
             // its own eviction (store entry already dropped above).
             if let Some(runtime) = self.runtimes.read().unwrap().get(&snap.id) {
@@ -766,22 +786,23 @@ impl PodLogic {
                 // stuck there, and its partially resolved volumes are the
                 // evidence — so it is retained on the error TTLs rather
                 // than left unmarked, which no reaper would ever look at.
-                let pod_dir = self.executor_provider.work_dir(&snap.id);
+                let data_dir = self.executor_provider.work_dir(&snap.id);
                 let now = chrono::Utc::now();
                 let reap_on = reaper::finalize_pod(
-                    &pod_dir,
+                    &data_dir,
+                    &self.executor_provider.state_dir(&snap.spec),
                     reaper::Outcome::Failed,
                     &self.cleanup_config.ttls,
                     now,
                 );
                 reaper::schedule_deadline(
-                    &pod_dir,
-                    reaper::ScheduledReap::DataDirs,
+                    &data_dir,
+                    reaper::ScheduledReap::DataDir,
                     reap_on,
                     now,
                     &self.shutdown_rx,
                 );
-                self.evict_pod(&snap.id).await;
+                self.evict_pod(&snap).await;
                 self.runtimes.write().unwrap().remove(&snap.id);
                 return Ok(());
             }
@@ -818,20 +839,33 @@ impl PodLogic {
     /// The delete clock runs from here rather than from completion because
     /// until this point the runner still answers queries about the pod, so
     /// its dir is live data.
-    async fn evict_pod(&self, id: &PodId) {
-        let pod_dir = self.executor_provider.work_dir(id);
+    async fn evict_pod(&self, snap: &PodSnapshot) {
+        let id = &snap.id;
+        let state_dir = self.executor_provider.state_dir(&snap.spec);
         let now = chrono::Utc::now();
-        let delete_on = reaper::mark_pod_evicted(&pod_dir, &self.cleanup_config.ttls, now);
+        let delete_on = reaper::mark_pod_evicted(&state_dir, &self.cleanup_config.ttls, now);
         self.store.evict(id).await;
         // A zero TTL acts here; anything later waits out its own deadline.
-        reaper::reap_pod_dir(&pod_dir, now);
+        reaper::apply_deadline(&state_dir, reaper::ScheduledReap::StateDir, now);
         reaper::schedule_deadline(
-            &pod_dir,
-            reaper::ScheduledReap::PodDir,
+            &state_dir,
+            reaper::ScheduledReap::StateDir,
             delete_on,
             now,
             &self.shutdown_rx,
         );
+    }
+
+    /// Pick up the pod dirs a previous incarnation of the runner left,
+    /// applying or scheduling every deadline they carry. Call once at
+    /// startup, before the runner admits pods.
+    pub fn recover_pod_dirs(&self) -> reaper::RecoveryStats {
+        reaper::recover_pod_dirs(
+            self.executor_provider.layout(),
+            &self.cleanup_config.ttls,
+            chrono::Utc::now(),
+            &self.shutdown_rx,
+        )
     }
 
     /// Get a pod by namespace and name.
@@ -1016,6 +1050,20 @@ impl PodLogic {
 // ---------------------------------------------------------------------------
 
 /// Build the initial [`PodStatus`] for a newly created pod.
+/// Give a pod with no usable creation time the admission time as one.
+///
+/// The creation time names the pod's incarnation dir, so every admitted pod
+/// must carry one, and it must be fixed once: every later path is derived
+/// from the spec. The API server always sets it; a pod submitted around it
+/// (`kpr`) gets the admission time, so a replay of such a pod after a
+/// restart starts a new incarnation dir rather than continuing its own.
+fn stamp_creation_time(spec: &mut PodSpec, now: chrono::DateTime<chrono::Utc>) {
+    if spec.metadata.incarnation_stamp().is_none() {
+        spec.metadata.creation_timestamp =
+            Some(now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    }
+}
+
 fn build_initial_status(spec: &PodSpec) -> PodStatus {
     let mut status = PodStatus {
         phase: PodPhase::Pending,
@@ -1071,6 +1119,7 @@ async fn monitor_pod(
     runtimes: Arc<RwLock<HashMap<PodId, PodRuntime>>>,
     metrics: Option<Arc<Metrics>>,
     id: PodId,
+    state_dir: PathBuf,
     deleted: Arc<AtomicBool>,
     mut shutdown: watch::Receiver<()>,
 ) {
@@ -1196,16 +1245,17 @@ async fn monitor_pod(
     // what the pod used.
     //
     // A pod whose event stream died without a Completed event never reached
-    // a terminal phase, so it gets no marker — the run rotation deals with
-    // those.
-    let work_dir = executor_provider.work_dir(&id);
+    // a terminal phase, so it gets no marker — the next run's recovery
+    // finalizes those.
+    let data_dir = executor_provider.work_dir(&id);
     if let Some(outcome) = final_outcome {
         let now = chrono::Utc::now();
-        let reap_on = reaper::finalize_pod(&work_dir, outcome, &cleanup_config.ttls, now);
-        reaper::reap_pod_dir(&work_dir, now);
+        let reap_on =
+            reaper::finalize_pod(&data_dir, &state_dir, outcome, &cleanup_config.ttls, now);
+        reaper::apply_deadline(&data_dir, reaper::ScheduledReap::DataDir, now);
         reaper::schedule_deadline(
-            &work_dir,
-            reaper::ScheduledReap::DataDirs,
+            &data_dir,
+            reaper::ScheduledReap::DataDir,
             reap_on,
             now,
             &reap_shutdown,
@@ -1218,12 +1268,12 @@ async fn monitor_pod(
     if deleted.load(Ordering::Relaxed) {
         debug!("Evicting deleted pod");
         let now = chrono::Utc::now();
-        let delete_on = reaper::mark_pod_evicted(&work_dir, &cleanup_config.ttls, now);
+        let delete_on = reaper::mark_pod_evicted(&state_dir, &cleanup_config.ttls, now);
         store.evict(&id).await;
-        reaper::reap_pod_dir(&work_dir, now);
+        reaper::apply_deadline(&state_dir, reaper::ScheduledReap::StateDir, now);
         reaper::schedule_deadline(
-            &work_dir,
-            reaper::ScheduledReap::PodDir,
+            &state_dir,
+            reaper::ScheduledReap::StateDir,
             delete_on,
             now,
             &reap_shutdown,
@@ -1285,6 +1335,7 @@ async fn prepare_and_run(
     tasks: Arc<Vec<Arc<dyn PodTask>>>,
 ) {
     let pod_work_dir = executor_provider.work_dir(&id);
+    let pod_state_dir = executor_provider.state_dir(&original_spec);
     let timeout = original_spec
         .spec
         .active_deadline_seconds
@@ -1298,19 +1349,6 @@ async fn prepare_and_run(
     // For the failure paths below, which finalize the pod dir and so need a
     // reap timer. Subscribed now, well before any shutdown.
     let reap_shutdown = shutdown_tx.subscribe();
-
-    // Record the pod's cleanup TTLs before anything else can fail: a pod
-    // that dies in preparation still needs a retention policy, and writing
-    // it here means the pod dir carries its own — unaffected by a later
-    // config edit or a runner restart.
-    let ttls = ttl::resolve_cleanup_ttls(
-        &cleanup_config.ttls,
-        &original_spec.metadata.annotations,
-        &chrono::Utc::now().to_rfc3339(),
-    );
-    if let Err(e) = ttl::write_cleanup_ttls(&pod_work_dir, &ttls) {
-        warn!(pod = %id, error = %e, "Failed to write cleanup TTLs");
-    }
 
     let prepare_result = prepare_pod(
         &original_spec,
@@ -1357,13 +1395,14 @@ async fn prepare_and_run(
             let now = chrono::Utc::now();
             let reap_on = reaper::finalize_pod(
                 &pod_work_dir,
+                &pod_state_dir,
                 reaper::Outcome::Failed,
                 &cleanup_config.ttls,
                 now,
             );
             reaper::schedule_deadline(
                 &pod_work_dir,
-                reaper::ScheduledReap::DataDirs,
+                reaper::ScheduledReap::DataDir,
                 reap_on,
                 now,
                 &reap_shutdown,
@@ -1405,13 +1444,14 @@ async fn prepare_and_run(
             let now = chrono::Utc::now();
             let reap_on = reaper::finalize_pod(
                 &pod_work_dir,
+                &pod_state_dir,
                 reaper::Outcome::Failed,
                 &cleanup_config.ttls,
                 now,
             );
             reaper::schedule_deadline(
                 &pod_work_dir,
-                reaper::ScheduledReap::DataDirs,
+                reaper::ScheduledReap::DataDir,
                 reap_on,
                 now,
                 &reap_shutdown,
@@ -1439,6 +1479,7 @@ async fn prepare_and_run(
             Arc::clone(&runtimes),
             metrics,
             id.clone(),
+            pod_state_dir,
             Arc::clone(&deleted),
             monitor_shutdown,
         )
@@ -1488,6 +1529,19 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    /// The state dir of the only incarnation of pod `name`.
+    fn only_state_dir(provider: &dyn ExecutorProvider, name: &str) -> PathBuf {
+        let name_dir = provider.layout().name_dir(name);
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(&name_dir)
+            .unwrap_or_else(|e| panic!("{}: {e}", name_dir.display()))
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        assert_eq!(dirs.len(), 1, "one incarnation expected: {dirs:?}");
+        dirs.pop().unwrap()
+    }
+
     fn make_provider() -> Arc<DefaultExecutorProvider> {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let base = std::env::temp_dir().join(format!(
@@ -1496,7 +1550,7 @@ mod tests {
             n,
         ));
         Arc::new(DefaultExecutorProvider {
-            pods_dir: base.join("pods"),
+            layout: PodLayout::new(&base),
             pid_dir: base.join("pids"),
             propagate_env: true,
             die_with_parent: true,
@@ -1506,19 +1560,8 @@ mod tests {
         })
     }
 
-    /// Build a CleanupConfig with paths under a temp directory so tests
-    /// don't write to the repository root.
     fn test_cleanup_config() -> CleanupConfig {
-        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!(
-            "pod-runner-rs2-test-cleanup-{}-{}",
-            std::process::id(),
-            n,
-        ));
-        CleanupConfig {
-            pods_dir: base.join("pods"),
-            ..CleanupConfig::default()
-        }
+        CleanupConfig::default()
     }
 
     fn make_logic() -> PodLogic {
@@ -1683,7 +1726,7 @@ mod tests {
             std::process::id(),
         ));
         let provider = DefaultExecutorProvider {
-            pods_dir: base.join("pods"),
+            layout: PodLayout::new(&base),
             pid_dir: base.join("pids"),
             propagate_env: true,
             die_with_parent: true,
@@ -1694,20 +1737,64 @@ mod tests {
         let spec = Arc::new(make_spec("default", "app", "uid-1"));
         let id = PodId::from_spec(&spec);
 
-        let _executor = provider.create(spec, &id);
+        let _executor = provider.create(Arc::clone(&spec), &id);
 
         // Directories should exist after create()
-        assert!(provider.pods_dir.join(id.full()).exists());
-        assert!(provider.log_dir(&id).unwrap().exists());
+        assert!(provider.work_dir(&id).exists());
+        assert!(provider.log_dir(&spec).unwrap().exists());
+        assert!(
+            provider
+                .log_dir(&spec)
+                .unwrap()
+                .starts_with(provider.state_dir(&spec)),
+            "logs are part of the pod's record, not its data",
+        );
     }
 
     #[test]
     fn executor_provider_log_dir() {
         let provider = make_provider();
-        let id = PodId::new("default", "app", "uid-1");
+        let mut spec = make_spec("default", "app", "uid-1");
+        spec.metadata.creation_timestamp = Some("2026-10-19T14:30:05Z".into());
 
-        let log_dir = provider.log_dir(&id).unwrap();
-        assert!(log_dir.ends_with("default_app_uid-1/log"));
+        let log_dir = provider.log_dir(&spec).unwrap();
+        assert!(
+            log_dir.ends_with(
+                std::path::Path::new("app")
+                    .join("20261019T143005Z")
+                    .join("log")
+            ),
+            "{log_dir:?}"
+        );
+    }
+
+    #[test]
+    fn stamp_creation_time_fills_only_a_missing_or_malformed_one() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-19T14:30:05.123Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let mut spec = make_spec("default", "app", "uid-1");
+        stamp_creation_time(&mut spec, now);
+        assert_eq!(
+            spec.metadata.creation_timestamp.as_deref(),
+            Some("2026-10-19T14:30:05Z")
+        );
+
+        spec.metadata.creation_timestamp = Some("garbage".into());
+        stamp_creation_time(&mut spec, now);
+        assert_eq!(
+            spec.metadata.creation_timestamp.as_deref(),
+            Some("2026-10-19T14:30:05Z")
+        );
+
+        spec.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".into());
+        stamp_creation_time(&mut spec, now);
+        assert_eq!(
+            spec.metadata.creation_timestamp.as_deref(),
+            Some("2026-01-01T00:00:00Z"),
+            "the API server's value is kept"
+        );
     }
 
     // -- get_capacity / get_node_conditions / get_node_addresses --
@@ -2158,26 +2245,68 @@ mod tests {
             .is_ok()
         }
 
-        /// Wait until the cleanup TTLs file carries `raw` as its failure TTL.
-        ///
-        /// The file is written more than once — the config defaults first,
-        /// then again once the pod's annotation is applied — so waiting only
-        /// for the path to exist can read the earlier version and see the
-        /// default where the test expects the override.
-        async fn wait_for_cleanup_ttls(
-            pod_dir: &std::path::Path,
-            raw: &str,
-        ) -> Option<ttl::CleanupTtls> {
-            tokio::time::timeout(Duration::from_secs(30), async {
-                loop {
-                    match ttl::read_cleanup_ttls(pod_dir) {
-                        Some(ttls) if ttls.reap_ttl_on_failure.raw == raw => return ttls,
-                        _ => tokio::time::sleep(Duration::from_millis(50)).await,
-                    }
-                }
-            })
-            .await
-            .ok()
+        #[tokio::test]
+        async fn incarnations_of_a_name_get_their_own_state_dirs() {
+            let (logic, _, _) = make_logic_with_store();
+            let layout = logic.executor_provider.layout().clone();
+
+            let mut first = make_pod_spec_uid("app", "uid-1", "echo first");
+            first.metadata.creation_timestamp = Some("2026-10-19T14:00:00Z".into());
+            let first_state = layout.state_dir(&first);
+            logic.create_pod(first).await.unwrap();
+            assert_eq!(wait_for_terminal(&logic, "app").await, PodPhase::Succeeded);
+            logic.delete_pod("default", "app", None).await.unwrap();
+
+            let mut second = make_pod_spec_uid("app", "uid-2", "echo second");
+            second.metadata.creation_timestamp = Some("2026-10-19T15:00:00Z".into());
+            let second_state = layout.state_dir(&second);
+            logic.create_pod(second).await.unwrap();
+            assert_eq!(wait_for_terminal(&logic, "app").await, PodPhase::Succeeded);
+
+            assert_eq!(first_state.parent(), second_state.parent());
+            assert_eq!(first_state.file_name().unwrap(), "20261019T140000Z");
+            assert_eq!(second_state.file_name().unwrap(), "20261019T150000Z");
+            for (dir, out) in [(&first_state, "first"), (&second_state, "second")] {
+                let log = dir
+                    .join(crate::server::config::POD_LOG_SUBDIR)
+                    .join("main")
+                    .join("0.log");
+                assert!(wait_for_presence(&log).await, "{}", log.display());
+                let content = std::fs::read_to_string(&log).unwrap();
+                assert!(content.contains(out), "{}: {content}", log.display());
+            }
+            assert!(
+                first_state.join(DELETE_ON_FILE).exists(),
+                "the deleted incarnation's delete clock runs"
+            );
+            assert!(
+                !second_state.join(DELETE_ON_FILE).exists(),
+                "the live incarnation's does not"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_pod_without_a_creation_time_is_stamped_at_admission() {
+            let (logic, _, _) = make_logic_with_store();
+            let spec = make_pod_spec("app", "sleep 60");
+            assert!(spec.metadata.creation_timestamp.is_none());
+
+            let snap = logic.create_pod(spec).await.unwrap();
+
+            let stamp = snap
+                .spec
+                .metadata
+                .incarnation_stamp()
+                .expect("stamped at admission");
+            assert!(
+                logic
+                    .executor_provider
+                    .layout()
+                    .state_dir_at("app", &stamp)
+                    .join(CLEANUP_TTLS_FILE)
+                    .exists(),
+                "the incarnation dir is named by the stamp"
+            );
         }
 
         #[tokio::test]
@@ -2194,19 +2323,21 @@ mod tests {
             // Default reap-on-success is 0s, and the inline pass runs after
             // the orchestrator's post-completion tasks, so poll instead of
             // assuming it lands immediately.
-            let pod_dir = logic.executor_provider.work_dir(&id);
+            let data_dir = logic.executor_provider.work_dir(&id);
+            let state_dir = only_state_dir(logic.executor_provider.as_ref(), &id.name);
             assert!(
-                wait_for_absence(&pod_dir.join(POD_WORK_SUBDIR)).await,
-                "work/ should be reaped as soon as the pod succeeds",
+                wait_for_absence(&data_dir).await,
+                "the data dir should be reaped as soon as the pod succeeds",
             );
-            assert!(pod_dir.join(REAPED_MARKER).exists(), "the reap is recorded",);
             assert!(
-                logic.executor_provider.log_dir(&id).unwrap().exists(),
+                only_state_dir(logic.executor_provider.as_ref(), &id.name)
+                    .join(crate::server::config::POD_LOG_SUBDIR)
+                    .exists(),
                 "container logs survive the reap — they are the record",
             );
             assert!(
-                pod_dir.join(SUCCEEDED_MARKER).exists(),
-                "the rest of the pod dir survives the reap",
+                state_dir.join(SUCCEEDED_MARKER).exists(),
+                "the state dir survives the reap",
             );
         }
 
@@ -2229,7 +2360,6 @@ mod tests {
                 pod_dir.join(POD_WORK_SUBDIR).exists(),
                 "the default 1h reap-on-error keeps work/ for debugging",
             );
-            assert!(!pod_dir.join(REAPED_MARKER).exists());
         }
 
         #[tokio::test]
@@ -2288,23 +2418,27 @@ mod tests {
                 .unwrap();
             let id = PodId::new("default", "app", "uid-app");
 
-            // Written before the pod is prepared, so it is there while the
-            // pod still runs — a pod that dies in preparation has a policy
-            // too.
-            let pod_dir = logic.executor_provider.work_dir(&id);
-            assert!(wait_for_presence(&pod_dir.join(CLEANUP_TTLS_FILE)).await);
-
-            let ttls = ttl::read_cleanup_ttls(&pod_dir).expect("cleanup TTLs readable");
+            // Written at admission, before the pod is prepared, so it is
+            // there while the pod still runs — a pod that dies in
+            // preparation has a policy too. Each half goes in the dir it
+            // governs.
+            let reap: ttl::ReapTtls =
+                ttl::read_cleanup_ttls(&logic.executor_provider.work_dir(&id))
+                    .expect("reap TTLs readable");
             assert_eq!(
-                ttls.reap_ttl_on_success.raw,
+                reap.reap_ttl_on_success.raw,
                 DEFAULT_POD_DATA_REAP_TTL_ON_POD_SUCCESS
             );
+            assert_eq!(reap.reap_ttl_on_success.source, ttl::TtlSource::Config);
+            assert!(!reap.written_at.is_empty());
+
+            let delete: ttl::DeleteTtls =
+                ttl::read_cleanup_ttls(&only_state_dir(logic.executor_provider.as_ref(), &id.name))
+                    .expect("delete TTLs readable");
             assert_eq!(
-                ttls.delete_ttl_on_failure.raw,
+                delete.delete_ttl_on_failure.raw,
                 DEFAULT_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE
             );
-            assert_eq!(ttls.reap_ttl_on_success.source, ttl::TtlSource::Config);
-            assert!(!ttls.written_at.is_empty());
         }
 
         #[tokio::test]
@@ -2318,16 +2452,14 @@ mod tests {
             logic.create_pod(spec).await.unwrap();
             let id = PodId::new("default", "app", "uid-app");
 
-            let pod_dir = logic.executor_provider.work_dir(&id);
-            let ttls = wait_for_cleanup_ttls(&pod_dir, "45m")
-                .await
-                .expect("cleanup TTLs must record the annotated value");
+            let ttls: ttl::ReapTtls =
+                ttl::read_cleanup_ttls(&logic.executor_provider.work_dir(&id))
+                    .expect("cleanup TTLs must record the annotated value");
             assert_eq!(ttls.reap_ttl_on_failure.raw, "45m");
             assert_eq!(ttls.reap_ttl_on_failure.secs, Some(2700));
             assert_eq!(ttls.reap_ttl_on_failure.source, ttl::TtlSource::Annotation);
             // Only the annotated value is overridden.
             assert_eq!(ttls.reap_ttl_on_success.source, ttl::TtlSource::Config);
-            assert_eq!(ttls.delete_ttl_on_failure.source, ttl::TtlSource::Config);
         }
 
         // -- finalization: every terminal path stamps the pod dir --
@@ -2342,19 +2474,14 @@ mod tests {
             let id = PodId::new("default", "app", "uid-app");
             assert_eq!(wait_for_terminal(&logic, "app").await, PodPhase::Succeeded);
 
-            let pod_dir = logic.executor_provider.work_dir(&id);
-            assert!(wait_for_presence(&pod_dir.join(SUCCEEDED_MARKER)).await);
-            assert!(!pod_dir.join(FAILED_MARKER).exists());
-            // Default reap-on-success is 0s, so the inline pass reaps at
-            // completion and consumes the deadline it just wrote.
-            assert!(wait_for_presence(&pod_dir.join(REAPED_MARKER)).await);
-            assert_eq!(
-                reaper::read_deadline(&pod_dir, REAP_ON_FILE),
-                None,
-                "a reaped deadline is consumed",
-            );
+            let state_dir = only_state_dir(logic.executor_provider.as_ref(), &id.name);
+            assert!(wait_for_presence(&state_dir.join(SUCCEEDED_MARKER)).await);
+            assert!(!state_dir.join(FAILED_MARKER).exists());
+            // Default reap-on-success is 0s, so the inline pass removes the
+            // data dir at completion.
+            assert!(wait_for_absence(&logic.executor_provider.work_dir(&id)).await);
             assert!(
-                !pod_dir.join(DELETE_ON_FILE).exists(),
+                !state_dir.join(DELETE_ON_FILE).exists(),
                 "the delete clock starts when the pod leaves the runner",
             );
         }
@@ -2372,6 +2499,12 @@ mod tests {
             let pod_dir = logic.executor_provider.work_dir(&id);
             assert!(wait_for_presence(&pod_dir.join(FAILED_MARKER)).await);
             assert!(!pod_dir.join(SUCCEEDED_MARKER).exists());
+            assert!(
+                only_state_dir(logic.executor_provider.as_ref(), &id.name)
+                    .join(FAILED_MARKER)
+                    .exists(),
+                "the state dir is marked too",
+            );
             // Default reap-on-error is 1h out.
             let reap_on = reaper::read_deadline(&pod_dir, REAP_ON_FILE).expect("reap deadline");
             assert!(!reap_on.is_due(chrono::Utc::now()), "{reap_on:?}");
@@ -2398,7 +2531,9 @@ mod tests {
             );
             assert!(reaper::read_deadline(&pod_dir, REAP_ON_FILE).is_some());
             assert!(
-                !pod_dir.join(crate::server::config::POD_LOG_SUBDIR).exists(),
+                !only_state_dir(logic.executor_provider.as_ref(), &id.name)
+                    .join(crate::server::config::POD_LOG_SUBDIR)
+                    .exists(),
                 "no container ran, so there is no log dir — the store is the record",
             );
         }
@@ -2416,8 +2551,8 @@ mod tests {
                 .unwrap();
             let id = PodId::new("default", "stuck", "uid-stuck");
             let pod_dir = logic.executor_provider.work_dir(&id);
-            // Wait until the preparer is actually running before deleting.
-            assert!(wait_for_presence(&pod_dir.join(CLEANUP_TTLS_FILE)).await);
+            // The policy is written at admission, before the preparer starts.
+            assert!(pod_dir.join(CLEANUP_TTLS_FILE).exists());
 
             logic.delete_pod("default", "stuck", None).await.unwrap();
 
@@ -2932,7 +3067,7 @@ mod tests {
 
             let provider = make_provider();
             let file_store = FileStore::new(FileStoreConfig {
-                root_dir: provider.pods_dir.clone(),
+                layout: provider.layout.clone(),
                 write_running_spec: false,
             });
             let store: Arc<dyn PodStore> = Arc::new(MultiplexStore::new(
@@ -2983,7 +3118,7 @@ mod tests {
             let id = PodId::new("default", "never", "uid-never");
             assert_eq!(wait_for_terminal(&logic, "never").await, PodPhase::Failed);
 
-            let pod_dir = provider.work_dir(&id);
+            let pod_dir = only_state_dir(provider.as_ref(), &id.name);
             assert!(wait_for_presence(&pod_dir.join(FAILED_MARKER)).await);
 
             // The control plane deletes the pod, as it does for every
@@ -3023,15 +3158,17 @@ mod tests {
                 .unwrap();
             let id = PodId::new("default", "app", "uid-app");
             assert_eq!(wait_for_terminal(&logic, "app").await, PodPhase::Succeeded);
-            let pod_dir = provider.work_dir(&id);
+            let pod_dir = only_state_dir(provider.as_ref(), &id.name);
             assert!(wait_for_presence(&pod_dir.join(SUCCEEDED_MARKER)).await);
 
             logic.delete_pod("default", "app", None).await.unwrap();
 
             // Default delete-on-success is 1h out, so the record stays.
-            assert!(pod_dir.exists(), "the pod dir outlives the delete");
+            assert!(pod_dir.exists(), "the state dir outlives the delete");
             assert!(
-                provider.log_dir(&id).unwrap().exists(),
+                only_state_dir(provider.as_ref(), &id.name)
+                    .join(crate::server::config::POD_LOG_SUBDIR)
+                    .exists(),
                 "container logs outlive the delete",
             );
             assert!(
@@ -3061,7 +3198,7 @@ mod tests {
             logic.create_pod(spec).await.unwrap();
             let id = PodId::new("default", "app", "uid-app");
             assert_eq!(wait_for_terminal(&logic, "app").await, PodPhase::Succeeded);
-            let pod_dir = provider.work_dir(&id);
+            let pod_dir = only_state_dir(provider.as_ref(), &id.name);
             assert!(wait_for_presence(&pod_dir.join(SUCCEEDED_MARKER)).await);
 
             logic.delete_pod("default", "app", None).await.unwrap();

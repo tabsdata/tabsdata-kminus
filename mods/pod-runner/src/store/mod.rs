@@ -39,6 +39,7 @@
 //! ```
 
 pub mod file;
+pub mod layout;
 pub mod memory;
 pub mod multiplex;
 
@@ -595,7 +596,7 @@ mod tests {
 
     fn make_file_store(name: &str) -> FileStore {
         FileStore::new(FileStoreConfig {
-            root_dir: temp_dir(name),
+            layout: layout::PodLayout::new(&temp_dir(name)),
             write_running_spec: true,
         })
     }

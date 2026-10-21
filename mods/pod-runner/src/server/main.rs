@@ -104,7 +104,8 @@ async fn main() {
     // Install rustls crypto provider (needed by kube client in resolvers)
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    // Kill any orphaned processes from a previous run
+    // Kill any orphaned processes from a previous run. The PID dir is fixed
+    // across restarts, so it holds what a crashed run left.
     let stale_killed = pod_runner::process::executor::cleanup_stale_pids(&pr_config.pid_dir);
     if stale_killed > 0 {
         warn!(stale_killed, "Killed stale processes from previous run");
@@ -160,10 +161,15 @@ async fn main() {
     .register_task(Arc::new(DiskSizePodTask::with_interval(
         std::time::Duration::from_secs(pr_config.dir_size_scan_interval_secs),
     )))
-    .runner_work_dir(pr_config.run_dir.clone())
+    // The whole data dir: pod-run/, pod-state/ and pod-pid/.
+    .runner_work_dir(pr_config.data_dir.clone())
     .register_runner_task(Arc::new(DiskSizeRunnerTask::with_interval(
         std::time::Duration::from_secs(pr_config.dir_size_scan_interval_secs),
     )));
+
+    // Pick up the pod dirs the previous run left, before any pod is admitted:
+    // their deadlines are on disk, and a restart must not lose them.
+    logic.recover_pod_dirs();
 
     // Spawn metrics server
     let metrics_port = pr_config.metrics_port();

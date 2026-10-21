@@ -2,24 +2,44 @@
 
 //! File-based [`PodStore`] implementation.
 //!
-//! Persists pod specs and statuses to disk. On creation, a timestamped
-//! directory is created under the root. Each pod gets its own
-//! subdirectory containing spec files and timestamped status snapshots.
+//! Persists pod specs and statuses to disk, in the `store/` subdir of each
+//! pod incarnation's state dir (see [`PodLayout`]).
 //!
 //! # Directory layout
 //!
 //! ```text
-//! root/
-//!   20260407T194530/                    # store session (start time)
-//!     default_app_uid-1/                # pod dir (PodId::full())
-//!       original-spec.json
-//!       running-spec.json               # optional (see FileStoreConfig)
-//!       status/
-//!         20260407T194530123.json        # timestamped status snapshots
-//!         20260407T194531456.json
-//!     prod_web_uid-2/
-//!       ...
+//! pod-state/
+//!   3f/                                 # bucket (layout::state_bucket)
+//!     app/                              # pod name
+//!       20260407T194530Z/               # incarnation (creation time)
+//!         store/
+//!           original-spec.json
+//!           running-spec.json           # optional (see FileStoreConfig)
+//!           status/
+//!             20260407T194530123.json   # timestamped status snapshots
+//!             20260407T194531456.json
 //! ```
+//!
+//! # Write-only in production
+//!
+//! The server only ever writes through this store. It sits behind a
+//! [`MultiplexStore`](super::multiplex::MultiplexStore) that sends every
+//! read to the [`MemoryStore`](super::memory::MemoryStore), so `get`,
+//! `get_by_name`, `list`, `list_in_namespace` and `len` here are never
+//! called outside tests. They are kept so the store is a complete
+//! [`PodStore`] and its writes can be checked by reading them back. The
+//! on-disk record is read by people and tools, not through this API.
+//!
+//! The state dir is a function of the spec, so it is resolved once, at
+//! [`put`](PodStore::put), and remembered per pod id for the calls that
+//! only carry the id. The reads therefore cover the pods put into this
+//! store — those of this run; the dirs earlier runs left are records on
+//! disk, not pods it serves.
+//!
+//! State dirs outlive a restart, and a pod replayed after one keeps its
+//! creation time, so it writes into the dir its previous attempt left: the
+//! spec is overwritten and the status history carries on, latest snapshot
+//! first.
 //!
 //! # Logging
 //!
@@ -35,10 +55,7 @@
 //! - The hot path is `update_status`, which at 500 concurrent pods
 //!   peaks at ~80 writes/sec — ~10 ms of aggregate blocking time
 //!   per second across the tokio blocking pool.
-//! - Reads (`get`, `list`, `get_by_name`) are usually served from
-//!   [`MemoryStore`](super::memory::MemoryStore) via
-//!   [`MultiplexStore`](super::multiplex::MultiplexStore); `FileStore`
-//!   reads are predominantly test-only.
+//! - Reads are never served from here in production (see above).
 //!
 //! Under those conditions the blocking cost is negligible and the
 //! `std::fs` + `serde_json` code stays simple.
@@ -49,9 +66,10 @@
 //! the I/O off the tokio worker threads. The trait is already async,
 //! so callers need no changes — only this file does.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use tracing::{debug, debug_span, warn};
@@ -59,6 +77,7 @@ use tracing::{debug, debug_span, warn};
 use crate::spec::pod::PodSpec;
 use crate::spec::status::PodStatus;
 
+use super::layout::PodLayout;
 use super::{PodId, PodSnapshot, PodStore, SpecView};
 
 // ---------------------------------------------------------------------------
@@ -66,10 +85,10 @@ use super::{PodId, PodSnapshot, PodStore, SpecView};
 // ---------------------------------------------------------------------------
 
 /// Configuration for the file store.
+#[derive(Default)]
 pub struct FileStoreConfig {
-    /// Root directory for the store. A timestamped session directory
-    /// is created under this path.
-    pub root_dir: PathBuf,
+    /// Pod layout; the store writes under each pod's state dir.
+    pub layout: PodLayout,
     /// Whether to write the running (prepared) spec to disk.
     ///
     /// Set to `false` if the running spec may contain resolved secrets
@@ -77,64 +96,58 @@ pub struct FileStoreConfig {
     pub write_running_spec: bool,
 }
 
-impl Default for FileStoreConfig {
-    fn default() -> Self {
-        Self {
-            root_dir: PathBuf::from("run").join("pods"),
-            write_running_spec: false,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // FileStore
 // ---------------------------------------------------------------------------
 
-/// File-based pod store. Persists specs and statuses under each pod's
-/// `store/` subdirectory: `<pods_dir>/<pod_id>/store/`.
-///
-/// Run rotation (see `rotate_run_dir`) provides session isolation —
-/// each pod-runner restart writes to a fresh `run/pods/` tree.
+/// File-based pod store. Persists specs and statuses under each pod
+/// incarnation's `store/` subdirectory:
+/// `<pod-state>/<bucket>/<pod_name>/<stamp>/store/`.
 pub struct FileStore {
-    /// Pods directory: `<workdir>/run/pods/`.
-    pods_dir: PathBuf,
     config: FileStoreConfig,
+    /// Store dir of every pod put into this store, by pod id.
+    store_dirs: RwLock<HashMap<PodId, PathBuf>>,
 }
 
 impl FileStore {
-    /// Create a new file store.
-    ///
-    /// `config.root_dir` points at the pods directory
-    /// (`<workdir>/run/pods/`). No session subdirectory is created —
-    /// run rotation handles isolation between restarts.
+    /// Create a new file store rooted at `config.layout`'s state root.
     pub fn new(config: impl Into<FileStoreConfig>) -> Self {
         let config = config.into();
-        let pods_dir = config.root_dir.clone();
-        if let Err(e) = fs::create_dir_all(&pods_dir) {
-            warn!(error = %e, dir = ?pods_dir, "Failed to create pods directory");
+        let root = &config.layout.state_root;
+        if let Err(e) = fs::create_dir_all(root) {
+            warn!(error = %e, dir = ?root, "Failed to create pod state directory");
         }
-        debug!(dir = ?pods_dir, "File store initialized");
-        Self { pods_dir, config }
+        debug!(dir = ?root, "File store initialized");
+        Self {
+            config,
+            store_dirs: RwLock::new(HashMap::new()),
+        }
     }
 
-    /// The pods directory path.
-    pub fn pods_dir(&self) -> &Path {
-        &self.pods_dir
+    /// The pod-state root directory.
+    pub fn state_root(&self) -> &Path {
+        &self.config.layout.state_root
     }
 
     // -- internal helpers --------------------------------------------------
 
-    fn pod_dir(&self, id: &PodId) -> PathBuf {
-        self.pods_dir.join(id.full())
+    /// The store dir of a pod put into this store: `<state_dir>/store/`.
+    fn store_dir(&self, id: &PodId) -> Option<PathBuf> {
+        self.store_dirs
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .cloned()
     }
 
-    /// Per-pod store directory: `<pods_dir>/<pod_id>/store/`.
-    fn store_dir(&self, id: &PodId) -> PathBuf {
-        self.pod_dir(id).join("store")
-    }
-
-    fn status_dir(&self, id: &PodId) -> PathBuf {
-        self.store_dir(id).join("status")
+    /// Every pod put into this store.
+    fn pod_ids(&self) -> Vec<PodId> {
+        self.store_dirs
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned()
+            .collect()
     }
 
     fn write_json<T: serde::Serialize>(&self, path: &Path, value: &T) {
@@ -170,14 +183,14 @@ impl FileStore {
         }
     }
 
-    fn write_status(&self, id: &PodId, status: &PodStatus) {
+    fn write_status(&self, store: &Path, status: &PodStatus) {
         let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S%3f");
-        let path = self.status_dir(id).join(format!("{}.json", ts));
+        let path = store.join("status").join(format!("{}.json", ts));
         self.write_json(&path, status);
     }
 
-    fn read_latest_status(&self, id: &PodId) -> Option<PodStatus> {
-        let status_dir = self.status_dir(id);
+    fn read_latest_status(&self, store: &Path) -> Option<PodStatus> {
+        let status_dir = store.join("status");
         let mut entries: Vec<PathBuf> = fs::read_dir(&status_dir)
             .ok()?
             .filter_map(|e| e.ok())
@@ -188,8 +201,7 @@ impl FileStore {
         entries.last().and_then(|path| self.read_json(path))
     }
 
-    fn read_spec(&self, id: &PodId, view: SpecView) -> Option<Arc<PodSpec>> {
-        let store = self.store_dir(id);
+    fn read_spec(&self, store: &Path, view: SpecView) -> Option<Arc<PodSpec>> {
         let path = match view {
             SpecView::Running => {
                 let running = store.join("running-spec.json");
@@ -205,29 +217,14 @@ impl FileStore {
     }
 
     fn read_snapshot(&self, id: &PodId, view: SpecView) -> Option<PodSnapshot> {
-        let spec = self.read_spec(id, view)?;
-        let status = self.read_latest_status(id)?;
+        let store = self.store_dir(id)?;
+        let spec = self.read_spec(&store, view)?;
+        let status = self.read_latest_status(&store)?;
         Some(PodSnapshot {
             id: id.clone(),
             spec,
             status,
         })
-    }
-
-    fn list_pod_ids(&self) -> Vec<PodId> {
-        let entries = match fs::read_dir(&self.pods_dir) {
-            Ok(rd) => rd,
-            Err(_) => return Vec::new(),
-        };
-        entries
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .filter_map(|e| {
-                let spec_path = e.path().join("store").join("original-spec.json");
-                let spec: PodSpec = self.read_json(&spec_path)?;
-                Some(PodId::from_spec(&spec))
-            })
-            .collect()
     }
 }
 
@@ -245,7 +242,7 @@ impl PodStore for FileStore {
         status: PodStatus,
     ) {
         let _span = debug_span!("file_store", pod = %id).entered();
-        let store = self.store_dir(&id);
+        let store = self.config.layout.store_dir(&original_spec);
         if let Err(e) = fs::create_dir_all(&store) {
             warn!(error = %e, "Failed to create pod store directory");
             return;
@@ -257,15 +254,24 @@ impl PodStore for FileStore {
             self.write_json(&store.join("running-spec.json"), running_spec.as_ref());
         }
 
-        self.write_status(&id, &status);
+        self.write_status(&store, &status);
+        self.store_dirs
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id, store);
     }
 
     async fn update_status(&self, id: &PodId, status: PodStatus) {
         let _span = debug_span!("file_store", pod = %id).entered();
-        if self.pod_dir(id).exists() {
-            self.write_status(id, &status);
+        // A state dir its delete deadline already took stays gone.
+        if let Some(store) = self.store_dir(id)
+            && store.parent().is_some_and(Path::exists)
+        {
+            self.write_status(&store, &status);
         }
     }
+
+    // -- reads: test-only, the server reads from the memory store ---------
 
     async fn get(&self, id: &PodId, view: SpecView) -> Option<PodSnapshot> {
         self.read_snapshot(id, view)
@@ -277,36 +283,21 @@ impl PodStore for FileStore {
         name: &str,
         view: SpecView,
     ) -> Option<PodSnapshot> {
-        let prefix = format!("{}_{}_", namespace, name);
-        let entries = match fs::read_dir(&self.pods_dir) {
-            Ok(rd) => rd,
-            Err(_) => return None,
-        };
-        for entry in entries.filter_map(|e| e.ok()) {
-            let dir_name = entry.file_name();
-            let dir_name = dir_name.to_string_lossy();
-            if dir_name.starts_with(&prefix) && entry.path().is_dir() {
-                let spec_path = entry.path().join("store").join("original-spec.json");
-                if let Some(spec) = self.read_json::<PodSpec>(&spec_path) {
-                    let id = PodId::from_spec(&spec);
-                    if id.namespace == namespace && id.name == name {
-                        return self.read_snapshot(&id, view);
-                    }
-                }
-            }
-        }
-        None
+        self.pod_ids()
+            .iter()
+            .filter(|id| id.namespace == namespace && id.name == name)
+            .find_map(|id| self.read_snapshot(id, view))
     }
 
     async fn list(&self, view: SpecView) -> Vec<PodSnapshot> {
-        self.list_pod_ids()
+        self.pod_ids()
             .iter()
             .filter_map(|id| self.read_snapshot(id, view))
             .collect()
     }
 
     async fn list_in_namespace(&self, namespace: &str, view: SpecView) -> Vec<PodSnapshot> {
-        self.list_pod_ids()
+        self.pod_ids()
             .iter()
             .filter(|id| id.namespace == namespace)
             .filter_map(|id| self.read_snapshot(id, view))
@@ -316,10 +307,15 @@ impl PodStore for FileStore {
     async fn remove(&self, id: &PodId) -> Option<PodSnapshot> {
         let _span = debug_span!("file_store", pod = %id).entered();
         let snap = self.read_snapshot(id, SpecView::Running);
-        // Remove only the store/ subdir — the pod dir may contain
-        // work/ and log/ that the reaper manages separately.
-        let store = self.store_dir(id);
-        if store.exists()
+        // Remove only the store/ subdir — the state dir also holds log/
+        // and the deadline files, which the reaper manages.
+        let store = self
+            .store_dirs
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(id);
+        if let Some(store) = store
+            && store.exists()
             && let Err(e) = fs::remove_dir_all(&store)
         {
             warn!(error = %e, "Failed to remove pod store directory");
@@ -336,13 +332,10 @@ impl PodStore for FileStore {
     }
 
     async fn len(&self) -> usize {
-        match fs::read_dir(&self.pods_dir) {
-            Ok(rd) => rd
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().join("store").is_dir())
-                .count(),
-            Err(_) => 0,
-        }
+        self.pod_ids()
+            .iter()
+            .filter(|id| self.store_dir(id).is_some_and(|d| d.is_dir()))
+            .count()
     }
 }
 
@@ -368,7 +361,7 @@ mod tests {
 
     fn make_store(name: &str) -> FileStore {
         FileStore::new(FileStoreConfig {
-            root_dir: temp_dir(name),
+            layout: PodLayout::new(&temp_dir(name)),
             write_running_spec: true,
         })
     }
@@ -379,6 +372,7 @@ mod tests {
                 namespace: namespace.to_string(),
                 name: name.to_string(),
                 uid: uid.to_string(),
+                creation_timestamp: Some("2026-10-19T14:30:05Z".to_string()),
                 ..Default::default()
             },
             spec: PodSpecBody::default(),
@@ -400,8 +394,8 @@ mod tests {
     #[tokio::test]
     async fn creates_session_directory() {
         let store = make_store("session-dir");
-        assert!(store.pods_dir().exists());
-        assert!(store.pods_dir().is_dir());
+        assert!(store.state_root().exists());
+        assert!(store.state_root().is_dir());
     }
 
     #[tokio::test]
@@ -434,7 +428,7 @@ mod tests {
     #[tokio::test]
     async fn put_without_running_spec() {
         let config = FileStoreConfig {
-            root_dir: temp_dir("no-running"),
+            layout: PodLayout::new(&temp_dir("no-running")),
             write_running_spec: false,
         };
         let store = FileStore::new(config);
@@ -456,8 +450,20 @@ mod tests {
         assert_eq!(snap.spec.metadata.uid, "uid-1");
 
         // No running-spec.json on disk (specs are under store/)
-        assert!(!store.store_dir(&id).join("running-spec.json").exists());
-        assert!(store.store_dir(&id).join("original-spec.json").exists());
+        assert!(
+            !store
+                .store_dir(&id)
+                .unwrap()
+                .join("running-spec.json")
+                .exists()
+        );
+        assert!(
+            store
+                .store_dir(&id)
+                .unwrap()
+                .join("original-spec.json")
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -485,7 +491,7 @@ mod tests {
         assert_eq!(snap.status.phase, PodPhase::Running);
 
         // Two status files on disk
-        let status_dir = store.status_dir(&id);
+        let status_dir = store.store_dir(&id).unwrap().join("status");
         let count = fs::read_dir(&status_dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -639,10 +645,11 @@ mod tests {
             .await;
 
         assert!(store.contains(&id).await);
+        let dir = store.store_dir(&id).unwrap();
         let snap = store.remove(&id).await.unwrap();
         assert_eq!(snap.id.name, "app");
         assert!(!store.contains(&id).await);
-        assert!(!store.store_dir(&id).exists());
+        assert!(!dir.exists());
         assert_eq!(store.len().await, 0);
     }
 
@@ -662,15 +669,13 @@ mod tests {
 
         let snap = store.evict(&id).await.unwrap();
         assert_eq!(snap.id.name, "app");
+        let dir = store.store_dir(&id).unwrap();
         assert!(
-            store.store_dir(&id).exists(),
+            dir.exists(),
             "the specs and statuses are the pod's record — evicting a pod \
              from the API must not destroy them",
         );
-        assert!(
-            store.store_dir(&id).join("original-spec.json").exists(),
-            "the spec survives",
-        );
+        assert!(dir.join("original-spec.json").exists(), "the spec survives");
     }
 
     #[tokio::test]
@@ -711,7 +716,7 @@ mod tests {
         assert_eq!(snap.status.phase, PodPhase::Succeeded);
 
         // Three status files total
-        let count = fs::read_dir(store.status_dir(&id))
+        let count = fs::read_dir(store.store_dir(&id).unwrap().join("status"))
             .unwrap()
             .filter_map(|e| e.ok())
             .count();
@@ -747,5 +752,59 @@ mod tests {
         let snap = store.get(&id, SpecView::Running).await.unwrap();
         assert_eq!(snap.status.phase, PodPhase::Running);
         assert_eq!(store.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn writes_into_the_incarnation_state_dir() {
+        let store = make_store("incarnations");
+        let first = make_spec("default", "app", "uid-1");
+        let mut second = (*make_spec("default", "app", "uid-2")).clone();
+        second.metadata.creation_timestamp = Some("2026-10-19T15:00:00Z".to_string());
+        let second = Arc::new(second);
+
+        for spec in [&first, &second] {
+            store
+                .put(
+                    PodId::from_spec(spec),
+                    Arc::clone(spec),
+                    Arc::clone(spec),
+                    make_status(PodPhase::Pending),
+                )
+                .await;
+        }
+
+        let layout = &store.config.layout;
+        for spec in [&first, &second] {
+            assert_eq!(
+                store.store_dir(&PodId::from_spec(spec)),
+                Some(layout.store_dir(spec)),
+            );
+            assert!(layout.store_dir(spec).join("original-spec.json").exists());
+        }
+        assert_ne!(layout.store_dir(&first), layout.store_dir(&second));
+        assert_eq!(store.len().await, 2);
+    }
+
+    #[tokio::test]
+    async fn update_status_does_not_recreate_a_deleted_state_dir() {
+        let store = make_store("deleted-state");
+        let spec = make_spec("default", "app", "uid-1");
+        let id = PodId::from_spec(&spec);
+        store
+            .put(
+                id.clone(),
+                Arc::clone(&spec),
+                Arc::clone(&spec),
+                make_status(PodPhase::Failed),
+            )
+            .await;
+        let state_dir = store.config.layout.state_dir(&spec);
+        fs::remove_dir_all(&state_dir).unwrap();
+
+        store
+            .update_status(&id, make_status(PodPhase::Failed))
+            .await;
+
+        assert!(!state_dir.exists(), "a late status must not resurrect it");
     }
 }

@@ -4,12 +4,13 @@
 //!
 //! Two independent clocks govern a finished pod's on-disk footprint:
 //!
-//! - **reap** — deletes the data dirs (`work/`, `volumes/`), the bulk of
-//!   the footprint. Runs from **pod completion**.
-//! - **delete** — deletes the whole pod dir, including the logs and specs
-//!   that are the pod's only record. Runs from the moment the pod is
-//!   **removed from the pod runner**, because until then the runner still
-//!   answers queries about it.
+//! - **reap** — deletes the pod's data dir (`pod-run/<pod_id>/`: `work/`,
+//!   `volumes/`), the bulk of the footprint. Runs from **pod completion**.
+//! - **delete** — deletes the pod incarnation's state dir
+//!   (`pod-state/<bucket>/<pod_name>/<stamp>/`: `log/`, `store/`), its only
+//!   record. Runs from the moment the pod is **removed from the pod
+//!   runner**, because until then the runner still answers queries about
+//!   it.
 //!
 //! Each clock has a TTL per outcome (success/failure), so four values in
 //! total. Every value is configured at the pod runner level and can be
@@ -19,11 +20,12 @@
 //! `never`. There is deliberately no `d` unit: `24h` says the same thing
 //! without a second way to spell it.
 //!
-//! The values resolved for a pod are written to
-//! [`CLEANUP_TTLS_FILE`] in the pod dir at pod start, recording where each
-//! one came from. Nothing on the reaping path re-derives them from config:
-//! the pod dir carries its own retention policy, so it stays correct
-//! across a config edit or a runner restart.
+//! The values resolved for a pod are written at pod start, recording where
+//! each one came from, to a [`CLEANUP_TTLS_FILE`] in each dir they govern:
+//! [`ReapTtls`] in the data dir, [`DeleteTtls`] in the state dir. Nothing
+//! on the reaping path re-derives them from config: each dir carries its
+//! own retention policy, so it stays correct across a config edit or a
+//! runner restart.
 
 use std::collections::HashMap;
 use std::fs;
@@ -32,6 +34,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -172,13 +175,13 @@ impl TtlSpec {
 /// The four cleanup TTLs as configured at the pod runner level.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TtlConfig {
-    /// Data dirs of a succeeded pod, from completion.
+    /// Data dir of a succeeded pod, from completion.
     pub reap_on_success: TtlSpec,
-    /// Data dirs of a failed pod, from completion.
+    /// Data dir of a failed pod, from completion.
     pub reap_on_failure: TtlSpec,
-    /// Pod dir of a succeeded pod, from removal from the runner.
+    /// State dir of a succeeded pod, from removal from the runner.
     pub delete_on_success: TtlSpec,
-    /// Pod dir of a failed pod, from removal from the runner.
+    /// State dir of a failed pod, from removal from the runner.
     pub delete_on_failure: TtlSpec,
 }
 
@@ -197,7 +200,7 @@ impl Default for TtlConfig {
 }
 
 // ---------------------------------------------------------------------------
-// CleanupTtls — resolved per pod
+// ReapTtls / DeleteTtls — resolved per pod
 // ---------------------------------------------------------------------------
 
 /// Where a resolved TTL came from.
@@ -210,7 +213,7 @@ pub enum TtlSource {
     Annotation,
 }
 
-/// One resolved TTL, as written to [`CLEANUP_TTLS_FILE`].
+/// One resolved TTL, as written to a [`CLEANUP_TTLS_FILE`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TtlSetting {
     /// The value as configured, e.g. `1h` or `never`.
@@ -231,35 +234,46 @@ impl TtlSetting {
     }
 }
 
-/// The cleanup TTLs resolved for one pod — the contents of
-/// [`CLEANUP_TTLS_FILE`].
+/// The reap TTLs resolved for one pod — the [`CLEANUP_TTLS_FILE`] in its
+/// data dir.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CleanupTtls {
+pub struct ReapTtls {
     /// When this file was written (RFC3339).
     pub written_at: String,
-    /// Data dirs of a succeeded pod, from completion.
+    /// Data dir of a succeeded pod, from completion.
     pub reap_ttl_on_success: TtlSetting,
-    /// Data dirs of a failed pod, from completion.
+    /// Data dir of a failed pod, from completion.
     pub reap_ttl_on_failure: TtlSetting,
-    /// Pod dir of a succeeded pod, from removal from the runner.
-    pub delete_ttl_on_success: TtlSetting,
-    /// Pod dir of a failed pod, from removal from the runner.
-    pub delete_ttl_on_failure: TtlSetting,
 }
 
-impl CleanupTtls {
+impl ReapTtls {
     /// The reap TTL for the outcome the pod reached.
-    pub fn reap_ttl(&self, succeeded: bool) -> Ttl {
+    pub fn ttl(&self, succeeded: bool) -> Ttl {
         if succeeded {
             self.reap_ttl_on_success.ttl()
         } else {
             self.reap_ttl_on_failure.ttl()
         }
     }
+}
 
+/// The delete TTLs resolved for one pod — the [`CLEANUP_TTLS_FILE`] in its
+/// state dir.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteTtls {
+    /// When this file was written (RFC3339).
+    pub written_at: String,
+    /// State dir of a succeeded pod, from removal from the runner.
+    pub delete_ttl_on_success: TtlSetting,
+    /// State dir of a failed pod, from removal from the runner.
+    pub delete_ttl_on_failure: TtlSetting,
+}
+
+impl DeleteTtls {
     /// The delete TTL for the outcome the pod reached.
-    pub fn delete_ttl(&self, succeeded: bool) -> Ttl {
+    pub fn ttl(&self, succeeded: bool) -> Ttl {
         if succeeded {
             self.delete_ttl_on_success.ttl()
         } else {
@@ -268,15 +282,15 @@ impl CleanupTtls {
     }
 }
 
-/// Resolve the four TTLs for a pod: each annotation overrides its config
+/// Resolve a pod's reap TTLs: each annotation overrides its config
 /// counterpart, and an annotation that doesn't parse is ignored with a
 /// warning rather than failing the pod.
-pub fn resolve_cleanup_ttls(
+pub fn resolve_reap_ttls(
     config: &TtlConfig,
     annotations: &HashMap<String, String>,
     written_at: &str,
-) -> CleanupTtls {
-    CleanupTtls {
+) -> ReapTtls {
+    ReapTtls {
         written_at: written_at.to_string(),
         reap_ttl_on_success: resolve_one(
             &config.reap_on_success,
@@ -288,6 +302,17 @@ pub fn resolve_cleanup_ttls(
             annotations,
             ANN_POD_DATA_REAP_TTL_ON_POD_FAILURE,
         ),
+    }
+}
+
+/// Resolve a pod's delete TTLs, as [`resolve_reap_ttls`] does its reap ones.
+pub fn resolve_delete_ttls(
+    config: &TtlConfig,
+    annotations: &HashMap<String, String>,
+    written_at: &str,
+) -> DeleteTtls {
+    DeleteTtls {
+        written_at: written_at.to_string(),
         delete_ttl_on_success: resolve_one(
             &config.delete_on_success,
             annotations,
@@ -328,23 +353,24 @@ fn resolve_one(config: &TtlSpec, annotations: &HashMap<String, String>, key: &st
 // On-disk access
 // ---------------------------------------------------------------------------
 
-/// Write [`CLEANUP_TTLS_FILE`] into `pod_dir`, creating the dir if needed.
-pub fn write_cleanup_ttls(pod_dir: &Path, ttls: &CleanupTtls) -> io::Result<()> {
-    fs::create_dir_all(pod_dir)?;
+/// Write a [`CLEANUP_TTLS_FILE`] — [`ReapTtls`] or [`DeleteTtls`] — into
+/// `dir`, creating the dir if needed.
+pub fn write_cleanup_ttls<T: Serialize>(dir: &Path, ttls: &T) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
     let json = serde_json::to_vec_pretty(ttls).map_err(io::Error::other)?;
-    fs::write(pod_dir.join(CLEANUP_TTLS_FILE), json)
+    fs::write(dir.join(CLEANUP_TTLS_FILE), json)
 }
 
-/// Read [`CLEANUP_TTLS_FILE`] from `pod_dir`. Returns `None` when it is
+/// Read the [`CLEANUP_TTLS_FILE`] from `dir`. Returns `None` when it is
 /// absent or unreadable — the caller falls back to live config, since a
-/// pod dir with no policy of its own is better reaped on the current
-/// settings than left forever.
-pub fn read_cleanup_ttls(pod_dir: &Path) -> Option<CleanupTtls> {
-    let path = pod_dir.join(CLEANUP_TTLS_FILE);
+/// dir with no policy of its own is better reaped on the current settings
+/// than left forever.
+pub fn read_cleanup_ttls<T: DeserializeOwned>(dir: &Path) -> Option<T> {
+    let path = dir.join(CLEANUP_TTLS_FILE);
     if !path.exists() {
         return None;
     }
-    match fs::read(&path).map(|raw| serde_json::from_slice::<CleanupTtls>(&raw)) {
+    match fs::read(&path).map(|raw| serde_json::from_slice::<T>(&raw)) {
         Ok(Ok(ttls)) => Some(ttls),
         Ok(Err(e)) => {
             warn!(path = ?path, error = %e, "Malformed cleanup TTLs file");
@@ -522,105 +548,118 @@ mod tests {
         assert_eq!(c.delete_on_failure.raw(), "24h");
     }
 
-    // -- resolve_cleanup_ttls --
+    // -- resolve_reap_ttls / resolve_delete_ttls --
 
     #[test]
     fn resolve_uses_config_when_no_annotations() {
-        let ttls = resolve_cleanup_ttls(&TtlConfig::default(), &HashMap::new(), "now");
-        assert_eq!(ttls.written_at, "now");
+        let reap = resolve_reap_ttls(&TtlConfig::default(), &HashMap::new(), "now");
+        let delete = resolve_delete_ttls(&TtlConfig::default(), &HashMap::new(), "now");
+        assert_eq!(reap.written_at, "now");
+        assert_eq!(delete.written_at, "now");
         for s in [
-            &ttls.reap_ttl_on_success,
-            &ttls.reap_ttl_on_failure,
-            &ttls.delete_ttl_on_success,
-            &ttls.delete_ttl_on_failure,
+            &reap.reap_ttl_on_success,
+            &reap.reap_ttl_on_failure,
+            &delete.delete_ttl_on_success,
+            &delete.delete_ttl_on_failure,
         ] {
             assert_eq!(s.source, TtlSource::Config);
         }
-        assert_eq!(ttls.reap_ttl_on_success.secs, Some(0));
-        assert_eq!(ttls.delete_ttl_on_failure.secs, Some(86_400));
+        assert_eq!(reap.reap_ttl_on_success.secs, Some(0));
+        assert_eq!(delete.delete_ttl_on_failure.secs, Some(86_400));
     }
 
     #[test]
     fn resolve_reap_on_success_annotation() {
-        let ttls = resolve_cleanup_ttls(
+        let reap = resolve_reap_ttls(
             &TtlConfig::default(),
             &ann(&[(ANN_POD_DATA_REAP_TTL_ON_POD_SUCCESS, "5m")]),
             "now",
         );
-        assert_eq!(ttls.reap_ttl_on_success.raw, "5m");
-        assert_eq!(ttls.reap_ttl_on_success.secs, Some(300));
-        assert_eq!(ttls.reap_ttl_on_success.source, TtlSource::Annotation);
-        // The other three are untouched.
-        assert_eq!(ttls.reap_ttl_on_failure.source, TtlSource::Config);
-        assert_eq!(ttls.delete_ttl_on_success.source, TtlSource::Config);
-        assert_eq!(ttls.delete_ttl_on_failure.source, TtlSource::Config);
+        assert_eq!(reap.reap_ttl_on_success.raw, "5m");
+        assert_eq!(reap.reap_ttl_on_success.secs, Some(300));
+        assert_eq!(reap.reap_ttl_on_success.source, TtlSource::Annotation);
+        assert_eq!(reap.reap_ttl_on_failure.source, TtlSource::Config);
     }
 
     #[test]
     fn resolve_reap_on_failure_annotation() {
-        let ttls = resolve_cleanup_ttls(
+        let reap = resolve_reap_ttls(
             &TtlConfig::default(),
             &ann(&[(ANN_POD_DATA_REAP_TTL_ON_POD_FAILURE, "2h")]),
             "now",
         );
-        assert_eq!(ttls.reap_ttl_on_failure.secs, Some(7200));
-        assert_eq!(ttls.reap_ttl_on_failure.source, TtlSource::Annotation);
+        assert_eq!(reap.reap_ttl_on_failure.secs, Some(7200));
+        assert_eq!(reap.reap_ttl_on_failure.source, TtlSource::Annotation);
     }
 
     #[test]
     fn resolve_delete_on_success_annotation() {
-        let ttls = resolve_cleanup_ttls(
+        let delete = resolve_delete_ttls(
             &TtlConfig::default(),
             &ann(&[(ANN_POD_DIR_DELETE_TTL_POD_SUCCESS_ON_POD_DELETE, "0s")]),
             "now",
         );
-        assert_eq!(ttls.delete_ttl_on_success.secs, Some(0));
-        assert_eq!(ttls.delete_ttl_on_success.source, TtlSource::Annotation);
+        assert_eq!(delete.delete_ttl_on_success.secs, Some(0));
+        assert_eq!(delete.delete_ttl_on_success.source, TtlSource::Annotation);
+        assert_eq!(delete.delete_ttl_on_failure.source, TtlSource::Config);
     }
 
     #[test]
     fn resolve_delete_on_failure_annotation() {
-        let ttls = resolve_cleanup_ttls(
+        let delete = resolve_delete_ttls(
             &TtlConfig::default(),
             &ann(&[(ANN_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE, TTL_NEVER)]),
             "now",
         );
-        assert_eq!(ttls.delete_ttl_on_failure.raw, TTL_NEVER);
-        assert_eq!(ttls.delete_ttl_on_failure.secs, None);
-        assert_eq!(ttls.delete_ttl_on_failure.ttl(), Ttl::Never);
-        assert_eq!(ttls.delete_ttl_on_failure.source, TtlSource::Annotation);
+        assert_eq!(delete.delete_ttl_on_failure.raw, TTL_NEVER);
+        assert_eq!(delete.delete_ttl_on_failure.secs, None);
+        assert_eq!(delete.delete_ttl_on_failure.ttl(), Ttl::Never);
+        assert_eq!(delete.delete_ttl_on_failure.source, TtlSource::Annotation);
+    }
+
+    #[test]
+    fn each_half_ignores_the_other_halfs_annotations() {
+        let annotations = ann(&[
+            (ANN_POD_DATA_REAP_TTL_ON_POD_SUCCESS, "5m"),
+            (ANN_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE, "5m"),
+        ]);
+        let reap = resolve_reap_ttls(&TtlConfig::default(), &annotations, "now");
+        let delete = resolve_delete_ttls(&TtlConfig::default(), &annotations, "now");
+        assert_eq!(reap.reap_ttl_on_failure.source, TtlSource::Config);
+        assert_eq!(delete.delete_ttl_on_success.source, TtlSource::Config);
     }
 
     #[test]
     fn resolve_ignores_invalid_annotation() {
-        let ttls = resolve_cleanup_ttls(
+        let reap = resolve_reap_ttls(
             &TtlConfig::default(),
             &ann(&[(ANN_POD_DATA_REAP_TTL_ON_POD_FAILURE, "1d")]),
             "now",
         );
-        assert_eq!(ttls.reap_ttl_on_failure.raw, "1h", "fell back to config");
-        assert_eq!(ttls.reap_ttl_on_failure.source, TtlSource::Config);
+        assert_eq!(reap.reap_ttl_on_failure.raw, "1h", "fell back to config");
+        assert_eq!(reap.reap_ttl_on_failure.source, TtlSource::Config);
     }
 
     #[test]
     fn resolve_ignores_unrelated_annotations() {
-        let ttls = resolve_cleanup_ttls(
+        let reap = resolve_reap_ttls(
             &TtlConfig::default(),
             &ann(&[("prSomethingElse", "5m")]),
             "now",
         );
-        assert_eq!(ttls.reap_ttl_on_success.source, TtlSource::Config);
+        assert_eq!(reap.reap_ttl_on_success.source, TtlSource::Config);
     }
 
     // -- outcome selection --
 
     #[test]
-    fn outcome_picks_the_matching_pair() {
-        let ttls = resolve_cleanup_ttls(&TtlConfig::default(), &HashMap::new(), "now");
-        assert_eq!(ttls.reap_ttl(true).secs(), Some(0));
-        assert_eq!(ttls.reap_ttl(false).secs(), Some(3600));
-        assert_eq!(ttls.delete_ttl(true).secs(), Some(3600));
-        assert_eq!(ttls.delete_ttl(false).secs(), Some(86_400));
+    fn outcome_picks_the_matching_ttl() {
+        let reap = resolve_reap_ttls(&TtlConfig::default(), &HashMap::new(), "now");
+        let delete = resolve_delete_ttls(&TtlConfig::default(), &HashMap::new(), "now");
+        assert_eq!(reap.ttl(true).secs(), Some(0));
+        assert_eq!(reap.ttl(false).secs(), Some(3600));
+        assert_eq!(delete.ttl(true).secs(), Some(3600));
+        assert_eq!(delete.ttl(false).secs(), Some(86_400));
     }
 
     // -- on-disk --
@@ -628,24 +667,36 @@ mod tests {
     #[test]
     fn write_then_read_round_trips() {
         let dir = tmp("round-trip");
-        let ttls = resolve_cleanup_ttls(
+        let reap = resolve_reap_ttls(
             &TtlConfig::default(),
             &ann(&[(ANN_POD_DATA_REAP_TTL_ON_POD_FAILURE, "15m")]),
             "2026-08-04T09:00:00+00:00",
         );
+        write_cleanup_ttls(&dir, &reap).unwrap();
+        assert_eq!(read_cleanup_ttls::<ReapTtls>(&dir), Some(reap));
 
-        write_cleanup_ttls(&dir, &ttls).unwrap();
-        assert_eq!(read_cleanup_ttls(&dir), Some(ttls));
+        let delete = resolve_delete_ttls(&TtlConfig::default(), &HashMap::new(), "now");
+        write_cleanup_ttls(&dir, &delete).unwrap();
+        assert_eq!(read_cleanup_ttls::<DeleteTtls>(&dir), Some(delete));
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn write_creates_the_pod_dir() {
-        let dir = tmp("creates-dir").join("nested");
-        let ttls = resolve_cleanup_ttls(&TtlConfig::default(), &HashMap::new(), "now");
+    fn a_file_of_the_other_half_does_not_read_back() {
+        let dir = tmp("other-half");
+        let reap = resolve_reap_ttls(&TtlConfig::default(), &HashMap::new(), "now");
+        write_cleanup_ttls(&dir, &reap).unwrap();
+        assert_eq!(read_cleanup_ttls::<DeleteTtls>(&dir), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
-        write_cleanup_ttls(&dir, &ttls).unwrap();
+    #[test]
+    fn write_creates_the_dir() {
+        let dir = tmp("creates-dir").join("nested");
+        let reap = resolve_reap_ttls(&TtlConfig::default(), &HashMap::new(), "now");
+
+        write_cleanup_ttls(&dir, &reap).unwrap();
         assert!(dir.join(CLEANUP_TTLS_FILE).exists());
 
         let _ = fs::remove_dir_all(dir.parent().unwrap());
@@ -655,7 +706,7 @@ mod tests {
     fn read_missing_file_is_none() {
         let dir = tmp("missing");
         fs::create_dir_all(&dir).unwrap();
-        assert_eq!(read_cleanup_ttls(&dir), None);
+        assert_eq!(read_cleanup_ttls::<ReapTtls>(&dir), None);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -664,28 +715,33 @@ mod tests {
         let dir = tmp("malformed");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(CLEANUP_TTLS_FILE), "{not json").unwrap();
-        assert_eq!(read_cleanup_ttls(&dir), None);
+        assert_eq!(read_cleanup_ttls::<ReapTtls>(&dir), None);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn json_uses_camel_case_keys() {
-        let ttls = resolve_cleanup_ttls(&TtlConfig::default(), &HashMap::new(), "now");
-        let json = serde_json::to_string(&ttls).unwrap();
+        let reap = resolve_reap_ttls(&TtlConfig::default(), &HashMap::new(), "now");
+        let json = serde_json::to_string(&reap).unwrap();
         assert!(json.contains("\"writtenAt\""), "{}", json);
         assert!(json.contains("\"reapTtlOnSuccess\""), "{}", json);
-        assert!(json.contains("\"deleteTtlOnFailure\""), "{}", json);
+        assert!(!json.contains("deleteTtl"), "{}", json);
         assert!(json.contains("\"source\":\"config\""), "{}", json);
+
+        let delete = resolve_delete_ttls(&TtlConfig::default(), &HashMap::new(), "now");
+        let json = serde_json::to_string(&delete).unwrap();
+        assert!(json.contains("\"deleteTtlOnFailure\""), "{}", json);
+        assert!(!json.contains("reapTtl"), "{}", json);
     }
 
     #[test]
     fn never_serializes_as_null_secs() {
-        let ttls = resolve_cleanup_ttls(
+        let delete = resolve_delete_ttls(
             &TtlConfig::default(),
             &ann(&[(ANN_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE, TTL_NEVER)]),
             "now",
         );
-        let json = serde_json::to_string(&ttls).unwrap();
+        let json = serde_json::to_string(&delete).unwrap();
         assert!(json.contains("\"raw\":\"never\",\"secs\":null"), "{}", json);
     }
 }

@@ -4,11 +4,13 @@
 
 """Integration tests for pod dir retention.
 
-Two clocks govern a finished pod's on-disk footprint. The reap deadline
-covers the data dirs (`work/`, `volumes/`) and runs from pod completion; the
-delete deadline covers the whole pod dir, including the `log/` and `store/`
-that are the pod's only record, and runs from the moment the pod is removed
-from the pod runner.
+A pod's footprint is two dirs with a clock each. The data dir
+(`data/pod-run/<pod_id>/`: `work/`, `volumes/`) goes on the reap deadline,
+which runs from pod completion. The state dir
+(`data/pod-state/<bucket>/<pod_name>/<stamp>/`: the `log/` and `store/` that
+are one incarnation's only record) goes on the delete deadline, which runs
+from the moment the pod is removed from the pod runner. Both clocks survive
+a restart.
 
 These tests drive the real binary, so they check what actually survives on
 disk rather than what the logic layer thinks it did.
@@ -16,9 +18,21 @@ disk rather than what the logic layer thinks it did.
 
 import json
 import os
+import re
 import time
 
-from conftest import load_pod_def, submit_pod, unique_name, wait_for_pod_phase
+from conftest import (
+    MtlsClient,
+    PodRunnerProcess,
+    TARGET_DIR,
+    _write_file_resolver_prsysconfig,
+    find_free_port,
+    get_session_timestamp,
+    load_pod_def,
+    submit_pod,
+    unique_name,
+    wait_for_pod_phase,
+)
 
 # Marker and deadline files the runner writes into each pod dir.
 CLEANUP_TTLS_FILE = "_cleanup_ttls.json"
@@ -26,15 +40,55 @@ SUCCEEDED_MARKER = "_succeeded"
 FAILED_MARKER = "_failed"
 REAP_ON_FILE = "_reap_on"
 DELETE_ON_FILE = "_delete_on"
-REAPED_MARKER = "_reaped"
 TTL_NEVER = "never"
 
+# Pod-state bucketing — part of the on-disk format (store/layout.rs).
+POD_STATE_BUCKETS = 256
+FNV_OFFSET_BASIS = 0xCBF29CE484222325
+FNV_PRIME = 0x100000001B3
+U64 = 0xFFFFFFFFFFFFFFFF
 
-def pod_dir(pod_runner, ns, name, uid):
+
+def state_bucket(pod_name):
+    """FNV-1a 64 of the pod name, xor-folded to 8 bits, as two hex digits."""
+    h = FNV_OFFSET_BASIS
+    for byte in pod_name.encode():
+        h = ((h ^ byte) * FNV_PRIME) & U64
+    h ^= h >> 32
+    h ^= h >> 16
+    h ^= h >> 8
+    return f"{h % POD_STATE_BUCKETS:02x}"
+
+
+def data_root(pod_runner):
+    return os.path.join(pod_runner.work_dir, "work_pr", "data")
+
+
+def data_dir(pod_runner, ns, name, uid):
+    """The pod's data dir: work/ and volumes/."""
+    return os.path.join(data_root(pod_runner), "pod-run", f"{ns}_{name}_{uid}")
+
+
+def name_dir(pod_runner, name):
+    """The dir every incarnation of a pod name shares."""
     return os.path.join(
-        pod_runner.work_dir, "work_pr", "data", "run", "pods",
-        f"{ns}_{name}_{uid}",
+        data_root(pod_runner), "pod-state", state_bucket(name), name
     )
+
+
+def state_dir(pod_runner, ns, name, uid):
+    """The state dir of the pod's only incarnation: log/ and store/.
+
+    The test pods carry no creationTimestamp, so admission stamps them and
+    the stamp is read back from disk. The dir is created at admission.
+    """
+    parent = name_dir(pod_runner, name)
+    assert wait_for_path(parent), f"no pod name dir {parent}"
+    stamps = [d for d in os.listdir(parent)
+              if os.path.isdir(os.path.join(parent, d))]
+    assert len(stamps) == 1, f"one incarnation expected in {parent}: {stamps}"
+    assert re.fullmatch(r"\d{8}T\d{6}Z", stamps[0]), stamps[0]
+    return os.path.join(parent, stamps[0])
 
 
 def wait_for_path(path, present=True, timeout=15):
@@ -66,22 +120,21 @@ def submit_annotated(mtls_client, pod_runner, annotations, args=None):
 class TestReaping:
     """The reap deadline: data dirs go, the record stays."""
 
-    def test_succeeded_pod_data_dirs_are_reaped(self, pod_runner, mtls_client):
+    def test_succeeded_pod_data_dir_is_reaped(self, pod_runner, mtls_client):
         name, ns, uid = submit_annotated(mtls_client, pod_runner, {})
         wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Succeeded"})
 
-        d = pod_dir(pod_runner, ns, name, uid)
+        d = data_dir(pod_runner, ns, name, uid)
+        s = state_dir(pod_runner, ns, name, uid)
         # Default reap-on-success is 0s, applied inline at completion.
-        assert wait_for_path(os.path.join(d, "work"), present=False), \
-            "work/ should be reaped as soon as the pod succeeds"
-        assert not os.path.exists(os.path.join(d, "volumes"))
-        assert os.path.exists(os.path.join(d, REAPED_MARKER))
-        assert os.path.exists(os.path.join(d, SUCCEEDED_MARKER))
-        # The record survives the reap.
-        assert os.path.exists(os.path.join(d, "log")), \
+        assert wait_for_path(d, present=False), \
+            "the data dir should be reaped as soon as the pod succeeds"
+        # The record lives in the state dir and survives the reap.
+        assert os.path.exists(os.path.join(s, SUCCEEDED_MARKER))
+        assert os.path.exists(os.path.join(s, "log")), \
             "container logs are the record and must survive the reap"
         assert os.path.exists(
-            os.path.join(d, "store", "original-spec.json")
+            os.path.join(s, "store", "original-spec.json")
         ), "the spec must survive the reap"
 
     def test_reap_ttl_annotation_defers_reaping(self, pod_runner, mtls_client):
@@ -90,11 +143,10 @@ class TestReaping:
         )
         wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Succeeded"})
 
-        d = pod_dir(pod_runner, ns, name, uid)
+        d = data_dir(pod_runner, ns, name, uid)
         assert wait_for_path(os.path.join(d, SUCCEEDED_MARKER))
         assert os.path.exists(os.path.join(d, "work")), \
             "the annotation defers the reap by an hour"
-        assert not os.path.exists(os.path.join(d, REAPED_MARKER))
         # The deadline is an absolute instant an hour out.
         assert read_marker(os.path.join(d, REAP_ON_FILE)) != TTL_NEVER
 
@@ -104,7 +156,7 @@ class TestReaping:
         )
         wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Succeeded"})
 
-        d = pod_dir(pod_runner, ns, name, uid)
+        d = data_dir(pod_runner, ns, name, uid)
         assert wait_for_path(os.path.join(d, SUCCEEDED_MARKER))
         assert read_marker(os.path.join(d, REAP_ON_FILE)) == TTL_NEVER, \
             "never is written out literally, not as a missing file"
@@ -118,16 +170,34 @@ class TestReaping:
         )
         wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Succeeded"})
 
-        d = pod_dir(pod_runner, ns, name, uid)
-        assert wait_for_path(os.path.join(d, CLEANUP_TTLS_FILE))
-        with open(os.path.join(d, CLEANUP_TTLS_FILE)) as f:
+        # Each half of the policy lives in the dir it governs. The data dir
+        # is reaped at once (0s on success), so read the state dir's half.
+        s = state_dir(pod_runner, ns, name, uid)
+        assert wait_for_path(os.path.join(s, CLEANUP_TTLS_FILE))
+        with open(os.path.join(s, CLEANUP_TTLS_FILE)) as f:
             ttls = json.load(f)
 
         assert ttls["deleteTtlOnFailure"] == {
             "raw": "90m", "secs": 5400, "source": "annotation",
         }
-        assert ttls["reapTtlOnSuccess"]["source"] == "config"
-        assert ttls["reapTtlOnSuccess"]["raw"] == "0s"
+        assert ttls["deleteTtlOnSuccess"]["source"] == "config"
+        assert "reapTtlOnSuccess" not in ttls, \
+            "the reap TTLs belong to the data dir"
+
+    def test_reap_ttls_live_in_the_data_dir(self, pod_runner, mtls_client):
+        name, ns, uid = submit_annotated(
+            mtls_client, pod_runner, {"prPodDataReapTtlOnPodSuccess": "1h"}
+        )
+        wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Succeeded"})
+
+        d = data_dir(pod_runner, ns, name, uid)
+        with open(os.path.join(d, CLEANUP_TTLS_FILE)) as f:
+            ttls = json.load(f)
+        assert ttls["reapTtlOnSuccess"] == {
+            "raw": "1h", "secs": 3600, "source": "annotation",
+        }
+        assert ttls["reapTtlOnFailure"]["source"] == "config"
+        assert "deleteTtlOnFailure" not in ttls
 
 
 class TestDeleteDeadline:
@@ -136,7 +206,7 @@ class TestDeleteDeadline:
     def test_deleted_pod_keeps_its_record(self, pod_runner, mtls_client):
         name, ns, uid = submit_annotated(mtls_client, pod_runner, {})
         wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Succeeded"})
-        d = pod_dir(pod_runner, ns, name, uid)
+        d = state_dir(pod_runner, ns, name, uid)
         assert wait_for_path(os.path.join(d, SUCCEEDED_MARKER))
 
         st, _ = mtls_client.delete(
@@ -145,7 +215,7 @@ class TestDeleteDeadline:
         assert st == 200
 
         # Default delete-on-success is 1h out, so the record stays.
-        assert os.path.exists(d), "the pod dir outlives the delete"
+        assert os.path.exists(d), "the state dir outlives the delete"
         assert os.path.exists(os.path.join(d, "log")), \
             "logs outlive the delete"
         assert os.path.exists(os.path.join(d, "store", "original-spec.json")), \
@@ -157,7 +227,7 @@ class TestDeleteDeadline:
         name, ns, uid = submit_annotated(mtls_client, pod_runner, {})
         wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Succeeded"})
 
-        d = pod_dir(pod_runner, ns, name, uid)
+        d = state_dir(pod_runner, ns, name, uid)
         assert wait_for_path(os.path.join(d, SUCCEEDED_MARKER))
         assert not os.path.exists(os.path.join(d, DELETE_ON_FILE)), \
             "a pod the runner still reports on has no delete deadline"
@@ -169,7 +239,7 @@ class TestDeleteDeadline:
             mtls_client, pod_runner, {"prPodDirDeleteTtlPodSuccessOnPodDelete": "0s"}
         )
         wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Succeeded"})
-        d = pod_dir(pod_runner, ns, name, uid)
+        d = state_dir(pod_runner, ns, name, uid)
         assert wait_for_path(os.path.join(d, SUCCEEDED_MARKER))
 
         st, _ = mtls_client.delete(
@@ -185,7 +255,7 @@ class TestDeleteDeadline:
             mtls_client, pod_runner, {"prPodDirDeleteTtlPodSuccessOnPodDelete": TTL_NEVER}
         )
         wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Succeeded"})
-        d = pod_dir(pod_runner, ns, name, uid)
+        d = state_dir(pod_runner, ns, name, uid)
         assert wait_for_path(os.path.join(d, SUCCEEDED_MARKER))
 
         mtls_client.delete(
@@ -199,18 +269,20 @@ class TestDeleteDeadline:
 class TestFailureRetention:
     """A failed pod's reason has to outlive the pod."""
 
-    def test_failed_pod_keeps_its_data_dirs(self, pod_runner, mtls_client):
+    def test_failed_pod_keeps_its_data_dir(self, pod_runner, mtls_client):
         name, ns, uid = submit_annotated(
             mtls_client, pod_runner, {}, args=["exit 1"]
         )
         wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Failed"})
 
-        d = pod_dir(pod_runner, ns, name, uid)
+        d = data_dir(pod_runner, ns, name, uid)
         assert wait_for_path(os.path.join(d, FAILED_MARKER))
         assert not os.path.exists(os.path.join(d, SUCCEEDED_MARKER))
         assert os.path.exists(os.path.join(d, "work")), \
             "the default 1h reap-on-error keeps work/ for debugging"
-        assert not os.path.exists(os.path.join(d, REAPED_MARKER))
+        assert os.path.exists(
+            os.path.join(state_dir(pod_runner, ns, name, uid), FAILED_MARKER)
+        )
 
     def test_deleting_a_failed_pod_keeps_the_reason(
         self, pod_runner, mtls_client
@@ -219,7 +291,7 @@ class TestFailureRetention:
             mtls_client, pod_runner, {}, args=["echo boom >&2; exit 3"]
         )
         wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Failed"})
-        d = pod_dir(pod_runner, ns, name, uid)
+        d = state_dir(pod_runner, ns, name, uid)
         assert wait_for_path(os.path.join(d, FAILED_MARKER))
 
         st, _ = mtls_client.delete(
@@ -242,3 +314,95 @@ class TestFailureRetention:
         assert os.path.exists(os.path.join(d, "store", "original-spec.json"))
         assert os.path.exists(os.path.join(d, "log")), \
             "container logs must survive the delete"
+
+
+class TestIncarnations:
+    """Incarnations of a pod name share its dir, one stamp dir each."""
+
+    def test_each_incarnation_gets_its_own_stamp_dir(
+        self, pod_runner, mtls_client
+    ):
+        name = unique_name("inc")
+        stamps = []
+        for created, stamp in [
+            ("2026-10-19T14:00:00Z", "20261019T140000Z"),
+            ("2026-10-19T15:00:00Z", "20261019T150000Z"),
+        ]:
+            pod = load_pod_def("single-container")
+            pod["metadata"]["name"] = name
+            pod["metadata"]["uid"] = unique_name("uid")
+            pod["metadata"]["creationTimestamp"] = created
+            _, ns = submit_pod(mtls_client, pod_runner, pod)
+            wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Succeeded"})
+            st, _ = mtls_client.delete(
+                f"{pod_runner.url}/deletePod?namespace={ns}&name={name}"
+            )
+            assert st == 200
+            stamps.append(stamp)
+
+        parent = name_dir(pod_runner, name)
+        assert sorted(os.listdir(parent)) == stamps, \
+            "the uid is not part of the path; the creation time is"
+        for stamp in stamps:
+            d = os.path.join(parent, stamp)
+            assert os.path.isdir(os.path.join(d, "log"))
+            assert os.path.exists(os.path.join(d, "store", "original-spec.json"))
+            with open(os.path.join(d, CLEANUP_TTLS_FILE)) as f:
+                assert "deleteTtlOnSuccess" in json.load(f), \
+                    "each incarnation carries its own delete TTLs"
+            assert os.path.exists(os.path.join(d, DELETE_ON_FILE))
+
+
+class TestRestart:
+    """Both clocks survive a pod runner restart."""
+
+    def test_deadlines_survive_a_restart(self, pod_runner_bin):
+        work_dir = os.path.join(
+            TARGET_DIR, f"testrun.{get_session_timestamp()}", "_pod_runner_restart"
+        )
+        os.makedirs(work_dir, exist_ok=True)
+        _write_file_resolver_prsysconfig(os.path.join(work_dir, "config"))
+        pr = PodRunnerProcess(pod_runner_bin, work_dir, find_free_port())
+        pr.start()
+        try:
+            client = MtlsClient(pr.vk_prconfig_path, pr.work_dir)
+
+            # Finished and deleted: its record is on a 3s delete clock,
+            # which a restart must not reset.
+            gone, ns, gone_uid = submit_annotated(
+                client, pr, {"prPodDirDeleteTtlPodSuccessOnPodDelete": "3s"}
+            )
+            wait_for_pod_phase(client, pr, ns, gone, {"Succeeded"})
+            gone_state = state_dir(pr, ns, gone, gone_uid)
+            assert wait_for_path(os.path.join(gone_state, SUCCEEDED_MARKER))
+            st, _ = client.delete(
+                f"{pr.url}/deletePod?namespace={ns}&name={gone}"
+            )
+            assert st == 200
+
+            # Finished, never deleted: the runner forgets it on restart, so
+            # its delete clock starts then.
+            kept, ns, kept_uid = submit_annotated(client, pr, {})
+            wait_for_pod_phase(client, pr, ns, kept, {"Succeeded"})
+            kept_state = state_dir(pr, ns, kept, kept_uid)
+            assert wait_for_path(os.path.join(kept_state, SUCCEEDED_MARKER))
+            assert not os.path.exists(os.path.join(kept_state, DELETE_ON_FILE))
+
+            pr.stop()
+            pr.start()
+
+            assert wait_for_path(gone_state, present=False, timeout=15), \
+                "a delete deadline pending at shutdown is picked up again"
+            assert not os.path.exists(os.path.dirname(gone_state)), \
+                "the pod name dir goes with its last incarnation"
+            assert wait_for_path(os.path.join(kept_state, DELETE_ON_FILE)), \
+                "a pod the restarted runner no longer knows starts its delete clock"
+            assert os.path.exists(os.path.join(kept_state, "log")), \
+                "and keeps its record until that clock runs out"
+
+            data = data_root(pr)
+            assert os.path.isdir(os.path.join(data, "pod-pid"))
+            assert not [n for n in os.listdir(data) if n.startswith("run")], \
+                "every dir is fixed across restarts; no per-run dirs"
+        finally:
+            pr.stop()

@@ -13,6 +13,7 @@ use crate::logic::ttl::TtlConfig;
 use crate::logic::{CapacityConfig, CleanupConfig, DefaultExecutorProvider, LogicConfig};
 use crate::pod::resolver::ResolverConfig;
 use crate::store::file::FileStoreConfig;
+use crate::store::layout::PodLayout;
 
 // Re-export TLS types so existing `use crate::server::config::*` still works.
 pub use crate::tls::{CertSource, ServerTlsConfig};
@@ -23,31 +24,26 @@ pub use crate::tls::{CertSource, ServerTlsConfig};
 //
 // Layout under workdir:
 //
-//   <workdir>/run/               ← current run (rotated on startup)
-//     pods/<pod_id>/             ← per-pod, co-located
-//       work/<container>/        ← container working directories
-//       log/<container>/         ← container stdout/stderr + probe logs
-//       store/                   ← original-spec.json, running-spec.json, status/
-//       FINISHED                 ← terminal sentinel
-//       archive.tgz             ← per-pod archive (created on cleanup)
-//     pids/                      ← process PID tracking files
-//   <workdir>/run_<stamp>/       ← previous runs (purged, newest kept)
+//   <workdir>/data/
+//     pod-run/<pod_id>/                ← pod data, reaped on the reap deadline
+//       work/<container>/              ← container working directories
+//       volumes/<volume>/              ← pod-level volumes
+//     pod-state/<bucket>/<pod_name>/   ← shared by a pod name's incarnations
+//       <stamp>/                       ← one incarnation's record, deleted on the delete deadline
+//         log/<container>/             ← container stdout/stderr + probe logs
+//         store/                       ← original-spec.json, running-spec.json, status/
+//     pod-pid/<pid>                    ← process PID tracking files
+//
+// Every dir is fixed across restarts: pod dirs carry their own deadlines
+// (see `crate::store::layout`), and a PID file left by a crashed run is
+// exactly what the next run's startup scan needs to find.
 
-/// Default top-level run directory (under workdir). At startup the real
-/// one is minted as `run_<YYYYMMDDThhmmssZ>` — created fresh rather than
-/// rotated by rename, because on Windows a rename fails while any handle
-/// inside is still open, and a swallowed failure meant the crashed run's
-/// tree was silently reused.
-pub const RUN_DIR: &str = "run";
-
-/// Prefix of the per-run directories minted at startup.
-pub const RUN_DIR_PREFIX: &str = "run_";
-/// Subdirectory of run/ for per-pod data.
-pub const PODS_SUBDIR: &str = "pods";
-/// Subdirectory of run/ for process PID tracking files.
-pub const PIDS_SUBDIR: &str = "pids";
-/// Number of previous run directories to keep beside the current one.
-pub const PREV_RUN_DIRS_TO_KEEP: usize = 2;
+/// Subdirectory of data/ for per-pod data dirs (`work/`, `volumes/`).
+pub const POD_RUN_DIR: &str = "pod-run";
+/// Subdirectory of data/ for per-pod record dirs (`log/`, `store/`).
+pub const POD_STATE_DIR: &str = "pod-state";
+/// Subdirectory of data/ for process PID tracking files.
+pub const POD_PID_DIR: &str = "pod-pid";
 
 /// Per-pod subdirectory for container working directories.
 pub const POD_WORK_SUBDIR: &str = "work";
@@ -133,21 +129,23 @@ pub struct PRConfig {
     pub config_dir: PathBuf,
 
     /// The instance workdir. Kept whole rather than derived back out of
-    /// `run_dir`, which sits two levels down, so the messages directory km
-    /// reads can be addressed directly.
+    /// `data_dir`, so the messages directory km reads can be addressed
+    /// directly.
     pub work_dir: PathBuf,
 
-    /// Run directory: `<workdir>/run/`. Rotated on startup.
-    pub run_dir: PathBuf,
+    /// Data directory: `<workdir>/data/`. Holds the pod layout roots and
+    /// the PID files.
+    pub data_dir: PathBuf,
 
-    /// Pods directory: `<workdir>/run/pods/`. Per-pod data co-located here.
-    pub pods_dir: PathBuf,
+    /// Pod layout: `<workdir>/data/pod-run/` for pod data,
+    /// `<workdir>/data/pod-state/` for pod records.
+    pub pod_layout: PodLayout,
 
     /// Pod-runner's own log directory (for `pod-runner.log`).
-    /// NOT container logs — those live under `pods/<pod_id>/log/`.
+    /// NOT container logs — those live in each pod's state dir.
     pub log_dir: PathBuf,
 
-    /// Directory for process PID tracking files: `<workdir>/run/pids/`.
+    /// Directory for process PID tracking files: `<workdir>/data/pod-pid/`.
     pub pid_dir: PathBuf,
 
     // -- pod limits --
@@ -217,7 +215,6 @@ pub struct PRConfig {
 
 impl Default for PRConfig {
     fn default() -> Self {
-        let run = PathBuf::from(RUN_DIR);
         Self {
             bind_address: format!("{DEFAULT_ADDRESS}:{DEFAULT_PORT}"),
             node_address: DEFAULT_ADDRESS.to_string(),
@@ -230,10 +227,10 @@ impl Default for PRConfig {
 
             config_dir: PathBuf::from(crate::config::cli::DEFAULT_CONFIGDIR),
             work_dir: PathBuf::from("."),
-            run_dir: run.clone(),
-            pods_dir: run.join(PODS_SUBDIR),
+            data_dir: PathBuf::new(),
+            pod_layout: PodLayout::default(),
             log_dir: PathBuf::from("log"),
-            pid_dir: run.join(PIDS_SUBDIR),
+            pid_dir: PathBuf::from(POD_PID_DIR),
 
             default_grace_period_secs: 120,
             container_max_restarts: 0,
@@ -303,7 +300,7 @@ impl From<&PRConfig> for LogicConfig {
 impl From<&PRConfig> for DefaultExecutorProvider {
     fn from(c: &PRConfig) -> Self {
         Self {
-            pods_dir: c.pods_dir.clone(),
+            layout: c.pod_layout.clone(),
             pid_dir: c.pid_dir.clone(),
             propagate_env: c.propagate_env,
             die_with_parent: c.die_with_parent,
@@ -318,7 +315,6 @@ impl From<&PRConfig> for CleanupConfig {
     fn from(c: &PRConfig) -> Self {
         Self {
             ttls: c.ttls.clone(),
-            pods_dir: c.pods_dir.clone(),
         }
     }
 }
@@ -326,7 +322,7 @@ impl From<&PRConfig> for CleanupConfig {
 impl From<&PRConfig> for FileStoreConfig {
     fn from(c: &PRConfig) -> Self {
         Self {
-            root_dir: c.pods_dir.clone(),
+            layout: c.pod_layout.clone(),
             write_running_spec: c.write_running_spec,
         }
     }
@@ -344,10 +340,8 @@ mod tests {
     #[test]
     fn prconfig_default_dirs_use_constants() {
         let c = PRConfig::default();
-        let run = PathBuf::from(RUN_DIR);
-        assert_eq!(c.run_dir, run);
-        assert_eq!(c.pods_dir, run.join(PODS_SUBDIR));
-        assert_eq!(c.pid_dir, run.join(PIDS_SUBDIR));
+        assert_eq!(c.pod_layout, PodLayout::new(&c.data_dir));
+        assert_eq!(c.pid_dir, c.data_dir.join(POD_PID_DIR));
         assert_eq!(c.log_dir, PathBuf::from("log"));
     }
 
@@ -414,12 +408,20 @@ mod tests {
                 reap_on_failure: TtlSpec::parse("30m").unwrap(),
                 ..TtlConfig::default()
             },
-            pods_dir: PathBuf::from("/custom/pods"),
             ..PRConfig::default()
         };
 
         let cc = CleanupConfig::from(&pr);
         assert_eq!(cc.ttls.reap_on_failure.raw(), "30m");
-        assert_eq!(cc.pods_dir, PathBuf::from("/custom/pods"));
+    }
+
+    #[test]
+    fn executor_provider_and_store_share_the_pod_layout() {
+        let pr = PRConfig {
+            pod_layout: PodLayout::new(std::path::Path::new("/custom/data")),
+            ..PRConfig::default()
+        };
+        assert_eq!(DefaultExecutorProvider::from(&pr).layout, pr.pod_layout);
+        assert_eq!(FileStoreConfig::from(&pr).layout, pr.pod_layout);
     }
 }

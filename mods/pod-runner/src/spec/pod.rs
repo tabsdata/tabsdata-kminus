@@ -320,9 +320,33 @@ pub struct PodMetadata {
     pub uid: String,
     pub name: String,
     pub namespace: String,
+    /// When the pod was created (RFC3339), as set by the API server. Pod
+    /// runner sets it to the admission time when it is absent, so every
+    /// admitted pod carries one: it names the pod's incarnation dir.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creation_timestamp: Option<String>,
     pub annotations: HashMap<String, String>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// Format of an incarnation stamp: compact UTC, safe in a path on every
+/// platform (RFC3339's `:` is not on Windows).
+pub const INCARNATION_STAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
+
+impl PodMetadata {
+    /// The pod's incarnation stamp: [`creation_timestamp`](Self::creation_timestamp)
+    /// in [`INCARNATION_STAMP_FORMAT`]. `None` when it is absent or not
+    /// RFC3339.
+    pub fn incarnation_stamp(&self) -> Option<String> {
+        let raw = self.creation_timestamp.as_deref()?;
+        let at = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+        Some(
+            at.with_timezone(&chrono::Utc)
+                .format(INCARNATION_STAMP_FORMAT)
+                .to_string(),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -493,5 +517,54 @@ spec:
         let s1 = proj.sources[1].config_map.as_ref().unwrap();
         assert_eq!(s1.name, "tabsdata-configs-apiserver-log");
         assert_eq!(s1.items[0].path, "apiserver/apiserver.log.yaml");
+    }
+
+    #[test]
+    fn creation_timestamp_round_trips_as_camel_case() {
+        let json = r#"{"metadata":{"name":"app","creationTimestamp":"2026-10-19T14:30:05Z"}}"#;
+        let pod: PodSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            pod.metadata.creation_timestamp.as_deref(),
+            Some("2026-10-19T14:30:05Z")
+        );
+        assert!(
+            !pod.metadata.extra.contains_key("creationTimestamp"),
+            "typed, not left in the flattened extras"
+        );
+        let out = serde_json::to_string(&pod).unwrap();
+        assert!(
+            out.contains(r#""creationTimestamp":"2026-10-19T14:30:05Z""#),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn absent_creation_timestamp_is_not_serialized() {
+        let out = serde_json::to_string(&PodSpec::default()).unwrap();
+        assert!(!out.contains("creationTimestamp"), "{out}");
+    }
+
+    #[test]
+    fn incarnation_stamp_is_compact_utc() {
+        let mut m = PodMetadata {
+            creation_timestamp: Some("2026-10-19T14:30:05Z".into()),
+            ..Default::default()
+        };
+        assert_eq!(m.incarnation_stamp().as_deref(), Some("20261019T143005Z"));
+
+        m.creation_timestamp = Some("2026-10-19T16:30:05+02:00".into());
+        assert_eq!(
+            m.incarnation_stamp().as_deref(),
+            Some("20261019T143005Z"),
+            "normalized to UTC"
+        );
+    }
+
+    #[test]
+    fn incarnation_stamp_of_missing_or_malformed_is_none() {
+        let mut m = PodMetadata::default();
+        assert_eq!(m.incarnation_stamp(), None);
+        m.creation_timestamp = Some("yesterday".into());
+        assert_eq!(m.incarnation_stamp(), None);
     }
 }

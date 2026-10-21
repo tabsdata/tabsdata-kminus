@@ -190,22 +190,24 @@ pub struct YamlSysConfig {
     pub images_dir: String,
 
     // -- cleanup --
-    /// TTL before a succeeded pod's data dirs (`work/`, `volumes/`) are
-    /// reaped, counted from pod completion. `<number>[s|m|h]` or `never`.
+    /// TTL before a succeeded pod's data dir (`pod-run/<pod_id>/`: `work/`,
+    /// `volumes/`) is reaped, counted from pod completion.
+    /// `<number>[s|m|h]` or `never`.
     #[serde(alias = "podDataReapTtlOnPodSuccess")]
     pub pod_data_reap_ttl_on_pod_success: String,
 
-    /// TTL before a failed pod's data dirs are reaped, counted from pod
+    /// TTL before a failed pod's data dir is reaped, counted from pod
     /// completion. `<number>[s|m|h]` or `never`.
     #[serde(alias = "podDataReapTtlOnPodFailure")]
     pub pod_data_reap_ttl_on_pod_failure: String,
 
-    /// TTL before a succeeded pod's dir is deleted, counted from the pod's
-    /// removal from the pod runner. `<number>[s|m|h]` or `never`.
+    /// TTL before a succeeded pod incarnation's state dir
+    /// (`pod-state/<bucket>/<pod_name>/<stamp>/`: `log/`, `store/`) is
+    /// deleted, counted from the pod's removal from the pod runner. `<number>[s|m|h]` or `never`.
     #[serde(alias = "podDirDeleteTtlPodSuccessOnPodDelete")]
     pub pod_dir_delete_ttl_pod_success_on_pod_delete: String,
 
-    /// TTL before a failed pod's dir is deleted, counted from the pod's
+    /// TTL before a failed pod's state dir is deleted, counted from the pod's
     /// removal from the pod runner. `<number>[s|m|h]` or `never`.
     #[serde(alias = "podDirDeleteTtlPodFailureOnPodDelete")]
     pub pod_dir_delete_ttl_pod_failure_on_pod_delete: String,

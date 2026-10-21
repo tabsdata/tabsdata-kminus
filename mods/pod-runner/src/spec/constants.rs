@@ -165,16 +165,16 @@ pub const ANN_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE: &str =
 // `never`. Reap TTLs run from pod completion; delete TTLs run from the
 // moment the pod is removed from the pod runner.
 
-/// Default TTL before a succeeded pod's data dirs are reaped.
+/// Default TTL before a succeeded pod's data dir is reaped.
 pub const DEFAULT_POD_DATA_REAP_TTL_ON_POD_SUCCESS: &str = "0s";
 
-/// Default TTL before a failed pod's data dirs are reaped.
+/// Default TTL before a failed pod's data dir is reaped.
 pub const DEFAULT_POD_DATA_REAP_TTL_ON_POD_FAILURE: &str = "1h";
 
-/// Default TTL before a succeeded pod's dir is deleted.
+/// Default TTL before a succeeded pod's state dir is deleted.
 pub const DEFAULT_POD_DIR_DELETE_TTL_POD_SUCCESS_ON_POD_DELETE: &str = "1h";
 
-/// Default TTL before a failed pod's dir is deleted.
+/// Default TTL before a failed pod's state dir is deleted.
 pub const DEFAULT_POD_DIR_DELETE_TTL_POD_FAILURE_ON_POD_DELETE: &str = "24h";
 
 /// TTL value meaning "no deadline" — nothing is ever reaped or deleted.
@@ -184,26 +184,25 @@ pub const TTL_NEVER: &str = "never";
 // Pod dir marker and deadline files
 // ---------------------------------------------------------------------------
 
-/// Per-pod file holding the resolved cleanup TTLs, written at pod start.
+/// Per-pod file holding the resolved cleanup TTLs, written at pod start
+/// into both pod dirs: the reap TTLs in the data dir, the delete TTLs in
+/// the state dir.
 pub const CLEANUP_TTLS_FILE: &str = "_cleanup_ttls.json";
 
-/// Marker written to the pod dir when the pod completes successfully.
+/// Marker written to both pod dirs when the pod completes successfully.
 /// Content is the RFC3339 completion time — the reap clock origin.
 pub const SUCCEEDED_MARKER: &str = "_succeeded";
 
-/// Marker written to the pod dir when the pod completes with a failure.
+/// Marker written to both pod dirs when the pod completes with a failure.
 /// Content is the RFC3339 completion time — the reap clock origin.
 pub const FAILED_MARKER: &str = "_failed";
 
-/// Deadline file for reaping the pod's data dirs (`work/`, `volumes/`).
+/// Deadline file, in the data dir, for reaping it (`work/`, `volumes/`).
 /// Content is an RFC3339 instant or [`TTL_NEVER`].
 pub const REAP_ON_FILE: &str = "_reap_on";
 
-/// Deadline file for deleting the whole pod dir. Written when the pod is
-/// removed from the pod runner. Content is an RFC3339 instant or
-/// [`TTL_NEVER`]; absence means the pod has not been removed yet.
+/// Deadline file, in the state dir, for deleting it (`log/`, `store/`).
+/// Written when the pod is removed from the pod runner. Content is an
+/// RFC3339 instant or [`TTL_NEVER`]; absence means the pod has not been
+/// removed yet.
 pub const DELETE_ON_FILE: &str = "_delete_on";
-
-/// Marker written once the pod's data dirs have been reaped. Content is
-/// the RFC3339 time of the reap.
-pub const REAPED_MARKER: &str = "_reaped";

@@ -304,8 +304,8 @@ against the images root (`--imagesdir`, falling back to `imagesDir` in
 
 ### Working Directory
 
-Each container runs in `<pod_dir>/work/<container-name>/` where
-`<pod_dir>` is `<workdir>/run/pods/<namespace>_<name>_<uid>/`.
+Each container runs in `<data_dir>/work/<container-name>/` where
+`<data_dir>` is the pod's data dir, `<workdir>/data/pod-run/<namespace>_<name>_<uid>/`.
 The image directory template (if any) is copied here before the
 container starts. All filesystem resources should be referenced
 relative to this directory.
@@ -450,7 +450,7 @@ Prometheus metrics served on a separate port at `/metrics`. The port comes from 
 Follows K8s log naming conventions:
 
 ```
-<workdir>/run/pods/<namespace>_<name>_<uid>/
+<workdir>/data/pod-state/<bucket>/<pod_name>/<stamp>/
   log/<container-name>/
     0.log               # Current log (restart_count=0)
     0.log.1             # Rotated (most recent)
@@ -498,23 +498,40 @@ Both stores are updated on every state change.
 
 ## Reaping
 
-Two independent clocks govern a finished pod's on-disk footprint:
+A pod's footprint is split across two dirs with independent clocks:
 
-- **reap** deletes the data dirs -- `work/` and `volumes/`. They hold everything the containers
-  produced and are usually the bulk of the footprint, while nothing reads them once the pod is
-  done. The clock runs from **pod completion**.
-- **delete** deletes the whole pod dir, including the `log/` and `store/` that are the pod's only
-  record of what it did and why it ended. The clock runs from the moment the pod is **removed from
-  the pod runner**, because until then the runner still answers queries about it.
+- **data dir** -- `<workdir>/data/pod-run/<pod_id>/`: `work/` and `volumes/`. Everything the
+  containers produced, usually the bulk of the footprint, and nothing reads it once the pod is
+  done. It is **reaped** on a clock that runs from **pod completion**.
+- **state dir** -- `<workdir>/data/pod-state/<bucket>/<pod_name>/<stamp>/`: the `log/` and
+  `store/` that are one incarnation's only record of what it did and why it ended. It is
+  **deleted** on a clock that runs from the moment the pod is **removed from the pod runner**,
+  because until then the runner still answers queries about it.
+
+`<pod_id>` is `<namespace>_<name>_<uid>`: the data dir is per uid, so a new incarnation never
+touches the data an earlier one is still keeping for inspection. The state path leaves the uid
+out. A pod runner serves a single namespace, so the pod name identifies a pod across its
+incarnations; they share `<pod_name>/`, each in a `<stamp>/` of its own -- the pod's
+`metadata.creationTimestamp` in compact UTC (`20261019T143005Z`; RFC3339's `:` is not valid in a
+Windows path). Admission sets the creation time to the admission time on a pod that has none
+(`kpr` submissions), so every incarnation has a stamp. A pod replayed after a restart keeps its
+creation time and lands back in its own stamp dir. Two incarnations created within the same second
+share one -- accepted, since the logs rotate rather than collide.
+
+`<bucket>` is two lowercase hex digits: FNV-1a 64 of the pod name, xor-folded to 8 bits (256
+buckets). State dirs outlive their pods and accumulate far more entries than data dirs, so the
+bucket keeps any one directory from growing unbounded -- and since every part of the path is
+computed from the pod name and creation time, a pod's records can be found whether or not the
+runner still knows the pod.
 
 Each clock has a TTL per outcome, so four settings in total:
 
-| Setting                                | Default | Governs                                 |
-|----------------------------------------|---------|-----------------------------------------|
-| `podDataReapTtlOnPodSuccess`           | `0s`    | `work/` + `volumes/` of a succeeded pod |
-| `podDataReapTtlOnPodFailure`           | `1h`    | `work/` + `volumes/` of a failed pod    |
-| `podDirDeleteTtlPodSuccessOnPodDelete` | `1h`    | pod dir of a succeeded pod              |
-| `podDirDeleteTtlPodFailureOnPodDelete` | `24h`   | pod dir of a failed pod                 |
+| Setting                                | Default | Governs                          |
+|----------------------------------------|---------|----------------------------------|
+| `podDataReapTtlOnPodSuccess`           | `0s`    | data dir of a succeeded pod      |
+| `podDataReapTtlOnPodFailure`           | `1h`    | data dir of a failed pod         |
+| `podDirDeleteTtlPodSuccessOnPodDelete` | `1h`    | state dir of a succeeded incarnation |
+| `podDirDeleteTtlPodFailureOnPodDelete` | `24h`   | state dir of a failed incarnation    |
 
 A value is `<number><unit>` with unit `s`, `m` or `h`, or `never` to keep the files indefinitely.
 There is no `d` unit -- `24h` says the same thing without a second spelling. An invalid value in
@@ -527,34 +544,47 @@ warning and the configured value is used.
 
 ### How it works on disk
 
-The resolved values are written to `_cleanup_ttls.json` in the pod dir at pod start, recording
-where each one came from. Nothing on the reaping path re-derives them from config, so a pod dir
-carries its own retention policy and stays correct across a config edit or a runner restart.
+Each dir carries everything its own clock needs, so the two never consult each other. At pod
+admission the resolved values are written to a `_cleanup_ttls.json` in each dir, recording where
+each one came from: the reap TTLs in the data dir, the delete TTLs in the incarnation's state dir.
+Incarnations of one name can carry different annotations and end differently, so each has its own
+policy, outcome marker and deadline; the `<pod_name>/` dir above them holds nothing but them. Nothing on
+the reaping path re-derives them from config, so each dir carries its own retention policy and
+stays correct across a config edit or a runner restart.
 
-At completion the pod dir gets an outcome marker (`_succeeded` or `_failed`, content the
-completion time) and `_reap_on`. When the pod leaves the runner it gets `_delete_on`. Deadlines
-are stored as absolute instants, or the literal `never`, so a reader can see exactly when a dir
-was due -- no TTL arithmetic, and "never expires" is distinguishable from "the file is missing".
-These files are the record of what was scheduled; nothing reads them back to decide.
+At completion both dirs get an outcome marker (`_succeeded` or `_failed`, content the completion
+time) and the data dir gets `_reap_on`. When the pod leaves the runner the state dir gets
+`_delete_on`. Deadlines are stored as absolute instants, or the literal `never`, so a reader can
+see exactly when a dir is due -- no TTL arithmetic, and "never expires" is distinguishable from
+"the file is missing". Acting on a deadline removes the whole dir it lives in.
 
-- **Inline**: whenever a pod is finalized or evicted, the deadlines are applied immediately, so a
-  `0s` TTL acts at once. When both deadlines are due, delete wins -- there is no point reaping a
-  dir that is about to go. A deadline that can't be parsed is never acted on.
-- **Timers**: a deadline still ahead gets one task that sleeps until it comes due and then acts.
-  There is no scanning daemon: a deadline is known the moment it is written, so the runner waits
-  on it directly instead of re-reading every finished pod dir to rediscover what it already knew.
-  Each sleep is raced against shutdown, so a pending deadline never holds the runner's exit --
-  what it would have done is dropped, and rotation picks it up next run. A pod's two timers can
-  come due at the same moment, since deleting a pod that is still live starts both clocks at
-  once; the delete tolerates the reap dropping its marker into the dir mid-walk and simply walks
-  it again.
-- **Rotation**: on startup, every pod dir in the just-rotated `run.N` has its data dirs reaped
-  regardless of its own deadline -- those pods belong to a runner that no longer exists. This is
-  also what takes over the deadlines dropped at shutdown, and it covers pods a `SIGKILL`ed runner
-  never finalized. An explicit `never` is honoured.
+- **Inline**: whenever a pod is finalized or evicted, the deadline is applied immediately, so a
+  `0s` TTL acts at once. A deadline that can't be parsed is never acted on. Removing an
+  incarnation's state dir also removes its `<pod_name>/` dir once that is empty -- with a plain
+  `rmdir`, never a recursive delete, so a new incarnation being admitted at the same moment
+  either keeps it from going or recreates it.
+- **Timers**: a deadline still ahead gets one task that sleeps until it comes due. There is no
+  scanning daemon: a deadline is known the moment it is written, so the runner waits on it
+  directly instead of re-reading every finished pod dir to rediscover what it already knew. On
+  waking, the task re-reads the deadline file and acts only if it still holds the deadline it was
+  scheduled for -- a dir claimed again in the meantime (below) has had it cleared. Each sleep is
+  raced against shutdown, so a pending deadline never holds the runner's exit.
+- **Recovery**: the deadlines are on disk, so a restart loses none of them. At startup, before
+  any pod is admitted, the runner walks both roots and applies or schedules every deadline it
+  finds. A data dir with no outcome marker belonged to a pod the previous run never finalized; it
+  is finalized as failed and reaped on its failure TTL. A state dir with no `_delete_on` belonged
+  to a pod still in the runner when it went down; the runner keeps no pods across a restart, so
+  that pod has left it and its delete clock starts now (as failed, if it never finished).
+- **Re-admission**: a pod replayed after a restart has the same uid and creation time, so it
+  claims its previous attempt's dirs back at admission. The data dir is removed outright: it is
+  the previous attempt's, and would collide with this one's. The state dir is kept, so the
+  previous attempt's logs (shifted into rotation) and status history stay readable, but its
+  outcome marker and `_delete_on` are cleared, which stands any pending delete task down.
 
-The runner keeps no pod state between runs, so in-memory timers lose nothing a later run needs:
-a pod whose deadline outlives the process that scheduled it is reclaimed by rotation instead.
+Process PID files live in the equally fixed `<workdir>/data/pod-pid/`: one `<pid>` file per
+container process, content the program name, removed when the process exits. At startup any file
+still there was left by a run that did not stop its containers; a still-running process with that
+pid and program is killed, and the file removed. There are no per-run directories.
 
 A pod that is never deleted keeps `log/` and `store/` for as long as the runner reports on it:
 the control plane owns that pod's lifetime, and its record is live data until it doesn't.
@@ -572,29 +602,28 @@ but the record itself.
     prsysconfig.yaml                             # Persistent, user-editable
   log/
     pod-runner.log                               # pod-runner's own log (rotated)
-  run/                                           # Current run (rotated on restart)
-    pods/<namespace>_<name>_<uid>/               # Per-pod, co-located
+  data/
+    pod-run/<namespace>_<name>_<uid>/            # Pod data dir -- removed on the reap deadline
       volumes/<volume_name>/                     # Pod-level volumes (emptyDir dir, hostPath symlink, configMap files)
-                                                 # -- reaped on the reap deadline
       work/<container>/                          # Container working directory (mount paths symlink into volumes/)
-                                                 # -- reaped on the reap deadline
-      log/<container>/
-        0.log                                    # Container stdout/stderr
-        0.log.1                                  # Rolled log
-        probe-startup.log                        # Probe output
-      store/
-        original-spec.json                       # Original pod spec
-        running-spec.json                        # Preprocessed spec (optional)
-        status/<timestamp>.json                  # Timestamped status snapshots
-      _cleanup_ttls.json                         # Resolved cleanup TTLs (written at pod start)
+      _cleanup_ttls.json                         # Resolved reap TTLs (written at admission)
       _succeeded | _failed                       # Outcome marker, content = completion time
       _reap_on                                   # Reap deadline, or "never"
-      _delete_on                                 # Delete deadline, or "never" (written at eviction)
-      _reaped                                    # Written once the data dirs are reaped
       _size                                      # Cached disk usage
-    pids/<pid>                                   # Process PID tracking
-  run.0/                                         # Previous run (auto-rotated)
-  run.1/                                         # Two runs ago
+    pod-state/<bucket>/<pod_name>/               # Shared by the name's incarnations; removed with the last
+      <stamp>/                                   # One incarnation's state dir -- removed on the delete deadline
+        log/<container>/
+          0.log                                  # Container stdout/stderr
+          0.log.1                                # Rolled log
+          probe-startup.log                      # Probe output
+        store/
+          original-spec.json                     # Original pod spec
+          running-spec.json                      # Preprocessed spec (optional)
+          status/<timestamp>.json                # Timestamped status snapshots
+        _cleanup_ttls.json                       # Resolved delete TTLs (written at admission)
+        _succeeded | _failed                     # Outcome marker, content = completion time
+        _delete_on                               # Delete deadline, or "never" (written at eviction)
+    pod-pid/<pid>                                # Process PID tracking, content = program name
 ```
 
 ---

@@ -331,7 +331,7 @@ mod tests {
         let base = std::env::temp_dir()
             .join(format!("pod-runner-rs2-test-server-{}", std::process::id(),));
         let provider = Arc::new(DefaultExecutorProvider {
-            pods_dir: base.join("pods"),
+            layout: crate::store::layout::PodLayout::new(&base),
             pid_dir: base.join("pids"),
             propagate_env: true,
             die_with_parent: true,
@@ -339,11 +339,7 @@ mod tests {
             restart_backoff_base: Duration::from_secs(2),
             shutdown_grace_period: Duration::from_secs(30),
         });
-        let cleanup = crate::logic::CleanupConfig {
-            pods_dir: base.join("pods"),
-
-            ..crate::logic::CleanupConfig::default()
-        };
+        let cleanup = crate::logic::CleanupConfig::default();
         let (shutdown_tx, _) = watch::channel(());
         let logic = PodLogic::new(
             LogicConfig::default(),

@@ -479,7 +479,7 @@ kpr logs <pod-name> --container <name> --follow --tail 50
 Container logs are stored under the pod's log directory:
 
 ```
-<workdir>/run/pods/<namespace>_<name>_<uid>/log/<container-name>/
+<workdir>/data/pod-state/<bucket>/<pod_name>/<creation_time>/log/<container-name>/
   0.log               # Current log (restart 0)
   0.log.1             # Most recent rotation
   0.log.2             # Older rotation
@@ -607,12 +607,9 @@ Key metrics:
     control-plane/               # control-plane runtime data
     virtual-kubelet/             # virtual-kubelet runtime data
     km/                          # kminus PID files
-
-  run/                           # pod-runner current run
-    pods/<pod_id>/               # per-pod co-located data
-    pids/                        # process PID tracking
-  run.0/                         # previous run (rotated)
-  run.1/                         # two runs ago
+    pod-run/<pod_id>/            # pod-runner: per-pod data (work/, volumes/)
+    pod-state/<bucket>/<pod_name>/<creation_time>/  # pod-runner: per-incarnation record (log/, store/)
+    pod-pid/                     # pod-runner: process PID tracking
 ```
 
 ### TLS
@@ -663,14 +660,17 @@ kubectl logs <name> -c <container>
 A failed pod keeps its working directory for an hour, and its logs and specs for a day. Inspect them directly:
 
 ```bash
-ls run/pods/<namespace>_<name>_<uid>/
+ls data/pod-run/<namespace>_<name>_<uid>/               # work/, volumes/
+ls data/pod-state/*/<name>/                              # one dir per incarnation, by creation time
+ls data/pod-state/*/<name>/<creation_time>/              # log/, store/
 ```
 
 Two clocks govern how long that lasts. The **reap** deadline (`podDataReapTtlOnPodFailure`, default `1h`) covers
-`work/` and `volumes/` — the bulk of the disk — and runs from the moment the pod finished. The **delete** deadline
-(`podDirDeleteTtlPodFailureOnPodDelete`, default `24h`) covers the whole dir including `log/` and `store/`, and runs
-from when the pod was removed from the pod runner. `_reap_on` and `_delete_on` in the pod dir hold the exact
-instants, so you can always see how long you have.
+the data dir — `work/` and `volumes/`, the bulk of the disk — and runs from the moment the pod finished. The
+**delete** deadline (`podDirDeleteTtlPodFailureOnPodDelete`, default `24h`) covers the state dir — `log/` and
+`store/` — and runs from when the pod was removed from the pod runner. `_reap_on` in the data dir and `_delete_on` in
+the state dir hold the exact instants, so you can always see how long you have. Both clocks carry on across a pod
+runner restart.
 
 To hold onto a pod for longer, raise either value in `prsysconfig.yaml` or annotate the pod:
 
@@ -681,15 +681,15 @@ metadata:
     prPodDirDeleteTtlPodFailureOnPodDelete: "72h"    # keep logs and specs for three days
 ```
 
-A pod that **succeeds** is reaped immediately (`podDataReapTtlOnPodSuccess`, default `0s`) and its dir deleted an
-hour after the control plane removes it. Set `prPodDataReapTtlOnPodSuccess` to inspect what a successful run left
+A pod that **succeeds** is reaped immediately (`podDataReapTtlOnPodSuccess`, default `0s`) and its state dir deleted
+an hour after the control plane removes it. Set `prPodDataReapTtlOnPodSuccess` to inspect what a successful run left
 behind.
 
 If a pod failed before any container started — a missing hostPath volume, an unresolvable configmap — there are no
 container logs to read, because nothing ever ran. The reason is in the status snapshots:
 
 ```bash
-cat run/pods/<namespace>_<name>_<uid>/store/status/*.json | grep message
+cat data/pod-state/*/<name>/<creation_time>/store/status/*.json | grep message
 ```
 
 ### Connection Refused
