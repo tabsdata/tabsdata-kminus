@@ -484,7 +484,7 @@ supports:
   `kubectl logs --timestamps`)
 
 The `/getPodLogs` endpoint serves the logs of every pod filed under a log
-pod id: the value of the pod's `pod.log.id` label, or its name when it has
+pod id: the value of the pod's `tabsdata.com/log-id` label, or its name when it has
 none (see Reaping). It reads the pod-state dirs, so it works whether or not
 the pods still exist. virtual-kubelet does not call it; `kubectl logs` goes
 through `/getContainerLogs`. Apart from `logPodId`, it takes the query
@@ -494,7 +494,7 @@ string of `/getContainerLogs`:
 GET /getPodLogs?logPodId=nightly[&podName=<pod>][&containerName=web][&tailLines=100][&previous=true][&timestamps=true]
 ```
 
-Set `pod.log.id` on a CronJob's, Job's or Deployment's pod template and
+Set `tabsdata.com/log-id` on a CronJob's, Job's or Deployment's pod template and
 every pod it creates is filed under that id: all the runs of a CronJob,
 all the retries of a Job, all the replicas and rollouts of a Deployment.
 Pods (incarnations) come oldest first, each opening with a separator that
@@ -563,9 +563,9 @@ A pod's footprint is split across two dirs with independent clocks:
 `<pod_id>` is `<namespace>_<name>_<uid>`: the data dir is per uid, so a new pod never touches the
 data an earlier one is still keeping for inspection.
 
-The state path is keyed by the **log pod id**: the value of the pod's `pod.log.id` label when it
+The state path is keyed by the **log pod id**: the value of the pod's `tabsdata.com/log-id` label when it
 carries one that is a valid Kubernetes name, and the pod name otherwise. The label is the
-`podLogIdLabel` setting in `prsysconfig.yaml`; empty disables it. A label value that is not a valid
+`logIdLabel` setting in `prsysconfig.yaml`; empty disables it. A label value that is not a valid
 name is ignored with a warning at admission, and the pod is filed under its name. The uid is never
 part of the state path, and a pod runner serves a single namespace, so the id is unique as given.
 
@@ -671,7 +671,7 @@ but the record itself.
       _succeeded | _failed                       # Outcome marker, content = completion time
       _reap_on                                   # Reap deadline, or "never"
       _size                                      # Cached disk usage
-    pod-state/<bucket>/<log_pod_id>/             # pod.log.id label value, or pod name; removed with the last pod
+    pod-state/<bucket>/<log_pod_id>/             # tabsdata.com/log-id label value, or pod name; removed with the last pod
       <stamp>_<pod_name>/                        # One pod's state dir -- removed on the delete deadline
         log/<container>/
           0.log                                  # Container stdout/stderr

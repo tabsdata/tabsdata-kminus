@@ -316,7 +316,7 @@ async fn handle_get_container_logs(
 /// GET /getPodLogs?logPodId=...&podName=...&namespace=...&containerName=...&tailLines=...&previous=...&timestamps=...
 ///
 /// Streams the logs of every pod filed under a log pod id — the value of a
-/// pod's `pod.log.id` label, or its name when it has none — oldest first,
+/// pod's `tabsdata.com/log-id` label, or its name when it has none — oldest first,
 /// each opening with a `POD STARTED <creation time> <pod name>` separator.
 /// Read from the pod-state dirs, whether or not the pods still exist. Not
 /// called by virtual-kubelet, which serves `kubectl logs` through
@@ -807,7 +807,7 @@ mod tests {
         ] {
             let mut spec = pod_spec_json(name, &format!("echo {out}"));
             spec["metadata"]["creationTimestamp"] = serde_json::json!(created);
-            spec["metadata"]["labels"] = serde_json::json!({"pod.log.id": "podlogs-cron"});
+            spec["metadata"]["labels"] = serde_json::json!({"tabsdata.com/log-id": "podlogs-cron"});
             request(&addr, "POST", "/createPod", Some(spec)).await;
             wait_for_phase(&addr, name, "Succeeded").await;
             request(&addr, "DELETE", &format!("/deletePod?name={name}"), None).await;

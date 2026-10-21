@@ -162,8 +162,8 @@ pub fn resolve_config(cli: &CliArgs) -> Result<PRConfig, String> {
     //    crashed run left are what the startup scan looks for.
     let data_dir = workdir.join("data");
     let pid_dir = data_dir.join(POD_PID_DIR);
-    let pod_layout = crate::store::layout::PodLayout::new(&data_dir)
-        .with_log_id_label(sys.pod_log_id_label.clone());
+    let pod_layout =
+        crate::store::layout::PodLayout::new(&data_dir).with_log_id_label(sys.log_id_label.clone());
 
     for dir in [
         &data_dir,
@@ -942,11 +942,11 @@ server:
         let c = resolve_with_syscfg("log-id-default", "nodename: \"n\"\n").unwrap();
         assert_eq!(
             c.pod_layout.log_id_label,
-            crate::spec::constants::DEFAULT_POD_LOG_ID_LABEL
+            crate::spec::constants::DEFAULT_LOG_ID_LABEL
         );
-        let c = resolve_with_syscfg("log-id-custom", "podLogIdLabel: \"tabsdata.com/log-id\"\n")
-            .unwrap();
-        assert_eq!(c.pod_layout.log_id_label, "tabsdata.com/log-id");
+        let c =
+            resolve_with_syscfg("log-id-custom", "logIdLabel: \"example.com/run-id\"\n").unwrap();
+        assert_eq!(c.pod_layout.log_id_label, "example.com/run-id");
     }
 
     #[test]

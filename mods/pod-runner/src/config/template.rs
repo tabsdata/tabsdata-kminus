@@ -95,7 +95,7 @@ podDirDeleteTtlPodFailureOnPodDelete: "24h"
 # pods are filed under one log pod id, read with /getPodLogs?logPodId=<id>.
 # Empty disables the label.
 
-podLogIdLabel: "pod.log.id"
+logIdLabel: "tabsdata.com/log-id"
 
 # ---------------------------------------------------------------------------
 # Node capacity

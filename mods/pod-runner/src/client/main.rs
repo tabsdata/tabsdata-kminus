@@ -215,12 +215,12 @@ enum Command {
         previous: bool,
     },
 
-    /// Logs of every pod filed under a log pod id (the pod's `pod.log.id`
+    /// Logs of every pod filed under a log pod id (the pod's `tabsdata.com/log-id`
     /// label, or its name), oldest first, read from disk — whether or not
     /// the pods still exist.
     #[command(name = "pod-logs")]
     PodLogs {
-        /// Log pod id: the `pod.log.id` label value, or the pod name.
+        /// Log pod id: the `tabsdata.com/log-id` label value, or the pod name.
         #[arg(short = 'i', long)]
         log_pod_id: String,
 

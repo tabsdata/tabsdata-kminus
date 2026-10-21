@@ -17,7 +17,7 @@
 //!   path is computed rather than looked up.
 //!
 //! The **log pod id** is the value of the pod's log id label
-//! ([`DEFAULT_POD_LOG_ID_LABEL`], configurable) when it carries one that is
+//! ([`DEFAULT_LOG_ID_LABEL`], configurable) when it carries one that is
 //! a valid Kubernetes name, and the pod name otherwise. A workload that sets
 //! the label on its pod template — a CronJob, a Job with retries, a
 //! Deployment — files all its pods under one id, so all of them are read
@@ -39,12 +39,12 @@
 //! unbounded.
 //!
 //! [`PodMetadata::incarnation_stamp`]: crate::spec::pod::PodMetadata::incarnation_stamp
-//! [`DEFAULT_POD_LOG_ID_LABEL`]: crate::spec::constants::DEFAULT_POD_LOG_ID_LABEL
+//! [`DEFAULT_LOG_ID_LABEL`]: crate::spec::constants::DEFAULT_LOG_ID_LABEL
 
 use std::path::{Path, PathBuf};
 
 use crate::server::config::{POD_LOG_SUBDIR, POD_RUN_DIR, POD_STATE_DIR, POD_STORE_SUBDIR};
-use crate::spec::constants::DEFAULT_POD_LOG_ID_LABEL;
+use crate::spec::constants::DEFAULT_LOG_ID_LABEL;
 use crate::spec::pod::PodSpec;
 
 use super::PodId;
@@ -127,7 +127,7 @@ impl PodLayout {
         Self {
             run_root: data_dir.join(POD_RUN_DIR),
             state_root: data_dir.join(POD_STATE_DIR),
-            log_id_label: DEFAULT_POD_LOG_ID_LABEL.to_string(),
+            log_id_label: DEFAULT_LOG_ID_LABEL.to_string(),
         }
     }
 
@@ -260,7 +260,7 @@ mod tests {
         let mut s = spec(name, &format!("uid-{name}"), Some(created));
         s.metadata
             .labels
-            .insert(DEFAULT_POD_LOG_ID_LABEL.into(), log_id.into());
+            .insert(DEFAULT_LOG_ID_LABEL.into(), log_id.into());
         s
     }
 

@@ -482,12 +482,12 @@ kpr pod-logs -i <log-pod-id> --pod <pod-name>     # one pod only, no separator
 `kpr pod-logs` (endpoint `/getPodLogs`) reads the logs kept on disk, so it works for pods that are finished and
 deleted, until their delete TTL runs out.
 
-- **Log pod id:** the value of the pod's `pod.log.id` label, or its name when it has none.
+- **Log pod id:** the value of the pod's `tabsdata.com/log-id` label, or its name when it has none.
 - **Grouping:** set the label on a CronJob's, Job's or Deployment's pod template and all of its pods (every run,
   retry or replica) are read back together.
 - **Output:** each pod opens with a `POD STARTED <creation time> <pod name>` separator, and its containers follow
   one another, init containers first.
-- **Configuration:** the label is the `podLogIdLabel` setting in `prsysconfig.yaml`. Its value must be a valid
+- **Configuration:** the label is the `logIdLabel` setting in `prsysconfig.yaml`. Its value must be a valid
   Kubernetes name; otherwise the pod is filed under its name.
 
 ### Log Files on Disk

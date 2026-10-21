@@ -9,7 +9,7 @@ A pod's footprint is two dirs with a clock each. The data dir
 which runs from pod completion. The state dir
 (`data/pod-state/<bucket>/<log_pod_id>/<stamp>_<pod_name>/`: the `log/` and
 `store/` that are one pod's only record; the log pod id is the pod's
-`pod.log.id` label, or its name) goes on the delete deadline, which runs
+`tabsdata.com/log-id` label, or its name) goes on the delete deadline, which runs
 from the moment the pod is removed from the pod runner. Both clocks survive
 a restart.
 
@@ -384,7 +384,7 @@ class TestIncarnations:
             pod["metadata"]["name"] = unique_name(log_id)
             pod["metadata"]["uid"] = unique_name("uid")
             pod["metadata"]["creationTimestamp"] = created
-            pod["metadata"].setdefault("labels", {})["pod.log.id"] = log_id
+            pod["metadata"].setdefault("labels", {})["tabsdata.com/log-id"] = log_id
             name, ns = submit_pod(mtls_client, pod_runner, pod)
             wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Succeeded"})
             mtls_client.delete(
