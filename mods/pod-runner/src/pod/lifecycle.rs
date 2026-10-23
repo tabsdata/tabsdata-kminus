@@ -92,6 +92,7 @@ pub struct TransitionError {
 pub enum WaitingReason {
     PodInitializing,
     ContainerCreating,
+    CrashLoopBackOff,
     Custom(String),
 }
 
@@ -100,6 +101,7 @@ impl WaitingReason {
         match self {
             Self::PodInitializing => REASON_POD_INITIALIZING,
             Self::ContainerCreating => REASON_CONTAINERS_CREATING,
+            Self::CrashLoopBackOff => REASON_CRASH_LOOP_BACK_OFF,
             Self::Custom(s) => s.as_str(),
         }
     }
@@ -321,6 +323,37 @@ impl ContainerLifecycle {
                 reason: format!(
                     "container '{}' can only terminate from {}",
                     self.name, STATE_NAME_RUNNING,
+                ),
+            }),
+        }
+    }
+
+    /// Transition `Terminated → Waiting(CrashLoopBackOff)` ahead of an
+    /// in-place restart, counting it in `restart_count`.
+    ///
+    /// Returns [`TransitionError`] if the container is not currently in
+    /// the `Terminated` state.
+    pub fn on_back_off(&mut self) -> Result<(), TransitionError> {
+        match &self.state {
+            ContainerState::Terminated { .. } => {
+                debug!(
+                    container = self.name.as_str(),
+                    role = %self.role,
+                    "Container state: Terminated -> Waiting(CrashLoopBackOff)",
+                );
+                self.state = ContainerState::Waiting {
+                    reason: WaitingReason::CrashLoopBackOff,
+                };
+                self.restart_count += 1;
+                Ok(())
+            }
+            other => Err(TransitionError {
+                machine: MACHINE_CONTAINER,
+                from: other.name().to_string(),
+                to: STATE_NAME_WAITING.to_string(),
+                reason: format!(
+                    "container '{}' can only back off from {}",
+                    self.name, STATE_NAME_TERMINATED,
                 ),
             }),
         }
@@ -902,6 +935,34 @@ mod tests {
         assert_eq!(c.terminated_exit_code(), Some(0));
         assert!(!c.is_started());
         assert!(!c.is_ready());
+    }
+
+    #[test]
+    fn container_terminated_backs_off_to_waiting_and_counts_the_restart() {
+        let mut c = container("a");
+        c.on_started(TS).unwrap();
+        c.on_exited(1, TS2).unwrap();
+        c.on_back_off().unwrap();
+        assert_eq!(
+            c.state(),
+            &ContainerState::Waiting {
+                reason: WaitingReason::CrashLoopBackOff
+            }
+        );
+        assert_eq!(c.restart_count(), 1);
+        c.on_started(TS).unwrap();
+        assert!(c.is_running());
+    }
+
+    #[test]
+    fn container_running_back_off_rejected() {
+        let mut c = container("a");
+        c.on_started(TS).unwrap();
+        let err = c.on_back_off().unwrap_err();
+        assert_eq!(err.machine, MACHINE_CONTAINER);
+        assert_eq!(err.from, STATE_NAME_RUNNING);
+        assert_eq!(err.to, STATE_NAME_WAITING);
+        assert_eq!(c.restart_count(), 0);
     }
 
     #[test]

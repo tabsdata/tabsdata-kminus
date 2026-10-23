@@ -70,6 +70,7 @@ pub const REASON_ERROR: &str = "Error";
 pub const REASON_KILLED: &str = "Killed";
 pub const REASON_CONTAINER_NOT_FOUND: &str = "ContainerNotFound";
 pub const REASON_POD_INITIALIZING: &str = "PodInitializing";
+pub const REASON_CRASH_LOOP_BACK_OFF: &str = "CrashLoopBackOff";
 
 // ---------------------------------------------------------------------------
 // Pod-preparation failure reasons (set when prepare_pod fails before the

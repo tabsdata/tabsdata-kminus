@@ -187,8 +187,13 @@ spec:
 
 | Policy      | Behavior                                                           |
 |-------------|--------------------------------------------------------------------|
-| `Never`     | Container is not restarted after exit (default for Jobs)           |
-| `OnFailure` | Restart on non-zero exit, up to `maxRestartCount` times with exponential backoff |
+| `Never`     | A failed init container fails the pod (default for Jobs)           |
+| `OnFailure` | As `Never`: a Job's init containers do real work, so they are not re-run |
+| `Always`    | A failed init container restarts in place, up to `maxRestartCount` times, after an exponential backoff; the pod stays `Pending` with the init container waiting in `CrashLoopBackOff` |
+
+Main containers are never restarted in place: when they exit, the pod ends
+and its controller (Deployment, Job, CronJob) decides whether to start a new
+one.
 
 ```yaml
 spec:

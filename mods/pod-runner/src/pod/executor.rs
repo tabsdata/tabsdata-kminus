@@ -189,6 +189,12 @@ pub enum PodEventKind {
     ContainerFailed { name: String, exit_code: i32 },
     /// A container exited with exit code 0.
     ContainerSucceeded { name: String },
+    /// A failed container waits out its back-off before restarting in place.
+    ContainerBackOff {
+        name: String,
+        restart_count: u32,
+        delay: Duration,
+    },
     /// A probe executed with a result.
     ProbeResult {
         container: String,
@@ -530,6 +536,7 @@ enum LogConfig {
 /// Default log rotation: 100MB per file, 5 files.
 const DEFAULT_LOG_MAX_SIZE_BYTES: u64 = 100 * 1024 * 1024;
 const DEFAULT_LOG_MAX_FILES: usize = 5;
+const RESTART_BACKOFF_DOUBLINGS: u32 = 4;
 
 /// Timeout for waiting on a sidecar to exit after being killed.
 /// If exceeded, the sidecar is force-killed (SIGKILL, no grace period).
@@ -831,9 +838,7 @@ struct ContainerConfig {
     propagate_env: bool,
     extra_env: HashMap<String, String>,
     die_with_parent: bool,
-    #[allow(dead_code)] // used when restart logic is implemented
     max_restarts: u32,
-    #[allow(dead_code)] // used when restart logic is implemented
     restart_backoff_base: Duration,
     /// Grace period for container kills triggered by shutdown or phase failures.
     shutdown_grace_period: Duration,
@@ -1524,50 +1529,148 @@ async fn run_init_containers(
                 total,
                 "Running init container"
             );
-            spawn_container(
+            run_init_container(
                 container,
-                ContainerRole::Init,
-                0,
+                restarts_in_place(&pod.spec.restart_policy),
                 config,
                 state,
                 event_tx,
+                kill_watch,
                 shutdown,
             )
             .await?;
-
-            // Wait for init container to exit, with shutdown AND kill support.
-            // kill_watch is checked here so PodHandle::kill() during init
-            // phase is handled promptly instead of waiting for the init
-            // container to finish naturally.
-            let exit_code = tokio::select! {
-                result = wait_container(&container.name, state) => result?,
-                _ = shutdown.changed() => {
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "shutdown"));
-                }
-                _ = kill_watch.changed() => {
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "kill requested"));
-                }
-            };
-
-            mark_container_finished(
-                &container.name,
-                exit_code,
-                ContainerRole::Init,
-                state,
-                event_tx,
-            )
-            .await;
-
-            if exit_code != 0 {
-                return Err(io::Error::other(format!(
-                    "init container '{}' failed with exit code {}",
-                    container.name, exit_code
-                )));
-            }
         }
     }
 
     Ok(())
+}
+
+/// Only `Always`, which Kubernetes rejects on Job pods, restarts a failed
+/// init container in place: a Job's init containers do real work, so their
+/// failure must fail the pod, `OnFailure` included.
+fn restarts_in_place(policy: &RestartPolicy) -> bool {
+    matches!(policy, RestartPolicy::Always)
+}
+
+fn restart_delay(base: Duration, restart_count: u32) -> Duration {
+    base * 2u32.pow(restart_count.min(RESTART_BACKOFF_DOUBLINGS))
+}
+
+/// Run one init container to completion. With a restart policy that
+/// restarts in place, a failed run waits out an exponential back-off in
+/// `Waiting(CrashLoopBackOff)` and runs again, up to the configured maximum
+/// of restarts; the pod stays `Pending` throughout, as under a kubelet.
+async fn run_init_container(
+    container: &Container,
+    restarts: bool,
+    config: &ContainerConfig,
+    state: &Mutex<PodState>,
+    event_tx: &mpsc::Sender<PodEvent>,
+    kill_watch: &mut watch::Receiver<bool>,
+    shutdown: &mut watch::Receiver<()>,
+) -> io::Result<()> {
+    let mut restart_count = 0;
+    loop {
+        spawn_container(
+            container,
+            ContainerRole::Init,
+            restart_count,
+            config,
+            state,
+            event_tx,
+            shutdown,
+        )
+        .await?;
+
+        // Wait for init container to exit, with shutdown AND kill support.
+        // kill_watch is checked here so PodHandle::kill() during init
+        // phase is handled promptly instead of waiting for the init
+        // container to finish naturally.
+        let exit_code = tokio::select! {
+            result = wait_container(&container.name, state) => result?,
+            _ = shutdown.changed() => {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "shutdown"));
+            }
+            _ = kill_watch.changed() => {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "kill requested"));
+            }
+        };
+
+        mark_container_finished(
+            &container.name,
+            exit_code,
+            ContainerRole::Init,
+            state,
+            event_tx,
+        )
+        .await;
+
+        if exit_code == 0 {
+            return Ok(());
+        }
+        if !restarts || restart_count >= config.max_restarts {
+            return Err(io::Error::other(format!(
+                "init container '{}' failed with exit code {}",
+                container.name, exit_code
+            )));
+        }
+
+        let delay = restart_delay(config.restart_backoff_base, restart_count);
+        restart_count += 1;
+        back_off_container(
+            &container.name,
+            ContainerRole::Init,
+            restart_count,
+            delay,
+            state,
+            event_tx,
+        )
+        .await;
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = shutdown.changed() => {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "shutdown"));
+            }
+            _ = kill_watch.changed() => {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "kill requested"));
+            }
+        }
+    }
+}
+
+async fn back_off_container(
+    name: &str,
+    role: ContainerRole,
+    restart_count: u32,
+    delay: Duration,
+    state: &Mutex<PodState>,
+    event_tx: &mpsc::Sender<PodEvent>,
+) {
+    warn!(
+        container = name,
+        role = %role,
+        restart_count,
+        delay_ms = delay.as_millis() as u64,
+        "Container failed; restarting in place after back-off"
+    );
+    let snapshot = {
+        let mut st = state.lock().await;
+        if let Some(cl) = st.lifecycle.container_by_role_mut(name, role)
+            && let Err(e) = cl.on_back_off()
+        {
+            warn!("Rejected container back-off transition: {}", e);
+        }
+        st.status()
+    };
+    emit(
+        event_tx,
+        PodEventKind::ContainerBackOff {
+            name: name.to_string(),
+            restart_count,
+            delay,
+        },
+        &snapshot,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1968,6 +2071,8 @@ fn update_readiness_conditions(st: &mut PodState) {
 #[cfg(test)]
 #[cfg(unix)] // All pod executor tests use Unix shell commands (sh, echo, sleep, etc.)
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use crate::spec::pod::{EnvVar, PodMetadata, PodSpecBody};
     use crate::testutils::test_dir;
@@ -2232,6 +2337,128 @@ mod tests {
         )));
         assert!(!events.iter().any(|e| matches!(&e.kind,
             PodEventKind::ContainerStarted { name, .. } if name == "main")));
+    }
+
+    fn pod_spec_restarting(
+        init_containers: Vec<Container>,
+        containers: Vec<Container>,
+        restart_policy: RestartPolicy,
+    ) -> Arc<PodSpec> {
+        let mut pod = Arc::unwrap_or_clone(pod_spec(init_containers, containers));
+        pod.spec.restart_policy = restart_policy;
+        Arc::new(pod)
+    }
+
+    fn failing_until(attempts_file: &Path, failures: u32) -> String {
+        format!(
+            "n=$(cat {file} 2>/dev/null || echo 0); n=$((n + 1)); echo $n > {file}; \
+             [ $n -gt {failures} ]",
+            file = attempts_file.display(),
+        )
+    }
+
+    fn back_offs(events: &[PodEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(&e.kind, PodEventKind::ContainerBackOff { .. }))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn test_init_container_restarts_in_place_until_it_succeeds() {
+        let dir = test_dir!();
+        let (_tx, rx) = shutdown();
+        let mut h = PodExecutor::new(pod_spec_restarting(
+            vec![container("init", &failing_until(&dir.join("attempts"), 2))],
+            vec![container("main", "exit 0")],
+            RestartPolicy::Always,
+        ))
+        .max_restarts(5)
+        .restart_backoff_base(Duration::from_millis(10))
+        .spawn(rx)
+        .await
+        .unwrap();
+        let events = collect_events(&mut h).await;
+
+        assert_eq!(back_offs(&events), 2);
+        assert!(!events.iter().any(|e| matches!(
+            &e.kind,
+            PodEventKind::Completed {
+                phase: PodPhase::Failed
+            }
+        )));
+        assert!(events.iter().any(|e| matches!(&e.kind,
+            PodEventKind::ContainerStarted { name, .. } if name == "main")));
+        let st = h.state.lock().await;
+        assert_eq!(
+            st.lifecycle.init_container("init").unwrap().restart_count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_init_container_stops_restarting_after_the_maximum() {
+        let (_tx, rx) = shutdown();
+        let mut h = PodExecutor::new(pod_spec_restarting(
+            vec![container("init", "exit 1")],
+            vec![container("main", "exit 0")],
+            RestartPolicy::Always,
+        ))
+        .max_restarts(2)
+        .restart_backoff_base(Duration::from_millis(10))
+        .spawn(rx)
+        .await
+        .unwrap();
+        let events = collect_events(&mut h).await;
+
+        assert_eq!(back_offs(&events), 2);
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            PodEventKind::Completed {
+                phase: PodPhase::Failed
+            }
+        )));
+        let st = h.state.lock().await;
+        assert_eq!(
+            st.lifecycle.init_container("init").unwrap().restart_count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_init_container_of_a_job_pod_never_restarts() {
+        for restart_policy in [RestartPolicy::Never, RestartPolicy::OnFailure] {
+            let (_tx, rx) = shutdown();
+            let mut h = PodExecutor::new(pod_spec_restarting(
+                vec![container("init", "exit 1")],
+                vec![container("main", "exit 0")],
+                restart_policy,
+            ))
+            .max_restarts(5)
+            .restart_backoff_base(Duration::from_millis(10))
+            .spawn(rx)
+            .await
+            .unwrap();
+            let events = collect_events(&mut h).await;
+
+            assert_eq!(back_offs(&events), 0);
+            assert!(events.iter().any(|e| matches!(
+                &e.kind,
+                PodEventKind::Completed {
+                    phase: PodPhase::Failed
+                }
+            )));
+        }
+    }
+
+    #[test]
+    fn test_restart_delay_doubles_up_to_sixteen_times_the_base() {
+        let delays: Vec<u128> = (0..6)
+            .map(|restart_count| {
+                restart_delay(Duration::from_millis(10), restart_count).as_millis()
+            })
+            .collect();
+        assert_eq!(delays, vec![10, 20, 40, 80, 160, 160]);
     }
 
     #[tokio::test]
@@ -4225,7 +4452,7 @@ mod tests {
                     PodEventKind::ContainerReady { .. } => {
                         readiness_changes.push(true);
                     }
-                    PodEventKind::ProbeResult { success: _, .. } => {
+                    PodEventKind::ProbeResult { .. } => {
                         // Track readiness in status
                         let ready = ev
                             .status

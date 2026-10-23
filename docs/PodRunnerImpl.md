@@ -258,7 +258,9 @@ Success responses return the requested object directly. Errors return `{ "error"
 3. Init Container Phase
        Run init containers sequentially in declaration order.
        Sidecars (restartPolicy: Always) start async and run alongside main containers.
-       If any non-sidecar init container fails, mark pod as Failed.
+       If a non-sidecar init container fails, restart it in place when the
+       pod's restartPolicy is Always (up to maxRestartCount, with backoff);
+       otherwise, or past the maximum, mark the pod as Failed.
              |
 4. Main Container Phase
        Run all main containers concurrently.
@@ -381,10 +383,16 @@ Three sources, evaluated in priority order (lowest to highest):
 
 | Policy      | Behavior                                                      |
 |-------------|---------------------------------------------------------------|
-| `Never`     | Container is not restarted after exit                         |
-| `OnFailure` | Restart only on non-zero exit, up to `maxRestartCount` times  |
+| `Never`     | A failed init container fails the pod                         |
+| `OnFailure` | As `Never`; a Job's init containers are never re-run          |
+| `Always`    | A failed init container restarts in place, up to `maxRestartCount` times |
 
-Restart backoff: `restartBackoffBaseSecs * 2^restart_count`.
+Only init containers restart in place; a main container's exit ends the pod.
+While an init container backs off it waits in `CrashLoopBackOff`, its
+`restartCount` grows and each run writes its own `<restartCount>.log`.
+
+Restart backoff: `restartBackoffBaseSecs * 2^restart_count`, capped at
+`restartBackoffBaseSecs * 16`.
 
 ---
 

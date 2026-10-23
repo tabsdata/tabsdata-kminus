@@ -1091,15 +1091,9 @@ impl ExecutorHandle {
 fn now_or_never(handle: &mut JoinHandle<i32>) -> Option<Result<i32, tokio::task::JoinError>> {
     use std::future::Future;
     use std::pin::Pin;
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Context, Poll, Waker};
 
-    struct NoopWaker;
-    impl Wake for NoopWaker {
-        fn wake(self: std::sync::Arc<Self>) {}
-    }
-
-    let waker = Waker::from(std::sync::Arc::new(NoopWaker));
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     match Pin::new(handle).poll(&mut cx) {
         Poll::Ready(val) => Some(val),
         Poll::Pending => None,

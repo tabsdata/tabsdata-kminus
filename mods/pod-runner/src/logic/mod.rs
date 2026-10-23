@@ -1204,6 +1204,18 @@ async fn monitor_pod(
                             m.containers_running.dec();
                         }
                     }
+                    PodEventKind::ContainerBackOff {
+                        name,
+                        restart_count,
+                        delay,
+                    } => {
+                        warn!(
+                            container = name.as_str(),
+                            restart_count,
+                            delay_ms = delay.as_millis() as u64,
+                            "Container backing off before restarting",
+                        );
+                    }
                     PodEventKind::Completed { phase } => {
                         if *phase == crate::spec::constants::PodPhase::Failed {
                             warn!(
