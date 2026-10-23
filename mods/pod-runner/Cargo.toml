@@ -98,7 +98,7 @@ sysinfo = { version = "0.39.6" }
 tar = { version = "0.4" }
 thiserror = { version = "2" }
 time = { version = "0.3" }
-tokio = { version = "1.54.0", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
 tokio-rustls = { version = "0.26" }
 tokio-stream = { version = "0.1" }
 tracing = { version = "0.1.44" }
@@ -119,7 +119,7 @@ serial_test = { version = "4" }
 # `test-util` enables `tokio::time::pause()` / `#[tokio::test(start_paused
 # = true)]` used by the resolver backoff tests so they can validate
 # multi-minute waits in milliseconds.
-tokio = { version = "1.54.0", features = ["test-util"] }
+tokio = { version = "1.54.1", features = ["test-util"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["signal", "process"] }
