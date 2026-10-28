@@ -20,7 +20,7 @@ authors = [
 homepage = "https://www.tabsdata.com"
 publish = false
 repository = "https://github.com/tabsdata/tabsdata-km"
-rust-version = "1.98.1"
+rust-version = "1.99.1"
 
 [[bin]]
 name = "km"
