@@ -97,6 +97,13 @@ pub struct CliArgs {
     /// Seconds between readiness heartbeats.
     #[arg(long, default_value_t = DEFAULT_HEARTBEAT_SECS)]
     pub heartbeat_secs: u64,
+
+    /// Name each pod's data dir `<namespace>_<base>_<uid digits>` rather
+    /// than `<namespace>_<name>_<uid>`, to keep pod paths within Windows'
+    /// 260 characters. km passes it for an instance created with
+    /// `TD_KMINUS_COMPACT=true`; it must not change while pods exist.
+    #[arg(long)]
+    pub compact_pod_dirs: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +125,13 @@ mod tests {
         assert!(args.port.is_none());
         assert!(args.metrics_port.is_none());
         assert_eq!(args.loglevel, LogLevel::Debug);
+        assert!(!args.compact_pod_dirs);
+    }
+
+    #[test]
+    fn parse_compact_pod_dirs() {
+        let args = CliArgs::try_parse_from(["prog", "--compact-pod-dirs"]).unwrap();
+        assert!(args.compact_pod_dirs);
     }
 
     #[test]

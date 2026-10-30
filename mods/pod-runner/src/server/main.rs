@@ -30,6 +30,7 @@ async fn main() {
     // the log directory. Logging is initialised below once we've
     // decided where to write.
     let cli = CliArgs::parse();
+    pod_runner::store::set_compact_pod_dirs(cli.compact_pod_dirs);
     // A bad config is the operator's problem, not a crash: report it on
     // stderr and exit. Panicking would render the message through `Debug`,
     // which escapes the newlines that make a multi-line complaint readable,

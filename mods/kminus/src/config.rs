@@ -233,6 +233,12 @@ pub struct KmSysConfig {
     /// Absent in files written before heartbeats existed: defaulted.
     #[serde(default)]
     pub heartbeat: KmHeartbeat,
+    /// Whether the pod-runner names pod data dirs compactly. Fixed when the
+    /// instance is created: a pod's data dir is found by that name, so
+    /// changing it would lose the dirs of pods already running. Absent in
+    /// files written before it existed: not compact.
+    #[serde(default, rename = "compactPodDirs")]
+    pub compact_pod_dirs: bool,
 }
 
 impl KmSysConfig {
@@ -246,15 +252,21 @@ impl KmSysConfig {
             },
             ports: KmPorts::from_portstart(portstart)?,
             heartbeat: KmHeartbeat::default(),
+            compact_pod_dirs: false,
         })
     }
 
     /// Create `kmsysconfig.yaml` in `configdir` with defaults seeded from
-    /// `portstart`. Errors with `AlreadyExists` if the file is already there.
+    /// `portstart`, and compact pod dirs as `compact_pod_dirs` says. Errors
+    /// with `AlreadyExists` if the file is already there.
     ///
     /// Any 0-valued port stays 0 in the file — it is replaced with a
     /// fresh random port at runtime via [`Self::resolve_random_ports`].
-    pub fn create(configdir: &Path, portstart: u16) -> std::io::Result<Self> {
+    pub fn create(
+        configdir: &Path,
+        portstart: u16,
+        compact_pod_dirs: bool,
+    ) -> std::io::Result<Self> {
         let path = configdir.join(KM_SYSCONFIG_FILE);
         if path.exists() {
             return Err(std::io::Error::new(
@@ -262,8 +274,9 @@ impl KmSysConfig {
                 format!("{} already exists", path.display()),
             ));
         }
-        let cfg = Self::defaults(portstart)
+        let mut cfg = Self::defaults(portstart)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        cfg.compact_pod_dirs = compact_pod_dirs;
         fs::create_dir_all(configdir)?;
         let header = "# km system configuration.\n\
             # Log rotation, ports and heartbeat settings for the kminus stack.\n\
@@ -275,7 +288,9 @@ impl KmSysConfig {
             # component that dies is caught by its pid at once and does not\n\
             # wait this out.\n\
             # A port value of 0 means: pick a free random port on startup\n\
-            # (the file value stays 0; resolution happens in memory only).\n\n";
+            # (the file value stays 0; resolution happens in memory only).\n\
+            # compactPodDirs: short pod data dir names, set at creation;\n\
+            # do not change it while the instance has pods.\n\n";
         let body = serde_yaml::to_string(&cfg).map_err(|e| std::io::Error::other(e.to_string()))?;
         fs::write(&path, format!("{}{}", header, body))?;
         Ok(cfg)
@@ -402,9 +417,27 @@ mod tests {
     #[test]
     fn create_writes_when_missing() {
         let dir = tempdir();
-        let cfg = KmSysConfig::create(&dir, 11000).unwrap();
+        let cfg = KmSysConfig::create(&dir, 11000, false).unwrap();
         assert_eq!(cfg.ports.api, 11000);
         assert!(dir.join(KM_SYSCONFIG_FILE).exists());
+        assert!(!KmSysConfig::load(&dir).unwrap().compact_pod_dirs);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_keeps_compact_pod_dirs_for_every_later_load() {
+        let dir = tempdir();
+        KmSysConfig::create(&dir, 11000, true).unwrap();
+        assert!(KmSysConfig::load(&dir).unwrap().compact_pod_dirs);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_from_before_compact_pod_dirs_is_not_compact() {
+        let dir = tempdir();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(KM_SYSCONFIG_FILE), "log:\n  maxSizeMB: 1\n  maxFiles: 1\nports:\n  api: 1\n  kcm: 2\n  pr: 3\n  prMetrics: 4\n  vk: 5\n").unwrap();
+        assert!(!KmSysConfig::load(&dir).unwrap().compact_pod_dirs);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -412,7 +445,7 @@ mod tests {
     fn create_errors_when_file_exists() {
         let dir = tempdir();
         fs::write(dir.join(KM_SYSCONFIG_FILE), "log:\n  maxSizeMB: 1\n  maxFiles: 1\nports:\n  api: 1\n  kcm: 2\n  pr: 3\n  prMetrics: 4\n  vk: 5\n").unwrap();
-        let res = KmSysConfig::create(&dir, 11000);
+        let res = KmSysConfig::create(&dir, 11000, false);
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
         let _ = fs::remove_dir_all(&dir);
@@ -421,7 +454,7 @@ mod tests {
     #[test]
     fn create_rejects_out_of_range_portstart() {
         let dir = tempdir();
-        let res = KmSysConfig::create(&dir, MAX_PORTSTART + 1);
+        let res = KmSysConfig::create(&dir, MAX_PORTSTART + 1, false);
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
         assert!(!dir.join(KM_SYSCONFIG_FILE).exists());

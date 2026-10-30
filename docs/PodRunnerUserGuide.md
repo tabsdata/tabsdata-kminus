@@ -688,7 +688,7 @@ kubectl logs <name> -c <container>
 A failed pod keeps its working directory for an hour, and its logs and specs for a day. Inspect them directly:
 
 ```bash
-ls data/pod-run/<namespace>_<name>_<uid>/               # work/, volumes/
+ls data/pod-run/<namespace>_<name>_<uid>/               # work/, volumes/ (compact: <namespace>_<base>_<uid digits>)
 ls data/pod-state/*/<log_pod_id>/                        # one dir per pod, by creation time
 ls data/pod-state/*/<log_pod_id>/<creation_time>_<name>/ # log/, store/
 ```

@@ -102,6 +102,9 @@ pub fn start(
     if let Some(dir) = imagesdir {
         command.args(["--imagesdir", dir]);
     }
+    if sys_cfg.compact_pod_dirs {
+        command.arg("--compact-pod-dirs");
+    }
     capture_stderr(&mut command, logdir, BIN);
     apply_subprocess_flags(&mut command);
     let pr = Tracked::spawn(command, KM_KILL_TOKEN_VAR, &run.scope(BIN))

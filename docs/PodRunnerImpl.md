@@ -571,6 +571,13 @@ A pod's footprint is split across two dirs with independent clocks:
 `<pod_id>` is `<namespace>_<name>_<uid>`: the data dir is per uid, so a new pod never touches the
 data an earlier one is still keeping for inspection.
 
+With `--compact-pod-dirs` it is `<namespace>_<base>_<uid digits>` instead, to keep pod paths within
+Windows' 260 characters: `<base>` is the pod name without the parts Kubernetes generates (the
+pod-template hash, the random suffix) and `<uid digits>` the uid's first 10 hex digits, which keep it
+unique. km passes the flag for an instance created with `TD_KMINUS_COMPACT=true`, recorded as
+`compactPodDirs` in `kmsysconfig.yaml`; it never changes afterwards, because a pod's data dir is
+found by this name.
+
 The state path is keyed by the **log pod id**: the value of the pod's `tabsdata.com/log-id` label when it
 carries one that is a valid Kubernetes name, and the pod name otherwise. The label is the
 `logIdLabel` setting in `prsysconfig.yaml`; empty disables it. A label value that is not a valid
