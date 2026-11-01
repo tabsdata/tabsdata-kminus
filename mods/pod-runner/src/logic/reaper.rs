@@ -5,9 +5,10 @@
 //!
 //! A pod's footprint is two dirs (see [`crate::store::layout`]):
 //!
-//! - the **data dir**, `pod-run/<pod_id>/` — `work/` and `volumes/`,
+//! - the **data dir**, `pod-run/<uid>/` — `work/` and `volumes/`,
 //!   everything the containers produced and usually the bulk of the disk.
-//!   It goes on the **reap** deadline, measured from pod completion.
+//!   It goes on the **reap** deadline, measured from pod completion, and
+//!   its `pod-run/<pod_id>` link goes with it.
 //! - the **state dir**, `pod-state/<bucket>/<pod_name>/<stamp>/` — `log/`
 //!   and `store/`, the record of what one incarnation of the pod did and why
 //!   it ended. It goes on
@@ -48,8 +49,7 @@ use super::ttl::{
 use crate::spec::constants::{
     DELETE_ON_FILE, FAILED_MARKER, PodPhase, REAP_ON_FILE, SUCCEEDED_MARKER, TTL_NEVER,
 };
-use crate::store::PodId;
-use crate::store::layout::PodLayout;
+use crate::store::layout::{PodLayout, remove_run_links_to, run_dir_pod};
 
 // ---------------------------------------------------------------------------
 // CleanupConfig
@@ -494,6 +494,9 @@ fn remove_on_deadline(dir: &Path, kind: ScheduledReap) -> bool {
     if !delete_pod_dir(dir) {
         return false;
     }
+    if kind == ScheduledReap::DataDir {
+        remove_run_links_to(dir);
+    }
     if kind == ScheduledReap::StateDir
         && let Some(name_dir) = dir.parent()
     {
@@ -603,17 +606,15 @@ pub fn schedule_deadline(
     };
 
     // The pod identity, recovered from the dir: `<name>_<uid>` like every
-    // other pod-scoped log line for a data dir, `<name>/<stamp>` for an
-    // incarnation's state dir, which carries no uid.
+    // other pod-scoped log line for a data dir, from its link, and
+    // `<name>/<stamp>` for an incarnation's state dir, which carries no uid.
     let file_name = |d: &Path| {
         d.file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default()
     };
     let pod = match kind {
-        ScheduledReap::DataDir => PodId::from_full(&file_name(dir))
-            .map(|id| id.to_string())
-            .unwrap_or_default(),
+        ScheduledReap::DataDir => run_dir_pod(dir),
         ScheduledReap::StateDir => format!(
             "{}/{}",
             dir.parent().map(file_name).unwrap_or_default(),
@@ -703,6 +704,10 @@ pub fn recover_pod_dirs(
         }
         recover_one(&dir, ScheduledReap::DataDir, now, shutdown, &mut stats);
     }
+    let pruned = layout.prune_run_links();
+    if pruned > 0 {
+        debug!(pruned, "Pruned links to data dirs that are gone");
+    }
     for dir in layout.list_state_dirs() {
         write_outcome(&dir, Outcome::Failed, now);
         mark_pod_evicted(&dir, fallback, now);
@@ -751,6 +756,7 @@ mod tests {
         CLEANUP_TTLS_FILE,
     };
     use crate::spec::pod::{PodMetadata, PodSpec};
+    use crate::store::PodId;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -1747,6 +1753,36 @@ mod tests {
         assert!(!layout.run_dir(&PodId::from_spec(&running)).exists());
         assert!(!layout.state_dir(&finished).exists());
         assert!(layout.state_dir(&running).exists(), "24h not up yet");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_reaped_data_dir_takes_its_link_and_recovery_prunes_orphans() {
+        let base = tmp("reap-link");
+        let layout = PodLayout::new(&base);
+        let reaped = PodId::from_spec(&pod_spec("reaped", "uid-1"));
+        let orphan = PodId::new("default", "orphan", "uid-2");
+        for id in [&reaped, &orphan] {
+            fs::create_dir_all(layout.run_dir(id)).unwrap();
+            layout.link_run_dir(id).unwrap();
+        }
+        fs::remove_dir_all(layout.run_dir(&orphan)).unwrap();
+        let now = at(T0);
+        finalize_data_dir(
+            &layout.run_dir(&reaped),
+            Outcome::Succeeded,
+            &TtlConfig::default(),
+            now,
+        );
+
+        let (_tx, rx) = watch::channel(());
+        let stats = recover_pod_dirs(&layout, &TtlConfig::default(), now, &rx);
+
+        assert_eq!(stats.removed, 1);
+        assert!(!layout.run_dir(&reaped).exists());
+        assert!(fs::symlink_metadata(layout.run_link(&reaped)).is_err());
+        assert!(fs::symlink_metadata(layout.run_link(&orphan)).is_err());
 
         let _ = fs::remove_dir_all(&base);
     }

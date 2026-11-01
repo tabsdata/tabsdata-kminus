@@ -121,6 +121,8 @@ impl ExecutorProvider for DefaultExecutorProvider {
         // Ensure directories exist before the executor tries to use them
         if let Err(e) = std::fs::create_dir_all(&pod_dir) {
             warn!(pod = %id, error = %e, "Failed to create pod directory");
+        } else if let Err(e) = self.layout.link_run_dir(id) {
+            warn!(pod = %id, error = %e, "Failed to link pod directory by name");
         }
         if let Err(e) = std::fs::create_dir_all(&log_dir) {
             warn!(pod = %id, error = %e, "Failed to create log directory");

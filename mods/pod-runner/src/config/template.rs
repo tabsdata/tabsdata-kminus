@@ -66,7 +66,7 @@ imagesDir: ""
 # ---------------------------------------------------------------------------
 #
 # Two clocks govern a finished pod's disk footprint. The reap TTLs cover the
-# pod's data dir (data/pod-run/<pod_id>/: `work/`, `volumes/`) — the bulk of
+# pod's data dir (data/pod-run/<uid>/: `work/`, `volumes/`) — the bulk of
 # the footprint — and run from pod completion. The delete TTLs cover the
 # state dir of each pod incarnation (data/pod-state/<bucket>/<pod_name>/
 # <creation_time>/: the logs and specs that are its only record), and run

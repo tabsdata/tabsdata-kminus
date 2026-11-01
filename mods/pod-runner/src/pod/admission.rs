@@ -71,6 +71,11 @@ pub const ERR_SUBPATH_NOT_SUPPORTED: &str =
 pub const ERR_INVALID_MOUNT_PATH: &str =
     "pod-runner requires volumeMount mountPath to be container-absolute";
 
+/// Error message prefix when a pod's `metadata.uid` cannot name its data
+/// dir.
+pub const ERR_INVALID_UID: &str =
+    "pod-runner requires metadata.uid to be ASCII letters, digits and '-'";
+
 /// Volume mount fields that pod-runner cannot honor.
 const UNSUPPORTED_MOUNT_FIELDS: &[&str] = &["subPath", "subPathExpr"];
 
@@ -114,6 +119,9 @@ pub enum AdmissionError {
     /// A volumeMount's `mountPath` is not a container-absolute path.
     #[error("{ERR_INVALID_MOUNT_PATH} ({location})")]
     InvalidMountPath { location: String },
+    /// The pod's `metadata.uid` is empty or not a plain path component.
+    #[error("{ERR_INVALID_UID} (metadata.uid: '{uid}')")]
+    InvalidUid { uid: String },
 }
 
 /// Validate a pod spec. Returns `Ok(())` if the spec is accepted, or an
@@ -128,6 +136,7 @@ pub enum AdmissionError {
 /// never enters the store, so the caller is responsible for surfacing the
 /// error to the API client.
 pub fn admit(spec: &PodSpec) -> Result<(), AdmissionError> {
+    check_uid(&spec.metadata.uid)?;
     for v in &spec.spec.volumes {
         check_supported_volume(v)?;
     }
@@ -141,6 +150,19 @@ pub fn admit(spec: &PodSpec) -> Result<(), AdmissionError> {
         check_supported_probes(c)?;
         check_no_subpath_mounts(c)?;
         check_mount_paths(c)?;
+    }
+    Ok(())
+}
+
+/// Reject a uid that cannot name the pod's data dir, `pod-run/<uid>/`: an
+/// empty one, or one with a character that is not an ASCII letter, a digit
+/// or `-`. Kubernetes' own uids are UUIDs. Without `_`, no uid can be
+/// mistaken for the `<namespace>_<name>_<uid>` links beside the data dirs.
+fn check_uid(uid: &str) -> Result<(), AdmissionError> {
+    if uid.is_empty() || !uid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(AdmissionError::InvalidUid {
+            uid: uid.to_string(),
+        });
     }
     Ok(())
 }
@@ -578,6 +600,8 @@ mod tests {
         // The whole pipeline: a secret volume in YAML reaches admission via
         // `extra` and is rejected (rather than silently producing no mount).
         let yaml = r#"
+metadata:
+  uid: uid-1
 spec:
   volumes:
     - name: sec
@@ -692,6 +716,8 @@ spec:
     #[test]
     fn subpath_deserializes_into_extra_and_is_rejected() {
         let yaml = r#"
+metadata:
+  uid: uid-1
 spec:
   containers:
     - name: app
@@ -827,6 +853,8 @@ spec:
     fn invalid_mount_path_from_yaml_is_rejected() {
         // The full pipeline, as the pod def reached the runner.
         let yaml = r#"
+metadata:
+  uid: uid-1
 spec:
   volumes:
     - name: runtimes
@@ -844,5 +872,31 @@ spec:
             admit(&pod),
             Err(AdmissionError::InvalidMountPath { .. })
         ));
+    }
+
+    #[test]
+    fn uids_that_cannot_name_a_data_dir_are_rejected() {
+        for bad in ["", ".", "..", "a/b", r"a\b", "a_b", "a b", "a:b", "ü"] {
+            let mut pod = pod_with_container(Container {
+                name: "app".to_string(),
+                ..Default::default()
+            });
+            pod.metadata.uid = bad.to_string();
+            let err = admit(&pod).unwrap_err();
+            assert!(matches!(err, AdmissionError::InvalidUid { .. }), "{bad:?}");
+            assert!(err.to_string().contains(ERR_INVALID_UID), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn kubernetes_uids_are_admitted() {
+        for good in ["d3744bc5-73c9-4f49-ae29-c9c7855b1c16", "uid-1", "A9"] {
+            let mut pod = pod_with_container(Container {
+                name: "app".to_string(),
+                ..Default::default()
+            });
+            pod.metadata.uid = good.to_string();
+            assert!(admit(&pod).is_ok(), "{good:?}");
+        }
     }
 }

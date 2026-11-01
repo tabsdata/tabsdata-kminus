@@ -425,7 +425,6 @@ mod tests {
             loglevel: crate::config::loglevel::LogLevel::Debug,
             heartbeat_file: None,
             heartbeat_secs: crate::config::cli::DEFAULT_HEARTBEAT_SECS,
-            compact_pod_dirs: false,
         };
 
         let config = resolve_config(&cli).unwrap();
@@ -509,7 +508,6 @@ podDataReapTtlOnPodSuccess: "5m"
             loglevel: crate::config::loglevel::LogLevel::Debug,
             heartbeat_file: None,
             heartbeat_secs: crate::config::cli::DEFAULT_HEARTBEAT_SECS,
-            compact_pod_dirs: false,
         };
 
         let config = resolve_config(&cli).unwrap();
@@ -543,7 +541,6 @@ podDataReapTtlOnPodSuccess: "5m"
             loglevel: crate::config::loglevel::LogLevel::Debug,
             heartbeat_file: None,
             heartbeat_secs: crate::config::cli::DEFAULT_HEARTBEAT_SECS,
-            compact_pod_dirs: false,
         }
     }
 
@@ -646,7 +643,6 @@ podDataReapTtlOnPodSuccess: "5m"
             loglevel: crate::config::loglevel::LogLevel::Debug,
             heartbeat_file: None,
             heartbeat_secs: crate::config::cli::DEFAULT_HEARTBEAT_SECS,
-            compact_pod_dirs: false,
         };
 
         let config = resolve_config(&cli).unwrap();
@@ -700,7 +696,6 @@ podDataReapTtlOnPodSuccess: "5m"
             loglevel: crate::config::loglevel::LogLevel::Debug,
             heartbeat_file: None,
             heartbeat_secs: crate::config::cli::DEFAULT_HEARTBEAT_SECS,
-            compact_pod_dirs: false,
         };
 
         let c = resolve_config(&cli).unwrap();
@@ -742,7 +737,6 @@ podDataReapTtlOnPodSuccess: "5m"
             loglevel: crate::config::loglevel::LogLevel::Debug,
             heartbeat_file: None,
             heartbeat_secs: crate::config::cli::DEFAULT_HEARTBEAT_SECS,
-            compact_pod_dirs: false,
         };
 
         let c = resolve_config(&cli).unwrap();
@@ -794,7 +788,6 @@ podDataReapTtlOnPodSuccess: "5m"
             loglevel: crate::config::loglevel::LogLevel::Debug,
             heartbeat_file: None,
             heartbeat_secs: crate::config::cli::DEFAULT_HEARTBEAT_SECS,
-            compact_pod_dirs: false,
         };
 
         let c = resolve_config(&cli).unwrap();
@@ -865,7 +858,6 @@ capacity:
             loglevel: crate::config::loglevel::LogLevel::Debug,
             heartbeat_file: None,
             heartbeat_secs: crate::config::cli::DEFAULT_HEARTBEAT_SECS,
-            compact_pod_dirs: false,
         };
 
         let c = resolve_config(&cli).unwrap();
@@ -938,7 +930,6 @@ server:
             loglevel: crate::config::loglevel::LogLevel::Debug,
             heartbeat_file: None,
             heartbeat_secs: crate::config::cli::DEFAULT_HEARTBEAT_SECS,
-            compact_pod_dirs: false,
         };
 
         let result = resolve_config(&cli);

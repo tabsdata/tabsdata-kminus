@@ -190,7 +190,7 @@ pub struct YamlSysConfig {
     pub images_dir: String,
 
     // -- cleanup --
-    /// TTL before a succeeded pod's data dir (`pod-run/<pod_id>/`: `work/`,
+    /// TTL before a succeeded pod's data dir (`pod-run/<uid>/`: `work/`,
     /// `volumes/`) is reaped, counted from pod completion.
     /// `<number>[s|m|h]` or `never`.
     #[serde(alias = "podDataReapTtlOnPodSuccess")]

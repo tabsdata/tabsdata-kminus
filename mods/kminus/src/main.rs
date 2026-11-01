@@ -62,12 +62,6 @@ const DEFAULT_PORTSTART: u16 = 10300;
 /// and every `km start`/`km restart` — that the fixed dev token is in use.
 const FIXED_AUTH_TOKEN_ENV: &str = "TD_DEV_FIXED_AUTH_TOKEN";
 
-/// Env var read once, by `km create`: when set to "true", the instance's
-/// pod-runner names pod data dirs compactly, to keep pod paths within
-/// Windows' 260 characters. Recorded in `kmsysconfig.yaml`, so every later
-/// start keeps the choice whether or not the variable is still set.
-const COMPACT_ENV: &str = "TD_KMINUS_COMPACT";
-
 fn canonicalize(label: &str, path: &Path) -> std::io::Result<PathBuf> {
     let result = dunce::canonicalize(path);
     if let Ok(resolved) = &result {
@@ -1123,8 +1117,7 @@ fn command_create(args: CreateArgs) {
         std::process::exit(1);
     });
 
-    let compact_pod_dirs = env_flag_enabled(std::env::var(COMPACT_ENV).ok().as_deref());
-    if let Err(e) = KmSysConfig::create(&paths.configdir, args.portstart, compact_pod_dirs) {
+    if let Err(e) = KmSysConfig::create(&paths.configdir, args.portstart) {
         eprintln!("ERROR: {e}");
         std::process::exit(1);
     }

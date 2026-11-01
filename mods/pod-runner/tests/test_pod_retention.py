@@ -5,7 +5,7 @@
 """Integration tests for pod dir retention.
 
 A pod's footprint is two dirs with a clock each. The data dir
-(`data/pod-run/<pod_id>/`: `work/`, `volumes/`) goes on the reap deadline,
+(`data/pod-run/<uid>/`: `work/`, `volumes/`) goes on the reap deadline,
 which runs from pod completion. The state dir
 (`data/pod-state/<bucket>/<log_pod_id>/<stamp>_<pod_name>/`: the `log/` and
 `store/` that are one pod's only record; the log pod id is the pod's
@@ -67,6 +67,11 @@ def data_root(pod_runner):
 
 def data_dir(pod_runner, ns, name, uid):
     """The pod's data dir: work/ and volumes/."""
+    return os.path.join(data_root(pod_runner), "pod-run", uid)
+
+
+def data_link(pod_runner, ns, name, uid):
+    """The link naming the pod's data dir by pod id."""
     return os.path.join(data_root(pod_runner), "pod-run", f"{ns}_{name}_{uid}")
 
 
@@ -132,6 +137,8 @@ class TestReaping:
         # Default reap-on-success is 0s, applied inline at completion.
         assert wait_for_path(d, present=False), \
             "the data dir should be reaped as soon as the pod succeeds"
+        assert not os.path.lexists(data_link(pod_runner, ns, name, uid)), \
+            "the data dir's link goes with it"
         # The record lives in the state dir and survives the reap.
         assert os.path.exists(os.path.join(s, SUCCEEDED_MARKER))
         assert os.path.exists(os.path.join(s, "log")), \
@@ -150,6 +157,9 @@ class TestReaping:
         assert wait_for_path(os.path.join(d, SUCCEEDED_MARKER))
         assert os.path.exists(os.path.join(d, "work")), \
             "the annotation defers the reap by an hour"
+        link = data_link(pod_runner, ns, name, uid)
+        assert os.path.islink(link) and os.readlink(link) == uid, \
+            "the data dir is linked by pod id, relatively"
         # The deadline is an absolute instant an hour out.
         assert read_marker(os.path.join(d, REAP_ON_FILE)) != TTL_NEVER
 

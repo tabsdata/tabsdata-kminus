@@ -309,7 +309,7 @@ against the images root (`--imagesdir`, falling back to `imagesDir` in
 ### Working Directory
 
 Each container runs in `<data_dir>/work/<container-name>/` where
-`<data_dir>` is the pod's data dir, `<workdir>/data/pod-run/<namespace>_<name>_<uid>/`.
+`<data_dir>` is the pod's data dir, `<workdir>/data/pod-run/<uid>/`.
 The image directory template (if any) is copied here before the
 container starts. All filesystem resources should be referenced
 relative to this directory.
@@ -560,7 +560,7 @@ Both stores are updated on every state change.
 
 A pod's footprint is split across two dirs with independent clocks:
 
-- **data dir** -- `<workdir>/data/pod-run/<pod_id>/`: `work/` and `volumes/`. Everything the
+- **data dir** -- `<workdir>/data/pod-run/<uid>/`: `work/` and `volumes/`. Everything the
   containers produced, usually the bulk of the footprint, and nothing reads it once the pod is
   done. It is **reaped** on a clock that runs from **pod completion**.
 - **state dir** -- `<workdir>/data/pod-state/<bucket>/<log_pod_id>/<stamp>_<pod_name>/`: the
@@ -568,15 +568,14 @@ A pod's footprint is split across two dirs with independent clocks:
   **deleted** on a clock that runs from the moment the pod is **removed from the pod runner**,
   because until then the runner still answers queries about it.
 
-`<pod_id>` is `<namespace>_<name>_<uid>`: the data dir is per uid, so a new pod never touches the
-data an earlier one is still keeping for inspection.
-
-With `--compact-pod-dirs` it is `<namespace>_<base>_<uid digits>` instead, to keep pod paths within
-Windows' 260 characters: `<base>` is the pod name without the parts Kubernetes generates (the
-pod-template hash, the random suffix) and `<uid digits>` the uid's first 10 hex digits, which keep it
-unique. km passes the flag for an instance created with `TD_KMINUS_COMPACT=true`, recorded as
-`compactPodDirs` in `kmsysconfig.yaml`; it never changes afterwards, because a pod's data dir is
-found by this name.
+The data dir is named by the pod's uid alone: per uid, so a new pod never touches the data an
+earlier one is still keeping for inspection, and as short as a unique name can be, so the paths
+under it stay within Windows' 260 characters. Admission rejects a uid that is not ASCII letters,
+digits and `-`, so it is always a plain path component. Beside it, `<workdir>/data/pod-run/<pod_id>`,
+`<pod_id>` being `<namespace>_<name>_<uid>`, is a relative symlink to it for anyone looking for a
+pod by name; the pod runner itself never goes through it. A uid has no `_` and a pod id always has
+two, so a data dir and a link never share a name. Reaping a data dir removes its link, and startup
+recovery removes links whose data dir is gone.
 
 The state path is keyed by the **log pod id**: the value of the pod's `tabsdata.com/log-id` label when it
 carries one that is a valid Kubernetes name, and the pod name otherwise. The label is the
@@ -679,13 +678,14 @@ but the record itself.
   log/
     pod-runner.log                               # pod-runner's own log (rotated)
   data/
-    pod-run/<namespace>_<name>_<uid>/            # Pod data dir -- removed on the reap deadline
+    pod-run/<uid>/                               # Pod data dir -- removed on the reap deadline
       volumes/<volume_name>/                     # Pod-level volumes (emptyDir dir, hostPath symlink, configMap files)
       work/<container>/                          # Container working directory (mount paths symlink into volumes/)
       _cleanup_ttls.json                         # Resolved reap TTLs (written at admission)
       _succeeded | _failed                       # Outcome marker, content = completion time
       _reap_on                                   # Reap deadline, or "never"
       _size                                      # Cached disk usage
+    pod-run/<namespace>_<name>_<uid>             # Symlink to pod-run/<uid>/, removed with it
     pod-state/<bucket>/<log_pod_id>/             # tabsdata.com/log-id label value, or pod name; removed with the last pod
       <stamp>_<pod_name>/                        # One pod's state dir -- removed on the delete deadline
         log/<container>/

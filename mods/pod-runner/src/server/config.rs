@@ -25,9 +25,10 @@ pub use crate::tls::{CertSource, ServerTlsConfig};
 // Layout under workdir:
 //
 //   <workdir>/data/
-//     pod-run/<pod_id>/                ← pod data, reaped on the reap deadline
+//     pod-run/<uid>/                   ← pod data, reaped on the reap deadline
 //       work/<container>/              ← container working directories
 //       volumes/<volume>/              ← pod-level volumes
+//     pod-run/<pod_id>                 ← symlink to pod-run/<uid>/, for people
 //     pod-state/<bucket>/<pod_name>/   ← shared by a pod name's incarnations
 //       <stamp>/                       ← one incarnation's record, deleted on the delete deadline
 //         log/<container>/             ← container stdout/stderr + probe logs

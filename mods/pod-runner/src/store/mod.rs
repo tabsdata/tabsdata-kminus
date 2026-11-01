@@ -43,7 +43,7 @@ pub mod layout;
 pub mod memory;
 pub mod multiplex;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -53,29 +53,6 @@ use crate::spec::status::PodStatus;
 // ---------------------------------------------------------------------------
 // PodId
 // ---------------------------------------------------------------------------
-
-/// Whether [`PodId::full`] is compact. Set once, at startup, from
-/// `--compact-pod-dirs`; a pod's data dir is found by this name, so it never
-/// changes while the runner is up.
-static COMPACT_POD_DIRS: OnceLock<bool> = OnceLock::new();
-
-/// Make [`PodId::full`] compact for the rest of the process. Only the first
-/// call counts.
-pub fn set_compact_pod_dirs(compact: bool) {
-    let _ = COMPACT_POD_DIRS.set(compact);
-}
-
-/// Hex digits of the uid a compact [`PodId::full`] keeps: 40 bits, which no
-/// two pods of one runner share.
-const COMPACT_UID_DIGITS: usize = 10;
-
-/// What Kubernetes draws generated name parts from — a pod's random
-/// `generateName` suffix, a ReplicaSet's pod-template hash — and their
-/// lengths. A compact [`PodId::full`] drops up to two such trailing parts
-/// from the pod name; the uid keeps it unique, so this only shortens it.
-const GENERATED_NAME_ALPHABET: &str = "bcdfghjklmnpqrstvwxz2456789";
-const GENERATED_NAME_PART_LENGTHS: std::ops::RangeInclusive<usize> = 5..=10;
-const GENERATED_NAME_PARTS: usize = 2;
 
 /// Pod identifier: namespace + name + uid.
 ///
@@ -119,43 +96,18 @@ impl PodId {
         format!("{}/{}", self.namespace, self.name)
     }
 
-    /// `namespace_name_uid` format for file paths and unique keys. Compact
-    /// (`--compact-pod-dirs`), it is `namespace_base_uiddigits` instead: the
-    /// name without its generated parts and the uid's first hex digits, to
-    /// keep pod paths within Windows' 260 characters.
+    /// `namespace_name_uid` format for unique keys, and the name of the
+    /// link to the pod's data dir.
     pub fn full(&self) -> String {
-        self.full_as(COMPACT_POD_DIRS.get().copied().unwrap_or(false))
-    }
-
-    fn full_as(&self, compact: bool) -> String {
-        if !compact {
-            return format!("{}_{}_{}", self.namespace, self.name, self.uid);
-        }
-        let mut base = self.name.as_str();
-        for _ in 0..GENERATED_NAME_PARTS {
-            match base.rsplit_once('-') {
-                Some((head, part)) if !head.is_empty() && is_generated_name_part(part) => {
-                    base = head
-                }
-                _ => break,
-            }
-        }
-        let uid: String = self
-            .uid
-            .chars()
-            .filter(|c| *c != '-')
-            .take(COMPACT_UID_DIGITS)
-            .collect();
-        format!("{}_{}_{}", self.namespace, base, uid)
+        format!("{}_{}_{}", self.namespace, self.name, self.uid)
     }
 
     /// Inverse of [`full`](Self::full): parse a `namespace_name_uid` key
-    /// (e.g. a pod directory name) back into a `PodId`. Returns `None` if
+    /// (e.g. a data dir link's name) back into a `PodId`. Returns `None` if
     /// the key isn't three non-empty underscore-separated parts. Safe to
     /// split on `_` because K8s namespaces and names are DNS-1123 labels
     /// (no underscore) and UIDs are UUIDs (no underscore), so only the
-    /// three separators we wrote are present. A compact key parses too, to
-    /// its base and uid digits, which is enough to name it in logs.
+    /// three separators we wrote are present.
     pub fn from_full(full: &str) -> Option<PodId> {
         let mut parts = full.splitn(3, '_');
         let namespace = parts.next()?;
@@ -173,17 +125,10 @@ impl PodId {
     }
 }
 
-fn is_generated_name_part(part: &str) -> bool {
-    GENERATED_NAME_PART_LENGTHS.contains(&part.len())
-        && part.chars().all(|c| GENERATED_NAME_ALPHABET.contains(c))
-}
-
 // Logging format: the k8s pod identity, `name_uid`. The uid
 // distinguishes incarnations of a reused pod name, and the pair is the
-// trailing two segments of the `full()` pod directory name (compact, the
-// dir keeps the name's base and the uid's first digits, which still
-// match), so log lines correlate directly with on-disk pod dirs. Namespace
-// is omitted
+// trailing two segments of the `full()` data dir link name, so log
+// lines correlate directly with on-disk pod dirs. Namespace is omitted
 // — pod-runner logs are already per-node and namespace adds no
 // disambiguation.
 impl std::fmt::Display for PodId {
@@ -577,41 +522,6 @@ mod tests {
         assert_eq!(PodId::from_full("default_app"), None);
         assert_eq!(PodId::from_full("nounderscores"), None);
         assert_eq!(PodId::from_full("default__uid"), None);
-    }
-
-    #[test]
-    fn test_pod_id_compact_drops_the_generated_name_parts_and_most_of_the_uid() {
-        let id = PodId::new(
-            "default",
-            "srv-apiserver-5d47dbb5dd-lt95q",
-            "d3744bc5-73c9-4f49-ae29-c9c7855b1c16",
-        );
-        assert_eq!(id.full_as(true), "default_srv-apiserver_d3744bc573");
-        assert_eq!(
-            id.full_as(false),
-            "default_srv-apiserver-5d47dbb5dd-lt95q_d3744bc5-73c9-4f49-ae29-c9c7855b1c16"
-        );
-        let job = PodId::new("default", "ini-venvloader-hk9n8", "uid-1");
-        assert_eq!(job.full_as(true), "default_ini-venvloader_uid1");
-    }
-
-    #[test]
-    fn test_pod_id_compact_keeps_name_parts_kubernetes_never_generates() {
-        for name in ["app", "my-app", "srv-apiserver", "web-12345", "db-mysql"] {
-            let id = PodId::new("default", name, "uid");
-            assert_eq!(id.full_as(true), format!("default_{name}_uid"));
-        }
-    }
-
-    #[test]
-    fn test_pod_id_compact_is_unique_by_uid_and_parses() {
-        let first = PodId::new("default", "web-lt95q", "aaaaaaaaaa-1");
-        let second = PodId::new("default", "web-hk9n8", "bbbbbbbbbb-1");
-        assert_ne!(first.full_as(true), second.full_as(true));
-        assert_eq!(
-            PodId::from_full(&first.full_as(true)),
-            Some(PodId::new("default", "web", "aaaaaaaaaa")),
-        );
     }
 
     // -- MemoryStore tests via the shared test suite --

@@ -635,7 +635,8 @@ Key metrics:
     control-plane/               # control-plane runtime data
     virtual-kubelet/             # virtual-kubelet runtime data
     km/                          # kminus PID files
-    pod-run/<pod_id>/            # pod-runner: per-pod data (work/, volumes/)
+    pod-run/<uid>/               # pod-runner: per-pod data (work/, volumes/)
+    pod-run/<namespace>_<name>_<uid>  # pod-runner: symlink to the pod's pod-run/<uid>/
     pod-state/<bucket>/<log_pod_id>/<creation_time>_<pod_name>/  # pod-runner: per-pod record (log/, store/)
     pod-pid/                     # pod-runner: process PID tracking
 ```
@@ -688,7 +689,7 @@ kubectl logs <name> -c <container>
 A failed pod keeps its working directory for an hour, and its logs and specs for a day. Inspect them directly:
 
 ```bash
-ls data/pod-run/<namespace>_<name>_<uid>/               # work/, volumes/ (compact: <namespace>_<base>_<uid digits>)
+ls data/pod-run/<namespace>_<name>_<uid>/               # work/, volumes/ (a link to pod-run/<uid>/)
 ls data/pod-state/*/<log_pod_id>/                        # one dir per pod, by creation time
 ls data/pod-state/*/<log_pod_id>/<creation_time>_<name>/ # log/, store/
 ```

@@ -4,7 +4,7 @@
 //!
 //! Two independent clocks govern a finished pod's on-disk footprint:
 //!
-//! - **reap** — deletes the pod's data dir (`pod-run/<pod_id>/`: `work/`,
+//! - **reap** — deletes the pod's data dir (`pod-run/<uid>/`: `work/`,
 //!   `volumes/`), the bulk of the footprint. Runs from **pod completion**.
 //! - **delete** — deletes the pod incarnation's state dir
 //!   (`pod-state/<bucket>/<pod_name>/<stamp>/`: `log/`, `store/`), its only

@@ -5,11 +5,15 @@
 //! A pod's footprint is split in two, because the halves have different
 //! lifetimes and different readers:
 //!
-//! - **pod-run** — `<data>/pod-run/<pod_id>/`: what the containers produce
+//! - **pod-run** — `<data>/pod-run/<uid>/`: what the containers produce
 //!   (`work/`, `volumes/`). The bulk of the disk, dead weight once the pod
-//!   is finished, so it goes on the reap deadline. Keyed by the full pod id,
-//!   uid included, so a new pod never touches the data an earlier one is
-//!   still keeping for inspection.
+//!   is finished, so it goes on the reap deadline. Keyed by the uid alone,
+//!   so a new pod never touches the data an earlier one is still keeping for
+//!   inspection, and every path under it stays as short as it can be —
+//!   Windows caps a path at 260 characters. Beside it,
+//!   `<data>/pod-run/<pod_id>` is a symlink to it, for people looking for a
+//!   pod by name; the runner itself never goes through the link. A uid has
+//!   no `_` (admission) and a pod id always does, so the two never collide.
 //! - **pod-state** — `<data>/pod-state/<bucket>/<log_pod_id>/<incarnation>/`:
 //!   the record of what one pod did and why it ended (`log/`, `store/`).
 //!   Small, and read after the fact by log pod id alone, whether or not the
@@ -41,11 +45,13 @@
 //! [`PodMetadata::incarnation_stamp`]: crate::spec::pod::PodMetadata::incarnation_stamp
 //! [`DEFAULT_LOG_ID_LABEL`]: crate::spec::constants::DEFAULT_LOG_ID_LABEL
 
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::server::config::{POD_LOG_SUBDIR, POD_RUN_DIR, POD_STATE_DIR, POD_STORE_SUBDIR};
 use crate::spec::constants::DEFAULT_LOG_ID_LABEL;
 use crate::spec::pod::PodSpec;
+use crate::utils::links::{remove_symlink, symlink_dir};
 
 use super::PodId;
 
@@ -137,9 +143,35 @@ impl PodLayout {
         self
     }
 
-    /// The pod's data dir: `<data>/pod-run/<pod_id>/`.
+    /// The pod's data dir: `<data>/pod-run/<uid>/`.
     pub fn run_dir(&self, id: &PodId) -> PathBuf {
+        self.run_root.join(&id.uid)
+    }
+
+    /// The symlink naming the pod's data dir by pod id:
+    /// `<data>/pod-run/<pod_id>`.
+    pub fn run_link(&self, id: &PodId) -> PathBuf {
         self.run_root.join(id.full())
+    }
+
+    /// Create the link to the pod's data dir unless one is there already.
+    /// It is relative, so it survives the instance dir moving.
+    pub fn link_run_dir(&self, id: &PodId) -> io::Result<()> {
+        let link = self.run_link(id);
+        if std::fs::symlink_metadata(&link).is_ok() {
+            return Ok(());
+        }
+        symlink_dir(Path::new(&id.uid), &link)
+    }
+
+    /// Remove every link in `pod-run/` whose data dir is gone. Returns how
+    /// many went.
+    pub fn prune_run_links(&self) -> usize {
+        run_links(&self.run_root)
+            .into_iter()
+            .filter(|link| !link.exists())
+            .inspect(|link| remove_symlink(link))
+            .count()
     }
 
     /// The log pod id `spec` is filed under: its log id label's value when
@@ -202,10 +234,65 @@ impl PodLayout {
             .collect()
     }
 
-    /// Every pod-run dir on disk.
+    /// Every pod-run dir on disk; their links are not.
     pub fn list_run_dirs(&self) -> Vec<PathBuf> {
-        subdirs(&self.run_root)
+        entries(&self.run_root)
+            .filter(|(_, file_type)| file_type.is_dir())
+            .map(|(path, _)| path)
+            .collect()
     }
+}
+
+/// The entries of `dir` with their own types, links not followed; none when
+/// it is absent or unreadable.
+fn entries(dir: &Path) -> impl Iterator<Item = (PathBuf, std::fs::FileType)> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| Some((e.path(), e.file_type().ok()?)))
+}
+
+/// The symlinks in `pod-run/`.
+fn run_links(run_root: &Path) -> Vec<PathBuf> {
+    entries(run_root)
+        .filter(|(_, file_type)| file_type.is_symlink())
+        .map(|(path, _)| path)
+        .collect()
+}
+
+/// The links beside the data dir `run_dir` that point at it.
+pub fn run_links_to(run_dir: &Path) -> Vec<PathBuf> {
+    let (Some(run_root), Some(name)) = (run_dir.parent(), run_dir.file_name()) else {
+        return Vec::new();
+    };
+    run_links(run_root)
+        .into_iter()
+        .filter(|link| std::fs::read_link(link).is_ok_and(|target| target == Path::new(name)))
+        .collect()
+}
+
+/// Remove the links to the data dir `run_dir`.
+pub fn remove_run_links_to(run_dir: &Path) {
+    for link in run_links_to(run_dir) {
+        remove_symlink(&link);
+    }
+}
+
+/// The pod whose data dir `run_dir` is, as its link names it; the bare uid
+/// when it has no link.
+pub fn run_dir_pod(run_dir: &Path) -> String {
+    run_links_to(run_dir)
+        .iter()
+        .filter_map(|link| link.file_name()?.to_str())
+        .find_map(PodId::from_full)
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| {
+            run_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
 }
 
 impl Default for PodLayout {
@@ -337,8 +424,9 @@ mod tests {
             layout.state_root,
             PathBuf::from("/w/data").join(POD_STATE_DIR)
         );
+        assert_eq!(layout.run_dir(&id), layout.run_root.join("uid-1"));
         assert_eq!(
-            layout.run_dir(&id),
+            layout.run_link(&id),
             layout.run_root.join("default_app_uid-1")
         );
         assert_eq!(layout.log_pod_dir("app"), id_dir);
@@ -485,6 +573,55 @@ mod tests {
         expected.sort();
         assert_eq!(state, expected);
         assert_eq!(layout.list_run_dirs().len(), specs.len());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_data_dir_is_linked_by_pod_id_and_listed_once() {
+        let base = tmp("link");
+        let layout = PodLayout::new(&base);
+        let id = PodId::new("default", "web-7d9f-x7k2p", "d3744bc5-73c9");
+        std::fs::create_dir_all(layout.run_dir(&id)).unwrap();
+        layout.link_run_dir(&id).unwrap();
+        layout.link_run_dir(&id).unwrap();
+
+        let link = layout.run_link(&id);
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            PathBuf::from("d3744bc5-73c9"),
+            "relative, so the instance dir can move"
+        );
+        assert!(link.join("").is_dir(), "the link resolves to the data dir");
+        assert_eq!(layout.list_run_dirs(), vec![layout.run_dir(&id)]);
+        assert_eq!(run_links_to(&layout.run_dir(&id)), vec![link.clone()]);
+        assert_eq!(
+            run_dir_pod(&layout.run_dir(&id)),
+            "web-7d9f-x7k2p_d3744bc5-73c9"
+        );
+
+        remove_run_links_to(&layout.run_dir(&id));
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        assert_eq!(run_dir_pod(&layout.run_dir(&id)), "d3744bc5-73c9");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn links_whose_data_dir_is_gone_are_pruned() {
+        let base = tmp("prune");
+        let layout = PodLayout::new(&base);
+        let kept = PodId::new("default", "kept", "u1");
+        let gone = PodId::new("default", "gone", "u2");
+        for id in [&kept, &gone] {
+            std::fs::create_dir_all(layout.run_dir(id)).unwrap();
+            layout.link_run_dir(id).unwrap();
+        }
+        std::fs::remove_dir_all(layout.run_dir(&gone)).unwrap();
+
+        assert_eq!(layout.prune_run_links(), 1);
+        assert!(std::fs::symlink_metadata(layout.run_link(&kept)).is_ok());
+        assert!(std::fs::symlink_metadata(layout.run_link(&gone)).is_err());
 
         let _ = std::fs::remove_dir_all(&base);
     }

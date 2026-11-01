@@ -39,7 +39,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use tracing::warn;
@@ -47,6 +46,7 @@ use tracing::warn;
 use crate::pod::prepare::PrepareError;
 use crate::pod::resolver::k8s_values::ResolvedK8sValues;
 use crate::spec::pod::{KeyToPath, PodSpec, Volume, VolumeMount};
+use crate::utils::links::{remove_symlink, symlink_dir};
 
 /// Directory under the pod dir where volumes are materialized:
 /// `<pod_dir>/volumes/<volume_name>`.
@@ -368,22 +368,6 @@ fn resolve_existing_prefix(path: &Path) -> Option<PathBuf> {
         below.push(current.file_name()?);
         current = current.parent()?;
     }
-}
-
-/// Create a directory symlink at `link` pointing to `target`.
-fn symlink_dir(target: &Path, link: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    return std::os::unix::fs::symlink(target, link);
-    #[cfg(windows)]
-    return std::os::windows::fs::symlink_dir(target, link);
-}
-
-/// Remove a directory symlink (best-effort).
-fn remove_symlink(link: &Path) {
-    #[cfg(unix)]
-    let _ = fs::remove_file(link);
-    #[cfg(windows)]
-    let _ = fs::remove_dir(link).or_else(|_| fs::remove_file(link));
 }
 
 // ---------------------------------------------------------------------------
