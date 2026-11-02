@@ -35,8 +35,17 @@ pub fn write_pid(dir: &Path, name: &str, pid: u32) {
     }
     let path = dir.join(format!("{}.{}", pid, name));
     let content = match identity::process_start_time(pid) {
-        Some(secs) => identity::owner_identity(pid, secs),
-        None => {
+        Ok(Some(secs)) => identity::owner_identity(pid, secs),
+        Err(error) => {
+            warn!(
+                name,
+                pid,
+                %error,
+                "Cannot read the process table; PID file will not be verifiable"
+            );
+            format!("{}{}{}", pid, identity::OWNER_SEP, identity::UNKNOWN_STAMP)
+        }
+        Ok(None) => {
             // Only reachable if the process went away between spawning and
             // this call. Recorded unverifiably on purpose: a reader will
             // treat it as stale, which for a process that is already gone
@@ -67,6 +76,9 @@ pub enum Recorded {
     /// something else, which reads the same way and must, since acting on
     /// it either way would be acting on a stranger.
     Stale(u32),
+    /// A file, but the process table cannot be read, so whether its subject
+    /// still runs is unknown. Neither started over nor signalled.
+    Unknown(u32),
 }
 
 /// Read the PID file for `name` and say whether its subject is still
@@ -94,17 +106,20 @@ pub fn recorded(dir: &Path, name: &str) -> Recorded {
         let Ok(pid) = pid_str.parse::<u32>() else {
             continue;
         };
-        let verified = fs::read_to_string(entry.path())
-            .ok()
-            .and_then(|content| {
-                let (recorded_pid, stamp) = identity::parse_owner(content.trim())?;
-                Some(recorded_pid == pid && identity::running_since(pid, stamp))
-            })
-            .unwrap_or(false);
-        return if verified {
-            Recorded::Live(pid)
-        } else {
-            Recorded::Stale(pid)
+        let verified = fs::read_to_string(entry.path()).ok().and_then(|content| {
+            let (recorded_pid, stamp) = identity::parse_owner(content.trim())?;
+            if recorded_pid != pid {
+                return Some(Ok(false));
+            }
+            Some(identity::running_since(pid, stamp))
+        });
+        return match verified {
+            Some(Ok(true)) => Recorded::Live(pid),
+            Some(Ok(false)) | None => Recorded::Stale(pid),
+            Some(Err(error)) => {
+                warn!(name, pid, %error, "Cannot read the process table; PID file unverified");
+                Recorded::Unknown(pid)
+            }
         };
     }
     Recorded::Absent
@@ -256,8 +271,16 @@ pub fn capture_stderr(command: &mut Command, logdir: &Path, bin: &str) {
 /// the run's kill token, and the token sweep after a teardown reclaims
 /// whatever outlives this.
 pub fn stop_recorded(dir: &Path, name: &str, grace: Duration) {
-    let Recorded::Live(pid) = recorded(dir, name) else {
-        return;
+    let pid = match recorded(dir, name) {
+        Recorded::Live(pid) => pid,
+        Recorded::Unknown(pid) => {
+            warn!(
+                name,
+                pid, "Cannot verify the recorded process; not signalling it"
+            );
+            return;
+        }
+        Recorded::Absent | Recorded::Stale(_) => return,
     };
     info!(
         name,
@@ -269,7 +292,7 @@ pub fn stop_recorded(dir: &Path, name: &str, grace: Duration) {
 
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline {
-        if !matches!(recorded(dir, name), Recorded::Live(_)) {
+        if matches!(recorded(dir, name), Recorded::Absent | Recorded::Stale(_)) {
             return;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -288,7 +311,13 @@ pub fn stop_recorded(dir: &Path, name: &str, grace: Duration) {
 fn collect_descendants(root: u32) -> Vec<u32> {
     use sysinfo::{Pid, ProcessesToUpdate, System};
 
-    let mut system = System::new();
+    let mut system = match System::new() {
+        Ok(system) => system,
+        Err(error) => {
+            warn!(root, %error, "Cannot read the process table; no descendants to kill");
+            return Vec::new();
+        }
+    };
     system.refresh_processes(ProcessesToUpdate::All, true);
     let root_pid = Pid::from_u32(root);
     let mut descendants: Vec<u32> = Vec::new();

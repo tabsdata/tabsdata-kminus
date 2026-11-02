@@ -22,26 +22,33 @@
 /// process, so use it only where something else establishes identity.
 ///
 /// On Unix an unreaped zombie answers yes; that reservation is exactly
-/// what makes the PID safe to signal until the parent reaps. On Windows
-/// this asks the process object (`OpenProcess` + `GetExitCodeProcess`)
-/// rather than spawning `tasklist`; an unopenable (elevated) process
-/// reads as absent, and an exit code of 259 (`STILL_ACTIVE`) reads as
-/// running — the documented wart of this API.
+/// what makes the PID safe to signal until the parent reaps. A process
+/// this one may not signal (`EPERM`) exists all the same, and answers yes.
+/// On Windows this asks the process object (`OpenProcess` +
+/// `GetExitCodeProcess`) rather than spawning `tasklist`; a process that
+/// refuses to be opened (elevated, `ERROR_ACCESS_DENIED`) exists and
+/// answers yes, and an exit code of 259 (`STILL_ACTIVE`) reads as running
+/// — the documented wart of this API.
 pub fn is_pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+        matches!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None),
+            Ok(()) | Err(nix::errno::Errno::EPERM)
+        )
     }
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_ACCESS_DENIED, GetLastError, STILL_ACTIVE,
+        };
         use windows_sys::Win32::System::Threading::{
             GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         };
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if handle.is_null() {
-                return false;
+                return GetLastError() == ERROR_ACCESS_DENIED;
             }
             let mut code: u32 = 0;
             let ok = GetExitCodeProcess(handle, &mut code) != 0;

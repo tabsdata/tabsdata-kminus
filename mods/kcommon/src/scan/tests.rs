@@ -56,7 +56,11 @@ fn spawn_helper(token: &str) -> Child {
 fn wait_visible(token: &str) -> bool {
     let deadline = Instant::now() + POLL_TIMEOUT;
     while Instant::now() < deadline {
-        if !Scan::load().under(KM_KILL_TOKEN_VAR, token).is_empty() {
+        if !Scan::load()
+            .unwrap()
+            .under(KM_KILL_TOKEN_VAR, token)
+            .is_empty()
+        {
             return true;
         }
         std::thread::sleep(POLL_INTERVAL);
@@ -105,7 +109,7 @@ fn under_selects_by_prefix_and_excludes_wider_scopes() {
     let mut b = spawn_helper(&pod_b);
     assert!(wait_visible(&pod_a) && wait_visible(&pod_b));
 
-    let scan = Scan::load();
+    let scan = Scan::load().unwrap();
     let under_a = scan.under(KM_KILL_TOKEN_VAR, run.scope("pod-a").as_prefix());
     assert!(under_a.iter().any(|f| f.pid == a.id()));
     assert!(
@@ -128,7 +132,7 @@ fn under_selects_by_prefix_and_excludes_wider_scopes() {
 #[test]
 #[serial(kcommon_sweep)]
 fn owner_liveness_separates_this_run_from_a_dead_one() {
-    let scan_before = Scan::load();
+    let scan_before = Scan::load().unwrap();
     assert!(scan_before.owner_alive(own_run().as_str()));
     assert!(!scan_before.owner_alive(&dead_owner_token("x")));
     // Unparseable is "cannot prove stale", never "stale".
@@ -161,7 +165,7 @@ fn kill_found_reverifies_before_signalling() {
     let token = dead_owner_token("reverify");
     let mut helper = spawn_helper(&token);
     assert!(wait_visible(&token));
-    let snapshot = Scan::load().under(KM_KILL_TOKEN_VAR, &token);
+    let snapshot = Scan::load().unwrap().under(KM_KILL_TOKEN_VAR, &token);
     assert_eq!(snapshot.len(), 1);
 
     // The helper dies between the snapshot and the kill; its number is now
@@ -218,7 +222,7 @@ fn terminate_found_asks_gracefully() {
     let token = dead_owner_token("graceful");
     let mut helper = spawn_helper(&token);
     assert!(wait_visible(&token));
-    let found = Scan::load().under(KM_KILL_TOKEN_VAR, &token);
+    let found = Scan::load().unwrap().under(KM_KILL_TOKEN_VAR, &token);
 
     assert_eq!(terminate_found(&found), 1);
 

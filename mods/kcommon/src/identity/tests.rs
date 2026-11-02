@@ -66,13 +66,13 @@ fn is_unknown_stamp_recognises_only_the_fallback() {
 #[test]
 fn running_since_confirms_this_process_and_rejects_impostors() {
     let own = std::process::id();
-    let start = process_start_time(own).expect("own start time");
+    let start = process_start_time(own).unwrap().expect("own start time");
 
-    assert!(running_since(own, &owner_stamp(start)));
+    assert!(running_since(own, &owner_stamp(start)).unwrap());
     // Right pid, wrong birth: what a recycled number looks like.
-    assert!(!running_since(own, UNKNOWN_STAMP));
+    assert!(!running_since(own, UNKNOWN_STAMP).unwrap());
     // A pid nothing holds.
-    assert!(!running_since(u32::MAX - 1, &owner_stamp(start)));
+    assert!(!running_since(u32::MAX - 1, &owner_stamp(start)).unwrap());
 }
 
 #[cfg(unix)]
@@ -92,9 +92,13 @@ fn running_since_rejects_an_exited_child() {
         .spawn()
         .expect("spawn");
     let pid = child.id();
-    let stamp = owner_stamp(process_start_time(pid).expect("start time of a running child"));
+    let stamp = owner_stamp(
+        process_start_time(pid)
+            .unwrap()
+            .expect("start time of a running child"),
+    );
     assert!(
-        running_since(pid, &stamp),
+        running_since(pid, &stamp).unwrap(),
         "a live child must read as running",
     );
 
@@ -102,7 +106,7 @@ fn running_since_rejects_an_exited_child() {
 
     // Poll until the exit has landed in the process table.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while running_since(pid, &stamp) {
+    while running_since(pid, &stamp).unwrap() {
         assert!(
             std::time::Instant::now() < deadline,
             "an unreaped exited child must stop reading as running",

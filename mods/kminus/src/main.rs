@@ -1157,6 +1157,13 @@ fn command_start(args: StartArgs) {
     // Refuse to start over a live instance. `cleanup_stale_pids` (below)
     // would otherwise silently kill the running km and take over, which
     // reads as a no-op to the user. Report status and exit instead.
+    if let Recorded::Unknown(pid) = recorded(&paths.pids, BIN_KM) {
+        eprintln!(
+            "ERROR: cannot tell whether Tabsdata K- (K minus) is already running \
+             (km pid={pid}): the process table cannot be read. Not starting a second one."
+        );
+        std::process::exit(1);
+    }
     if matches!(recorded(&paths.pids, BIN_KM), Recorded::Live(_)) {
         println!();
         println!("Tabsdata K- (K minus) is already running");
@@ -1439,7 +1446,14 @@ fn command_stop(args: StopArgs) {
             shutdown_from_pids(&paths, ports.as_ref());
             println!("Stopped.");
         }
-        _ => {
+        Recorded::Unknown(pid) => {
+            eprintln!(
+                "ERROR: cannot tell whether km (pid={pid}) is running: the process table \
+                 cannot be read. Nothing was signalled."
+            );
+            std::process::exit(1);
+        }
+        Recorded::Absent | Recorded::Stale(_) => {
             // No live km orchestrator. Either it is not running, or it
             // died leaving children behind. Clean up directly.
             let stale: Vec<&str> = [virtual_kubelet::BIN, pod_runner::BIN, control_plane::BIN]
@@ -1492,6 +1506,10 @@ fn print_component_status(paths: &Paths, name: &str) {
     match recorded(&paths.pids, name) {
         Recorded::Live(pid) => println!("  {:<16} running   pid={}{}", name, pid, beat),
         Recorded::Stale(pid) => println!("  {:<16} DEAD      pid={} (stale PID file)", name, pid),
+        Recorded::Unknown(pid) => println!(
+            "  {:<16} UNKNOWN   pid={} (process table unreadable)",
+            name, pid
+        ),
         Recorded::Absent => println!("  {:<16} stopped", name),
     }
 }

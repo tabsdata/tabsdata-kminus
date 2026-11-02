@@ -50,6 +50,14 @@ fn is_pid_alive_sees_this_process_and_not_an_unused_number() {
     assert!(!is_pid_alive(UNUSED_PID));
 }
 
+/// PID 1 always runs and belongs to root: an unprivileged caller gets
+/// `EPERM` asking about it, which must still read as alive.
+#[cfg(unix)]
+#[test]
+fn is_pid_alive_sees_a_process_it_may_not_signal() {
+    assert!(is_pid_alive(1));
+}
+
 #[test]
 fn force_kill_stops_a_running_process() {
     let mut child = long_running();

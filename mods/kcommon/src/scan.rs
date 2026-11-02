@@ -36,23 +36,20 @@ pub struct Found {
 /// children re-expose it. A process that sanitised its own environment is
 /// invisible along with everything below it. And on Windows an elevated
 /// process cannot be read by a non-elevated scanner.
+///
+/// Loading fails when the process table cannot be read at all. A sweep
+/// then finds nothing and kills nothing: it acts only on what it can see.
 pub struct Scan(System);
 
-impl Default for Scan {
-    fn default() -> Self {
-        Self::load()
-    }
-}
-
 impl Scan {
-    pub fn load() -> Self {
-        let mut system = System::new();
+    pub fn load() -> Result<Self, sysinfo::Error> {
+        let mut system = System::new()?;
         system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::nothing().with_environ(UpdateKind::Always),
         );
-        Self(system)
+        Ok(Self(system))
     }
 
     /// Every process whose `var` token starts with `prefix` — excluding
@@ -104,9 +101,16 @@ impl Scan {
 
 /// Whether the process at `pid` still carries exactly this token in `var`
 /// — re-read from the live process, which is what makes killing from an
-/// aged snapshot safe. One single-process environment read.
+/// aged snapshot safe. One single-process environment read. A process
+/// table that cannot be read confirms nothing, so it reads as `false`.
 pub fn still_carries(pid: u32, var: &str, expected: &str) -> bool {
-    let mut system = System::new();
+    let mut system = match System::new() {
+        Ok(system) => system,
+        Err(error) => {
+            warn!(pid, %error, "Cannot read the process table; not signalling");
+            return false;
+        }
+    };
     let pid = Pid::from_u32(pid);
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
@@ -180,7 +184,13 @@ pub fn kill_found(var: &str, found: &[Found]) -> usize {
 pub fn kill_until_clean(var: &str, prefix: &str, max_rounds: usize) -> usize {
     let mut total = 0;
     for round in 0..max_rounds {
-        let found = Scan::load().under(var, prefix);
+        let found = match Scan::load() {
+            Ok(scan) => scan.under(var, prefix),
+            Err(error) => {
+                warn!(prefix, %error, "Cannot read the process table; sweep stopped");
+                return total;
+            }
+        };
         if found.is_empty() {
             return total;
         }
@@ -219,7 +229,13 @@ pub fn kill_until_clean(var: &str, prefix: &str, max_rounds: usize) -> usize {
 /// token alone — and leaves a live owner's processes strictly alone.
 /// Returns how many were killed.
 pub fn kill_strays_of_dead_runs(var: &str) -> usize {
-    let scan = Scan::load();
+    let scan = match Scan::load() {
+        Ok(scan) => scan,
+        Err(error) => {
+            warn!(%error, "Cannot read the process table; strays left for the next sweep");
+            return 0;
+        }
+    };
     let strays = scan.strays_of_dead_owners(var);
     if strays.is_empty() {
         return 0;

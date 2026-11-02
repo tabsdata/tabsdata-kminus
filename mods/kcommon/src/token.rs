@@ -102,11 +102,13 @@ impl Run {
     pub fn current() -> Self {
         let pid = std::process::id();
         let owner = match identity::process_start_time(pid) {
-            Some(secs) => identity::owner_identity(pid, secs),
+            Ok(Some(secs)) => identity::owner_identity(pid, secs),
             // Unverifiable on purpose: a token nobody can confirm alive is
             // reclaimed by the next run's sweep, which for an identity
             // that could not even be read is the safe direction.
-            None => format!("{}{}{}", pid, identity::OWNER_SEP, identity::UNKNOWN_STAMP),
+            Ok(None) | Err(_) => {
+                format!("{}{}{}", pid, identity::OWNER_SEP, identity::UNKNOWN_STAMP)
+            }
         };
         let millis = chrono::Utc::now().timestamp_subsec_millis();
         Run(format!("{owner}.{millis:03}"))

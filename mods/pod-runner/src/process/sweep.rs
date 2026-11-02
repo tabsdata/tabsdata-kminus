@@ -157,9 +157,15 @@ impl Orphans {
     pub async fn find(prefix: &str) -> Self {
         let prefix = prefix.to_string();
         Self {
-            found: on_scan_slot(move || Scan::load().under(PR_KILL_TOKEN_VAR, &prefix))
-                .await
-                .unwrap_or_default(),
+            found: on_scan_slot(move || match Scan::load() {
+                Ok(scan) => scan.under(PR_KILL_TOKEN_VAR, &prefix),
+                Err(error) => {
+                    warn!(prefix, %error, "Cannot read the process table; no orphans found");
+                    Vec::new()
+                }
+            })
+            .await
+            .unwrap_or_default(),
             terminated_at: None,
         }
     }
@@ -415,7 +421,7 @@ mod tests {
 
     #[test]
     fn owner_alive_recognises_this_runner_and_rejects_dead_ones() {
-        let scan = Scan::load();
+        let scan = Scan::load().unwrap();
         assert!(scan.owner_alive(&container_token(&pod_prefix("p", "u"), "c")));
         assert!(!scan.owner_alive(&dead_runner_token("p_u", "c")));
         // Our own PID, but not our start time: exactly what a restarted

@@ -68,35 +68,38 @@ pub fn is_unknown_stamp(stamp: &str) -> bool {
     stamp == UNKNOWN_STAMP
 }
 
-/// Start time of `pid` in epoch seconds, if the process can be read.
+/// Start time of `pid` in epoch seconds: `None` when no such process
+/// exists, an error when the process table cannot be read at all — which
+/// says nothing about the process, so callers must not read it as gone.
 /// Refreshed without environments or command lines, which are what make
 /// a process-table read expensive.
-pub fn process_start_time(pid: u32) -> Option<u64> {
-    let mut system = System::new();
+pub fn process_start_time(pid: u32) -> Result<Option<u64>, sysinfo::Error> {
+    let mut system = System::new()?;
     let pid = Pid::from_u32(pid);
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         false,
         ProcessRefreshKind::nothing(),
     );
-    system.process(pid).map(|p| p.start_time())
+    Ok(system.process(pid).map(|p| p.start_time()))
 }
 
 /// Whether a live process holds `pid` and started at `stamp` — the one
 /// question a bare liveness check cannot answer. A zombie reads as gone:
 /// it is still listed with its original start time, but nothing can be
-/// asked of it or waited for.
-pub fn running_since(pid: u32, stamp: &str) -> bool {
-    let mut system = System::new();
+/// asked of it or waited for. An error when the process table cannot be
+/// read: the answer is then unknown, neither running nor gone.
+pub fn running_since(pid: u32, stamp: &str) -> Result<bool, sysinfo::Error> {
+    let mut system = System::new()?;
     let pid = Pid::from_u32(pid);
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         false,
         ProcessRefreshKind::nothing(),
     );
-    system.process(pid).is_some_and(|p| {
+    Ok(system.process(pid).is_some_and(|p| {
         p.status() != sysinfo::ProcessStatus::Zombie && owner_stamp(p.start_time()) == stamp
-    })
+    }))
 }
 
 #[cfg(test)]
