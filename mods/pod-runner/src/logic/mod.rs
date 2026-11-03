@@ -35,14 +35,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use tracing::{Instrument, debug, info, info_span, trace, trace_span, warn};
+use tracing::{Instrument, debug, error, info, info_span, trace, trace_span, warn};
 
 use crate::metrics::Metrics;
 pub use crate::pod::container_log::ContainerLogOptions;
 use crate::pod::executor::{
     PodEventKind, PodExecutor, PodHandle, PodKillHandle, PodLogHandle, PodTask,
 };
-use crate::pod::prepare::prepare_pod;
+use crate::pod::prepare::{PrepareError, prepare_pod};
 pub use crate::pod::resolver::ResolverSet;
 use crate::process::sweep;
 use crate::spec::constants::*;
@@ -1358,7 +1358,9 @@ fn build_failed_prep_status(reason: &str, message: &str) -> PodStatus {
 /// - **Cancelled** by `delete_pod` — the task exits silently; the caller
 ///   has already removed the store and runtime entries.
 /// - **Other** preparation error (parse error, executor spawn failure,
-///   etc.) — pod transitions to `Failed`/`PodPreparationFailed`.
+///   an executable path too long for Windows, etc.) — pod transitions to
+///   `Failed`/`PodPreparationFailed`, with the full error as the status
+///   message. A too-long executable path is logged at error level.
 #[allow(clippy::too_many_arguments)]
 async fn prepare_and_run(
     id: PodId,
@@ -1423,6 +1425,17 @@ async fn prepare_and_run(
             let reason = if err.is_timeout() {
                 warn!(error = %err, "Pod preparation timed out");
                 REASON_DEADLINE_EXCEEDED
+            } else if let PrepareError::ExecutableTooLong {
+                container, path, ..
+            } = &err
+            {
+                error!(
+                    container = %container,
+                    path = %path,
+                    error = %err,
+                    "Pod preparation failed: executable path too long for Windows",
+                );
+                REASON_POD_PREPARATION_FAILED
             } else {
                 warn!(error = %err, "Pod preparation failed");
                 REASON_POD_PREPARATION_FAILED
@@ -3344,6 +3357,33 @@ mod tests {
                 init_cond.message, REASON_DEADLINE_EXCEEDED,
                 "Initialized condition should carry the DeadlineExceeded reason",
             );
+        }
+
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn executable_path_too_long_for_windows_fails_preparation() {
+            let (logic, _, _) = make_logic_with_store();
+            let mut pod = make_pod_spec("long", "exit 0");
+            pod.spec.containers[0].command = vec![format!(
+                "$(KM_CONTAINER_ROOT)/{}/x.exe",
+                "a".repeat(crate::pod::prepare::WINDOWS_EXECUTABLE_PATH_LIMIT)
+            )];
+            pod.spec.containers[0].args.clear();
+            logic.create_pod(pod).await.unwrap();
+
+            assert_eq!(wait_for_terminal(&logic, "long").await, PodPhase::Failed);
+            let status = logic.get_pod_status("default", "long").await.unwrap();
+            assert!(
+                status.message.contains("MAX_PATH") && status.message.contains("'main'"),
+                "the status message carries the full error, got: {}",
+                status.message,
+            );
+            let init_cond = status
+                .conditions
+                .iter()
+                .find(|c| c.condition_type == CONDITION_INITIALIZED)
+                .expect("Initialized condition should be set");
+            assert_eq!(init_cond.message, REASON_POD_PREPARATION_FAILED);
         }
 
         #[tokio::test]

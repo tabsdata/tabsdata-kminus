@@ -2,20 +2,25 @@
 
 //! Pod preparation — transform an original spec into a running spec.
 //!
-//! The preparation pipeline has four steps:
+//! The preparation pipeline has five steps:
 //!
 //! 1. **[`rewrite_pod_paths`]** — rewrite `workingDir` and `volumeMount.mountPath`
 //!    to physical paths under the pod working directory.
 //! 2. **[`resolve_k8s_values`]** — resolve environment variables and
-//!    fetch configmap data referenced by `configMap` volumes.
-//! 3. **[`create_container_dirs`]** — create container working directories and
+//!    fetch configmap data referenced by `configMap` volumes;
+//!    [`apply_envs_and_substitute`] then applies them and substitutes
+//!    `$(VAR)` in env, `command` and `args`.
+//! 3. **[`check_executable_paths`]** — on Windows only, reject the pod when a
+//!    container's resolved executable path exceeds
+//!    [`WINDOWS_EXECUTABLE_PATH_LIMIT`], before anything is written to disk.
+//! 4. **[`create_container_dirs`]** — create container working directories and
 //!    copy image template directories.
-//! 4. **[`setup_volumes`]** — materialize pod volumes under
+//! 5. **[`setup_volumes`]** — materialize pod volumes under
 //!    `<pod_dir>/volumes/` (emptyDir directories, hostPath symlinks,
 //!    configMap volume directories with one file per key) and symlink
 //!    each container mount path to its volume directory.
 //!
-//! [`prepare_pod`] runs all four steps in order and returns the running spec.
+//! [`prepare_pod`] runs all five steps in order and returns the running spec.
 //!
 //! # Waiting for missing configmaps / secrets
 //!
@@ -122,6 +127,21 @@ pub enum PrepareError {
     /// Image template directory is missing for a container.
     #[error("Image directory for container '{container}' not found at {path}")]
     ImageDirMissing { container: String, path: String },
+    /// A container's resolved executable path is longer than Windows supports.
+    #[error(
+        "Container '{container}' executable path is {length} characters, over the \
+         {limit}-character limit Windows supports: {path}. Windows caps a path at \
+         MAX_PATH, 260 characters including the terminating NUL; the executable, \
+         its interpreter's imports and its working directory break beyond it. \
+         Place the instance at a shorter location: a shorter user home directory, \
+         user name or instance name"
+    )]
+    ExecutableTooLong {
+        container: String,
+        path: String,
+        length: usize,
+        limit: usize,
+    },
     /// Filesystem I/O error with caller-supplied context.
     #[error("{context}: {source}")]
     Io {
@@ -172,6 +192,13 @@ const ENV_KM_CONTAINER_ROOT: &str = "KM_CONTAINER_ROOT";
 /// Annotation key added to metadata to indicate the pod has been prepared.
 const PREPARED_ANNOTATION: &str = "pr.tabsdata.com/prepared";
 
+/// Longest executable path, in UTF-16 units, a container may resolve to on
+/// Windows: `MAX_PATH` (260) less the terminating NUL.
+pub const WINDOWS_EXECUTABLE_PATH_LIMIT: usize = 259;
+
+/// Prefix that marks a Windows verbatim path; not part of the path length.
+const VERBATIM_PREFIX: &str = r"\\?\";
+
 /// Image value that means "no template to copy".
 const IMAGE_SKIP: &str = "/dev/null";
 
@@ -194,8 +221,9 @@ enum ImageKind {
 
 /// Prepare a pod spec for native execution.
 ///
-/// Runs the full pipeline: path rewriting, env resolution, directory
-/// creation (with image copying), and volume setup.
+/// Runs the full pipeline: path rewriting, env resolution and substitution,
+/// the Windows executable path length check, directory creation (with image
+/// copying), and volume setup.
 ///
 /// `images_dir` is the root used to resolve relative container `image`
 /// paths. Absolute `image` paths are used as-is. An empty path disables
@@ -212,6 +240,9 @@ pub async fn prepare_pod(
     let mut prepared = rewrite_pod_paths(spec, pod_dir)?;
     let resolved = resolve_k8s_values(&prepared, namespace, resolvers, timeout, cancel).await?;
     apply_envs_and_substitute(&mut prepared, &resolved);
+    if cfg!(windows) {
+        check_executable_paths(&prepared, WINDOWS_EXECUTABLE_PATH_LIMIT)?;
+    }
     create_container_dirs(&prepared, pod_dir, images_dir)?;
     setup_volumes(&prepared, &resolved, pod_dir)?;
     Ok(prepared)
@@ -420,7 +451,41 @@ fn substitute_dollar(s: &str, env: &HashMap<String, String>) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Step 3: create container dirs (+ image copy)
+// Step 3: check executable path lengths
+// ---------------------------------------------------------------------------
+
+/// Reject the pod if any container's executable path is longer than `limit`.
+///
+/// The executable is the first element of the substituted `command` (or of
+/// `args` when `command` is empty), measured the way the spawn sees it on
+/// Windows: `/` converted to `\`, without a `\\?\` verbatim prefix, and
+/// counted in UTF-16 units. Containers are checked init first, in
+/// declaration order; the first offender is reported.
+///
+/// Pure and platform-independent; [`prepare_pod`] enforces it only on
+/// Windows, with [`WINDOWS_EXECUTABLE_PATH_LIMIT`].
+pub fn check_executable_paths(spec: &PodSpec, limit: usize) -> Result<(), PrepareError> {
+    for c in spec.spec.all_containers() {
+        let Some(executable) = c.command.first().or_else(|| c.args.first()) else {
+            continue;
+        };
+        let native = executable.replace('/', "\\");
+        let path = native.strip_prefix(VERBATIM_PREFIX).unwrap_or(&native);
+        let length = path.encode_utf16().count();
+        if length > limit {
+            return Err(PrepareError::ExecutableTooLong {
+                container: c.name.clone(),
+                path: path.to_string(),
+                length,
+                limit,
+            });
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Step 4: create container dirs (+ image copy)
 // ---------------------------------------------------------------------------
 
 /// Create container working directories and populate them from the
@@ -571,7 +636,7 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), PrepareError> {
 }
 
 // ---------------------------------------------------------------------------
-// Step 4: set up volumes
+// Step 5: set up volumes
 // ---------------------------------------------------------------------------
 
 /// Materialize pod volumes under `<pod_dir>/volumes/` (emptyDir
@@ -1172,6 +1237,194 @@ mod tests {
             fs::read_to_string(mount.join("logging.yaml")).unwrap(),
             "level: info"
         );
+    }
+
+    #[tokio::test]
+    async fn full_pipeline_checks_the_substituted_executable_path_on_windows_only() {
+        let dir = temp_dir("full-pipeline-long-executable");
+        let mut app = make_container("app", "", vec![]);
+        app.command = vec![format!(
+            "$(KM_CONTAINER_ROOT)/{}/x.exe",
+            "a".repeat(WINDOWS_EXECUTABLE_PATH_LIMIT)
+        )];
+        let pod = make_pod(vec![app], vec![]);
+        let (_tx, mut cancel) = watch::channel(());
+
+        let result = prepare_pod(
+            &pod,
+            &dir,
+            "default",
+            &ResolverSet::default(),
+            Path::new(""),
+            None,
+            &mut cancel,
+        )
+        .await;
+
+        if cfg!(windows) {
+            let err = result.unwrap_err();
+            let PrepareError::ExecutableTooLong {
+                container, path, ..
+            } = &err
+            else {
+                panic!("expected ExecutableTooLong, got {err:?}");
+            };
+            assert_eq!(container, "app");
+            assert!(!path.contains("$(KM_CONTAINER_ROOT)"), "{path}");
+            assert!(
+                !dir.join("work").exists(),
+                "nothing written before the check"
+            );
+        } else {
+            result.unwrap();
+        }
+    }
+
+    // -- check_executable_paths --
+
+    fn with_executable(name: &str, executable: &str) -> Container {
+        Container {
+            name: name.to_string(),
+            command: vec![executable.to_string()],
+            ..Default::default()
+        }
+    }
+
+    /// An absolute Windows executable path of exactly `len` UTF-16 units.
+    fn executable_of_len(len: usize) -> String {
+        let head = r"C:\pods\";
+        let tail = r"\x.exe";
+        format!("{head}{}{tail}", "a".repeat(len - head.len() - tail.len()))
+    }
+
+    fn too_long(result: Result<(), PrepareError>) -> (String, String, usize, usize) {
+        match result {
+            Err(PrepareError::ExecutableTooLong {
+                container,
+                path,
+                length,
+                limit,
+            }) => (container, path, length, limit),
+            other => panic!("expected ExecutableTooLong, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn executable_path_at_the_limit_is_accepted() {
+        let pod = make_pod(
+            vec![with_executable("app", &executable_of_len(259))],
+            vec![],
+        );
+        check_executable_paths(&pod, 259).unwrap();
+    }
+
+    #[test]
+    fn executable_path_one_over_the_limit_is_rejected() {
+        let executable = executable_of_len(260);
+        let pod = make_pod(vec![with_executable("app", &executable)], vec![]);
+        let (container, path, length, limit) = too_long(check_executable_paths(&pod, 259));
+        assert_eq!(container, "app");
+        assert_eq!(path, executable);
+        assert_eq!((length, limit), (260, 259));
+    }
+
+    #[test]
+    fn executable_path_is_measured_with_backslashes() {
+        let executable = executable_of_len(260).replace('\\', "/");
+        let pod = make_pod(vec![with_executable("app", &executable)], vec![]);
+        let (_, path, length, _) = too_long(check_executable_paths(&pod, 259));
+        assert_eq!(path, executable_of_len(260));
+        assert_eq!(length, 260);
+    }
+
+    #[test]
+    fn verbatim_prefix_does_not_count_towards_the_length() {
+        let executable = format!(r"\\?\{}", executable_of_len(259));
+        let pod = make_pod(vec![with_executable("app", &executable)], vec![]);
+        check_executable_paths(&pod, 259).unwrap();
+    }
+
+    #[test]
+    fn executable_path_is_counted_in_utf16_units() {
+        let executable = executable_of_len(259).replacen('a', "\u{10400}", 1);
+        let pod = make_pod(vec![with_executable("app", &executable)], vec![]);
+        let (_, _, length, _) = too_long(check_executable_paths(&pod, 259));
+        assert_eq!(length, 260);
+    }
+
+    #[test]
+    fn executable_falls_back_to_the_first_arg_without_a_command() {
+        let mut app = Container {
+            name: "app".to_string(),
+            ..Default::default()
+        };
+        app.args = vec![executable_of_len(300), "short".to_string()];
+        let pod = make_pod(vec![app], vec![]);
+        let (container, _, length, _) = too_long(check_executable_paths(&pod, 259));
+        assert_eq!((container.as_str(), length), ("app", 300));
+    }
+
+    #[test]
+    fn only_the_executable_is_checked_not_its_arguments() {
+        let mut app = with_executable("app", &executable_of_len(100));
+        app.args = vec![executable_of_len(400)];
+        let pod = make_pod(vec![app], vec![]);
+        check_executable_paths(&pod, 259).unwrap();
+    }
+
+    #[test]
+    fn container_without_command_or_args_is_skipped() {
+        let pod = make_pod(vec![make_container("app", "", vec![])], vec![]);
+        check_executable_paths(&pod, 259).unwrap();
+    }
+
+    #[test]
+    fn init_container_executable_path_is_checked() {
+        let pod = make_pod(
+            vec![with_executable("app", &executable_of_len(100))],
+            vec![with_executable("setup", &executable_of_len(300))],
+        );
+        let (container, _, _, _) = too_long(check_executable_paths(&pod, 259));
+        assert_eq!(container, "setup");
+    }
+
+    #[test]
+    fn first_offender_is_reported_init_containers_first() {
+        let pod = make_pod(
+            vec![
+                with_executable("ok", &executable_of_len(100)),
+                with_executable("main-long", &executable_of_len(300)),
+            ],
+            vec![
+                with_executable("init-ok", &executable_of_len(100)),
+                with_executable("init-long", &executable_of_len(280)),
+            ],
+        );
+        let (container, _, length, _) = too_long(check_executable_paths(&pod, 259));
+        assert_eq!((container.as_str(), length), ("init-long", 280));
+    }
+
+    #[test]
+    fn executable_path_error_names_the_cause_and_the_remedy() {
+        let executable = executable_of_len(260);
+        let pod = make_pod(vec![with_executable("app", &executable)], vec![]);
+        let err = check_executable_paths(&pod, 259).unwrap_err();
+        assert!(!err.is_timeout());
+        assert!(!err.is_cancelled());
+        let message = err.to_string();
+        for needle in [
+            "'app'",
+            executable.as_str(),
+            "260 characters",
+            "259-character",
+            "MAX_PATH",
+            "terminating NUL",
+            "user home",
+            "user name",
+            "instance name",
+        ] {
+            assert!(message.contains(needle), "{needle:?} missing in: {message}");
+        }
     }
 
     // -- apply_envs_and_substitute --

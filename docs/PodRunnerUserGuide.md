@@ -148,6 +148,13 @@ during pod preparation, matching the kubelet's expansion semantics:
 
 Substitution runs before (and in addition to) the container shell's own `$VAR` expansion.
 
+On Windows the executable a container runs (the first element of `command`, or of `args` when
+`command` is empty), once substituted, must be at most 259 characters: Windows' `MAX_PATH` is 260
+including the terminating NUL, and executables, Python interpreters in particular, break beyond it.
+A longer one fails pod preparation: the pod goes `Failed` with reason `PodPreparationFailed`, and
+its status message names the container, the path and its length. Shorten the location the pod
+runner works in (for a Tabsdata instance: the user home directory, user name or instance name).
+
 ### Init Containers
 
 Init containers run sequentially before main containers:

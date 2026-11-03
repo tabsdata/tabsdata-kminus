@@ -1487,11 +1487,15 @@ fn normalize_spawn_path(path: &Path) -> PathBuf {
 
 /// `CreateProcess` takes the program in `lpApplicationName`, which is capped at
 /// `MAX_PATH` — 260 including the terminating null — no matter what the
-/// system-wide long-path setting or the caller's manifest says. A pod path
-/// stacks the instance name, the run directory, the pod name with its
-/// ReplicaSet hash and UID, the container directory and the interpreter prefix,
-/// and crosses that routinely; the spawn then fails with `ERROR_PATH_NOT_FOUND`
-/// (os error 3), which reads as a missing binary rather than a length problem.
+/// system-wide long-path setting or the caller's manifest says. Over it the
+/// spawn fails with `ERROR_PATH_NOT_FOUND` (os error 3), which reads as a
+/// missing binary rather than a length problem.
+///
+/// A container's program never gets here over the cap: pod preparation
+/// rejects it first ([`crate::pod::prepare::check_executable_paths`]), because
+/// lifting the `CreateProcess` cap is not enough — the interpreter, its
+/// imports and the working directory still break beyond `MAX_PATH`. The
+/// handling below keeps the executor correct on its own for any caller.
 #[cfg(windows)]
 const MAX_PATH_LIMIT: usize = 260;
 

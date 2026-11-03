@@ -249,7 +249,9 @@ Success responses return the requested object directly. Errors return `{ "error"
 2. Preparation
        Rewrite paths to physical filesystem locations.
        Resolve environment variables and configmap-volume data from
-       secrets/configmaps.
+       secrets/configmaps, and substitute $(VAR) in env, command and args.
+       On Windows, reject the pod when a container's resolved executable path
+       is longer than 259 characters (MAX_PATH less the terminating NUL).
        Create container working directories.
        Copy image directory templates.
        Set up volume mounts (emptyDir dirs, hostPath symlinks, configMap
