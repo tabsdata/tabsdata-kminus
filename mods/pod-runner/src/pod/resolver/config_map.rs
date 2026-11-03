@@ -13,8 +13,10 @@
 //!   returned;
 //! - the cancel signal fires — [`ConfigMapResolverErrorKind::Cancelled`]
 //!   is returned;
-//! - a non-retryable error occurs (e.g. YAML parse, unreachable kube API)
+//! - a non-retryable error occurs (e.g. YAML parse, a kube API 4xx)
 //!   — [`ConfigMapResolverErrorKind::Other`] is returned without retrying.
+//!
+//! Transient kube API failures (5xx, 429, transport) are retried the same way.
 //!
 //! Existence is checked at the **entry** (configmap object) level. The
 //! resolver does not inspect individual keys — a missing key inside an
@@ -135,7 +137,7 @@ impl ConfigMapResolver for FileConfigMapResolver {
             OP_NAME,
             timeout,
             cancel,
-            ConfigMapResolverError::is_not_found,
+            ConfigMapResolverError::retry,
             || async { self.try_fetch(names) },
         )
         .await
@@ -169,9 +171,7 @@ impl KubeConfigMapResolver {
         Ok(Self { client })
     }
 
-    /// Single-pass fetch. A kube API 404 produces
-    /// [`ConfigMapResolverErrorKind::NotFound`]; everything else is
-    /// classified as [`ConfigMapResolverErrorKind::Other`] (no retry).
+    /// Single-pass fetch, classified by [`ConfigMapResolverError::from_kube`].
     async fn try_fetch(
         &self,
         namespace: &str,
@@ -184,15 +184,10 @@ impl KubeConfigMapResolver {
         let mut result = HashMap::new();
 
         for name in names {
-            let cm = match api.get(name).await {
-                Ok(c) => c,
-                Err(kube::Error::Api(e)) if e.code == 404 => {
-                    return Err(ConfigMapResolverError::not_found(name, e.message));
-                }
-                Err(e) => {
-                    return Err(ConfigMapResolverError::other(name, format!("{}", e)));
-                }
-            };
+            let cm = api
+                .get(name)
+                .await
+                .map_err(|e| ConfigMapResolverError::from_kube(name, e))?;
 
             let data: HashMap<String, String> = cm.data.unwrap_or_default().into_iter().collect();
             result.insert(name.clone(), data);
@@ -214,7 +209,7 @@ impl ConfigMapResolver for KubeConfigMapResolver {
             OP_NAME,
             timeout,
             cancel,
-            ConfigMapResolverError::is_not_found,
+            ConfigMapResolverError::retry,
             || self.try_fetch(namespace, names),
         )
         .await
@@ -378,5 +373,57 @@ mod tests {
         let other = ConfigMapResolverError::other("c", "boom");
         assert!(!other.is_not_found());
         assert_eq!(other.kind, ConfigMapResolverErrorKind::Other);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn kube_resolver_retries_a_transient_api_failure() {
+        use super::super::test_kube::{ok_body, scripted_client, status_body};
+        use std::sync::atomic::Ordering;
+
+        let (client, calls) = scripted_client(vec![
+            status_body(500, "etcdserver: request timed out"),
+            ok_body(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "settings", "namespace": "default"},
+                "data": {"level": "info"},
+            })),
+        ]);
+        let resolver = KubeConfigMapResolver { client };
+        let (_tx, mut rx) = watch::channel(());
+
+        let result = resolver
+            .config_maps(
+                "default",
+                &["settings".to_string()],
+                Some(Duration::from_secs(60)),
+                &mut rx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["settings"]["level"], "info");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn kube_resolver_does_not_retry_a_refusal() {
+        use super::super::test_kube::{scripted_client, status_body};
+        use std::sync::atomic::Ordering;
+
+        let (client, calls) = scripted_client(vec![status_body(403, "forbidden")]);
+        let resolver = KubeConfigMapResolver { client };
+        let (_tx, mut rx) = watch::channel(());
+
+        let err = resolver
+            .config_maps(
+                "default",
+                &["settings".to_string()],
+                Some(Duration::from_secs(60)),
+                &mut rx,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ConfigMapResolverErrorKind::Other);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

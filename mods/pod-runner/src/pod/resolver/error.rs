@@ -15,8 +15,9 @@
 //! pre-unification API so existing callers compile unchanged.
 
 use std::marker::PhantomData;
+use std::time::Duration;
 
-use super::backoff::PollError;
+use super::backoff::{PollError, Retry};
 
 // ---------------------------------------------------------------------------
 // Resource markers
@@ -61,11 +62,12 @@ impl ResolverResource for ConfigMapResource {
 pub enum ResolverErrorKind {
     /// The named resource is not (yet) defined. Retryable.
     NotFound,
+    Transient,
     /// The wait exceeded the timeout. Pod should transition to Failed.
     Timeout,
     /// The cancel signal fired during the wait.
     Cancelled,
-    /// Non-retryable failure (parse error, unreachable kube API, etc.).
+    /// Non-retryable failure (parse error, kube API 4xx, etc.).
     Other,
 }
 
@@ -78,6 +80,7 @@ pub struct ResolverError<R: ResolverResource> {
     pub name: String,
     pub message: String,
     pub kind: ResolverErrorKind,
+    pub retry_after: Option<Duration>,
     _marker: PhantomData<R>,
 }
 
@@ -92,6 +95,36 @@ impl<R: ResolverResource> ResolverError<R> {
         Self::with_kind(name, message, ResolverErrorKind::Other)
     }
 
+    pub fn transient(
+        name: impl Into<String>,
+        message: impl Into<String>,
+        retry_after: Option<Duration>,
+    ) -> Self {
+        Self {
+            retry_after,
+            ..Self::with_kind(name, message, ResolverErrorKind::Transient)
+        }
+    }
+
+    pub fn from_kube(name: &str, err: kube::Error) -> Self {
+        match err {
+            kube::Error::Api(status) if status.code == 404 => Self::not_found(name, status.message),
+            kube::Error::Api(status) if status.code == 429 || status.code >= 500 => {
+                let retry_after = status
+                    .details
+                    .as_ref()
+                    .map(|d| d.retry_after_seconds)
+                    .filter(|&secs| secs > 0)
+                    .map(|secs| Duration::from_secs(secs.into()));
+                Self::transient(name, kube::Error::Api(status).to_string(), retry_after)
+            }
+            e @ (kube::Error::HyperError(_) | kube::Error::Service(_)) => {
+                Self::transient(name, e.to_string(), None)
+            }
+            e => Self::other(name, e.to_string()),
+        }
+    }
+
     fn with_kind(
         name: impl Into<String>,
         message: impl Into<String>,
@@ -101,6 +134,7 @@ impl<R: ResolverResource> ResolverError<R> {
             name: name.into(),
             message: message.into(),
             kind,
+            retry_after: None,
             _marker: PhantomData,
         }
     }
@@ -108,6 +142,16 @@ impl<R: ResolverResource> ResolverError<R> {
     /// True when this is a [`ResolverErrorKind::NotFound`].
     pub fn is_not_found(&self) -> bool {
         self.kind == ResolverErrorKind::NotFound
+    }
+
+    pub fn retry(&self) -> Retry {
+        match self.kind {
+            ResolverErrorKind::NotFound => Retry::Backoff,
+            ResolverErrorKind::Transient => self.retry_after.map_or(Retry::Backoff, Retry::After),
+            ResolverErrorKind::Timeout
+            | ResolverErrorKind::Cancelled
+            | ResolverErrorKind::Other => Retry::Never,
+        }
     }
 }
 
@@ -123,6 +167,7 @@ impl<R: ResolverResource> From<PollError<ResolverError<R>>> for ResolverError<R>
                     last_err.message,
                 ),
                 kind: ResolverErrorKind::Timeout,
+                retry_after: None,
                 _marker: PhantomData,
             },
             PollError::Cancelled { elapsed } => Self {
@@ -133,6 +178,7 @@ impl<R: ResolverResource> From<PollError<ResolverError<R>>> for ResolverError<R>
                     elapsed.as_secs_f64(),
                 ),
                 kind: ResolverErrorKind::Cancelled,
+                retry_after: None,
                 _marker: PhantomData,
             },
             PollError::Fatal(e) => e,
@@ -212,5 +258,61 @@ mod tests {
         let err: SecretResolverError = poll_err.into();
         assert_eq!(err.kind, ResolverErrorKind::Other);
         assert_eq!(err.name, "creds");
+    }
+
+    fn api_error(code: u16, retry_after_seconds: u32) -> kube::Error {
+        let status = serde_json::json!({
+            "code": code,
+            "message": format!("code {code}"),
+            "details": {"retryAfterSeconds": retry_after_seconds},
+        });
+        kube::Error::Api(Box::new(serde_json::from_value(status).unwrap()))
+    }
+
+    fn classify(err: kube::Error) -> ConfigMapResolverError {
+        ResolverError::from_kube("settings", err)
+    }
+
+    #[test]
+    fn kube_404_is_not_found() {
+        let err = classify(api_error(404, 0));
+        assert_eq!(err.kind, ResolverErrorKind::NotFound);
+        assert_eq!(err.retry(), Retry::Backoff);
+    }
+
+    #[test]
+    fn kube_5xx_is_transient() {
+        for code in [500, 502, 503, 504] {
+            let err = classify(api_error(code, 0));
+            assert_eq!(err.kind, ResolverErrorKind::Transient, "code {code}");
+            assert_eq!(err.retry(), Retry::Backoff, "code {code}");
+        }
+    }
+
+    #[test]
+    fn kube_429_is_transient_and_keeps_the_server_delay() {
+        let err = classify(api_error(429, 3));
+        assert_eq!(err.kind, ResolverErrorKind::Transient);
+        assert_eq!(err.retry(), Retry::After(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn kube_transport_failures_are_transient() {
+        let timeout = std::io::Error::new(std::io::ErrorKind::TimedOut, "deadline elapsed");
+        let err = classify(kube::Error::Service(Box::new(timeout)));
+        assert_eq!(err.kind, ResolverErrorKind::Transient);
+        assert_eq!(err.retry(), Retry::Backoff);
+    }
+
+    #[test]
+    fn kube_client_refusals_are_fatal() {
+        for code in [400, 401, 403, 409, 422] {
+            let err = classify(api_error(code, 0));
+            assert_eq!(err.kind, ResolverErrorKind::Other, "code {code}");
+            assert_eq!(err.retry(), Retry::Never, "code {code}");
+        }
+        let undecodable = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let err = classify(kube::Error::SerdeError(undecodable));
+        assert_eq!(err.retry(), Retry::Never);
     }
 }

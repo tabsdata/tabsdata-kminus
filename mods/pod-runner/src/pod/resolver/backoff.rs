@@ -9,6 +9,8 @@
 //!
 //! `0.5s, 1s, 2s, 4s, 8s, 16s, 32s, 64s, 122s, 122s, 122s, ...`
 //!
+//! A server-given retry delay replaces that attempt's step.
+//!
 //! The wait is bounded by an optional timeout (the pod's
 //! `activeDeadlineSeconds`) and a cancellation signal (typically a
 //! `watch::Receiver<()>` that fires on pod deletion or process shutdown).
@@ -47,6 +49,13 @@ pub fn backoff_for_attempt(attempt: usize) -> Duration {
     BACKOFF_SCHEDULE[attempt.min(BACKOFF_SCHEDULE.len() - 1)]
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Retry {
+    Never,
+    Backoff,
+    After(Duration),
+}
+
 // ---------------------------------------------------------------------------
 // Error
 // ---------------------------------------------------------------------------
@@ -75,9 +84,9 @@ pub enum PollError<E: std::fmt::Display + std::fmt::Debug> {
 /// signal fires, or `op` returns a non-retryable error.
 ///
 /// `op_name` is used as the `op` field in the per-backoff log lines.
-/// `is_retryable(&err)` is consulted on every error: when true the next
-/// retry is scheduled; when false the error is returned immediately as
-/// [`PollError::Fatal`].
+/// `retry(&err)` is consulted on every error: [`Retry::Never`] returns it
+/// immediately as [`PollError::Fatal`]; otherwise the next retry is
+/// scheduled.
 ///
 /// Logging:
 /// - At `info` on every backoff with the attempt number and sleep duration.
@@ -86,7 +95,7 @@ pub async fn poll_with_backoff<T, E, F, Fut>(
     op_name: &str,
     timeout: Option<Duration>,
     cancel: &mut watch::Receiver<()>,
-    is_retryable: impl Fn(&E) -> bool,
+    retry: impl Fn(&E) -> Retry,
     mut op: F,
 ) -> Result<T, PollError<E>>
 where
@@ -119,8 +128,12 @@ where
 
         match result {
             Ok(v) => return Ok(v),
-            Err(e) if !is_retryable(&e) => return Err(PollError::Fatal(e)),
             Err(e) => {
+                let base_delay = match retry(&e) {
+                    Retry::Never => return Err(PollError::Fatal(e)),
+                    Retry::Backoff => backoff_for_attempt(attempt),
+                    Retry::After(delay) => delay.min(BACKOFF_SCHEDULE[BACKOFF_SCHEDULE.len() - 1]),
+                };
                 last_err = Some(e);
 
                 let elapsed = start.elapsed();
@@ -140,7 +153,6 @@ where
                     });
                 }
 
-                let base_delay = backoff_for_attempt(attempt);
                 let sleep_dur = match timeout {
                     Some(t) => base_delay.min(t - elapsed),
                     None => base_delay,
@@ -186,6 +198,16 @@ mod tests {
     struct ToyErr {
         retryable: bool,
         msg: String,
+    }
+
+    impl ToyErr {
+        fn retry(&self) -> Retry {
+            if self.retryable {
+                Retry::Backoff
+            } else {
+                Retry::Never
+            }
+        }
     }
 
     impl std::fmt::Display for ToyErr {
@@ -236,7 +258,7 @@ mod tests {
             "test",
             Some(Duration::from_secs(60)),
             &mut rx,
-            |_| true,
+            |_| Retry::Backoff,
             || async { Ok::<i32, ToyErr>(42) },
         )
         .await;
@@ -253,7 +275,7 @@ mod tests {
             "test",
             Some(Duration::from_secs(3600)),
             &mut rx,
-            |e: &ToyErr| e.retryable,
+            ToyErr::retry,
             move || {
                 let calls = Arc::clone(&calls_inner);
                 async move {
@@ -285,7 +307,7 @@ mod tests {
             "test",
             Some(Duration::from_secs(60)),
             &mut rx,
-            |e: &ToyErr| e.retryable,
+            ToyErr::retry,
             move || {
                 let calls = Arc::clone(&calls_inner);
                 async move {
@@ -311,7 +333,7 @@ mod tests {
             "test",
             Some(Duration::from_secs(3)),
             &mut rx,
-            |_| true,
+            |_| Retry::Backoff,
             || async {
                 Err(ToyErr {
                     retryable: true,
@@ -345,7 +367,7 @@ mod tests {
             "test",
             None, // no timeout — only cancel can stop it
             &mut rx,
-            |_| true,
+            |_| Retry::Backoff,
             move || {
                 let calls = Arc::clone(&calls_inner);
                 async move {
@@ -371,12 +393,8 @@ mod tests {
 
         // 12 attempts — exceeds the 9-entry schedule, ensuring the cap
         // value is reused.
-        let result: Result<i32, _> = poll_with_backoff(
-            "test",
-            None,
-            &mut rx,
-            |e: &ToyErr| e.retryable,
-            move || {
+        let result: Result<i32, _> =
+            poll_with_backoff("test", None, &mut rx, ToyErr::retry, move || {
                 let calls = Arc::clone(&calls_inner);
                 async move {
                     let n = calls.fetch_add(1, Ordering::SeqCst);
@@ -389,11 +407,74 @@ mod tests {
                         Ok(99)
                     }
                 }
+            })
+            .await;
+
+        assert!(matches!(result, Ok(99)));
+        assert_eq!(calls.load(Ordering::SeqCst), 12);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_replaces_the_scheduled_step() {
+        let (_tx, mut rx) = watch::channel(());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_inner = Arc::clone(&calls);
+        let start = tokio::time::Instant::now();
+
+        let result: Result<i32, _> = poll_with_backoff(
+            "test",
+            Some(Duration::from_secs(60)),
+            &mut rx,
+            |_: &ToyErr| Retry::After(Duration::from_secs(7)),
+            move || {
+                let calls = Arc::clone(&calls_inner);
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(ToyErr {
+                            retryable: true,
+                            msg: "throttled".to_string(),
+                        })
+                    } else {
+                        Ok(5)
+                    }
+                }
             },
         )
         .await;
 
-        assert!(matches!(result, Ok(99)));
-        assert_eq!(calls.load(Ordering::SeqCst), 12);
+        assert!(matches!(result, Ok(5)));
+        assert_eq!(start.elapsed(), Duration::from_secs(7));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_is_capped_like_the_schedule() {
+        let (_tx, mut rx) = watch::channel(());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_inner = Arc::clone(&calls);
+        let start = tokio::time::Instant::now();
+
+        let result: Result<i32, _> = poll_with_backoff(
+            "test",
+            None,
+            &mut rx,
+            |_: &ToyErr| Retry::After(Duration::from_secs(600)),
+            move || {
+                let calls = Arc::clone(&calls_inner);
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(ToyErr {
+                            retryable: true,
+                            msg: "throttled".to_string(),
+                        })
+                    } else {
+                        Ok(5)
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Ok(5)));
+        assert_eq!(start.elapsed(), Duration::from_secs(122));
     }
 }

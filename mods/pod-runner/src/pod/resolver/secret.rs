@@ -13,8 +13,10 @@
 //!   returned;
 //! - the cancel signal fires — [`SecretResolverErrorKind::Cancelled`] is
 //!   returned;
-//! - a non-retryable error occurs (e.g. YAML parse, unreachable kube API)
+//! - a non-retryable error occurs (e.g. YAML parse, a kube API 4xx)
 //!   — [`SecretResolverErrorKind::Other`] is returned without retrying.
+//!
+//! Transient kube API failures (5xx, 429, transport) are retried the same way.
 //!
 //! Existence is checked at the **entry** (secret object) level. The
 //! resolver does not inspect individual keys — a missing key inside an
@@ -127,7 +129,7 @@ impl SecretResolver for FileSecretResolver {
             OP_NAME,
             timeout,
             cancel,
-            SecretResolverError::is_not_found,
+            SecretResolverError::retry,
             || async { self.try_fetch(names) },
         )
         .await
@@ -213,9 +215,7 @@ impl KubeSecretResolver {
         Ok(Self { client })
     }
 
-    /// Single-pass fetch. A kube API 404 produces
-    /// [`SecretResolverErrorKind::NotFound`]; everything else is
-    /// classified as [`SecretResolverErrorKind::Other`] (no retry).
+    /// Single-pass fetch, classified by [`SecretResolverError::from_kube`].
     async fn try_fetch(
         &self,
         namespace: &str,
@@ -228,15 +228,10 @@ impl KubeSecretResolver {
         let mut result = HashMap::new();
 
         for name in names {
-            let secret = match api.get(name).await {
-                Ok(s) => s,
-                Err(kube::Error::Api(e)) if e.code == 404 => {
-                    return Err(SecretResolverError::not_found(name, e.message));
-                }
-                Err(e) => {
-                    return Err(SecretResolverError::other(name, format!("{}", e)));
-                }
-            };
+            let secret = api
+                .get(name)
+                .await
+                .map_err(|e| SecretResolverError::from_kube(name, e))?;
 
             result.insert(name.clone(), secret_to_values(name, secret)?);
         }
@@ -281,13 +276,9 @@ impl SecretResolver for KubeSecretResolver {
         timeout: Option<Duration>,
         cancel: &mut watch::Receiver<()>,
     ) -> Result<HashMap<String, HashMap<String, String>>, SecretResolverError> {
-        poll_with_backoff(
-            OP_NAME,
-            timeout,
-            cancel,
-            SecretResolverError::is_not_found,
-            || self.try_fetch(namespace, names),
-        )
+        poll_with_backoff(OP_NAME, timeout, cancel, SecretResolverError::retry, || {
+            self.try_fetch(namespace, names)
+        })
         .await
         .map_err(Into::into)
     }
@@ -585,5 +576,57 @@ mod tests {
         assert_eq!(creds.get("D_EMPTY").map(String::as_str), Some(""));
         assert_eq!(creds.get("S_EMPTY").map(String::as_str), Some(""));
         assert_eq!(creds.get("S_NULL").map(String::as_str), Some(""));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn kube_resolver_retries_a_transient_api_failure() {
+        use super::super::test_kube::{ok_body, scripted_client, status_body};
+        use std::sync::atomic::Ordering;
+
+        let (client, calls) = scripted_client(vec![
+            status_body(500, "etcdserver: request timed out"),
+            ok_body(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {"name": "settings", "namespace": "default"},
+                "stringData": {"level": "info"},
+            })),
+        ]);
+        let resolver = KubeSecretResolver { client };
+        let (_tx, mut rx) = watch::channel(());
+
+        let result = resolver
+            .secrets(
+                "default",
+                &["settings".to_string()],
+                Some(Duration::from_secs(60)),
+                &mut rx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["settings"]["level"], "info");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn kube_resolver_does_not_retry_a_refusal() {
+        use super::super::test_kube::{scripted_client, status_body};
+        use std::sync::atomic::Ordering;
+
+        let (client, calls) = scripted_client(vec![status_body(403, "forbidden")]);
+        let resolver = KubeSecretResolver { client };
+        let (_tx, mut rx) = watch::channel(());
+
+        let err = resolver
+            .secrets(
+                "default",
+                &["settings".to_string()],
+                Some(Duration::from_secs(60)),
+                &mut rx,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, SecretResolverErrorKind::Other);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

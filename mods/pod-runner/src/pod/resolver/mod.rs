@@ -29,6 +29,8 @@ pub mod config_map;
 pub mod error;
 pub mod k8s_values;
 pub mod secret;
+#[cfg(test)]
+mod test_kube;
 pub mod volume;
 
 use std::collections::HashMap;

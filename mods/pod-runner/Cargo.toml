@@ -119,6 +119,7 @@ serial_test = { version = "4" }
 # = true)]` used by the resolver backoff tests so they can validate
 # multi-minute waits in milliseconds.
 tokio = { version = "1.54.1", features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["signal", "process"] }
