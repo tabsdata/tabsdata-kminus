@@ -33,10 +33,6 @@ pub const HEARTBEAT_FILE: &str = "heartbeat.json";
 /// reporting its own trouble, and counts as a miss.
 pub const STATUS_READY: &str = "ready";
 
-/// Slack added to the heartbeat interval before a poll counts as a miss,
-/// so a beat that is merely late does not trip the counter.
-const HEARTBEAT_GRACE: Duration = Duration::from_secs(2);
-
 /// Path of `name`'s heartbeat file: `<workdir>/data/<name>/heartbeat.json`.
 pub fn heartbeat_file(workdir: &Path, name: &str) -> PathBuf {
     workdir.join(DATA_DIR).join(name).join(HEARTBEAT_FILE)
@@ -44,7 +40,7 @@ pub fn heartbeat_file(workdir: &Path, name: &str) -> PathBuf {
 
 /// How old a heartbeat may get before a poll counts it as missed.
 pub fn stale_after(interval: Duration) -> Duration {
-    interval + HEARTBEAT_GRACE
+    interval.saturating_mul(2)
 }
 
 /// Filename of km's own ready marker, under `<workdir>/data/km/`.
@@ -165,7 +161,7 @@ pub fn wait_until_ready(name: &str, path: &Path, timeout: Duration) -> bool {
 /// Outcome of a single [`HeartbeatMonitor::poll`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum Beat {
-    /// Fresh and ready; the miss counter was reset.
+    /// Fresh and ready; both miss counters were reset.
     Healthy,
     /// Missed, still under the limit.
     Missed { misses: u32 },
@@ -208,13 +204,15 @@ impl Miss {
 /// a component saying nothing does not.
 const DEGRADED_TOLERANCE_FACTOR: u32 = 5;
 
-/// Consecutive-miss counter for one component, polled once per interval.
+/// Consecutive-miss counters for one component, polled once per interval.
 pub struct HeartbeatMonitor {
     name: &'static str,
     path: PathBuf,
     stale_after: Duration,
     max_missed: u32,
-    misses: u32,
+    degraded_misses: u32,
+    silent_misses: u32,
+    last_poll: Option<Instant>,
 }
 
 impl HeartbeatMonitor {
@@ -224,72 +222,76 @@ impl HeartbeatMonitor {
             path,
             stale_after,
             max_missed,
-            misses: 0,
+            degraded_misses: 0,
+            silent_misses: 0,
+            last_poll: None,
         }
     }
 
     /// Poll once. A missing, stale, unparseable or not-ready file is a
-    /// miss, logged with the running count; a good beat clears the count.
+    /// miss, logged with the running count; a good beat clears the counts.
     pub fn poll(&mut self) -> Beat {
-        match self.miss_reason() {
-            None => {
-                self.misses = 0;
-                Beat::Healthy
-            }
-            Some(Miss {
-                reason,
-                self_reported,
-            }) => {
-                self.misses += 1;
-                let limit = if self_reported {
-                    self.max_missed.saturating_mul(DEGRADED_TOLERANCE_FACTOR)
-                } else {
-                    self.max_missed
-                };
-                warn!(
-                    component = self.name,
-                    missed = self.misses,
-                    max_missed = limit,
-                    "Missed heartbeat ({}/{}): {}",
-                    self.misses,
-                    limit,
-                    reason
-                );
-                if self.misses >= limit {
-                    Beat::Failed {
-                        misses: self.misses,
-                        reason,
-                    }
-                } else {
-                    Beat::Missed {
-                        misses: self.misses,
-                    }
-                }
-            }
+        let now = Instant::now();
+        let watched = self.last_poll.map(|last| now.duration_since(last));
+        self.last_poll = Some(now);
+        let Some(Miss {
+            reason,
+            self_reported,
+        }) = self.miss_reason(watched)
+        else {
+            self.degraded_misses = 0;
+            self.silent_misses = 0;
+            return Beat::Healthy;
+        };
+        let (misses, limit) = if self_reported {
+            self.silent_misses = 0;
+            self.degraded_misses += 1;
+            (
+                self.degraded_misses,
+                self.max_missed.saturating_mul(DEGRADED_TOLERANCE_FACTOR),
+            )
+        } else {
+            self.silent_misses += 1;
+            (self.silent_misses, self.max_missed)
+        };
+        warn!(
+            component = self.name,
+            missed = misses,
+            max_missed = limit,
+            "Missed heartbeat ({}/{}): {}",
+            misses,
+            limit,
+            reason
+        );
+        if misses >= limit {
+            Beat::Failed { misses, reason }
+        } else {
+            Beat::Missed { misses }
         }
     }
 
     /// Why this poll is a miss, or `None` when the beat is good.
-    fn miss_reason(&self) -> Option<Miss> {
+    fn miss_reason(&self, watched: Option<Duration>) -> Option<Miss> {
         let Some((age, beat)) = read(&self.path) else {
             return Some(Miss::silent(format!(
                 "no readable heartbeat at {}",
                 self.path.display()
             )));
         };
+        let limit = watched.map_or(self.stale_after, |gap| gap.max(self.stale_after));
+        if age > limit {
+            return Some(Miss::silent(format!(
+                "last beat {}s ago, over the {}s limit",
+                age.as_secs(),
+                limit.as_secs()
+            )));
+        }
         if beat.status != STATUS_READY {
             // The component published this itself, so it is running and able
             // to report. Whatever it is unhappy about, it is not gone.
             return Some(Miss::degraded(format!(
                 "reported '{}': {}",
                 beat.status, beat.detail
-            )));
-        }
-        if age > self.stale_after {
-            return Some(Miss::silent(format!(
-                "last beat {}s ago, over the {}s limit",
-                age.as_secs(),
-                self.stale_after.as_secs()
             )));
         }
         None

@@ -35,11 +35,23 @@ fn heartbeat_file_sits_under_data_component() {
     );
 }
 
+fn age_beat(path: &Path, age: Duration) {
+    let file = fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(std::time::SystemTime::now() - age)
+        .unwrap();
+}
+
+fn write_aged_beat(dir: &Path, status: &str, age: Duration) -> PathBuf {
+    let path = write_beat(dir, status, "");
+    age_beat(&path, age);
+    path
+}
+
 #[test]
-fn stale_after_adds_grace_to_the_interval() {
+fn stale_after_grants_one_whole_interval_of_grace() {
     assert_eq!(
         stale_after(Duration::from_secs(15)),
-        Duration::from_secs(15) + HEARTBEAT_GRACE
+        Duration::from_secs(30)
     );
 }
 
@@ -174,5 +186,123 @@ fn a_self_reported_degraded_beat_outlasts_a_silent_one() {
         reason.contains("pod status sync stalled"),
         "reason = {reason}, want the component's own detail"
     );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_beat_late_by_less_than_one_interval_is_not_a_miss() {
+    let dir = tempdir();
+    let interval = Duration::from_secs(15);
+    let path = write_aged_beat(&dir, STATUS_READY, Duration::from_secs(20));
+    let mut m = HeartbeatMonitor::new("test", path.clone(), stale_after(interval), 4);
+    assert_eq!(m.poll(), Beat::Healthy);
+    age_beat(&path, Duration::from_secs(31));
+    assert_eq!(m.poll(), Beat::Missed { misses: 1 });
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn degraded_beats_do_not_spend_the_silent_budget() {
+    let dir = tempdir();
+    let stale = Duration::from_secs(60);
+    let path = write_beat(&dir, "degraded", "pod status sync stalled");
+    let mut m = HeartbeatMonitor::new("test", path.clone(), Duration::from_secs(17), 4);
+    assert_eq!(m.poll(), Beat::Missed { misses: 1 });
+    assert_eq!(m.poll(), Beat::Missed { misses: 2 });
+    write_aged_beat(&dir, STATUS_READY, stale);
+    assert_eq!(m.poll(), Beat::Missed { misses: 1 });
+    age_beat(&path, stale);
+    assert_eq!(m.poll(), Beat::Missed { misses: 2 });
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn consecutive_stale_beats_fail_at_the_limit() {
+    let dir = tempdir();
+    let path = write_aged_beat(&dir, STATUS_READY, Duration::from_secs(60));
+    let mut m = HeartbeatMonitor::new("test", path, Duration::from_secs(17), 4);
+    for miss in 1..4 {
+        assert_eq!(m.poll(), Beat::Missed { misses: miss });
+    }
+    let Beat::Failed { misses, reason } = m.poll() else {
+        panic!("the fourth consecutive stale beat must fail");
+    };
+    assert_eq!(misses, 4);
+    assert!(reason.contains("over the 17s limit"), "reason = {reason}");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_fresh_degraded_beat_ends_a_run_of_silence() {
+    let dir = tempdir();
+    let path = write_aged_beat(&dir, STATUS_READY, Duration::from_secs(60));
+    let mut m = HeartbeatMonitor::new("test", path, Duration::from_secs(17), 4);
+    assert_eq!(m.poll(), Beat::Missed { misses: 1 });
+    assert_eq!(m.poll(), Beat::Missed { misses: 2 });
+    write_beat(&dir, "degraded", "self-probe failed");
+    assert_eq!(m.poll(), Beat::Missed { misses: 1 });
+    write_aged_beat(&dir, STATUS_READY, Duration::from_secs(60));
+    assert_eq!(m.poll(), Beat::Missed { misses: 1 });
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn silence_leaves_a_run_of_degraded_beats_standing() {
+    let dir = tempdir();
+    let path = write_beat(&dir, "degraded", "self-probe failed");
+    let mut m = HeartbeatMonitor::new("test", path, Duration::from_secs(17), 4);
+    assert_eq!(m.poll(), Beat::Missed { misses: 1 });
+    assert_eq!(m.poll(), Beat::Missed { misses: 2 });
+    write_aged_beat(&dir, STATUS_READY, Duration::from_secs(60));
+    assert_eq!(m.poll(), Beat::Missed { misses: 1 });
+    write_beat(&dir, "degraded", "self-probe failed");
+    assert_eq!(m.poll(), Beat::Missed { misses: 3 });
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_fresh_ready_beat_resets_both_counts() {
+    let dir = tempdir();
+    let path = write_beat(&dir, "degraded", "self-probe failed");
+    let mut m = HeartbeatMonitor::new("test", path, Duration::from_secs(17), 4);
+    assert_eq!(m.poll(), Beat::Missed { misses: 1 });
+    write_aged_beat(&dir, STATUS_READY, Duration::from_secs(60));
+    assert_eq!(m.poll(), Beat::Missed { misses: 1 });
+    write_beat(&dir, STATUS_READY, "");
+    assert_eq!(m.poll(), Beat::Healthy);
+    write_aged_beat(&dir, STATUS_READY, Duration::from_secs(60));
+    assert_eq!(m.poll(), Beat::Missed { misses: 1 });
+    write_beat(&dir, "degraded", "self-probe failed");
+    assert_eq!(m.poll(), Beat::Missed { misses: 1 });
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_stale_degraded_beat_counts_as_silence() {
+    let dir = tempdir();
+    let path = write_aged_beat(&dir, "degraded", Duration::from_secs(60));
+    let mut m = HeartbeatMonitor::new("test", path, Duration::from_secs(17), 2);
+    assert_eq!(m.poll(), Beat::Missed { misses: 1 });
+    assert!(matches!(m.poll(), Beat::Failed { misses: 2, .. }));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_late_poll_excuses_a_beat_written_since_the_previous_one() {
+    let dir = tempdir();
+    let path = write_aged_beat(&dir, STATUS_READY, Duration::from_secs(18));
+    let mut m = HeartbeatMonitor::new("test", path, Duration::from_secs(17), 4);
+    m.last_poll = Instant::now().checked_sub(Duration::from_secs(36));
+    assert_eq!(m.poll(), Beat::Healthy);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_late_poll_still_counts_a_beat_older_than_the_gap() {
+    let dir = tempdir();
+    let path = write_aged_beat(&dir, STATUS_READY, Duration::from_secs(40));
+    let mut m = HeartbeatMonitor::new("test", path, Duration::from_secs(17), 4);
+    m.last_poll = Instant::now().checked_sub(Duration::from_secs(36));
+    assert_eq!(m.poll(), Beat::Missed { misses: 1 });
     fs::remove_dir_all(&dir).ok();
 }

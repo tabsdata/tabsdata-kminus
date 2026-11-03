@@ -107,7 +107,7 @@ first interval says `ready` rather than "not reported yet".
 
 | Exit | Meaning     | Condition                                      |
 |------|-------------|------------------------------------------------|
-| `0`  | ready       | km live, marker fresher than `interval + 2s`   |
+| `0`  | ready       | km live, marker fresher than `2 × interval`    |
 | `1`  | live        | km live, marker stale or never written         |
 | `2`  | not running | no live km pid                                 |
 
@@ -144,9 +144,12 @@ heartbeat:
   startupSecs: 120   # how long a component gets to become ready
 ```
 
-- **Stale after** = `interval + 2s` — the age at which a poll counts as a
-  miss. The 2s absorbs jitter, so a merely late beat does not trip the
-  counter.
+- **Stale after** = `2 × interval` — the age at which a poll counts as a
+  miss. The extra interval absorbs lateness, which grows with load: a
+  component beats only after its own self-check round trip, so a merely late
+  beat does not trip the counter. When km's own poll is itself late, the
+  limit stretches to the gap since its previous poll: a beat written since
+  km last looked is not counted against the component for km's starvation.
 - **Detection** = `interval × maxMissed` — consecutive misses before a
   running component is declared dead.
 - **Startup budget** = `startupSecs` — how long a component gets to report
@@ -284,7 +287,14 @@ normalised before comparison. Both Go binaries cross-compile clean for
   being slow.
 - **Stale, process alive** — wedged: alive but no longer serving. Counts as a
   miss against `maxMissed`, with no extra tolerance — silence says nothing
-  about whether the component is still working.
+  about whether the component is still working. A stale `degraded` beat is
+  silence too: only a fresh one proves the component is still reporting.
+
+The two kinds of miss keep separate counts, so degraded beats never spend the
+silent budget: `maxMissed` silent misses in a row are needed to fail on
+silence, however many degraded beats came first. A fresh `ready` beat clears
+both counts; a fresh `degraded` beat ends a run of silence; silence leaves a
+run of `degraded` beats standing, since it proves nothing about recovery.
 - **Process exited** — caught by the process check, typically within a
   second, and acted on at once: no staleness to wait for, no miss budget to
   spend.
