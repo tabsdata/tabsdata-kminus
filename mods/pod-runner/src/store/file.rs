@@ -13,7 +13,7 @@
 //!     app/                              # pod name
 //!       20260407T194530Z/               # incarnation (creation time)
 //!         store/
-//!           original-spec.json
+//!           original-spec.json          # env values masked
 //!           running-spec.json           # optional (see FileStoreConfig)
 //!           status/
 //!             20260407T194530123.json   # timestamped status snapshots
@@ -248,7 +248,10 @@ impl PodStore for FileStore {
             return;
         }
 
-        self.write_json(&store.join("original-spec.json"), original_spec.as_ref());
+        self.write_json(
+            &store.join("original-spec.json"),
+            &original_spec.with_env_values_masked(),
+        );
 
         if self.config.write_running_spec {
             self.write_json(&store.join("running-spec.json"), running_spec.as_ref());
@@ -347,7 +350,7 @@ impl PodStore for FileStore {
 mod tests {
     use super::*;
     use crate::spec::constants::PodPhase;
-    use crate::spec::pod::{PodMetadata, PodSpecBody};
+    use crate::spec::pod::{Container, EnvVar, MASKED_ENV_VALUE, PodMetadata, PodSpecBody};
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -463,6 +466,45 @@ mod tests {
                 .unwrap()
                 .join("original-spec.json")
                 .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn original_spec_on_disk_has_env_values_masked() {
+        let store = make_store("masked-env");
+        let mut original = (*make_spec("default", "app", "uid-1")).clone();
+        original.spec.containers.push(Container {
+            name: "app".to_string(),
+            env: vec![EnvVar {
+                name: "PASSWORD".to_string(),
+                value: Some("s3cr3t".to_string()),
+                value_from: None,
+            }],
+            ..Default::default()
+        });
+        let original = Arc::new(original);
+        let id = PodId::from_spec(&original);
+
+        store
+            .put(
+                id.clone(),
+                Arc::clone(&original),
+                Arc::clone(&original),
+                make_status(PodPhase::Pending),
+            )
+            .await;
+
+        let dir = store.store_dir(&id).unwrap();
+        let on_disk = fs::read_to_string(dir.join("original-spec.json")).unwrap();
+        assert!(!on_disk.contains("s3cr3t"), "{on_disk}");
+        assert!(on_disk.contains("PASSWORD"), "{on_disk}");
+        assert!(on_disk.contains(MASKED_ENV_VALUE), "{on_disk}");
+
+        let running = fs::read_to_string(dir.join("running-spec.json")).unwrap();
+        assert!(running.contains("s3cr3t"), "{running}");
+        assert_eq!(
+            original.spec.containers[0].env[0].value.as_deref(),
+            Some("s3cr3t")
         );
     }
 

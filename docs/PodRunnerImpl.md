@@ -695,7 +695,7 @@ but the record itself.
           0.log.1                                # Rolled log
           probe-startup.log                      # Probe output
         store/
-          original-spec.json                     # Original pod spec
+          original-spec.json                     # Original pod spec, env values masked
           running-spec.json                      # Preprocessed spec (optional)
           status/<timestamp>.json                # Timestamped status snapshots
         _cleanup_ttls.json                       # Resolved delete TTLs (written at admission)

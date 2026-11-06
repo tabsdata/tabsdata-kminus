@@ -355,6 +355,9 @@ impl PodMetadata {
 // Top-level pod
 // ---------------------------------------------------------------------------
 
+/// What [`PodSpec::with_env_values_masked`] puts in place of an env value.
+pub const MASKED_ENV_VALUE: &str = "<masked>";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PodSpec {
@@ -371,6 +374,23 @@ impl PodSpec {
             .iter()
             .map(|c| c.name.clone())
             .collect()
+    }
+
+    /// A copy whose every literal env value reads [`MASKED_ENV_VALUE`], for
+    /// writing to disk. A client may hand the pod over with its env already
+    /// resolved (the virtual-kubelet library turns `secretKeyRef` and
+    /// `envFrom` secrets into literal values), and a literal value does not
+    /// say where it came from, so none is kept.
+    pub fn with_env_values_masked(&self) -> PodSpec {
+        let mut masked = self.clone();
+        for container in masked.spec.all_containers_mut() {
+            for var in &mut container.env {
+                if var.value.is_some() {
+                    var.value = Some(MASKED_ENV_VALUE.to_string());
+                }
+            }
+        }
+        masked
     }
 
     /// The pod's `terminationGracePeriodSeconds` as a [`Duration`], if set.
@@ -417,6 +437,63 @@ spec:
         assert_eq!(
             pod.termination_grace_period(),
             Some(std::time::Duration::from_secs(45))
+        );
+    }
+
+    #[test]
+    fn with_env_values_masked_masks_every_literal_value() {
+        let yaml = r#"
+spec:
+  initContainers:
+    - name: init
+      image: /dev/null
+      env:
+        - name: INIT_TOKEN
+          value: init-secret
+  containers:
+    - name: app
+      image: /dev/null
+      env:
+        - name: PASSWORD
+          value: app-secret
+        - name: EMPTY
+          value: ""
+        - name: UNSET
+        - name: FROM_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: creds
+              key: password
+      envFrom:
+        - secretRef:
+            name: creds
+"#;
+        let pod: PodSpec = serde_yaml_ng::from_str(yaml).unwrap();
+        let masked = pod.with_env_values_masked();
+
+        let json = serde_json::to_string(&masked).unwrap();
+        assert!(!json.contains("init-secret"), "{json}");
+        assert!(!json.contains("app-secret"), "{json}");
+
+        let init = &masked.spec.init_containers[0].env;
+        assert_eq!(init[0].value.as_deref(), Some(MASKED_ENV_VALUE));
+        let app = &masked.spec.containers[0];
+        assert_eq!(app.env[0].name, "PASSWORD");
+        assert_eq!(app.env[0].value.as_deref(), Some(MASKED_ENV_VALUE));
+        assert_eq!(app.env[1].value.as_deref(), Some(MASKED_ENV_VALUE));
+        assert_eq!(app.env[2].value, None);
+        assert_eq!(app.env[3].value, None);
+        let secret_ref = app.env[3]
+            .value_from
+            .as_ref()
+            .and_then(|v| v.secret_key_ref.as_ref())
+            .unwrap();
+        assert_eq!(secret_ref.name, "creds");
+        assert_eq!(app.env_from[0].secret_ref.as_ref().unwrap().name, "creds");
+
+        assert_eq!(
+            pod.spec.containers[0].env[0].value.as_deref(),
+            Some("app-secret")
         );
     }
 
