@@ -25,8 +25,8 @@ script = [
 
     cd ${PROJECT_GO_KM_CONTROL_PLANE_FOLDER}
 
-    debug "🚀 go test ./..."
-    exec --fail-on-error go test ./...
+    debug "🚀 go run gotest.tools/gotestsum@${GOTESTSUM_VERSION} --format pkgname --format-icons text -- ./..."
+    exec --fail-on-error go run gotest.tools/gotestsum@${GOTESTSUM_VERSION} --format pkgname --format-icons text -- ./...
     ''']
 
 [tasks.__km__test_go_virtual_kubelet]
@@ -41,6 +41,6 @@ script = [
 
     cd ${PROJECT_GO_KM_VIRTUAL_KUBELET_FOLDER}
 
-    debug "🚀 go test ./..."
-    exec --fail-on-error go test ./...
+    debug "🚀 go run gotest.tools/gotestsum@${GOTESTSUM_VERSION} --format pkgname --format-icons text -- ./..."
+    exec --fail-on-error go run gotest.tools/gotestsum@${GOTESTSUM_VERSION} --format pkgname --format-icons text -- ./...
     ''']

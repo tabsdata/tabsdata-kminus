@@ -13,6 +13,6 @@ script = '''
 
     cd ${KM_ROOT}/mods/control-plane/src/main/go
 
-    debug "🚀 go test ./..."
-    exec --fail-on-error go test ./...
+    debug "🚀 go run gotest.tools/gotestsum@${GOTESTSUM_VERSION} --format pkgname --format-icons text -- ./..."
+    exec --fail-on-error go run gotest.tools/gotestsum@${GOTESTSUM_VERSION} --format pkgname --format-icons text -- ./...
 '''

@@ -73,7 +73,7 @@ Run from the repo root for the full workspace, or from a module folder
 | Task                          | Description                                                                                  |
 |-------------------------------|----------------------------------------------------------------------------------------------|
 | `cargo make build`            | Compile all modules (debug profile by default)                                               |
-| `cargo make test`             | Run unit tests (Go: `go test ./...`, Rust: `cargo nextest run --all-targets`)                |
+| `cargo make test`             | Run unit tests (Go: `gotestsum -- ./...`, Rust: `cargo nextest run --all-targets`)           |
 | `cargo make itest`            | Build, then run integration tests (no-op for modules without an itest dir)                   |
 | `cargo make clean`            | Remove `target/` for every module and the root `target/`                                     |
 | `cargo make clean -- --all`   | Same as `clean`, plus remove the control-plane K8s cache                                     |
