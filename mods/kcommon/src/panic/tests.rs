@@ -25,16 +25,17 @@ fn teardown_runs_once_and_the_panic_still_propagates() {
 
 #[test]
 fn a_hanging_teardown_is_abandoned_not_awaited() {
-    let started = std::time::Instant::now();
-    let (sender, receiver) = mpsc::channel::<()>();
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(200));
-        let _ = sender.send(());
-    });
-    let timed_out = receiver.recv_timeout(Duration::from_millis(20)).is_err();
-    assert!(timed_out, "a teardown slower than its budget must time out");
+    let finished = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&finished);
+    bounded(
+        Arc::new(move || {
+            thread::sleep(Duration::from_secs(60));
+            flag.store(true, Ordering::SeqCst);
+        }),
+        Duration::from_millis(20),
+    );
     assert!(
-        started.elapsed() < Duration::from_millis(150),
+        !finished.load(Ordering::SeqCst),
         "the wait must end at the budget, not at the teardown"
     );
 }

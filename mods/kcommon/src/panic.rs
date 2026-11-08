@@ -42,7 +42,7 @@ where
         let _ = Backtrace::force_capture();
         report(name, info);
         if !TEARDOWN_STARTED.swap(true, Ordering::SeqCst) {
-            bounded(Arc::clone(&teardown));
+            bounded(Arc::clone(&teardown), TEARDOWN_BUDGET);
         }
         previous(info);
     }));
@@ -59,13 +59,12 @@ fn report(name: &'static str, info: &panic::PanicHookInfo<'_>) {
     let _ = stderr.flush();
 }
 
-/// Run `teardown` on a helper thread, abandoning it after
-/// [`TEARDOWN_BUDGET`].
+/// Run `teardown` on a helper thread, abandoning it after `budget`.
 ///
 /// Detached rather than joined: a teardown that outruns the budget is
 /// waiting on a child that will not answer, and the abort that follows
 /// takes it down regardless.
-fn bounded<F>(teardown: Arc<F>)
+fn bounded<F>(teardown: Arc<F>, budget: Duration)
 where
     F: Fn() + Send + Sync + 'static,
 {
@@ -74,12 +73,12 @@ where
         teardown();
         let _ = sender.send(());
     });
-    if receiver.recv_timeout(TEARDOWN_BUDGET).is_err() {
+    if receiver.recv_timeout(budget).is_err() {
         let mut stderr = std::io::stderr().lock();
         let _ = writeln!(
             stderr,
             "Teardown did not finish within {}s; abandoning it.",
-            TEARDOWN_BUDGET.as_secs()
+            budget.as_secs()
         );
         let _ = stderr.flush();
     }
