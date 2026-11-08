@@ -1,0 +1,18 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__test_go_virtual_kubelet]
+plugin = "td-task-tracker"
+category = "04 - Test"
+description = "Task 'test' for virtual-kubelet project"
+cwd = "${KM_ROOT}/mods/virtual-kubelet"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/make-km/libraries/log.ds
+
+    cd ${KM_ROOT}/mods/virtual-kubelet/src/main/go
+
+    debug "🚀 go test ./..."
+    exec --fail-on-error go test ./...
+'''

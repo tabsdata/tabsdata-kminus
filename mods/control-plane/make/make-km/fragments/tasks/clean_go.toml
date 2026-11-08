@@ -1,0 +1,27 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__clean_go_control_plane]
+plugin = "td-task-tracker"
+category = "01 - Clean"
+description = "Task 'clean' for control-plane project"
+cwd = "${KM_ROOT}/mods/control-plane"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/make-km/libraries/log.ds
+
+    km_root = get_env KM_ROOT
+    target_folder = concat ${km_root} "/mods/control-plane/target"
+    if is_path_exists ${target_folder}
+        rm -r ${target_folder}
+    end
+
+    clean_all = get_env KM_CLEAN_ALL
+    if eq ${clean_all} "true"
+        cache_folder = concat ${km_root} "/mods/control-plane/cache"
+        if is_path_exists ${cache_folder}
+            rm -r ${cache_folder}
+        end
+    end
+'''

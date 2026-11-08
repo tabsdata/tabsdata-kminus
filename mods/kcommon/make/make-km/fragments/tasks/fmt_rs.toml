@@ -1,0 +1,15 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__fmt_rs_kcommon]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Task 'fmt' for kcommon project"
+cwd = "${KM_ROOT}/mods/kcommon"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/make-km/libraries/log.ds
+
+    debug "🚧 Task 'fmt' for kcommon is not implemented yet."
+'''

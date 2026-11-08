@@ -1,0 +1,15 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__license_go_virtual_kubelet]
+plugin = "td-task-tracker"
+category = "06 - Compliance"
+description = "Task 'license' for virtual-kubelet project"
+cwd = "${KM_ROOT}/mods/virtual-kubelet"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/make-km/libraries/log.ds
+
+    debug "🚧 Task 'license' for virtual-kubelet is not implemented yet."
+'''

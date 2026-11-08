@@ -1,0 +1,15 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__clippy_rs_pod_runner]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+description = "Task 'clippy' for pod-runner project"
+cwd = "${KM_ROOT}/mods/pod-runner"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/make-km/libraries/log.ds
+
+    debug "🚧 Task 'clippy' for pod-runner is not implemented yet."
+'''

@@ -3,7 +3,7 @@
 #
 
 extend = [
-    { path = "./make/fragments/shared/Maketask.toml", relative = "git" },
+    { path = "./make/make-km/fragments/standalone/Maketask.toml", relative = "git" },
 ]
 
 [tasks.make]

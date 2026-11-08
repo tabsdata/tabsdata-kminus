@@ -3,5 +3,5 @@
 #
 
 extend = [
-    { path = "./make/fragments/shared/Makeroot.toml", relative = "git" }
+    { path = "./make/make-km/fragments/standalone/Makeroot.toml", relative = "git" }
 ]

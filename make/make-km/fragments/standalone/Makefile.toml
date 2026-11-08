@@ -1,0 +1,9 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+extend = [
+    { path = "./make/make-km/fragments/standalone/Makeroot.toml", relative = "git" },
+
+    { path = "./make/make-km/fragments/standalone/Maketask.toml", relative = "git" }
+]

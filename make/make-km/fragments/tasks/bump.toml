@@ -1,0 +1,29 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__bump]
+plugin = "td-task-tracker"
+category = "02 - Tidy"
+private = true
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-km/libraries/log.ds
+
+    parts = split ${CARGO_MAKE_TASK_ARGS} ";"
+    q_parts = array_length ${parts}
+    if not eq ${q_parts} 2
+        error "❌ Usage: cargo make bump <old_version> <new_version>"
+        exit 1
+    end
+    old_version = array_get ${parts} 0
+    new_version = array_get ${parts} 1
+
+    tabsdata_root = get_env TABSDATA_ROOT
+
+    cd ${tabsdata_root}
+
+    debug "🚀 cargo make bump ${old_version} ${new_version}"
+    exec --fail-on-error cargo make bump ${old_version} ${new_version}
+    ''']

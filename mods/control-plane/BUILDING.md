@@ -43,7 +43,7 @@ The K8s version is configured by `K8S_VERSION` in the root `Makeroot.toml`
 (default `1.29`). setup-envtest resolves it to the latest patch release
 (e.g. `v1.29.5`), and the K8s source clone uses the same exact tag.
 
-`make/scripts/fetch_k8s_deps.py` detects the host OS / arch automatically
+`make/make-km/scripts/fetch_k8s_deps.py` detects the host OS / arch automatically
 (`darwin-arm64`, `linux-amd64`, …) and skips work entirely when the cache
 already contains the binaries for that platform.
 
@@ -61,7 +61,7 @@ The clean fix is to upgrade to **gopsutil v4**, which removed `go-m1cpu`
 entirely in favour of `ebitengine/purego` and needs no cgo. The `process` API
 used by `control-plane` is unchanged between v3 and v4, so the migration is an
 import-path bump; once done, `CGO_ENABLED=0` can be dropped from
-`make/fragments/tasks/build_go.toml`.
+`make/make-km/fragments/tasks/build_go.toml`.
 
 Two things worth knowing before revisiting this:
 

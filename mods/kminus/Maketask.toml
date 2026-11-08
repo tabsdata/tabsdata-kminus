@@ -3,43 +3,43 @@
 #
 
 extend = [
-    { path = "./make/fragments/plugins/tasks.toml", relative = "git" },
+    { path = "./make/make-km/fragments/plugins/tasks.toml", relative = "git" },
 
-    { path = "./make/fragments/tasks/permit_py.toml", relative = "git" },
-    { path = "./make/fragments/tasks/permit_rs.toml", relative = "git" },
-    { path = "./make/fragments/tasks/permit_go.toml", relative = "git" },
+    { path = "./make/make-km/fragments/tasks/permit_py.toml", relative = "git" },
+    { path = "./make/make-km/fragments/tasks/permit_rs.toml", relative = "git" },
+    { path = "./make/make-km/fragments/tasks/permit_go.toml", relative = "git" },
 
-    { path = "./make/fragments/common/permit.toml", relative = "git" },
+    { path = "./make/make-km/fragments/common/permit.toml", relative = "git" },
 
-    { path = "./mods/kminus/make/fragments/tasks/clean_rs.toml", relative = "git" },
-    { path = "./mods/kminus/make/fragments/tasks/lock_rs.toml", relative = "git" },
-    { path = "./mods/kminus/make/fragments/tasks/build_rs.toml", relative = "git" },
-    { path = "./mods/kminus/make/fragments/tasks/test_rs.toml", relative = "git" },
-    { path = "./mods/kminus/make/fragments/tasks/itest_rs.toml", relative = "git" },
-    { path = "./mods/kminus/make/fragments/tasks/check_rs.toml", relative = "git" },
-    { path = "./mods/kminus/make/fragments/tasks/clippy_rs.toml", relative = "git" },
-    { path = "./mods/kminus/make/fragments/tasks/fmt_rs.toml", relative = "git" },
-    { path = "./mods/kminus/make/fragments/tasks/license_rs.toml", relative = "git" },
-    { path = "./mods/kminus/make/fragments/tasks/outdated_rs.toml", relative = "git" },
-    { path = "./mods/kminus/make/fragments/tasks/machete_rs.toml", relative = "git" },
-    { path = "./mods/kminus/make/fragments/tasks/audit_rs.toml", relative = "git" },
-    { path = "./mods/kminus/make/fragments/tasks/deny_rs.toml", relative = "git" },
-    { path = "./mods/kminus/make/fragments/tasks/pants_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/make-km/fragments/tasks/clean_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/make-km/fragments/tasks/lock_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/make-km/fragments/tasks/build_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/make-km/fragments/tasks/test_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/make-km/fragments/tasks/itest_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/make-km/fragments/tasks/check_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/make-km/fragments/tasks/clippy_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/make-km/fragments/tasks/fmt_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/make-km/fragments/tasks/license_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/make-km/fragments/tasks/outdated_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/make-km/fragments/tasks/machete_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/make-km/fragments/tasks/audit_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/make-km/fragments/tasks/deny_rs.toml", relative = "git" },
+    { path = "./mods/kminus/make/make-km/fragments/tasks/pants_rs.toml", relative = "git" },
 
     # itest spawns the full kminus stack via the km orchestrator, which
     # in turn launches control-plane, pod-runner, and virtual-kubelet.
     # Pull in their build tasks and the assembly copy step so
     # `cargo make itest` from this module bundles every binary km needs
     # under target/dist/ without manual plumbing.
-    { path = "./mods/pod-runner/make/fragments/tasks/build_rs.toml", relative = "git" },
-    { path = "./mods/control-plane/make/fragments/tasks/build_go.toml", relative = "git" },
-    { path = "./mods/virtual-kubelet/make/fragments/tasks/build_go.toml", relative = "git" },
-    { path = "./make/fragments/tasks/assembly.toml", relative = "git" },
+    { path = "./mods/pod-runner/make/make-km/fragments/tasks/build_rs.toml", relative = "git" },
+    { path = "./mods/control-plane/make/make-km/fragments/tasks/build_go.toml", relative = "git" },
+    { path = "./mods/virtual-kubelet/make/make-km/fragments/tasks/build_go.toml", relative = "git" },
+    { path = "./make/make-km/fragments/tasks/assembly.toml", relative = "git" },
 
-    { path = "./make/fragments/hooks/banner.toml", relative = "git" },
-    { path = "./make/fragments/hooks/start.toml", relative = "git" },
-    { path = "./make/fragments/hooks/stop.toml", relative = "git" },
-    { path = "./make/fragments/hooks/failure.toml", relative = "git" },
+    { path = "./make/make-km/fragments/hooks/banner.toml", relative = "git" },
+    { path = "./make/make-km/fragments/hooks/start.toml", relative = "git" },
+    { path = "./make/make-km/fragments/hooks/stop.toml", relative = "git" },
+    { path = "./make/make-km/fragments/hooks/failure.toml", relative = "git" },
 ]
 
 [tasks.clean]

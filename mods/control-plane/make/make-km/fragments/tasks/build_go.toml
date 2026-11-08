@@ -1,0 +1,109 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__build_go_control_plane]
+plugin = "td-task-tracker"
+category = "03 - Build"
+description = "Task 'build' for control-plane project"
+cwd = "${KM_ROOT}/mods/control-plane"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/make-km/libraries/log.ds
+
+    go_target = exec --fail-on-error python ${GET_GO_TARGET_SCRIPT}
+    go_target_lines = split ${go_target.stdout} "\n"
+    go_os = array_get ${go_target_lines} 0
+    go_arch = array_get ${go_target_lines} 1
+    binary_extension = array_get ${go_target_lines} 2
+    go_os = trim ${go_os}
+    go_arch = trim ${go_arch}
+    binary_extension = trim ${binary_extension}
+    if not is_empty ${go_os}
+        set_env GOOS ${go_os}
+        set_env GOARCH ${go_arch}
+        debug "🎯 Cross-building Go for GOOS=${go_os} GOARCH=${go_arch}"
+    else
+        debug "🎯 Building Go for host target"
+    end
+
+    # Superseded by CGO_ENABLED=0 below: with cgo off there is no C compiler
+    # invocation left to warn. Kept for reference in case cgo is ever
+    # re-enabled here.
+    # build_os = os_family
+    # building_darwin = eq ${go_os} "darwin"
+    # building_host_mac = eq ${build_os} "mac"
+    # if is_empty ${go_os}
+    #     building_darwin = set ${building_host_mac}
+    # end
+    # if ${building_darwin}
+    #     set_env CGO_CFLAGS "-Wno-gnu-folding-constant"
+    #     debug "🍎 Suppressing clang GNU-folding warning for cgo (go-m1cpu on darwin)"
+    # end
+
+    # Workaround, not a fix: gopsutil v3 pulls in go-m1cpu, whose cgo package
+    # initializer reads M1-era IORegistry keys and null-derefs on Apple Silicon
+    # generations that no longer publish them, killing control-plane before
+    # main() runs. Disabling cgo drops that initializer from the build.
+    #
+    # The clean fix is upgrading to gopsutil v4, which dropped go-m1cpu entirely
+    # in favour of ebitengine/purego and needs no cgo; the process API used by
+    # control-plane is unchanged, so it is an import-path bump. Once migrated,
+    # delete this block. Bumping the Go toolchain does NOT help -- the offending
+    # initializer is still compiled and still crashes. See the import comment in
+    # mods/control-plane/src/main/go/main.go.
+    set_env CGO_ENABLED "0"
+    debug "🚫 Building Go without cgo (go-m1cpu's cgo initializer segfaults on some Apple Silicon hosts)"
+
+    source_folder = set "${KM_ROOT}/mods/control-plane/src/main/go"
+    target_folder = set "${KM_ROOT}/mods/control-plane/target"
+    cache_folder = set "${KM_ROOT}/mods/control-plane/cache"
+    output_file = concat ${target_folder} "/control-plane" ${binary_extension}
+
+    mkdir ${target_folder}
+
+    k8s_version = get_env K8S_VERSION
+
+    debug "🚀 python ${FETCH_K8S_SCRIPT} ${cache_folder} ${k8s_version}"
+    exec --fail-on-error python ${FETCH_K8S_SCRIPT} ${cache_folder} ${k8s_version}
+
+    cd ${source_folder}
+
+    is_assembly = eq ${td-profile} "assembly"
+    if ${is_assembly}
+        debug "🚀 go build \"-ldflags=-s -w\" -trimpath -o ${output_file} ."
+        exec --fail-on-error go build "-ldflags=-s -w" -trimpath -o ${output_file} .
+    else
+        debug "🚀 go build -o ${output_file} ."
+        exec --fail-on-error go build -o ${output_file} .
+    end
+
+    k8s_binaries = array kube-apiserver kube-controller-manager etcd kubectl
+    for binary in ${k8s_binaries}
+        matches = glob_array ${cache_folder}/*/${binary}
+        for match in ${matches}
+            name = basename ${match}
+            dest_name = set ${name}
+            if eq ${name} "kubectl"
+                dest_name = set "kmc"
+            end
+            dest = concat ${target_folder} "/" ${dest_name}
+            info "📦 Copying k8s binary ${match} -> ${dest}"
+            cp ${match} ${dest}
+        end
+        release ${matches}
+        matches_exe = glob_array ${cache_folder}/*/${binary}.exe
+        for match in ${matches_exe}
+            name = basename ${match}
+            dest_name = set ${name}
+            if eq ${name} "kubectl.exe"
+                dest_name = set "kmc.exe"
+            end
+            dest = concat ${target_folder} "/" ${dest_name}
+            info "📦 Copying k8s binary ${match} -> ${dest}"
+            cp ${match} ${dest}
+        end
+        release ${matches_exe}
+    end
+    release ${k8s_binaries}
+'''

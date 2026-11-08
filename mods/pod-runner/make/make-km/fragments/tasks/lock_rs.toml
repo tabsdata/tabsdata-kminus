@@ -1,0 +1,17 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__lock_rs_pod_runner]
+plugin = "td-task-tracker"
+category = "02 - Tidy"
+private = true
+cwd = "${KM_ROOT}/mods/pod-runner"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-km/libraries/log.ds
+
+    debug "🚀 cargo generate-lockfile"
+    exec --fail-on-error cargo generate-lockfile
+    ''']

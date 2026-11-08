@@ -1,0 +1,33 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__test_rs_kcommon]
+plugin = "td-task-tracker"
+category = "04 - Test"
+description = "Task 'test' for kcommon project"
+cwd = "${KM_ROOT}"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/make-km/libraries/log.ds
+
+    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} %{td-cargo-build-verb} %{td-rust-quiet} --locked %{td-build-target-token} %{td-build-target} --profile ${td-profile} --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML} --all-targets --tests"
+    exec --fail-on-error ${td-cargo} %{td-toolchain-token}%{td-toolchain} %{td-cargo-build-verb} %{td-rust-quiet} --locked %{td-build-target-token} %{td-build-target} --profile ${td-profile} --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML} --all-targets --tests
+    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} nextest run %{td-rust-cargo-quiet} --build-jobs ${td-nextest-build-jobs} --locked --no-fail-fast %{td-target-token} %{td-target} --test-threads ${td-nextest-test-threads} --cargo-profile ${td-profile} --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML} --all-targets"
+    exit_code = exec --get-exit-code ${td-cargo} %{td-toolchain-token}%{td-toolchain} nextest run %{td-rust-cargo-quiet} --build-jobs ${td-nextest-build-jobs} --locked --no-fail-fast %{td-target-token} %{td-target} --test-threads ${td-nextest-test-threads} --cargo-profile ${td-profile} --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML} --all-targets
+
+    is_zero = eq ${exit_code} "0"
+    if ${is_zero}
+        info "⌛️ Tests finished with zero exit code: '${exit_code}'"
+    else
+        info "⌛️ Tests finished with non-zero exit code: '${exit_code}'"
+        TD_FAIL_FAST_RS = get_env TD_FAIL_FAST_RS
+        if not ${TD_FAIL_FAST_RS}
+            info "⌛️ Setting TD_TESTS_CODE_RS to ${exit_code}..."
+            set_env TD_TESTS_CODE_RS ${exit_code}
+        else
+            info "⌛️ Failing fast..."
+            code = exit ${exit_code}
+        end
+    end
+'''

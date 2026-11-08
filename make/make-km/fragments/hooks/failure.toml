@@ -1,0 +1,86 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.failure]
+plugin = "td-task-tracker"
+category = "90 - Lifecycle"
+description = "Handle make errors"
+private = false
+script_runner = "@duckscript"
+script = '''
+    os = os_family
+
+    make_with_banners = get_env TD_MAKE_WITH_BANNERS
+    make_with_banners_empty = is_empty ${make_with_banners}
+    make_with_banners_true = eq ${make_with_banners} "true"
+    make_with_banners = set ${make_with_banners_empty} or ${make_with_banners_true}
+
+    if ${make_with_banners}
+        if eq ${os} "windows"
+            cm_run_task failure_windows
+        elseif eq ${os} "mac"
+            cm_run_task failure_mac
+        elseif eq ${os} "linux"
+            cm_run_task failure_linux
+        end
+    else
+        echo "⭕️ Ko!"
+    end
+'''
+
+[tasks.failure_windows]
+plugin = "td-task-tracker"
+category = "90 - Lifecycle"
+private = true
+ignore_errors = true
+env = { MAKE_SUCCESS = "false" }
+
+[tasks.failure_linux]
+plugin = "td-task-tracker"
+category = "90 - Lifecycle"
+private = true
+ignore_errors = true
+env = { MAKE_SUCCESS = "false" }
+
+[tasks.failure_mac]
+plugin = "td-task-tracker"
+category = "90 - Lifecycle"
+private = true
+ignore_errors = true
+env = { MAKE_SUCCESS = "false" }
+script_runner = "@duckscript"
+script = '''
+    km_root = get_env KM_ROOT
+
+    imgcat = which imgcat
+    has_imgcat = not equals ${imgcat} ""
+    if ${has_imgcat}
+        echo ""
+        image = concat ${km_root} "/make/make-km/resources/images/gopher-sad.png"
+        exec imgcat --width 24 ${image}
+    end
+
+    lolcat = which lolcat
+    figlet = which figlet
+    has_lolcat = not equals ${lolcat} ""
+    has_figlet = not equals ${figlet} ""
+    has_both = set ${has_lolcat} and ${has_figlet}
+
+    if ${has_both}
+        echo ""
+        font = concat ${km_root} "/make/make-km/resources/fonts/3d.flf"
+        fig_out = exec figlet -f ${font} Failed!
+        fig_text = set ${fig_out.stdout}
+
+        tmp_root = temp_dir
+        my_pid = pid
+        tmp_file = concat ${tmp_root} "/td-km-failure-" ${my_pid} ".txt"
+        writefile ${tmp_file} ${fig_text}
+        exec lolcat ${tmp_file}
+        rm ${tmp_file}
+        echo ""
+    else
+        echo "⭕️ Ko!"
+    end
+'''

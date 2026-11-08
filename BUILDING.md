@@ -6,7 +6,8 @@
 
 The build is driven by [cargo-make](https://github.com/sagiegurari/cargo-make).
 Tasks are defined in `Maketask.toml` (root) and per module under
-`mods/<m>/Maketask.toml`, with shared fragments under `make/`.
+`mods/<m>/Maketask.toml`, with shared fragments under `make/make-km/` (each
+module keeps its own under `mods/<m>/make/make-km/`).
 
 ## Project Layout
 
@@ -15,11 +16,14 @@ Tasks are defined in `Maketask.toml` (root) and per module under
 ├── Makeroot.toml             root environment (env files, scripts, hooks)
 ├── Maketask.toml             top-level tasks (build / test / clean / assembly / ...)
 ├── make/
-│   ├── fragments/            shared task / hook / plugin fragments
-│   ├── libraries/            duckscript helpers (log.ds, term.py)
-│   ├── resources/            banners, fonts, images
-│   ├── scripts/              build-time scripts (e.g. fetch_k8s_deps.py)
-│   └── settings/             *.env defaults loaded by Makeroot
+│   └── make-km/
+│       ├── fragments/        task / hook / plugin fragments; standalone/ is km's own
+│       │                     make root; shared/ and the exported tasks/ are loaded by os/ee
+│       ├── libraries/        duckscript helpers (log.ds, term.py)
+│       ├── resources/        banners, fonts, images
+│       ├── scripts/          build-time scripts (e.g. fetch_k8s_deps.py)
+│       ├── settings/         *.env defaults loaded by Makeroot
+│       └── tests/            tests of the build-time scripts
 ├── mods/
 │   ├── control-plane/        Go — Kubernetes control plane
 │   ├── virtual-kubelet/      Go — Virtual Kubelet provider

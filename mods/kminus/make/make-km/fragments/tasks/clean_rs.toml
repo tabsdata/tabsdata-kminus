@@ -1,0 +1,16 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__clean_rs_kminus]
+plugin = "td-task-tracker"
+category = "01 - Clean"
+description = "Task 'clean' for kminus project"
+cwd = "${KM_ROOT}"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/make-km/libraries/log.ds
+
+    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} clean --locked %{td-target-token} %{td-target} --manifest-path ${PROJECT_RS_KMINUS_CARGO_TOML}"
+    exec --fail-on-error ${td-cargo} %{td-toolchain-token}%{td-toolchain} clean --locked %{td-target-token} %{td-target} --manifest-path ${PROJECT_RS_KMINUS_CARGO_TOML}
+'''

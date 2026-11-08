@@ -1,0 +1,15 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__deny_rs_kcommon]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+description = "Task 'deny' for kcommon project"
+cwd = "${KM_ROOT}/mods/kcommon"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/make-km/libraries/log.ds
+
+    debug "🚧 Task 'deny' for kcommon is not implemented yet."
+'''
