@@ -1,0 +1,18 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__format_py]
+plugin = "td-task-tracker"
+category = "09 - Repair"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 ruff format make/make-km"
+    exec --fail-on-error ruff format make/make-km
+    debug "🚀 ruff check --fix make/make-km"
+    exec --fail-on-error ruff check --fix make/make-km
+'''

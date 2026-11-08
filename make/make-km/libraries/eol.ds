@@ -1,0 +1,29 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+fn require_lf
+    pathspec = set ${1}
+    tool = set ${2}
+    debug "🚀 git ls-files --eol -- ${pathspec}"
+    listing = exec --fail-on-error git ls-files --eol -- ${pathspec}
+    lines = split ${listing.stdout} "\n"
+    unpinned = set ""
+    for line in ${lines}
+        line = trim ${line}
+        if not is_empty ${line}
+            pinned = contains ${line} "eol=lf"
+            crlf = contains ${line} "w/crlf"
+            if not ${pinned}
+                unpinned = set "${unpinned}\n${line}"
+            elseif ${crlf}
+                unpinned = set "${unpinned}\n${line}"
+            end
+        end
+    end
+    release ${lines}
+    if not is_empty ${unpinned}
+        error "🚫 Files a Windows checkout gives CRLF line endings, which ${tool} rejects; pin them with eol=lf in .gitattributes:${unpinned}"
+        assert_fail
+    end
+end

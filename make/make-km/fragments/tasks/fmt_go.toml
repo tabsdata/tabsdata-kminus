@@ -21,6 +21,7 @@ cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
 script_runner = "@duckscript"
 script = '''
     !include_files ./make/make-os/libraries/log.ds
+    !include_files ./make/make-km/libraries/eol.ds
 
     cd ${PROJECT_TABSDATA_KM_ROOT_FOLDER}/mods/control-plane/src/main/go
 
@@ -31,6 +32,8 @@ script = '''
         error "🚫 Files not formatted with gofmt:\n${unformatted}"
         assert_fail
     end
+
+    require_lf "*.go" "gofmt"
 '''
 
 [tasks.__km__fmt_go_virtual_kubelet]
@@ -41,6 +44,7 @@ cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
 script_runner = "@duckscript"
 script = '''
     !include_files ./make/make-os/libraries/log.ds
+    !include_files ./make/make-km/libraries/eol.ds
 
     cd ${PROJECT_TABSDATA_KM_ROOT_FOLDER}/mods/virtual-kubelet/src/main/go
 
@@ -51,4 +55,6 @@ script = '''
         error "🚫 Files not formatted with gofmt:\n${unformatted}"
         assert_fail
     end
+
+    require_lf "*.go" "gofmt"
 '''

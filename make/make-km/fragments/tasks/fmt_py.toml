@@ -1,0 +1,18 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__fmt_py]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 ruff check make/make-km"
+    exec --fail-on-error ruff check make/make-km
+    debug "🚀 ruff format --check make/make-km"
+    exec --fail-on-error ruff format --check make/make-km
+'''
