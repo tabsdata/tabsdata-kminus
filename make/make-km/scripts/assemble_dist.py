@@ -13,7 +13,12 @@ COPY_RETRY_INTERVAL_SECONDS = 2
 
 GO_MODULES = ["control-plane", "virtual-kubelet"]
 RUST_MODULES = [("pod-runner", "pod-runner"), ("kminus", "km")]
-KUBERNETES_DEPENDENCIES = ["kube-apiserver", "kube-controller-manager", "etcd", "kubectl"]
+KUBERNETES_DEPENDENCIES = [
+    "kube-apiserver",
+    "kube-controller-manager",
+    "etcd",
+    "kubectl",
+]
 KUBERNETES_RENAMES = {"kubectl": "kmc"}
 
 
@@ -25,10 +30,9 @@ def copy_verified(source, destination):
             shutil.copy2(source, destination)
         except OSError as error:
             last_error = error
-        if (
-            os.path.isfile(destination)
-            and os.path.getsize(destination) == os.path.getsize(source)
-        ):
+        if os.path.isfile(destination) and os.path.getsize(
+            destination
+        ) == os.path.getsize(source):
             return
         if time.monotonic() >= deadline:
             if os.path.isfile(destination) and os.path.getsize(destination) > 0:
@@ -41,8 +45,7 @@ def copy_verified(source, destination):
                 return
             raise RuntimeError(
                 f"Failed to copy '{source}' -> '{destination}' after "
-                f"{COPY_TIMEOUT_SECONDS}s"
-                + (f": {last_error}" if last_error else "")
+                f"{COPY_TIMEOUT_SECONDS}s" + (f": {last_error}" if last_error else "")
             )
         print(
             f"   retrying copy '{source}' -> '{destination}' in "
@@ -78,9 +81,7 @@ def main():
             km_root, "mods", module, "target", f"{module}{exe_suffix}"
         )
         if os.path.isfile(source):
-            destination = os.path.join(
-                distribution_folder, f"{module}{exe_suffix}"
-            )
+            destination = os.path.join(distribution_folder, f"{module}{exe_suffix}")
             copy_verified(source, destination)
             print(f"Added Go binary '{destination}'")
             native_binaries.append(destination)
@@ -92,9 +93,7 @@ def main():
             km_root, "mods", module, "target", build_folder, f"{binary}{exe_suffix}"
         )
         if os.path.isfile(source):
-            destination = os.path.join(
-                distribution_folder, f"{binary}{exe_suffix}"
-            )
+            destination = os.path.join(distribution_folder, f"{binary}{exe_suffix}")
             copy_verified(source, destination)
             print(f"Added Rust binary '{destination}'")
             native_binaries.append(destination)

@@ -55,16 +55,15 @@ def run(cmd, **kwargs):
 
 def ensure_setup_envtest():
     """Ensure setup-envtest is installed, return its path."""
-    gobin = subprocess.check_output(
-        ["go", "env", "GOPATH"], text=True
-    ).strip()
+    gobin = subprocess.check_output(["go", "env", "GOPATH"], text=True).strip()
     gobin = os.path.join(gobin, "bin")
     envtest_bin = os.path.join(gobin, "setup-envtest")
 
     if not os.path.isfile(envtest_bin):
         print("Installing setup-envtest...")
         run([
-            "go", "install",
+            "go",
+            "install",
             "sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.19",
         ])
 
@@ -79,7 +78,17 @@ def fetch_envtest_binaries(envtest_bin, k8s_version, os_name, arch, cache_dir):
     Returns the full K8s version string (e.g., 'v1.29.5').
     """
     result = subprocess.check_output(
-        [envtest_bin, "use", k8s_version, "--os", os_name, "--arch", arch, "-p", "path"],
+        [
+            envtest_bin,
+            "use",
+            k8s_version,
+            "--os",
+            os_name,
+            "--arch",
+            arch,
+            "-p",
+            "path",
+        ],
         text=True,
     ).strip()
     envtest_path = result
@@ -105,8 +114,14 @@ def clone_k8s_source(source_dir, full_version):
     print(f"Cloning kubernetes {full_version} source (shallow)...")
     os.makedirs(source_dir, exist_ok=True)
     run([
-        "git", "clone", "--depth", "1", "--branch", full_version,
-        "https://github.com/kubernetes/kubernetes.git", k8s_dir,
+        "git",
+        "clone",
+        "--depth",
+        "1",
+        "--branch",
+        full_version,
+        "https://github.com/kubernetes/kubernetes.git",
+        k8s_dir,
     ])
     return k8s_dir
 
@@ -120,15 +135,17 @@ def build_kube_controller_manager(k8s_source, full_version, os_name, arch, cache
     env = os.environ.copy()
     env["CGO_ENABLED"] = "0"
     run(
-        ["go",
-         "build",
-         "-C",
-         k8s_source,
-         "-trimpath",
-         "-ldflags=-s -w",
-         "-o",
-         output,
-         "./cmd/kube-controller-manager",],
+        [
+            "go",
+            "build",
+            "-C",
+            k8s_source,
+            "-trimpath",
+            "-ldflags=-s -w",
+            "-o",
+            output,
+            "./cmd/kube-controller-manager",
+        ],
         env=env,
     )
 
@@ -160,7 +177,9 @@ def main():
     )
 
     k8s_source = clone_k8s_source(k8s_source_dir, full_version)
-    build_kube_controller_manager(k8s_source, full_version, os_name, arch, platform_cache)
+    build_kube_controller_manager(
+        k8s_source, full_version, os_name, arch, platform_cache
+    )
 
     # Ensure all binaries are executable
     for entry in os.listdir(platform_cache):
