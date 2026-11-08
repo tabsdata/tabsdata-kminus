@@ -11,5 +11,6 @@ script_runner = "@duckscript"
 script = '''
     !include_files ./make/make-km/libraries/log.ds
 
-    debug "🚧 Task 'deny' for pod-runner is not implemented yet."
+    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} deny --locked %{td-target-token} %{td-target} --log-level error --all-features --manifest-path ${PROJECT_RS_POD_RUNNER_CARGO_TOML} --config ${DENY_TOML} check bans advisories sources"
+    exec --fail-on-error ${td-cargo} %{td-toolchain-token}%{td-toolchain} deny --locked %{td-target-token} %{td-target} --log-level error --all-features --manifest-path ${PROJECT_RS_POD_RUNNER_CARGO_TOML} --config ${DENY_TOML} check bans advisories sources
 '''

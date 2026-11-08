@@ -1,0 +1,57 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__deny_rs]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+private = true
+run_task = [
+    { name = [
+        "__km__deny_rs_kcommon",
+        "__km__deny_rs_kminus",
+        "__km__deny_rs_pod_runner"
+    ] }
+]
+
+[tasks.__km__deny_rs_kcommon]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} deny --locked %{td-target-token} %{td-target} --log-level error --all-features --manifest-path ${PROJECT_RS_KM_KCOMMON_FOLDER}/Cargo.toml --config ${DENY_TOML} check bans advisories sources"
+    exec --fail-on-error ${td-cargo} %{td-toolchain-token}%{td-toolchain} deny --locked %{td-target-token} %{td-target} --log-level error --all-features --manifest-path ${PROJECT_RS_KM_KCOMMON_FOLDER}/Cargo.toml --config ${DENY_TOML} check bans advisories sources
+    ''']
+
+[tasks.__km__deny_rs_kminus]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} deny --locked %{td-target-token} %{td-target} --log-level error --all-features --manifest-path ${PROJECT_RS_KM_KMINUS_FOLDER}/Cargo.toml --config ${DENY_TOML} check bans advisories sources"
+    exec --fail-on-error ${td-cargo} %{td-toolchain-token}%{td-toolchain} deny --locked %{td-target-token} %{td-target} --log-level error --all-features --manifest-path ${PROJECT_RS_KM_KMINUS_FOLDER}/Cargo.toml --config ${DENY_TOML} check bans advisories sources
+    ''']
+
+[tasks.__km__deny_rs_pod_runner]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} deny --locked %{td-target-token} %{td-target} --log-level error --all-features --manifest-path ${PROJECT_RS_KM_POD_RUNNER_FOLDER}/Cargo.toml --config ${DENY_TOML} check bans advisories sources"
+    exec --fail-on-error ${td-cargo} %{td-toolchain-token}%{td-toolchain} deny --locked %{td-target-token} %{td-target} --log-level error --all-features --manifest-path ${PROJECT_RS_KM_POD_RUNNER_FOLDER}/Cargo.toml --config ${DENY_TOML} check bans advisories sources
+    ''']

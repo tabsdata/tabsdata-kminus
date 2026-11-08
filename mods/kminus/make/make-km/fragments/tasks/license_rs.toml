@@ -11,5 +11,6 @@ script_runner = "@duckscript"
 script = '''
     !include_files ./make/make-km/libraries/log.ds
 
-    debug "🚧 Task 'license' for kminus is not implemented yet."
+    debug "🚀 cargo %{td-toolchain-token}%{td-toolchain} deny --locked --log-level error --all-features --manifest-path ${PROJECT_RS_KMINUS_CARGO_TOML} --config ${DENY_TOML} check --hide-inclusion-graph licenses"
+    exec --fail-on-error cargo %{td-toolchain-token}%{td-toolchain} deny --locked --log-level error --all-features --manifest-path ${PROJECT_RS_KMINUS_CARGO_TOML} --config ${DENY_TOML} check --hide-inclusion-graph licenses
 '''

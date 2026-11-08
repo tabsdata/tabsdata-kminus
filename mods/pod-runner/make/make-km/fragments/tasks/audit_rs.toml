@@ -11,5 +11,9 @@ script_runner = "@duckscript"
 script = '''
     !include_files ./make/make-km/libraries/log.ds
 
-    debug "🚧 Task 'audit' for pod-runner is not implemented yet."
+    # cargo audit reads its ignore list from .cargo/audit.toml in the working folder.
+    cd ${TABSDATA_ROOT}
+
+    debug "🚀 cargo audit --deny warnings --file ${PROJECT_RS_POD_RUNNER_FOLDER}/Cargo.lock"
+    exec --fail-on-error cargo audit --deny warnings --file ${PROJECT_RS_POD_RUNNER_FOLDER}/Cargo.lock
 '''

@@ -1,0 +1,57 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__outdated_rs]
+plugin = "td-task-tracker"
+category = "05 - Inspect"
+private = true
+run_task = [
+    { name = [
+        "__km__outdated_rs_kcommon",
+        "__km__outdated_rs_kminus",
+        "__km__outdated_rs_pod_runner"
+    ] }
+]
+
+[tasks.__km__outdated_rs_kcommon]
+plugin = "td-task-tracker"
+category = "05 - Inspect"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 ${td-cargo} upgrade --dry-run --compatible allow --incompatible allow --pinned allow --manifest-path ${PROJECT_RS_KM_KCOMMON_FOLDER}/Cargo.toml"
+    exec --fail-on-error ${td-cargo} upgrade --dry-run --compatible allow --incompatible allow --pinned allow --manifest-path ${PROJECT_RS_KM_KCOMMON_FOLDER}/Cargo.toml
+    ''']
+
+[tasks.__km__outdated_rs_kminus]
+plugin = "td-task-tracker"
+category = "05 - Inspect"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 ${td-cargo} upgrade --dry-run --compatible allow --incompatible allow --pinned allow --manifest-path ${PROJECT_RS_KM_KMINUS_FOLDER}/Cargo.toml"
+    exec --fail-on-error ${td-cargo} upgrade --dry-run --compatible allow --incompatible allow --pinned allow --manifest-path ${PROJECT_RS_KM_KMINUS_FOLDER}/Cargo.toml
+    ''']
+
+[tasks.__km__outdated_rs_pod_runner]
+plugin = "td-task-tracker"
+category = "05 - Inspect"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 ${td-cargo} upgrade --dry-run --compatible allow --incompatible allow --pinned allow --manifest-path ${PROJECT_RS_KM_POD_RUNNER_FOLDER}/Cargo.toml"
+    exec --fail-on-error ${td-cargo} upgrade --dry-run --compatible allow --incompatible allow --pinned allow --manifest-path ${PROJECT_RS_KM_POD_RUNNER_FOLDER}/Cargo.toml
+    ''']

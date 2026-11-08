@@ -1,0 +1,57 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__clippy_rs]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+private = true
+run_task = [
+    { name = [
+        "__km__clippy_rs_kcommon",
+        "__km__clippy_rs_kminus",
+        "__km__clippy_rs_pod_runner"
+    ] }
+]
+
+[tasks.__km__clippy_rs_kcommon]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} clippy %{td-rust-quiet} --locked %{td-target-token} %{td-target} --all-targets --all-features --profile ${td-profile} --manifest-path ${PROJECT_RS_KM_KCOMMON_FOLDER}/Cargo.toml -- -D warnings"
+    exec --fail-on-error ${td-cargo} %{td-toolchain-token}%{td-toolchain} clippy %{td-rust-quiet} --locked %{td-target-token} %{td-target} --all-targets --all-features --profile ${td-profile} --manifest-path ${PROJECT_RS_KM_KCOMMON_FOLDER}/Cargo.toml -- -D warnings
+    ''']
+
+[tasks.__km__clippy_rs_kminus]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} clippy %{td-rust-quiet} --locked %{td-target-token} %{td-target} --all-targets --all-features --profile ${td-profile} --manifest-path ${PROJECT_RS_KM_KMINUS_FOLDER}/Cargo.toml -- -D warnings"
+    exec --fail-on-error ${td-cargo} %{td-toolchain-token}%{td-toolchain} clippy %{td-rust-quiet} --locked %{td-target-token} %{td-target} --all-targets --all-features --profile ${td-profile} --manifest-path ${PROJECT_RS_KM_KMINUS_FOLDER}/Cargo.toml -- -D warnings
+    ''']
+
+[tasks.__km__clippy_rs_pod_runner]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} clippy %{td-rust-quiet} --locked %{td-target-token} %{td-target} --all-targets --all-features --profile ${td-profile} --manifest-path ${PROJECT_RS_KM_POD_RUNNER_FOLDER}/Cargo.toml -- -D warnings"
+    exec --fail-on-error ${td-cargo} %{td-toolchain-token}%{td-toolchain} clippy %{td-rust-quiet} --locked %{td-target-token} %{td-target} --all-targets --all-features --profile ${td-profile} --manifest-path ${PROJECT_RS_KM_POD_RUNNER_FOLDER}/Cargo.toml -- -D warnings
+    ''']

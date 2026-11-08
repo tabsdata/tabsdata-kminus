@@ -1,0 +1,57 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__fmt_rs]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+private = true
+run_task = [
+    { name = [
+        "__km__fmt_rs_kcommon",
+        "__km__fmt_rs_kminus",
+        "__km__fmt_rs_pod_runner"
+    ] }
+]
+
+[tasks.__km__fmt_rs_kcommon]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 cargo fmt --manifest-path ${PROJECT_RS_KM_KCOMMON_FOLDER}/Cargo.toml --all --check"
+    exec --fail-on-error cargo fmt --manifest-path ${PROJECT_RS_KM_KCOMMON_FOLDER}/Cargo.toml --all --check
+    ''']
+
+[tasks.__km__fmt_rs_kminus]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 cargo fmt --manifest-path ${PROJECT_RS_KM_KMINUS_FOLDER}/Cargo.toml --all --check"
+    exec --fail-on-error cargo fmt --manifest-path ${PROJECT_RS_KM_KMINUS_FOLDER}/Cargo.toml --all --check
+    ''']
+
+[tasks.__km__fmt_rs_pod_runner]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 cargo fmt --manifest-path ${PROJECT_RS_KM_POD_RUNNER_FOLDER}/Cargo.toml --all --check"
+    exec --fail-on-error cargo fmt --manifest-path ${PROJECT_RS_KM_POD_RUNNER_FOLDER}/Cargo.toml --all --check
+    ''']

@@ -11,5 +11,6 @@ script_runner = "@duckscript"
 script = '''
     !include_files ./make/make-km/libraries/log.ds
 
-    debug "🚧 Task 'fmt' for kcommon is not implemented yet."
+    debug "🚀 cargo fmt --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML} --all --check"
+    exec --fail-on-error cargo fmt --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML} --all --check
 '''

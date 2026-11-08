@@ -6,10 +6,11 @@
 plugin = "td-task-tracker"
 category = "08 - Linting"
 description = "Task 'clippy' for kminus project"
-cwd = "${KM_ROOT}/mods/kminus"
+cwd = "${KM_ROOT}"
 script_runner = "@duckscript"
 script = '''
     !include_files ./make/make-km/libraries/log.ds
 
-    debug "🚧 Task 'clippy' for kminus is not implemented yet."
+    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} clippy %{td-rust-quiet} --locked %{td-target-token} %{td-target} --all-targets --all-features --profile ${td-profile} --manifest-path ${PROJECT_RS_KMINUS_CARGO_TOML} -- -D warnings"
+    exec --fail-on-error ${td-cargo} %{td-toolchain-token}%{td-toolchain} clippy %{td-rust-quiet} --locked %{td-target-token} %{td-target} --all-targets --all-features --profile ${td-profile} --manifest-path ${PROJECT_RS_KMINUS_CARGO_TOML} -- -D warnings
 '''

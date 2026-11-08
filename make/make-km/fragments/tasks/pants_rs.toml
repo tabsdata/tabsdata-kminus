@@ -1,0 +1,57 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__pants_rs]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+private = true
+run_task = [
+    { name = [
+        "__km__pants_rs_kcommon",
+        "__km__pants_rs_kminus",
+        "__km__pants_rs_pod_runner"
+    ] }
+]
+
+[tasks.__km__pants_rs_kcommon]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 cargo pants --ignore-file ${PANTS_JSON} --tomlfile ${PROJECT_RS_KM_KCOMMON_FOLDER}/Cargo.toml"
+    exec --fail-on-error cargo pants --ignore-file ${PANTS_JSON} --tomlfile ${PROJECT_RS_KM_KCOMMON_FOLDER}/Cargo.toml
+    ''']
+
+[tasks.__km__pants_rs_kminus]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 cargo pants --ignore-file ${PANTS_JSON} --tomlfile ${PROJECT_RS_KM_KMINUS_FOLDER}/Cargo.toml"
+    exec --fail-on-error cargo pants --ignore-file ${PANTS_JSON} --tomlfile ${PROJECT_RS_KM_KMINUS_FOLDER}/Cargo.toml
+    ''']
+
+[tasks.__km__pants_rs_pod_runner]
+plugin = "td-task-tracker"
+category = "07 - Shield"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    debug "🚀 cargo pants --ignore-file ${PANTS_JSON} --tomlfile ${PROJECT_RS_KM_POD_RUNNER_FOLDER}/Cargo.toml"
+    exec --fail-on-error cargo pants --ignore-file ${PANTS_JSON} --tomlfile ${PROJECT_RS_KM_POD_RUNNER_FOLDER}/Cargo.toml
+    ''']

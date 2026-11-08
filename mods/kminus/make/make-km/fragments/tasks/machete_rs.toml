@@ -11,5 +11,6 @@ script_runner = "@duckscript"
 script = '''
     !include_files ./make/make-km/libraries/log.ds
 
-    debug "🚧 Task 'machete' for kminus is not implemented yet."
+    debug "🚀 cargo machete --with-metadata ${PROJECT_RS_KMINUS_FOLDER}"
+    exec --fail-on-error cargo machete --with-metadata ${PROJECT_RS_KMINUS_FOLDER}
 '''

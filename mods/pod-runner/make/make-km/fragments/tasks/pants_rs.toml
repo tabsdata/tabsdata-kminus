@@ -11,5 +11,6 @@ script_runner = "@duckscript"
 script = '''
     !include_files ./make/make-km/libraries/log.ds
 
-    debug "🚧 Task 'pants' for pod-runner is not implemented yet."
+    debug "🚀 cargo pants --ignore-file ${PANTS_JSON} --tomlfile ${PROJECT_RS_POD_RUNNER_CARGO_TOML}"
+    exec --fail-on-error cargo pants --ignore-file ${PANTS_JSON} --tomlfile ${PROJECT_RS_POD_RUNNER_CARGO_TOML}
 '''

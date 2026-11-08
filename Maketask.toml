@@ -6,6 +6,19 @@ extend = [
     { path = "./make/make-km/fragments/standalone/Maketask.toml", relative = "git" },
 ]
 
+[tasks.assess]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Full verification, without building or testing"
+run_task = [
+    { name = [
+        "update",
+        "lock",
+        "assess_go",
+        "assess_rs"
+    ] }
+]
+
 [tasks.make]
 plugin = "td-task-tracker"
 category = "00 - Make"
@@ -40,6 +53,32 @@ run_task = [
         "compose_rs"], condition = { env = { "CLEAN" = "true" } } },
     { name = [
         "compose_rs"
+    ] }
+]
+
+[tasks.assess_go]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Task 'assess' for Go projects"
+run_task = [
+    { name = [
+        "clean_go",
+        "review_go"], condition = { env = { "CLEAN" = "true" } } },
+    { name = [
+        "review_go"
+    ] }
+]
+
+[tasks.assess_rs]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Task 'assess' for Rust projects"
+run_task = [
+    { name = [
+        "clean_rs",
+        "review_rs"], condition = { env = { "CLEAN" = "true" } } },
+    { name = [
+        "review_rs"
     ] }
 ]
 
@@ -182,6 +221,44 @@ run_task = [
         "compose_kcommon",
         "compose_pod_runner",
         "compose_kminus"
+    ] }
+]
+
+[tasks.review_go]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Every verification after building and testing, for Go projects"
+private = true
+run_task = [
+    { name = [
+        "check_go",
+        "clippy_go",
+        "fmt_go",
+        "license_go",
+        "outdated_go",
+        "machete_go",
+        "audit_go",
+        "deny_go",
+        "pants_go"
+    ] }
+]
+
+[tasks.review_rs]
+plugin = "td-task-tracker"
+category = "00 - Make"
+description = "Every verification after building and testing, for Rust projects"
+private = true
+run_task = [
+    { name = [
+        "check_rs",
+        "clippy_rs",
+        "fmt_rs",
+        "license_rs",
+        "outdated_rs",
+        "machete_rs",
+        "audit_rs",
+        "deny_rs",
+        "pants_rs"
     ] }
 ]
 

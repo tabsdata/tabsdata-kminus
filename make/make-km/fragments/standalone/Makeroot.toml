@@ -42,6 +42,9 @@ ASSEMBLE_DIST_SCRIPT = { value = "${KM_ROOT}/make/make-km/scripts/assemble_dist.
 BUMP_VERSION_SCRIPT = { value = "${TABSDATA_ROOT}/devutils/automation/tasks/makers/td-scripts/bump_version.py", normalize = true }
 CHECK_NATIVE_LIBS_SCRIPT = { value = "${TABSDATA_ROOT}/devutils/automation/tasks/makers/td-scripts/check_native_libs.py", normalize = true }
 
+DENY_TOML = { value = "${TABSDATA_ROOT}/.cargo/deny.toml", normalize = true }
+PANTS_JSON = { value = "${TABSDATA_ROOT}/.cargo/pants.json", normalize = true }
+
 [config]
 load_script = [
     '''

@@ -11,5 +11,6 @@ script_runner = "@duckscript"
 script = '''
     !include_files ./make/make-km/libraries/log.ds
 
-    debug "🚧 Task 'check' for kcommon is not implemented yet."
+    debug "🚀 ${td-cargo} %{td-toolchain-token}%{td-toolchain} check %{td-rust-quiet} --locked %{td-target-token} %{td-target} --all-targets --all-features --profile ${td-profile} --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML}"
+    exec --fail-on-error ${td-cargo} %{td-toolchain-token}%{td-toolchain} check %{td-rust-quiet} --locked %{td-target-token} %{td-target} --all-targets --all-features --profile ${td-profile} --manifest-path ${PROJECT_RS_KCOMMON_CARGO_TOML}
 '''
