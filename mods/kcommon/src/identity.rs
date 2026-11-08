@@ -79,7 +79,7 @@ pub fn process_start_time(pid: u32) -> Result<Option<u64>, sysinfo::Error> {
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         false,
-        ProcessRefreshKind::nothing(),
+        ProcessRefreshKind::nothing().without_tasks(),
     );
     Ok(system.process(pid).map(|p| p.start_time()))
 }
@@ -95,7 +95,7 @@ pub fn running_since(pid: u32, stamp: &str) -> Result<bool, sysinfo::Error> {
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         false,
-        ProcessRefreshKind::nothing(),
+        ProcessRefreshKind::nothing().without_tasks(),
     );
     Ok(system.process(pid).is_some_and(|p| {
         p.status() != sysinfo::ProcessStatus::Zombie && owner_stamp(p.start_time()) == stamp

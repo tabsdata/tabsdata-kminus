@@ -47,7 +47,9 @@ impl Scan {
         system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::nothing().with_environ(UpdateKind::Always),
+            ProcessRefreshKind::nothing()
+                .without_tasks()
+                .with_environ(UpdateKind::Always),
         );
         Ok(Self(system))
     }
@@ -115,7 +117,9 @@ pub fn still_carries(pid: u32, var: &str, expected: &str) -> bool {
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         false,
-        ProcessRefreshKind::nothing().with_environ(UpdateKind::Always),
+        ProcessRefreshKind::nothing()
+            .without_tasks()
+            .with_environ(UpdateKind::Always),
     );
     let Some(process) = system.process(pid) else {
         return false;
