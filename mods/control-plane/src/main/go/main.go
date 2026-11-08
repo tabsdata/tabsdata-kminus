@@ -1332,6 +1332,10 @@ func (m *etcdMaintainer) defrag(ctx context.Context, why string, size, inUse int
 }
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 	port := fs.String("port", "6443", "API server listen port")
 	kcmPort := fs.String("kcm-port", "10257", "kube-controller-manager secure port")
@@ -1357,7 +1361,7 @@ func main() {
 	exe, err := os.Executable()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "CRITICAL: cannot resolve own executable path: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	baseDir := filepath.Dir(exe)
 
@@ -1365,7 +1369,7 @@ func main() {
 	cwd, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "CRITICAL: cannot resolve the current directory: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	wd := *workDir
 	if !filepath.IsAbs(wd) {
@@ -1375,7 +1379,7 @@ func main() {
 	dataDir := filepath.Join(wd, "data", "control-plane")
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "CRITICAL: cannot create data dir %s: %v\n", dataDir, err)
-		os.Exit(1)
+		return 1
 	}
 
 	// Config dir (default: <workdir>/config)
@@ -1388,14 +1392,14 @@ func main() {
 	}
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "CRITICAL: cannot create config dir %s: %v\n", outDir, err)
-		os.Exit(1)
+		return 1
 	}
 
 	// Load or create cpsysconfig.yaml
 	cpSys, err := loadOrCreateCPSysConfig(outDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	// Load or create tokens.csv — static auth tokens, generated once and
@@ -1403,7 +1407,7 @@ func main() {
 	tokens, err := loadOrCreateTokens(outDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	// Log dir (default: <workdir>/log)
@@ -1416,7 +1420,7 @@ func main() {
 	}
 	if err := os.MkdirAll(ld, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "CRITICAL: cannot create log dir %s: %v\n", ld, err)
-		os.Exit(1)
+		return 1
 	}
 
 	// Setup control-plane's own rotating log (log package → file only)
@@ -1453,12 +1457,18 @@ func main() {
 	pidsDir := filepath.Join(dataDir, "pids")
 	if err := os.MkdirAll(pidsDir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "CRITICAL: cannot create pids dir %s: %v\n", pidsDir, err)
-		os.Exit(1)
+		return 1
 	}
 	killStaleProcesses(pidsDir, warn)
 
 	// Write own PID file
 	writePid(filepath.Join(pidsDir, fmt.Sprintf("%d.control-plane", os.Getpid())), os.Getpid())
+	defer func() {
+		if path, _ := pidFileForProcess(pidsDir, "control-plane"); path != "" {
+			os.Remove(path)
+		}
+		os.Remove(pidsDir)
+	}()
 
 	info("--- Local Control Plane ---")
 	info("Binary Dir:  %s", baseDir)
@@ -1476,18 +1486,18 @@ func main() {
 	// Check if asset binaries exist next to td_km
 	if _, err := os.Stat(filepath.Join(baseDir, "kube-apiserver"+ext)); os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "CRITICAL: kube-apiserver%s not found next to td_km!\n", ext)
-		os.Exit(1)
+		return 1
 	}
 
 	if _, err := os.Stat(filepath.Join(baseDir, "etcd"+ext)); os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "CRITICAL: etcd%s not found next to td_km!\n", ext)
-		os.Exit(1)
+		return 1
 	}
 
 	kcmPath := filepath.Join(baseDir, "kube-controller-manager"+ext)
 	if _, err := os.Stat(kcmPath); os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "CRITICAL: kube-controller-manager%s not found next to td_km!\n", ext)
-		os.Exit(1)
+		return 1
 	}
 
 	// Check if ports are available. etcd's are only listed when km pinned
@@ -1507,7 +1517,7 @@ func main() {
 		ln, err := net.Listen("tcp", "127.0.0.1:"+p.port)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "CRITICAL: %s port %s is already in use: %v\n", p.name, p.port, err)
-			os.Exit(1)
+			return 1
 		}
 		ln.Close()
 	}
@@ -1589,12 +1599,81 @@ func main() {
 		Set("service-account-issuer", "https://kubernetes.default.svc").
 		Set("token-auth-file", filepath.Join(outDir, tokensFile))
 
+	// Before any child starts: an unhandled SIGTERM ends this process at once,
+	// leaving etcd and the API server running. Startup checks for one between
+	// its steps; the supervision loop below takes over once it is done.
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	interrupted := func() bool {
+		select {
+		case <-sigChan:
+			info("\n[+] Shutdown requested")
+			return true
+		default:
+			return false
+		}
+	}
+
+	// Cancelled as run returns, after the deferred shutdown below has had its
+	// go: kube-controller-manager is started under it, so a stop that outlives
+	// its SIGTERM still gets killed.
+	ctx, cancelAll := context.WithCancel(context.Background())
+	defer cancelAll()
+
+	if interrupted() {
+		return 0
+	}
+
 	// Start the Server
 	cfg, err := testEnv.Start()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to start: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
+
+	// From here on every return stops the children, whatever the reason.
+	var kcmCmd *exec.Cmd
+	var kcmExited <-chan string
+	var maintainer *etcdMaintainer
+	defer func() {
+		info("\n[+] Shutting down...")
+
+		// Before anything is stopped: this is the last moment etcd can answer,
+		// and the size it finishes at is what the next start inherits.
+		if maintainer != nil {
+			shutdownCtx, cancelShutdownReport := reportCtx(context.Background())
+			maintainer.logStorage(shutdownCtx, messageStopPhase)
+			cancelShutdownReport()
+		}
+
+		// Stop kube-controller-manager. The watcher goroutine owns Wait(), so
+		// take its result rather than calling Wait() again, which would error —
+		// and skip the whole dance when it has already exited and been reaped.
+		if kcmCmd != nil && kcmCmd.Process != nil && !processGone(kcmName, kcmCmd.Process.Pid) {
+			info("[+] Stopping kube-controller-manager...")
+			if err := kcmCmd.Process.Signal(syscall.SIGTERM); err != nil {
+				warn("cannot signal kube-controller-manager: %v", err)
+			}
+			select {
+			case <-kcmExited:
+			case <-time.After(kcmStopTimeout):
+				warn("kube-controller-manager did not exit within %s", kcmStopTimeout)
+			}
+		}
+
+		// Stop the test environment (etcd + kube-apiserver)
+		if err := testEnv.Stop(); err != nil {
+			info("Warning: %v (processes may have already stopped)", err)
+		}
+
+		// Ensure all child processes are actually dead before removing PID files.
+		// envtest.Stop() may return before children have fully exited.
+		for _, name := range []string{"kube-controller-manager", "kube-apiserver", "etcd"} {
+			stopAndCleanPid(pidsDir, name, info)
+		}
+
+		info("[+] Stopped successfully")
+	}()
 
 	// Write PID files for etcd and kube-apiserver (envtest child processes)
 	envtestChildren := writeChildPids(pidsDir)
@@ -1611,13 +1690,12 @@ func main() {
 	client, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create client: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
-	// Cancelled as main returns; kube-controller-manager is started under it,
-	// so a stop that outlives its SIGTERM still gets killed.
-	ctx, cancelAll := context.WithCancel(context.Background())
-	defer cancelAll()
+	if interrupted() {
+		return 0
+	}
 
 	// Create kube-node-lease namespace
 	info("[+] Creating kube-node-lease namespace...")
@@ -1641,9 +1719,16 @@ func main() {
 		info("[+] kube-system namespace created")
 	}
 
+	if interrupted() {
+		return 0
+	}
+
 	// Wait for API server to be fully ready
 	info("[+] Waiting for API server to be ready...")
 	for i := 0; i < 30; i++ {
+		if interrupted() {
+			return 0
+		}
 		_, err := client.Discovery().ServerVersion()
 		if err == nil {
 			info("[+] API server is ready")
@@ -1651,7 +1736,7 @@ func main() {
 		}
 		if i == 29 {
 			fmt.Fprintf(os.Stderr, "CRITICAL: API server did not become ready: %v\n", err)
-			os.Exit(1)
+			return 1
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
@@ -1660,13 +1745,17 @@ func main() {
 	kcmConfigPath := filepath.Join(outDir, "kubeconfig-kcm.yaml")
 	if err := writeKubeconfig(kcmConfigPath, cfg.Host, "kcm", tokens[kcmUserName]); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to write KCM kubeconfig: %v\n", err)
-		os.Exit(1)
+		return 1
+	}
+
+	if interrupted() {
+		return 0
 	}
 
 	// Start kube-controller-manager with rotating log
 	kcmLog := newRotatingLog(ld, "kube-controller-manager", *logMaxSizeMB, *logMaxFiles)
 	info("[+] Starting kube-controller-manager...")
-	kcmCmd := exec.CommandContext(ctx, kcmPath,
+	kcmCmd = exec.CommandContext(ctx, kcmPath,
 		"--kubeconfig", kcmConfigPath,
 		"--leader-elect=false",
 		"--controllers=job,cronjob,ttl-after-finished,garbagecollector,deployment,replicaset",
@@ -1681,19 +1770,19 @@ func main() {
 
 	if err := kcmCmd.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to start kube-controller-manager: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	writePid(filepath.Join(pidsDir, fmt.Sprintf("%d.kube-controller-manager", kcmCmd.Process.Pid)), kcmCmd.Process.Pid)
 	info("[+] kube-controller-manager started (pid: %d)", kcmCmd.Process.Pid)
 	// This process owns kcm, so its exit status is available — unlike the
 	// envtest pair, which can only be checked by pid.
-	kcmExited := watchExit(kcmName, kcmCmd)
+	kcmExited = watchExit(kcmName, kcmCmd)
 
 	// Generate VK kubeconfig
 	vkConfigPath := filepath.Join(outDir, "vk-kubeconfig.yaml")
 	if err := writeKubeconfig(vkConfigPath, cfg.Host, "vk-user", tokens[vkUserName]); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to write VK kubeconfig: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	info("[+] VK Kubeconfig written to: %s", vkConfigPath)
 
@@ -1701,7 +1790,7 @@ func main() {
 	configPath := filepath.Join(outDir, "kubeconfig.yaml")
 	if err := writeKubeconfig(configPath, cfg.Host, "admin", tokens[adminUserName]); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to write admin kubeconfig: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	info("[+] Admin Kubeconfig written to: %s", configPath)
 
@@ -1713,8 +1802,6 @@ func main() {
 	// Supervise the children from here on. Each round probes all three and
 	// republishes the heartbeat km watches; km never probes them itself,
 	// since only this process knows the port envtest gave etcd.
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	// Derived from ctx so a shutdown aborts an in-flight probe at once,
 	// separate from ctx so it does not kill kube-controller-manager before
@@ -1798,7 +1885,7 @@ func main() {
 	// Only beats once the children have been healthy at least once: km's
 	// readiness gate opens on the first ready beat, so beating before then
 	// would report a control plane that is still coming up as usable.
-	maintainer := newEtcdMaintainer(plainClient,
+	maintainer = newEtcdMaintainer(plainClient,
 		testEnv.ControlPlane.Etcd.URL.String(), dataDir, wd, cpSys, info, warn,
 		func() {
 			if everHealthy {
@@ -1912,50 +1999,5 @@ func main() {
 	}
 	cancelProbes()
 
-	info("\n[+] Shutting down...")
-
-	// Before anything is stopped: this is the last moment etcd can answer, and
-	// the size it finishes at is what the next start inherits.
-	shutdownCtx, cancelShutdownReport := reportCtx(context.Background())
-	maintainer.logStorage(shutdownCtx, messageStopPhase)
-	cancelShutdownReport()
-
-	// Stop kube-controller-manager. The watcher goroutine owns Wait(), so take
-	// its result rather than calling Wait() again, which would error — and skip
-	// the whole dance when it has already exited and been reaped.
-	if kcmCmd.Process != nil && !processGone(kcmName, kcmCmd.Process.Pid) {
-		info("[+] Stopping kube-controller-manager...")
-		if err := kcmCmd.Process.Signal(syscall.SIGTERM); err != nil {
-			warn("cannot signal kube-controller-manager: %v", err)
-		}
-		select {
-		case <-kcmExited:
-		case <-time.After(kcmStopTimeout):
-			warn("kube-controller-manager did not exit within %s", kcmStopTimeout)
-		}
-	}
-
-	// Stop the test environment (etcd + kube-apiserver)
-	if err := testEnv.Stop(); err != nil {
-		info("Warning: %v (processes may have already stopped)", err)
-	}
-
-	// Ensure all child processes are actually dead before removing PID files.
-	// envtest.Stop() may return before children have fully exited.
-	for _, name := range []string{"kube-controller-manager", "kube-apiserver", "etcd"} {
-		stopAndCleanPid(pidsDir, name, info)
-	}
-
-	// Clean up own PID and pids directory
-	path, _ := pidFileForProcess(pidsDir, "control-plane")
-	if path != "" {
-		os.Remove(path)
-	}
-	os.Remove(pidsDir)
-
-	info("[+] Stopped successfully")
-
-	if exitCode != 0 {
-		os.Exit(exitCode)
-	}
+	return exitCode
 }
