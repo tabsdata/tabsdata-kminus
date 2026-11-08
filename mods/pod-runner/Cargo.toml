@@ -89,7 +89,6 @@ prometheus = { version = "0.14" }
 rcgen = { version = "0.14" }
 reqwest = { version = "0.13.5", features = ["rustls", "stream", "json", "query"], default-features = false }
 rustls = { version = "0.23.46" }
-rustls-pemfile = { version = "2" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154" }
 serde_yaml_ng = { version = "0.10" }
@@ -108,12 +107,9 @@ uuid = { version = "1.29.0", features = ["v4"] }
 
 chrono = { version = "0.4.45" }
 data-encoding = { version = "2.11.1" }
-filetime = { version = "0.2.29" }
 http-body-util = { version = "0.1" }
 hyper = { version = "1" }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
-libc = { version = "0.2.191" }
-rstest = { version = "0.28" }
 serial_test = { version = "4" }
 # `test-util` enables `tokio::time::pause()` / `#[tokio::test(start_paused
 # = true)]` used by the resolver backoff tests so they can validate

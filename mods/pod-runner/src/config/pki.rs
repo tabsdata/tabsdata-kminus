@@ -227,14 +227,9 @@ mod tests {
         assert!(pki.client_cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(pki.client_key_pem.contains("BEGIN"));
 
-        // Verify certs parse through rustls_pemfile
-        let ca_certs: Vec<_> = rustls_pemfile::certs(&mut pki.ca_cert_pem.as_bytes())
-            .collect::<Result<_, _>>()
-            .unwrap();
+        let ca_certs = crate::tls::load_certs(pki.ca_cert_pem.as_bytes()).unwrap();
         assert_eq!(ca_certs.len(), 1);
-        let server_certs: Vec<_> = rustls_pemfile::certs(&mut pki.server_cert_pem.as_bytes())
-            .collect::<Result<_, _>>()
-            .unwrap();
+        let server_certs = crate::tls::load_certs(pki.server_cert_pem.as_bytes()).unwrap();
         assert_eq!(server_certs.len(), 1);
     }
 

@@ -12,6 +12,7 @@
 
 use std::path::Path;
 
+use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tracing::trace;
 
@@ -45,10 +46,10 @@ pub enum TlsError {
     },
     /// Failed to parse PEM-encoded certificates.
     #[error("Failed to parse certificates: {0}")]
-    ParseCerts(std::io::Error),
+    ParseCerts(pem::Error),
     /// Failed to parse a PEM-encoded private key.
     #[error("Failed to parse private key: {0}")]
-    ParseKey(std::io::Error),
+    ParseKey(pem::Error),
     /// PEM data contained no certificates.
     #[error("No certificates found in PEM data")]
     EmptyCerts,
@@ -212,7 +213,7 @@ pub fn resolve_cert_bytes(file_path: &Path, data_b64: &str) -> Result<Option<Vec
 
 /// Parse PEM-encoded certificates, returning DER representations.
 pub fn load_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, TlsError> {
-    let certs: Vec<_> = rustls_pemfile::certs(&mut &*pem)
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(pem)
         .collect::<Result<_, _>>()
         .map_err(TlsError::ParseCerts)?;
     if certs.is_empty() {
@@ -224,9 +225,10 @@ pub fn load_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, TlsError> 
 
 /// Parse a PEM-encoded private key, returning the DER representation.
 pub fn load_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, TlsError> {
-    rustls_pemfile::private_key(&mut &*pem)
-        .map_err(TlsError::ParseKey)?
-        .ok_or(TlsError::EmptyKey)
+    PrivateKeyDer::from_pem_slice(pem).map_err(|error| match error {
+        pem::Error::NoItemsFound => TlsError::EmptyKey,
+        error => TlsError::ParseKey(error),
+    })
 }
 
 // ---------------------------------------------------------------------------
