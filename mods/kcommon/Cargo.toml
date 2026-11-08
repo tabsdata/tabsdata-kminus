@@ -60,7 +60,7 @@ ignored = []
 
 chrono = { version = "0.4.45" }
 sysinfo = { version = "0.40.1" }
-tracing = { version = "0.1.44" }
+tracing = { version = "0.1.44", features = ["log"] }
 
 [dev-dependencies]
 
