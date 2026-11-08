@@ -141,13 +141,13 @@ class TestStableAcrossRestarts:
         proving the controllers are live. The client also uses the
         kubeconfig saved during the first run.
         """
-        from test_controllers import (
-            _is_not_found,
-            _load_clients,
-            _make_job,
-            _mark_pod_succeeded,
-            _wait_for,
-            _wait_for_job_pod,
+        from control_plane_testlib.kube import (
+            is_not_found,
+            load_clients,
+            make_job,
+            mark_pod_succeeded,
+            wait_for,
+            wait_for_job_pod,
         )
 
         api_port = find_free_port()
@@ -164,20 +164,20 @@ class TestStableAcrossRestarts:
         cp2 = ControlPlaneProcess(control_plane_bin, test_dir, api_port, kcm_port)
         cp2.start()
         try:
-            core, batch = _load_clients(saved)
+            core, batch = load_clients(saved)
 
             batch.create_namespaced_job(
                 namespace="default",
-                body=_make_job("restart-ttl-job", ttl_seconds_after_finished=1),
+                body=make_job("restart-ttl-job", ttl_seconds_after_finished=1),
             )
 
-            pod = _wait_for_job_pod(core, "restart-ttl-job")
-            _mark_pod_succeeded(core, pod.metadata.name)
+            pod = wait_for_job_pod(core, "restart-ttl-job")
+            mark_pod_succeeded(core, pod.metadata.name)
 
             # The job controller marks the job Complete, then the
             # ttl-after-finished controller deletes it 1s later.
-            _wait_for(
-                lambda: _is_not_found(
+            wait_for(
+                lambda: is_not_found(
                     lambda: batch.read_namespaced_job(
                         name="restart-ttl-job", namespace="default"
                     )

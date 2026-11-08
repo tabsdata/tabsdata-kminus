@@ -27,7 +27,7 @@ import uuid
 import pytest
 import yaml
 
-from itest_common import find_free_port, get_session_timestamp
+from itest_common import get_session_id, start_on_free_ports
 from pod_runner_testlib import TARGET_DIR, make_test_dir
 
 
@@ -274,15 +274,18 @@ def _write_file_resolver_prsysconfig(configdir):
 
 @pytest.fixture(scope="session")
 def pod_runner(pod_runner_bin):
-    ts = get_session_timestamp()
+    ts = get_session_id()
     work_dir = os.path.join(TARGET_DIR, f"testrun.{ts}", "_pod_runner")
     os.makedirs(work_dir, exist_ok=True)
 
     _write_file_resolver_prsysconfig(os.path.join(work_dir, "config"))
 
-    port = find_free_port()
-    pr = PodRunnerProcess(pod_runner_bin, work_dir, port, metrics_port=0)
-    pr.start()
+    def start(port):
+        pr = PodRunnerProcess(pod_runner_bin, work_dir, port, metrics_port=0)
+        pr.start()
+        return pr
+
+    pr = start_on_free_ports(start, 1)
     yield pr
     pr.stop()
 

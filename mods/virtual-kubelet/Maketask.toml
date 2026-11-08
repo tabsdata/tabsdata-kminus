@@ -10,6 +10,7 @@ extend = [
     { path = "./make/make-km/fragments/tasks/permit_go.toml", relative = "git" },
 
     { path = "./make/make-km/fragments/common/permit.toml", relative = "git" },
+    { path = "./make/make-km/fragments/common/variables.toml", relative = "git" },
 
     { path = "./mods/virtual-kubelet/make/make-km/fragments/tasks/clean_go.toml", relative = "git" },
     { path = "./mods/virtual-kubelet/make/make-km/fragments/tasks/lock_go.toml", relative = "git" },

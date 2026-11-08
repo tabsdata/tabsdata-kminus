@@ -1,0 +1,18 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__set_mode_test_py]
+plugin = "td-task-tracker"
+category = "02 - Tidy"
+private = true
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-km/libraries/log.ds
+
+    if is_empty ${verbose}
+        set_env TD_VERBOSE "false"
+    end
+    debug "🔅 Using td verbose: '${TD_VERBOSE}'"
+    ''']

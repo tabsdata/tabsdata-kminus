@@ -1,0 +1,464 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__itest_py]
+plugin = "td-task-tracker"
+category = "04 - Test"
+private = true
+run_task = [
+    { name = [
+        "__km__itest_py_control_plane",
+        "__km__itest_py_virtual_kubelet",
+        "__km__itest_py_pod_runner",
+        "__km__itest_py_kminus"
+    ] }
+]
+
+[tasks.__km__itest_py_control_plane]
+plugin = "td-task-tracker"
+category = "04 - Test"
+private = true
+dependencies = ["__os__set_mode_test_py"]
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+    !include_files ./make/make-os/libraries/skipe.ds
+
+    verbose = get_env TD_VERBOSE
+
+    km_workers = get_env TD_KM_PYTEST_NUMPROCESSES
+    if is_empty ${km_workers}
+        km_workers = set "4"
+    end
+
+    os_family = os_family
+    if eq ${os_family} "windows"
+        separator = set ";"
+    else
+        separator = set ":"
+    end
+    suite_folder = set "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/mods/control-plane/src/itest"
+    previous_python_path = get_env PYTHONPATH
+    set_env PYTHONPATH "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/test${separator}${suite_folder}${separator}${previous_python_path}"
+    set_env TD_BIN_FOLDER "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/target/dist"
+
+    cd "${suite_folder}"
+
+    report_folder = set "${PROJECT_TABSDATA_ROOT_FOLDER}/target/reports/pytest/km_control_plane"
+    rm -r ${report_folder}
+    mkdir ${report_folder}
+    report_file = set ${report_folder}/pytest.html
+
+    td_tb = set "--tb=line"
+    td_fail = set ""
+    arguments = split ${CARGO_MAKE_TASK_ARGS} ;
+    for argument in ${arguments}
+        is_tb = starts_with ${argument} "--tb="
+        if ${is_tb}
+            td_tb = set ${argument}
+            td_fail = set "--instafail"
+            info "🛟 Using fail option: ${td_tb}"
+            info "📝 Using traceback option: ${td_fail}"
+        end
+    end
+
+    markers = get_env MARKERS
+
+    if eq ${verbose} "false"
+        debug "🚀 pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini=\"filterwarnings=ignore\" -n ${km_workers} --dist=loadgroup bin/ --template=html1/index.html --report=${report_file} -ra --durations=8 -m \"${markers}\""
+        exit_code = exec --get-exit-code pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini="filterwarnings=ignore" -n ${km_workers} --dist=loadgroup bin/ --template=html1/index.html --report=${report_file} -ra --durations=8 -m "${markers}"
+    else
+        debug "🚀 pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini=\"filterwarnings=ignore\" -v --full-trace --log-level=DEBUG --setup-show -n ${km_workers} --dist=loadgroup bin/ --template=html1/index.html --report=${report_file} -ra --durations=8 -m \"${markers}\""
+        exit_code = exec --get-exit-code pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini="filterwarnings=ignore" -v --full-trace --log-level=DEBUG --setup-show -n ${km_workers} --dist=loadgroup bin/ --template=html1/index.html --report=${report_file} -ra --durations=8 -m "${markers}"
+    end
+
+    set_env PYTHONPATH ${previous_python_path}
+    unset_env TD_BIN_FOLDER
+
+    is_zero = eq ${exit_code} "0"
+    is_five = eq ${exit_code} "5"
+    if ${is_zero} or ${is_five}
+        info "⌛️ Pytest finished with zero-or-five exit code: '${exit_code}'"
+    else
+        info "⌛️ Pytest finished with non-zero-or-five exit code: '${exit_code}'"
+        skipe_itest_py = get_env skipe_itest_py
+        if not is_empty ${skipe_itest_py}
+            if is_error
+                echo ""
+            end
+            error "🧨🧨🧨🧨"
+
+            error ""
+
+            error "🧨 TASK '__km__itest_py_control_plane' FAILED with exit code '${exit_code}' — error skipped (--skipe)"
+
+            error ""
+
+            error "🔎 The following files and folders may contain information to help diagnose the failure:"
+
+            error ""
+
+            error "📊 ${report_file}"
+
+            error ""
+
+            error "💾 ${suite_folder}"
+
+            error ""
+
+            error "🧨🧨🧨🧨"
+            if is_error
+                echo ""
+            end
+        else
+            TD_FAIL_FAST_PY = get_env TD_FAIL_FAST_PY
+            if not ${TD_FAIL_FAST_PY}
+                info "⌛️ Setting Pytest TD_TESTS_CODE_PY to ${exit_code}..."
+                set_env TD_TESTS_CODE_PY ${exit_code}
+            else
+                info "⌛️ Pytest failing fast..."
+                code = exit ${exit_code}
+            end
+        end
+    end
+
+    info "📊 Pytest report generated at: 👉 ${report_file}\n"
+    ''']
+
+[tasks.__km__itest_py_virtual_kubelet]
+plugin = "td-task-tracker"
+category = "04 - Test"
+private = true
+dependencies = ["__os__set_mode_test_py"]
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+    !include_files ./make/make-os/libraries/skipe.ds
+
+    verbose = get_env TD_VERBOSE
+
+    km_workers = get_env TD_KM_PYTEST_NUMPROCESSES
+    if is_empty ${km_workers}
+        km_workers = set "4"
+    end
+
+    os_family = os_family
+    if eq ${os_family} "windows"
+        separator = set ";"
+    else
+        separator = set ":"
+    end
+    suite_folder = set "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/mods/virtual-kubelet/src/itest"
+    previous_python_path = get_env PYTHONPATH
+    set_env PYTHONPATH "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/test${separator}${suite_folder}${separator}${previous_python_path}"
+    set_env TD_BIN_FOLDER "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/target/dist"
+
+    cd "${suite_folder}"
+
+    report_folder = set "${PROJECT_TABSDATA_ROOT_FOLDER}/target/reports/pytest/km_virtual_kubelet"
+    rm -r ${report_folder}
+    mkdir ${report_folder}
+    report_file = set ${report_folder}/pytest.html
+
+    td_tb = set "--tb=line"
+    td_fail = set ""
+    arguments = split ${CARGO_MAKE_TASK_ARGS} ;
+    for argument in ${arguments}
+        is_tb = starts_with ${argument} "--tb="
+        if ${is_tb}
+            td_tb = set ${argument}
+            td_fail = set "--instafail"
+            info "🛟 Using fail option: ${td_tb}"
+            info "📝 Using traceback option: ${td_fail}"
+        end
+    end
+
+    markers = get_env MARKERS
+
+    if eq ${verbose} "false"
+        debug "🚀 pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini=\"filterwarnings=ignore\" -n ${km_workers} --dist=loadgroup bin/ --template=html1/index.html --report=${report_file} -ra --durations=8 -m \"${markers}\""
+        exit_code = exec --get-exit-code pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini="filterwarnings=ignore" -n ${km_workers} --dist=loadgroup bin/ --template=html1/index.html --report=${report_file} -ra --durations=8 -m "${markers}"
+    else
+        debug "🚀 pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini=\"filterwarnings=ignore\" -v --full-trace --log-level=DEBUG --setup-show -n ${km_workers} --dist=loadgroup bin/ --template=html1/index.html --report=${report_file} -ra --durations=8 -m \"${markers}\""
+        exit_code = exec --get-exit-code pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini="filterwarnings=ignore" -v --full-trace --log-level=DEBUG --setup-show -n ${km_workers} --dist=loadgroup bin/ --template=html1/index.html --report=${report_file} -ra --durations=8 -m "${markers}"
+    end
+
+    set_env PYTHONPATH ${previous_python_path}
+    unset_env TD_BIN_FOLDER
+
+    is_zero = eq ${exit_code} "0"
+    is_five = eq ${exit_code} "5"
+    if ${is_zero} or ${is_five}
+        info "⌛️ Pytest finished with zero-or-five exit code: '${exit_code}'"
+    else
+        info "⌛️ Pytest finished with non-zero-or-five exit code: '${exit_code}'"
+        skipe_itest_py = get_env skipe_itest_py
+        if not is_empty ${skipe_itest_py}
+            if is_error
+                echo ""
+            end
+            error "🧨🧨🧨🧨"
+
+            error ""
+
+            error "🧨 TASK '__km__itest_py_virtual_kubelet' FAILED with exit code '${exit_code}' — error skipped (--skipe)"
+
+            error ""
+
+            error "🔎 The following files and folders may contain information to help diagnose the failure:"
+
+            error ""
+
+            error "📊 ${report_file}"
+
+            error ""
+
+            error "💾 ${suite_folder}"
+
+            error ""
+
+            error "🧨🧨🧨🧨"
+            if is_error
+                echo ""
+            end
+        else
+            TD_FAIL_FAST_PY = get_env TD_FAIL_FAST_PY
+            if not ${TD_FAIL_FAST_PY}
+                info "⌛️ Setting Pytest TD_TESTS_CODE_PY to ${exit_code}..."
+                set_env TD_TESTS_CODE_PY ${exit_code}
+            else
+                info "⌛️ Pytest failing fast..."
+                code = exit ${exit_code}
+            end
+        end
+    end
+
+    info "📊 Pytest report generated at: 👉 ${report_file}\n"
+    ''']
+
+[tasks.__km__itest_py_pod_runner]
+plugin = "td-task-tracker"
+category = "04 - Test"
+private = true
+dependencies = ["__os__set_mode_test_py"]
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+    !include_files ./make/make-os/libraries/skipe.ds
+
+    verbose = get_env TD_VERBOSE
+
+    km_workers = get_env TD_KM_PYTEST_NUMPROCESSES
+    if is_empty ${km_workers}
+        km_workers = set "4"
+    end
+
+    os_family = os_family
+    if eq ${os_family} "windows"
+        separator = set ";"
+    else
+        separator = set ":"
+    end
+    suite_folder = set "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/mods/pod-runner/tests"
+    previous_python_path = get_env PYTHONPATH
+    set_env PYTHONPATH "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/test${separator}${suite_folder}${separator}${previous_python_path}"
+    set_env TD_BIN_FOLDER "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/target/dist"
+
+    cd "${suite_folder}"
+
+    report_folder = set "${PROJECT_TABSDATA_ROOT_FOLDER}/target/reports/pytest/km_pod_runner"
+    rm -r ${report_folder}
+    mkdir ${report_folder}
+    report_file = set ${report_folder}/pytest.html
+
+    td_tb = set "--tb=line"
+    td_fail = set ""
+    arguments = split ${CARGO_MAKE_TASK_ARGS} ;
+    for argument in ${arguments}
+        is_tb = starts_with ${argument} "--tb="
+        if ${is_tb}
+            td_tb = set ${argument}
+            td_fail = set "--instafail"
+            info "🛟 Using fail option: ${td_tb}"
+            info "📝 Using traceback option: ${td_fail}"
+        end
+    end
+
+    markers = get_env MARKERS
+
+    if eq ${verbose} "false"
+        debug "🚀 pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini=\"filterwarnings=ignore\" -n ${km_workers} --dist=loadgroup . --template=html1/index.html --report=${report_file} -ra --durations=8 -m \"${markers}\""
+        exit_code = exec --get-exit-code pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini="filterwarnings=ignore" -n ${km_workers} --dist=loadgroup . --template=html1/index.html --report=${report_file} -ra --durations=8 -m "${markers}"
+    else
+        debug "🚀 pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini=\"filterwarnings=ignore\" -v --full-trace --log-level=DEBUG --setup-show -n ${km_workers} --dist=loadgroup . --template=html1/index.html --report=${report_file} -ra --durations=8 -m \"${markers}\""
+        exit_code = exec --get-exit-code pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini="filterwarnings=ignore" -v --full-trace --log-level=DEBUG --setup-show -n ${km_workers} --dist=loadgroup . --template=html1/index.html --report=${report_file} -ra --durations=8 -m "${markers}"
+    end
+
+    set_env PYTHONPATH ${previous_python_path}
+    unset_env TD_BIN_FOLDER
+
+    is_zero = eq ${exit_code} "0"
+    is_five = eq ${exit_code} "5"
+    if ${is_zero} or ${is_five}
+        info "⌛️ Pytest finished with zero-or-five exit code: '${exit_code}'"
+    else
+        info "⌛️ Pytest finished with non-zero-or-five exit code: '${exit_code}'"
+        skipe_itest_py = get_env skipe_itest_py
+        if not is_empty ${skipe_itest_py}
+            if is_error
+                echo ""
+            end
+            error "🧨🧨🧨🧨"
+
+            error ""
+
+            error "🧨 TASK '__km__itest_py_pod_runner' FAILED with exit code '${exit_code}' — error skipped (--skipe)"
+
+            error ""
+
+            error "🔎 The following files and folders may contain information to help diagnose the failure:"
+
+            error ""
+
+            error "📊 ${report_file}"
+
+            error ""
+
+            error "💾 ${suite_folder}"
+
+            error ""
+
+            error "🧨🧨🧨🧨"
+            if is_error
+                echo ""
+            end
+        else
+            TD_FAIL_FAST_PY = get_env TD_FAIL_FAST_PY
+            if not ${TD_FAIL_FAST_PY}
+                info "⌛️ Setting Pytest TD_TESTS_CODE_PY to ${exit_code}..."
+                set_env TD_TESTS_CODE_PY ${exit_code}
+            else
+                info "⌛️ Pytest failing fast..."
+                code = exit ${exit_code}
+            end
+        end
+    end
+
+    info "📊 Pytest report generated at: 👉 ${report_file}\n"
+    ''']
+
+[tasks.__km__itest_py_kminus]
+plugin = "td-task-tracker"
+category = "04 - Test"
+private = true
+dependencies = ["__os__set_mode_test_py"]
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+    !include_files ./make/make-os/libraries/skipe.ds
+
+    verbose = get_env TD_VERBOSE
+
+    km_workers = get_env TD_KM_PYTEST_NUMPROCESSES
+    if is_empty ${km_workers}
+        km_workers = set "4"
+    end
+
+    os_family = os_family
+    if eq ${os_family} "windows"
+        separator = set ";"
+    else
+        separator = set ":"
+    end
+    suite_folder = set "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/mods/kminus/tests"
+    previous_python_path = get_env PYTHONPATH
+    set_env PYTHONPATH "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/test${separator}${suite_folder}${separator}${previous_python_path}"
+    set_env TD_BIN_FOLDER "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/target/dist"
+
+    cd "${suite_folder}"
+
+    report_folder = set "${PROJECT_TABSDATA_ROOT_FOLDER}/target/reports/pytest/km_kminus"
+    rm -r ${report_folder}
+    mkdir ${report_folder}
+    report_file = set ${report_folder}/pytest.html
+
+    td_tb = set "--tb=line"
+    td_fail = set ""
+    arguments = split ${CARGO_MAKE_TASK_ARGS} ;
+    for argument in ${arguments}
+        is_tb = starts_with ${argument} "--tb="
+        if ${is_tb}
+            td_tb = set ${argument}
+            td_fail = set "--instafail"
+            info "🛟 Using fail option: ${td_tb}"
+            info "📝 Using traceback option: ${td_fail}"
+        end
+    end
+
+    markers = get_env MARKERS
+
+    if eq ${verbose} "false"
+        debug "🚀 pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini=\"filterwarnings=ignore\" -n ${km_workers} --dist=loadgroup . --template=html1/index.html --report=${report_file} -ra --durations=8 -m \"${markers}\""
+        exit_code = exec --get-exit-code pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini="filterwarnings=ignore" -n ${km_workers} --dist=loadgroup . --template=html1/index.html --report=${report_file} -ra --durations=8 -m "${markers}"
+    else
+        debug "🚀 pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini=\"filterwarnings=ignore\" -v --full-trace --log-level=DEBUG --setup-show -n ${km_workers} --dist=loadgroup . --template=html1/index.html --report=${report_file} -ra --durations=8 -m \"${markers}\""
+        exit_code = exec --get-exit-code pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini="filterwarnings=ignore" -v --full-trace --log-level=DEBUG --setup-show -n ${km_workers} --dist=loadgroup . --template=html1/index.html --report=${report_file} -ra --durations=8 -m "${markers}"
+    end
+
+    set_env PYTHONPATH ${previous_python_path}
+    unset_env TD_BIN_FOLDER
+
+    is_zero = eq ${exit_code} "0"
+    is_five = eq ${exit_code} "5"
+    if ${is_zero} or ${is_five}
+        info "⌛️ Pytest finished with zero-or-five exit code: '${exit_code}'"
+    else
+        info "⌛️ Pytest finished with non-zero-or-five exit code: '${exit_code}'"
+        skipe_itest_py = get_env skipe_itest_py
+        if not is_empty ${skipe_itest_py}
+            if is_error
+                echo ""
+            end
+            error "🧨🧨🧨🧨"
+
+            error ""
+
+            error "🧨 TASK '__km__itest_py_kminus' FAILED with exit code '${exit_code}' — error skipped (--skipe)"
+
+            error ""
+
+            error "🔎 The following files and folders may contain information to help diagnose the failure:"
+
+            error ""
+
+            error "📊 ${report_file}"
+
+            error ""
+
+            error "💾 ${suite_folder}"
+
+            error ""
+
+            error "🧨🧨🧨🧨"
+            if is_error
+                echo ""
+            end
+        else
+            TD_FAIL_FAST_PY = get_env TD_FAIL_FAST_PY
+            if not ${TD_FAIL_FAST_PY}
+                info "⌛️ Setting Pytest TD_TESTS_CODE_PY to ${exit_code}..."
+                set_env TD_TESTS_CODE_PY ${exit_code}
+            else
+                info "⌛️ Pytest failing fast..."
+                code = exit ${exit_code}
+            end
+        end
+    end
+
+    info "📊 Pytest report generated at: 👉 ${report_file}\n"
+    ''']

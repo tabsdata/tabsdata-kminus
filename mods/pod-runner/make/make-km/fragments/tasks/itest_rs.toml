@@ -7,11 +7,14 @@ plugin = "td-task-tracker"
 category = "04 - Test"
 description = "Task 'itest' for pod-runner project"
 dependencies = [
+    "__km__set_mode_test_py",
     "__km__build_rs_pod_runner",
 ]
-cwd = "${KM_ROOT}/mods/pod-runner/tests"
+cwd = "${KM_ROOT}/mods/pod-runner"
 script_runner = "@duckscript"
 script = '''
+    !include_files ./make/make-km/libraries/log.ds
+
     km_root = get_env KM_ROOT
     test_folder = get_env KM_TEST_FOLDER
     profile = get_env profile
@@ -27,13 +30,66 @@ script = '''
     # target/<profile> directory.
     bin_folder = concat ${km_root} "/mods/pod-runner/target/" ${build_folder}
 
-    itest_folder = concat ${km_root} "/mods/pod-runner/tests"
-    if is_dir ${itest_folder}
+    suite_folder = concat ${km_root} "/mods/pod-runner/tests"
+    tests_found = is_dir ${suite_folder}
+    if ${tests_found}
+        verbose = get_env TD_VERBOSE
+
+        km_workers = get_env TD_KM_PYTEST_NUMPROCESSES
+        if is_empty ${km_workers}
+            km_workers = set "4"
+        end
+
+        os_family = os_family
+        if eq ${os_family} "windows"
+            separator = set ";"
+        else
+            separator = set ":"
+        end
+        set_env PYTHONPATH "${test_folder}${separator}${suite_folder}"
         set_env TD_BIN_FOLDER ${bin_folder}
-        set_env PYTHONPATH ${test_folder}
-        runner = concat ${test_folder} "/pytest-noop.sh"
-        exec --fail-on-error ${runner} -v
+
+        cd "${suite_folder}"
+
+        report_folder = set "${km_root}/target/reports/pytest/km_pod_runner"
+        rm -r ${report_folder}
+        mkdir ${report_folder}
+        report_file = set ${report_folder}/pytest.html
+
+        td_tb = set "--tb=line"
+        td_fail = set ""
+        arguments = split ${CARGO_MAKE_TASK_ARGS} ;
+        for argument in ${arguments}
+            is_tb = starts_with ${argument} "--tb="
+            if ${is_tb}
+                td_tb = set ${argument}
+                td_fail = set "--instafail"
+                info "🛟 Using fail option: ${td_tb}"
+                info "📝 Using traceback option: ${td_fail}"
+            end
+        end
+
+        markers = get_env MARKERS
+
+        if eq ${verbose} "false"
+            debug "🚀 pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini=\"filterwarnings=ignore\" -n ${km_workers} --dist=loadgroup . --template=html1/index.html --report=${report_file} -ra --durations=8 -m \"${markers}\""
+            exit_code = exec --get-exit-code pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini="filterwarnings=ignore" -n ${km_workers} --dist=loadgroup . --template=html1/index.html --report=${report_file} -ra --durations=8 -m "${markers}"
+        else
+            debug "🚀 pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini=\"filterwarnings=ignore\" -v --full-trace --log-level=DEBUG --setup-show -n ${km_workers} --dist=loadgroup . --template=html1/index.html --report=${report_file} -ra --durations=8 -m \"${markers}\""
+            exit_code = exec --get-exit-code pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini="filterwarnings=ignore" -v --full-trace --log-level=DEBUG --setup-show -n ${km_workers} --dist=loadgroup . --template=html1/index.html --report=${report_file} -ra --durations=8 -m "${markers}"
+        end
+
+        is_zero = eq ${exit_code} "0"
+        is_five = eq ${exit_code} "5"
+        if ${is_zero} or ${is_five}
+            info "⌛️ Pytest finished with zero-or-five exit code: '${exit_code}'"
+        else
+            info "⌛️ Pytest finished with non-zero-or-five exit code: '${exit_code}'"
+            code = exit ${exit_code}
+        end
+
+        info "📊 Pytest report generated at: 👉 ${report_file}\n"
     else
-        echo (pod-runner: no integration tests -- skipping)
+        info "(pod-runner: no integration tests -- skipping)"
     end
 '''

@@ -22,13 +22,13 @@ import os
 import re
 import time
 
+from itest_common import find_free_port, get_session_id
+
 from conftest import (
     MtlsClient,
     PodRunnerProcess,
     TARGET_DIR,
     _write_file_resolver_prsysconfig,
-    find_free_port,
-    get_session_timestamp,
     load_pod_def,
     submit_pod,
     unique_name,
@@ -434,7 +434,7 @@ class TestRestart:
 
     def test_deadlines_survive_a_restart(self, pod_runner_bin):
         work_dir = os.path.join(
-            TARGET_DIR, f"testrun.{get_session_timestamp()}", "_pod_runner_restart"
+            TARGET_DIR, f"testrun.{get_session_id()}", "_pod_runner_restart"
         )
         os.makedirs(work_dir, exist_ok=True)
         _write_file_resolver_prsysconfig(os.path.join(work_dir, "config"))

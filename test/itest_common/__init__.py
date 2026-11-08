@@ -5,8 +5,9 @@
 
 Provides:
 - ControlPlaneProcess: manages a control-plane binary for tests
-- _find_free_port: find an available TCP port on localhost
-- make_test_dir / get_session_timestamp: test directory helpers
+- find_free_port: find an available TCP port on localhost
+- start_on_free_ports: start a server on free ports, again if one was taken
+- make_test_dir / get_session_id: test directory helpers
 """
 
 import os
@@ -14,28 +15,34 @@ import signal
 import socket
 import subprocess
 import warnings
-
-# Suppress urllib3 InsecureRequestWarning from kubernetes client
-# (control-plane generates kubeconfigs with insecure-skip-tls-verify: true)
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import time
 from datetime import datetime, timezone
 
+def pytest_configure(config):
+    # The control-plane writes kubeconfigs with insecure-skip-tls-verify: true. The
+    # filter must go through pytest: it drops filters set while collecting tests.
+    config.addinivalue_line(
+        "filterwarnings", "ignore::urllib3.exceptions.InsecureRequestWarning"
+    )
+
+
 # ---------------------------------------------------------------------------
-# Session timestamp
+# Session id
 # ---------------------------------------------------------------------------
 
-_session_timestamp: str | None = None
+_session_id: str | None = None
 
 
-def get_session_timestamp() -> str:
-    global _session_timestamp
-    if _session_timestamp is None:
-        _session_timestamp = datetime.now(timezone.utc).strftime(
-            "%Y%m%dT%H%M%S.%f"
-        )[:-3]
-    return _session_timestamp
+def get_session_id() -> str:
+    global _session_id
+    if _session_id is None:
+        _session_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")[:-3]
+        # xdist workers start within the same millisecond; without their id
+        # they would share session folders and each other's servers.
+        worker = os.environ.get("PYTEST_XDIST_WORKER")
+        if worker:
+            _session_id = f"{_session_id}.{worker}"
+    return _session_id
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +52,7 @@ def get_session_timestamp() -> str:
 
 def make_test_dir(node_id: str, target_dir: str) -> str:
     """Create a unique test directory under target_dir/testrun.<ts>/..."""
-    ts = get_session_timestamp()
+    ts = get_session_id()
     rel = node_id
     for prefix in ("bin/", "test_"):
         idx = rel.find(prefix)
@@ -68,6 +75,28 @@ def find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+_PORT_TAKEN = (
+    "already in use",
+    "only one usage of each socket address",
+)
+
+
+def start_on_free_ports(start, count, attempts=4):
+    """Return start(*ports) run on `count` freshly found free ports.
+
+    A port is only free when it is found: another process can take it before
+    the server binds it, more so with parallel workers. When the server
+    reports exactly that, it is started again on new ports.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return start(*(find_free_port() for _ in range(count)))
+        except (RuntimeError, TimeoutError) as error:
+            taken = any(marker in str(error).lower() for marker in _PORT_TAKEN)
+            if not taken or attempt == attempts:
+                raise
 
 
 # ---------------------------------------------------------------------------

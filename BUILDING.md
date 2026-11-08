@@ -30,7 +30,7 @@ module keeps its own under `mods/<m>/make/make-km/`).
 │   ├── pod-runner/           Rust — pod execution runtime
 │   └── kminus/               Rust — distribution binary (`km`)
 ├── ltest/                    Python load-test harness
-└── test/                     shared pytest helpers (pytest-noop.sh, etc.)
+└── test/                     shared integration-test helpers (itest_common)
 ```
 
 Each module produces its own `target/` next to its sources, and the root

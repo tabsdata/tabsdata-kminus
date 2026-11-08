@@ -10,7 +10,12 @@ import time
 import pytest
 import yaml
 
-from itest_common import ControlPlaneProcess, find_free_port, get_session_timestamp
+from itest_common import (  # noqa: F401
+    ControlPlaneProcess,
+    get_session_id,
+    pytest_configure,
+    start_on_free_ports,
+)
 from mock_pod_runner import MockPodRunner
 from virtual_kubelet_testlib import TARGET_DIR, make_test_dir
 
@@ -61,13 +66,15 @@ def virtual_kubelet_bin(bin_dir):
 
 @pytest.fixture(scope="session")
 def control_plane(control_plane_bin):
-    ts = get_session_timestamp()
+    ts = get_session_id()
     work_dir = os.path.join(TARGET_DIR, f"testrun.{ts}", "_control_plane")
     os.makedirs(work_dir, exist_ok=True)
-    api_port = find_free_port()
-    kcm_port = find_free_port()
-    cp = ControlPlaneProcess(control_plane_bin, work_dir, api_port, kcm_port)
-    cp.start()
+    def start(api_port, kcm_port):
+        cp = ControlPlaneProcess(control_plane_bin, work_dir, api_port, kcm_port)
+        cp.start()
+        return cp
+
+    cp = start_on_free_ports(start, 2)
     yield cp
     cp.stop()
 
@@ -174,7 +181,7 @@ def write_prconfig(path, pod_runner_url, node_name="test-vk-node", namespace="de
 
 @pytest.fixture(scope="session")
 def virtual_kubelet(virtual_kubelet_bin, control_plane, mock_pod_runner):
-    ts = get_session_timestamp()
+    ts = get_session_id()
     work_dir = os.path.join(TARGET_DIR, f"testrun.{ts}", "_virtual_kubelet")
     os.makedirs(work_dir, exist_ok=True)
 
@@ -184,14 +191,18 @@ def virtual_kubelet(virtual_kubelet_bin, control_plane, mock_pod_runner):
         node_name="test-vk-node",
     )
 
-    vk = VirtualKubeletProcess(
-        virtual_kubelet_bin,
-        control_plane.vk_kubeconfig,
-        prconfig_path,
-        work_dir,
-        kubelet_port=find_free_port(),
-    )
-    vk.start()
+    def start(kubelet_port):
+        vk = VirtualKubeletProcess(
+            virtual_kubelet_bin,
+            control_plane.vk_kubeconfig,
+            prconfig_path,
+            work_dir,
+            kubelet_port=kubelet_port,
+        )
+        vk.start()
+        return vk
+
+    vk = start_on_free_ports(start, 1)
     yield vk
     vk.stop()
 

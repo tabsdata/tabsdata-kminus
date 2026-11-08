@@ -6,7 +6,12 @@ import os
 
 import pytest
 
-from itest_common import ControlPlaneProcess, find_free_port
+from itest_common import (  # noqa: F401
+    ControlPlaneProcess,
+    find_free_port,
+    pytest_configure,
+    start_on_free_ports,
+)
 from control_plane_testlib import make_test_dir
 
 
@@ -58,10 +63,14 @@ def free_port_pair():
 
 
 @pytest.fixture
-def control_plane(control_plane_bin, test_dir, free_port_pair):
+def control_plane(control_plane_bin, test_dir):
     """Starts a control-plane process and stops it after the test."""
-    api_port, kcm_port = free_port_pair
-    cp = ControlPlaneProcess(control_plane_bin, test_dir, api_port, kcm_port)
-    cp.start()
+
+    def start(api_port, kcm_port):
+        cp = ControlPlaneProcess(control_plane_bin, test_dir, api_port, kcm_port)
+        cp.start()
+        return cp
+
+    cp = start_on_free_ports(start, 2)
     yield cp
     cp.stop()
