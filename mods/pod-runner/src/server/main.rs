@@ -5,7 +5,7 @@ use std::sync::Arc;
 use clap::Parser;
 use file_rotate::{ContentLimit, FileRotate, compression::Compression, suffix::AppendCount};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use pod_runner::config::cli::CliArgs;
 use pod_runner::config::resolve::resolve_config;
@@ -189,9 +189,17 @@ async fn main() {
     let state = Arc::new(AppState { logic });
     let app = create_router(Arc::clone(&state), Some(Arc::clone(&metrics)));
 
-    let listener = tokio::net::TcpListener::bind(&pr_config.bind_address)
-        .await
-        .unwrap();
+    let listener = match tokio::net::TcpListener::bind(&pr_config.bind_address).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            error!(addr = %pr_config.bind_address, "Cannot listen: {e}");
+            eprintln!(
+                "pod-runner: cannot listen on {}: {e}",
+                pr_config.bind_address
+            );
+            std::process::exit(1);
+        }
+    };
     info!(addr = %pr_config.bind_address, tls = "mTLS", "Server listening");
 
     // Hand km the node sizing to print with the startup banner. The pod
