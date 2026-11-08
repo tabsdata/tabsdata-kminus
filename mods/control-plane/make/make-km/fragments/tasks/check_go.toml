@@ -11,5 +11,8 @@ script_runner = "@duckscript"
 script = '''
     !include_files ./make/make-km/libraries/log.ds
 
-    debug "🚧 Task 'check' for control-plane is not implemented yet."
+    cd ${KM_ROOT}/mods/control-plane/src/main/go
+
+    debug "🚀 go vet ./..."
+    exec --fail-on-error go vet ./...
 '''

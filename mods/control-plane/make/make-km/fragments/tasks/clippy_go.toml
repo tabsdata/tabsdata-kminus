@@ -11,5 +11,8 @@ script_runner = "@duckscript"
 script = '''
     !include_files ./make/make-km/libraries/log.ds
 
-    debug "🚧 Task 'clippy' for control-plane is not implemented yet."
+    cd ${KM_ROOT}/mods/control-plane/src/main/go
+
+    debug "🚀 go run honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION} ./..."
+    exec --fail-on-error go run honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION} ./...
 '''

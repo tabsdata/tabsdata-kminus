@@ -11,5 +11,8 @@ script_runner = "@duckscript"
 script = '''
     !include_files ./make/make-km/libraries/log.ds
 
-    debug "🚧 Task 'audit' for virtual-kubelet is not implemented yet."
+    cd ${KM_ROOT}/mods/virtual-kubelet/src/main/go
+
+    debug "🚀 go run golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION} ./..."
+    exec --fail-on-error go run golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION} ./...
 '''

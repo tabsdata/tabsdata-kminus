@@ -11,5 +11,5 @@ script_runner = "@duckscript"
 script = '''
     !include_files ./make/make-km/libraries/log.ds
 
-    debug "🚧 Task 'pants' for virtual-kubelet is not implemented yet."
+    info "⏩ Covered by audit: govulncheck checks the Go dependencies against the Go vulnerability database."
 '''

@@ -11,5 +11,13 @@ script_runner = "@duckscript"
 script = '''
     !include_files ./make/make-km/libraries/log.ds
 
-    debug "🚧 Task 'fmt' for control-plane is not implemented yet."
+    cd ${KM_ROOT}/mods/control-plane/src/main/go
+
+    debug "🚀 gofmt -l ."
+    unformatted = exec --fail-on-error gofmt -l .
+    unformatted = trim ${unformatted.stdout}
+    if not is_empty ${unformatted}
+        error "🚫 Files not formatted with gofmt:\n${unformatted}"
+        assert_fail
+    end
 '''
