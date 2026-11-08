@@ -9,6 +9,7 @@ import pytest
 from itest_common import (  # noqa: F401
     ControlPlaneProcess,
     find_free_port,
+    pytest_collection_modifyitems,
     pytest_configure,
     start_on_free_ports,
 )

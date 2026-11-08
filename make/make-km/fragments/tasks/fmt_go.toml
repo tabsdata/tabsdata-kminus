@@ -1,0 +1,54 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__fmt_go]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+private = true
+run_task = [
+    { name = [
+        "__km__fmt_go_control_plane",
+        "__km__fmt_go_virtual_kubelet"
+    ] }
+]
+
+[tasks.__km__fmt_go_control_plane]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    cd ${PROJECT_TABSDATA_KM_ROOT_FOLDER}/mods/control-plane/src/main/go
+
+    debug "🚀 gofmt -l ."
+    unformatted = exec --fail-on-error gofmt -l .
+    unformatted = trim ${unformatted.stdout}
+    if not is_empty ${unformatted}
+        error "🚫 Files not formatted with gofmt:\n${unformatted}"
+        assert_fail
+    end
+'''
+
+[tasks.__km__fmt_go_virtual_kubelet]
+plugin = "td-task-tracker"
+category = "08 - Linting"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    cd ${PROJECT_TABSDATA_KM_ROOT_FOLDER}/mods/virtual-kubelet/src/main/go
+
+    debug "🚀 gofmt -l ."
+    unformatted = exec --fail-on-error gofmt -l .
+    unformatted = trim ${unformatted.stdout}
+    if not is_empty ${unformatted}
+        error "🚫 Files not formatted with gofmt:\n${unformatted}"
+        assert_fail
+    end
+'''

@@ -49,8 +49,6 @@ PANTS_JSON = { value = "${TABSDATA_ROOT}/.cargo/pants.json", normalize = true }
 CHECK_LICENSES_GO_SCRIPT = { value = "${TABSDATA_ROOT}/devutils/automation/tasks/makers/td-scripts/check_licenses_go.py", normalize = true }
 LICENSES_GO_CFG = { value = "${TABSDATA_ROOT}/.cargo/licenses-go.cfg", normalize = true }
 
-STATICCHECK_VERSION = "v0.8.2"
-GOVULNCHECK_VERSION = "v1.9.0"
 
 [config]
 load_script = [

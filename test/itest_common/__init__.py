@@ -14,9 +14,12 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import warnings
 import time
 from datetime import datetime, timezone
+
+import pytest
 
 def pytest_configure(config):
     # The control-plane writes kubeconfigs with insecure-skip-tls-verify: true. The
@@ -24,6 +27,18 @@ def pytest_configure(config):
     config.addinivalue_line(
         "filterwarnings", "ignore::urllib3.exceptions.InsecureRequestWarning"
     )
+
+
+def pytest_collection_modifyitems(config, items):
+    if sys.platform != "win32":
+        return
+    # Tracked gap: the suites start the binaries by their POSIX names and stop
+    # them with POSIX signals; skipping says so instead of "binary not found".
+    skip = pytest.mark.skip(
+        reason="km integration tests are not ported to Windows: POSIX binary names and signals"
+    )
+    for item in items:
+        item.add_marker(skip)
 
 
 # ---------------------------------------------------------------------------

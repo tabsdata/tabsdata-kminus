@@ -13,6 +13,7 @@ import yaml
 from itest_common import (  # noqa: F401
     ControlPlaneProcess,
     get_session_id,
+    pytest_collection_modifyitems,
     pytest_configure,
     start_on_free_ports,
 )

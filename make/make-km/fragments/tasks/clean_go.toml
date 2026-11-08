@@ -1,0 +1,55 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__clean_go]
+plugin = "td-task-tracker"
+category = "01 - Clean"
+private = true
+run_task = [
+    { name = [
+        "__km__clean_go_control_plane",
+        "__km__clean_go_virtual_kubelet"
+    ] }
+]
+
+[tasks.__km__clean_go_control_plane]
+plugin = "td-task-tracker"
+category = "01 - Clean"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    km_root = get_env PROJECT_TABSDATA_KM_ROOT_FOLDER
+    target_folder = concat ${km_root} "/mods/control-plane/target"
+    if is_path_exists ${target_folder}
+        rm -r ${target_folder}
+    end
+
+    clean_all = get_env KM_CLEAN_ALL
+    if eq ${clean_all} "true"
+        cache_folder = concat ${km_root} "/mods/control-plane/cache"
+        if is_path_exists ${cache_folder}
+            rm -r ${cache_folder}
+        end
+    end
+'''
+
+[tasks.__km__clean_go_virtual_kubelet]
+plugin = "td-task-tracker"
+category = "01 - Clean"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    km_root = get_env PROJECT_TABSDATA_KM_ROOT_FOLDER
+
+    target_folder = concat ${km_root} "/mods/virtual-kubelet/target"
+    if is_path_exists ${target_folder}
+        rm -r ${target_folder}
+    end
+'''

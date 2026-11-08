@@ -27,7 +27,11 @@ import uuid
 import pytest
 import yaml
 
-from itest_common import get_session_id, start_on_free_ports
+from itest_common import (  # noqa: F401
+    get_session_id,
+    pytest_collection_modifyitems,
+    start_on_free_ports,
+)
 from pod_runner_testlib import TARGET_DIR, make_test_dir
 
 

@@ -9,7 +9,12 @@ import time
 
 import pytest
 
-from itest_common import find_free_port, get_session_id, pytest_configure  # noqa: F401
+from itest_common import (  # noqa: F401
+    find_free_port,
+    get_session_id,
+    pytest_collection_modifyitems,
+    pytest_configure,
+)
 from kminus_testlib import TARGET_DIR, make_test_dir
 
 

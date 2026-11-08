@@ -12,5 +12,8 @@ script = [
     '''
     !include_files ./make/make-km/libraries/log.ds
 
-    warn "⏳ Nothing to do."
+    cd ${KM_ROOT}/mods/control-plane/src/main/go
+
+    debug "🚀 go mod tidy"
+    exec --fail-on-error go mod tidy
     ''']

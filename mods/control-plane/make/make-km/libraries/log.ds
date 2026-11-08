@@ -146,6 +146,9 @@ if not ${on_ga_true}
 
     if ${make_with_responsive}
         km_root = get_env KM_ROOT
+        if is_empty ${km_root}
+            km_root = get_env PROJECT_TABSDATA_KM_ROOT_FOLDER
+        end
         debug "📐 Root from environment: '${km_root}'"
 
         td_width_output = exec python ${km_root}/make/make-km/libraries/term.py
