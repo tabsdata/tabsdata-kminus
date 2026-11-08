@@ -1,6 +1,6 @@
 module minimal-vk
 
-go 1.26.2
+go 1.26.10
 
 require (
 	github.com/sirupsen/logrus v1.9.3

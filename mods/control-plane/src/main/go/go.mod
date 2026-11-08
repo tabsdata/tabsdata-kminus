@@ -1,6 +1,6 @@
 module control-plane
 
-go 1.26.2
+go 1.26.10
 
 require (
 	// v3 drags in the indirect github.com/shoenig/go-m1cpu below, whose cgo

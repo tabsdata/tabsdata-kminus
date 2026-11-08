@@ -67,7 +67,7 @@ Two things worth knowing before revisiting this:
 
 - **Upgrading the Go toolchain does not help.** The offending cgo initializer is
   still compiled and still crashes, independent of Go version. (The build
-  already requires Go ≥ 1.26.2 via `permit_go.toml`.)
+  already runs exactly Go 1.26.10, through `GOTOOLCHAIN`.)
 - **The crash is host-specific.** It does not reproduce on every Apple Silicon
   machine, so a successful local build is not evidence the problem is gone.
 
@@ -90,7 +90,9 @@ will re-populate it.
 
 ## Prerequisites
 
-- **Go 1.26.2** — for building control-plane and kube-controller-manager
+- **Go** — any installed version; the build sets `GOTOOLCHAIN=go1.26.10`
+  (`TABSDATA_GO_VERSION` in km's standalone `Makeroot.toml`), so Go runs exactly
+  1.26.10, downloading it once if the installed version differs
 - **Git** — for cloning the Kubernetes source
 - **setup-envtest** — installed automatically on first build via
   `go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.19`
