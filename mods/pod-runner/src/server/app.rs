@@ -830,7 +830,11 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body, "run-two\n", "one pod, no separator");
+        assert_eq!(
+            body.replace("\r\n", "\n"),
+            "run-two\n",
+            "one pod, no separator"
+        );
 
         let (status, _) = request(
             &addr,
