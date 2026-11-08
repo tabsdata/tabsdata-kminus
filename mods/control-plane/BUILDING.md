@@ -90,7 +90,7 @@ will re-populate it.
 
 ## Prerequisites
 
-- **Go 1.23+** — for building control-plane and kube-controller-manager
+- **Go 1.26.2** — for building control-plane and kube-controller-manager
 - **Git** — for cloning the Kubernetes source
 - **setup-envtest** — installed automatically on first build via
   `go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.19`
