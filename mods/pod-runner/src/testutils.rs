@@ -316,6 +316,22 @@ pub fn shell_cmd(cmd: &str) -> Vec<String> {
     }
 }
 
+/// Send pod-runner's and kcommon's debug traces to the test's captured
+/// output, timed from the moment it is installed. nextest shows that
+/// output only for a failing test, so a failure carries the timeline of
+/// what its pods did. Installs once per process; later calls are no-ops.
+pub fn init_test_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "pod_runner=debug,kcommon=debug",
+        ))
+        .with_timer(tracing_subscriber::fmt::time::uptime())
+        .with_thread_ids(true)
+        .with_ansi(false)
+        .with_test_writer()
+        .try_init();
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

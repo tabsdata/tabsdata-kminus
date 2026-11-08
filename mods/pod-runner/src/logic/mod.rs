@@ -1597,6 +1597,7 @@ mod tests {
     }
 
     fn make_provider() -> Arc<DefaultExecutorProvider> {
+        crate::testutils::init_test_tracing();
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let base = std::env::temp_dir().join(format!(
             "pod-runner-rs2-test-logic-{}-{}",
@@ -1944,24 +1945,68 @@ mod tests {
             (logic, store, shutdown_tx)
         }
 
-        /// Wait until a pod reaches a specific phase, with timeout.
+        /// Wait until a pod reaches a specific phase within `BUDGET`. A pod
+        /// that ends in another terminal phase fails at once.
+        ///
+        /// Polling goes on to `PATIENCE`, past the budget, so a failure
+        /// tells a slow pod (reached the phase, only late) from a stuck one
+        /// (never reached it). It reports what the polling saw: each phase
+        /// and when it was first seen, the slowest `get_pod`, the latest
+        /// wakeup of the poll sleep (a starved runtime wakes late), and the
+        /// last status.
         async fn wait_for_phase(logic: &PodLogic, name: &str, target: PodPhase) {
-            let result = tokio::time::timeout(Duration::from_secs(10), async {
+            const POLL: Duration = Duration::from_millis(50);
+            const BUDGET: Duration = Duration::from_secs(10);
+            const PATIENCE: Duration = Duration::from_secs(120);
+            let started = std::time::Instant::now();
+            let mut seen: Vec<(u128, PodPhase)> = Vec::new();
+            let mut polls = 0u32;
+            let mut slowest_get = Duration::ZERO;
+            let mut latest_wakeup = Duration::ZERO;
+            let mut last_error = None;
+            let mut last = None;
+            let result = tokio::time::timeout(PATIENCE, async {
                 loop {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    if let Ok(snap) = logic.get_pod("default", name, SpecView::Running).await
-                        && snap.status.phase == target
-                    {
-                        return;
+                    let slept = std::time::Instant::now();
+                    tokio::time::sleep(POLL).await;
+                    latest_wakeup = latest_wakeup.max(slept.elapsed().saturating_sub(POLL));
+                    polls += 1;
+                    let asked = std::time::Instant::now();
+                    let snap = logic.get_pod("default", name, SpecView::Running).await;
+                    slowest_get = slowest_get.max(asked.elapsed());
+                    match snap {
+                        Ok(snap) => {
+                            let phase = snap.status.phase;
+                            if seen.last().map(|(_, p)| *p) != Some(phase) {
+                                seen.push((started.elapsed().as_millis(), phase));
+                            }
+                            if phase == target {
+                                return true;
+                            }
+                            last = Some(snap.status);
+                            if phase.is_terminal() {
+                                return false;
+                            }
+                        }
+                        Err(e) => last_error = Some(e.to_string()),
                     }
                 }
             })
             .await;
-            assert!(
-                result.is_ok(),
-                "Timed out waiting for pod '{}' to reach {:?}",
-                name,
-                target,
+            let elapsed = started.elapsed();
+            let outcome = match result {
+                Ok(true) if elapsed <= BUDGET => return,
+                Ok(true) => format!("reached {target:?} only beyond the {BUDGET:?} budget"),
+                Ok(false) => format!("ended before reaching {target:?}"),
+                Err(_) => format!("never reached {target:?} within {PATIENCE:?}"),
+            };
+            panic!(
+                "Pod '{name}' {outcome}, after {} ms and {polls} polls\n\
+                 phases first seen at (ms, phase): {seen:?}\n\
+                 slowest get_pod: {slowest_get:?}; latest poll wakeup: {latest_wakeup:?} late\n\
+                 last get_pod error: {last_error:?}\n\
+                 last status: {last:#?}",
+                elapsed.as_millis(),
             );
         }
 

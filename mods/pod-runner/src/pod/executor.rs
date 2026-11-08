@@ -1018,6 +1018,7 @@ async fn transition_phase(
     let snapshot = st.status();
     drop(st); // release before emitting
 
+    debug!(from = ?old, to = ?new_phase, "Phase changed");
     emit(
         event_tx,
         PodEventKind::PhaseChanged {
@@ -1315,7 +1316,9 @@ async fn run_pod(
         );
         return;
     }
+    let phase_start = Instant::now();
     let start_result = start_main_containers(&pod, &state, &config, &event_tx, &shutdown).await;
+    let start_ms = phase_start.elapsed().as_millis();
     if let Err(e) = start_result {
         warn!("Failed to start main containers: {}", e);
         kill_all_in_state(
@@ -1333,6 +1336,12 @@ async fn run_pod(
         return;
     }
     transition_phase(&state, &event_tx, PodPhase::Running).await;
+    debug!(
+        init_ms,
+        start_ms,
+        total_ms = pod_start.elapsed().as_millis(),
+        "Pod timing (running)"
+    );
 
     // Phase 3: monitor main containers + probes (concurrent, with kill/shutdown)
     let phase_start = Instant::now();
