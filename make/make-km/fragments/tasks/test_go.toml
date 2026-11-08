@@ -1,0 +1,46 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__test_go]
+plugin = "td-task-tracker"
+category = "04 - Test"
+private = true
+run_task = [
+    { name = [
+        "__km__test_go_control_plane",
+        "__km__test_go_virtual_kubelet"
+    ] }
+]
+
+[tasks.__km__test_go_control_plane]
+plugin = "td-task-tracker"
+category = "04 - Test"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    cd ${PROJECT_GO_KM_CONTROL_PLANE_FOLDER}
+
+    debug "🚀 go test ./..."
+    exec --fail-on-error go test ./...
+    ''']
+
+[tasks.__km__test_go_virtual_kubelet]
+plugin = "td-task-tracker"
+category = "04 - Test"
+private = true
+cwd = "${PROJECT_TABSDATA_ROOT_FOLDER}"
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    cd ${PROJECT_GO_KM_VIRTUAL_KUBELET_FOLDER}
+
+    debug "🚀 go test ./..."
+    exec --fail-on-error go test ./...
+    ''']
