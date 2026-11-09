@@ -22,6 +22,9 @@ publish = false
 repository = "https://github.com/tabsdata/tabsdata-km"
 rust-version = "1.99.1"
 
+[lints.clippy]
+large_futures = "deny"
+
 [profile.dev]
 codegen-units = 32
 debug = true

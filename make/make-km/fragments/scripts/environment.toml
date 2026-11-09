@@ -69,6 +69,7 @@ env_scripts = [
         tabsdata_root = concat ${parent} "/tabsdata-os"
     end
     set_env TABSDATA_ROOT ${tabsdata_root}
+    set_env CLIPPY_CONF_DIR "${tabsdata_root}/.cargo"
     ''',
 
     # Set up rust settings (rustflags, target, toolchain, build folder, path, quiet)
