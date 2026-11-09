@@ -49,27 +49,15 @@ already contains the binaries for that platform.
 
 ## Why `control-plane` Is Built Without cgo
 
-The build sets `CGO_ENABLED=0` for the `control-plane` binary itself. This is a
-workaround, not a design choice: `gopsutil` v3 pulls in the indirect dependency
-`github.com/shoenig/go-m1cpu`, whose cgo package initializer reads M1-era
-IORegistry keys (`voltage-states5-sram`) and null-dereferences on Apple Silicon
-generations that no longer publish them — killing the binary before `main()`
-runs. Disabling cgo drops that initializer from the build and lets `gopsutil`
-take its pure-Go paths.
+The build sets `CGO_ENABLED=0` for the `control-plane` binary itself, as it
+does for `virtual-kubelet`, so that both binaries are statically linked and
+need no C toolchain on any build host.
 
-The clean fix is to upgrade to **gopsutil v4**, which removed `go-m1cpu`
-entirely in favour of `ebitengine/purego` and needs no cgo. The `process` API
-used by `control-plane` is unchanged between v3 and v4, so the migration is an
-import-path bump; once done, `CGO_ENABLED=0` can be dropped from
-`make/make-km/fragments/tasks/build_go.toml`.
-
-Two things worth knowing before revisiting this:
-
-- **Upgrading the Go toolchain does not help.** The offending cgo initializer is
-  still compiled and still crashes, independent of Go version. (The build
-  already runs exactly Go 1.26.10, through `GOTOOLCHAIN`.)
-- **The crash is host-specific.** It does not reproduce on every Apple Silicon
-  machine, so a successful local build is not evidence the problem is gone.
+`control-plane` uses **gopsutil v4**, which calls macOS system libraries through
+`ebitengine/purego` rather than cgo. Do not go back to gopsutil v3: it pulls in
+`github.com/shoenig/go-m1cpu`, whose cgo package initializer null-dereferences
+on Apple Silicon generations that no longer publish its IORegistry keys,
+killing the binary before `main()` runs on some hosts only.
 
 Note this is separate from `kube-controller-manager`, which is compiled with
 `CGO_ENABLED=0` for static-linking reasons and is unaffected by the above.

@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shirou/gopsutil/v3/process"
+	"github.com/shirou/gopsutil/v4/process"
 )
 
 var hexToken = regexp.MustCompile(`^[0-9a-f]{64}$`)

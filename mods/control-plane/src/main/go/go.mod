@@ -3,12 +3,7 @@ module control-plane
 go 1.26.10
 
 require (
-	// v3 drags in the indirect github.com/shoenig/go-m1cpu below, whose cgo
-	// initializer crashes on newer Apple Silicon; that is why the build forces
-	// CGO_ENABLED=0. Upgrading to gopsutil v4 removes go-m1cpu entirely (it uses
-	// ebitengine/purego instead) and lets cgo be re-enabled. The process API used
-	// here is identical in v4, so it is an import-path bump.
-	github.com/shirou/gopsutil/v3 v3.24.5
+	github.com/shirou/gopsutil/v4 v4.26.10
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	k8s.io/api v0.29.0
 	k8s.io/apimachinery v0.29.0
@@ -20,6 +15,7 @@ require gopkg.in/yaml.v2 v2.4.0
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/ebitengine/purego v0.11.2 // indirect
 	github.com/emicklei/go-restful/v3 v3.11.0 // indirect
 	github.com/evanphx/json-patch/v5 v5.8.0 // indirect
 	github.com/go-logr/logr v1.4.1 // indirect
@@ -41,11 +37,10 @@ require (
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c // indirect
-	github.com/shoenig/go-m1cpu v0.1.6 // indirect
+	github.com/power-devops/perfstat v0.0.0-20260805114148-88456608a4f6 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
-	github.com/tklauser/go-sysconf v0.3.12 // indirect
-	github.com/tklauser/numcpus v0.6.1 // indirect
+	github.com/tklauser/go-sysconf v0.4.0 // indirect
+	github.com/tklauser/numcpus v0.12.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/oauth2 v0.12.0 // indirect
