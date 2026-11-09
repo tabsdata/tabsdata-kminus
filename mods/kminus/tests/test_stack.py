@@ -9,11 +9,44 @@ K8s API, and verify execution through restart cycles.
 """
 
 import base64
+import os
+import signal
 import sys
 import time
 
+import psutil
+import pytest
 from conftest import KminusProcess
 from itest_common import find_free_port
+
+COMPONENTS = ("control-plane", "pod-runner", "virtual-kubelet")
+
+
+def _component_pids(work_dir):
+    pids = {}
+    for entry in os.listdir(os.path.join(work_dir, "data", "km", "pids")):
+        pid, _, name = entry.partition(".")
+        if name in COMPONENTS:
+            pids[name] = int(pid)
+    return pids
+
+
+def _wait_for_log_line(path, offset, line, timeout=15):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            if line in f.read():
+                return
+        time.sleep(0.1)
+    raise TimeoutError(f"{line!r} never appeared in {path}")
+
+
+def _running(pid):
+    try:
+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
 
 
 def _k8s_client(kubeconfig):
@@ -55,6 +88,35 @@ class TestStackStartStop:
             assert any("tdknode" in name for name in node_names)
         finally:
             km.stop()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="SIGHUP is a POSIX signal; Windows reports a closed console differently",
+)
+class TestHangup:
+    """A hangup, as from a closed terminal, leaves the whole stack running."""
+
+    def test_km_and_its_components_outlive_a_hangup(self, km_bin, test_dir):
+        km = KminusProcess(km_bin, test_dir)
+        km.start()
+        try:
+            components = _component_pids(km.work_dir)
+            assert set(components) == set(COMPONENTS), components
+            log = os.path.join(km.work_dir, "log", "km.log")
+            offset = os.path.getsize(log)
+
+            for pid in (km.process.pid, *components.values()):
+                os.kill(pid, signal.SIGHUP)
+            _wait_for_log_line(log, offset, b"Ignoring SIGHUP")
+
+            assert _k8s_client(km.kubeconfig).list_node().items
+            assert km.process.poll() is None, "km ended on SIGHUP"
+            for name, pid in components.items():
+                assert _running(pid), f"{name} ended on SIGHUP"
+        finally:
+            km.stop()
+        assert km.process.returncode == 130, "km did not stop on its signal alone"
 
 
 class TestPodSurvivesRestart:

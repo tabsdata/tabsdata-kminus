@@ -5,7 +5,54 @@
 """Integration tests for pod-runner server endpoints."""
 
 import os
+import signal
 import sys
+import time
+
+import pytest
+from conftest import MtlsClient, PodRunnerProcess, _write_file_resolver_prsysconfig
+from itest_common import start_on_free_ports
+
+
+def _wait_for_log_line(path, line, timeout=15):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.isfile(path):
+            with open(path, "rb") as f:
+                if line in f.read():
+                    return
+        time.sleep(0.1)
+    raise TimeoutError(f"{line!r} never appeared in {path}")
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="SIGHUP is a POSIX signal; Windows reports a closed console differently",
+)
+class TestHangup:
+    """A hangup, as from a closed terminal, leaves pod-runner serving."""
+
+    def test_a_hangup_leaves_the_runner_serving(self, pod_runner_bin, test_dir):
+        _write_file_resolver_prsysconfig(os.path.join(test_dir, "config"))
+
+        def start(port):
+            runner = PodRunnerProcess(pod_runner_bin, test_dir, port)
+            runner.start()
+            return runner
+
+        runner = start_on_free_ports(start, 1)
+        try:
+            runner.process.send_signal(signal.SIGHUP)
+            _wait_for_log_line(
+                os.path.join(test_dir, "log", "pod-runner.log"), b"Ignoring SIGHUP"
+            )
+            assert runner.process.poll() is None, "pod-runner ended on SIGHUP"
+            client = MtlsClient(runner.vk_prconfig_path, runner.work_dir)
+            status, _ = client.get(f"{runner.url}/capacity")
+            assert status == 200
+        finally:
+            runner.stop()
+        assert runner.process.returncode == 0, "pod-runner did not stop gracefully"
 
 
 class TestServerStartup:
