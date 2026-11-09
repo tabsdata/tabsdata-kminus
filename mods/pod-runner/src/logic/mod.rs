@@ -1892,13 +1892,9 @@ mod tests {
     mod async_tests {
         use super::*;
         use crate::server::config::POD_WORK_SUBDIR;
-        use crate::testutils::shell_cmd;
-        #[cfg(windows)]
-        const SLEEP_60: &str = "ping -n 61 127.0.0.1 > NUL";
-        #[cfg(not(windows))]
-        const SLEEP_60: &str = "sleep 60";
+        use crate::testutils::Script;
 
-        fn make_pod_spec(name: &str, cmd: &str) -> PodSpec {
+        fn make_pod_spec(name: &str, script: Script) -> PodSpec {
             PodSpec {
                 metadata: PodMetadata {
                     namespace: "default".to_string(),
@@ -1909,7 +1905,8 @@ mod tests {
                 spec: PodSpecBody {
                     containers: vec![Container {
                         name: "main".to_string(),
-                        command: shell_cmd(cmd),
+                        command: script.command(),
+                        env: script.env(),
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -1918,14 +1915,14 @@ mod tests {
             }
         }
 
-        fn make_pod_spec_ns(namespace: &str, name: &str, cmd: &str) -> PodSpec {
-            let mut spec = make_pod_spec(name, cmd);
+        fn make_pod_spec_ns(namespace: &str, name: &str, script: Script) -> PodSpec {
+            let mut spec = make_pod_spec(name, script);
             spec.metadata.namespace = namespace.to_string();
             spec
         }
 
-        fn make_pod_spec_uid(name: &str, uid: &str, cmd: &str) -> PodSpec {
-            let mut spec = make_pod_spec(name, cmd);
+        fn make_pod_spec_uid(name: &str, uid: &str, script: Script) -> PodSpec {
+            let mut spec = make_pod_spec(name, script);
             spec.metadata.uid = uid.to_string();
             spec
         }
@@ -2000,14 +1997,57 @@ mod tests {
                 Ok(false) => format!("ended before reaching {target:?}"),
                 Err(_) => format!("never reached {target:?} within {PATIENCE:?}"),
             };
+            let logs = log_tails(logic, name, last.as_ref()).await;
             panic!(
                 "Pod '{name}' {outcome}, after {} ms and {polls} polls\n\
                  phases first seen at (ms, phase): {seen:?}\n\
                  slowest get_pod: {slowest_get:?}; latest poll wakeup: {latest_wakeup:?} late\n\
                  last get_pod error: {last_error:?}\n\
-                 last status: {last:#?}",
+                 last status: {last:#?}\n\
+                 container logs (last {LOG_TAIL} lines):\n{logs}",
                 elapsed.as_millis(),
             );
+        }
+
+        const LOG_TAIL: u64 = 20;
+
+        async fn log_tails(logic: &PodLogic, name: &str, status: Option<&PodStatus>) -> String {
+            let mut containers: Vec<String> = status
+                .map(|s| {
+                    s.container_statuses
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if containers.is_empty() {
+                containers.push("main".to_string());
+            }
+            let mut report = String::new();
+            for container in containers {
+                let options = ContainerLogOptions {
+                    tail_lines: Some(LOG_TAIL),
+                    ..Default::default()
+                };
+                let tail = match logic
+                    .stream_container_logs("default", name, Some(&container), options)
+                    .await
+                {
+                    Ok(mut rx) => {
+                        let mut text = String::new();
+                        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                            while let Some(Ok(chunk)) = rx.recv().await {
+                                text.push_str(&String::from_utf8_lossy(&chunk));
+                            }
+                        })
+                        .await;
+                        text
+                    }
+                    Err(error) => format!("<unreadable: {error}>"),
+                };
+                report.push_str(&format!("--- {container} ---\n{}\n", tail.trim_end()));
+            }
+            report
         }
 
         /// Wait until a pod reaches any terminal phase, with timeout.
@@ -2053,7 +2093,7 @@ mod tests {
             let (logic, _, _) = make_logic_with_store();
 
             let snap = logic
-                .create_pod(make_pod_spec("app", "exit 0"))
+                .create_pod(make_pod_spec("app", Script::exits(0)))
                 .await
                 .unwrap();
             assert_eq!(snap.id.name, "app");
@@ -2071,7 +2111,7 @@ mod tests {
         async fn create_pod_stores_both_spec_variants() {
             let (logic, _, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("app", "sleep 60"))
+                .create_pod(make_pod_spec("app", Script::runs()))
                 .await
                 .unwrap();
 
@@ -2096,11 +2136,11 @@ mod tests {
             // second incarnation. The second create returns the current
             // snapshot without starting another run.
             let first = logic
-                .create_pod(make_pod_spec("app", "sleep 60"))
+                .create_pod(make_pod_spec("app", Script::runs()))
                 .await
                 .unwrap();
             let second = logic
-                .create_pod(make_pod_spec("app", "sleep 60"))
+                .create_pod(make_pod_spec("app", Script::runs()))
                 .await
                 .unwrap();
             assert_eq!(first.id, second.id);
@@ -2111,7 +2151,7 @@ mod tests {
         async fn create_pod_same_name_new_uid_rejected_when_live() {
             let (logic, _, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("app", "sleep 60"))
+                .create_pod(make_pod_spec("app", Script::runs()))
                 .await
                 .unwrap();
 
@@ -2119,7 +2159,7 @@ mod tests {
             // (retryable). The old pod is terminated so a later retry can
             // proceed once it has been reaped.
             let err = logic
-                .create_pod(make_pod_spec_uid("app", "uid-app-2", "sleep 60"))
+                .create_pod(make_pod_spec_uid("app", "uid-app-2", Script::runs()))
                 .await
                 .unwrap_err();
             assert!(matches!(err, LogicError::Conflict { .. }));
@@ -2130,7 +2170,7 @@ mod tests {
             let (logic, store, _) = make_logic_with_store();
             // First incarnation runs to completion but is never deleted.
             logic
-                .create_pod(make_pod_spec("app", "exit 0"))
+                .create_pod(make_pod_spec("app", Script::exits(0)))
                 .await
                 .unwrap();
             wait_for_terminal(&logic, "app").await;
@@ -2139,7 +2179,7 @@ mod tests {
             // New incarnation, same name, different uid: the stale
             // terminal entry is evicted and the new pod starts.
             let snap = logic
-                .create_pod(make_pod_spec_uid("app", "uid-app-2", "sleep 60"))
+                .create_pod(make_pod_spec_uid("app", "uid-app-2", Script::runs()))
                 .await
                 .unwrap();
             assert_eq!(snap.id.uid, "uid-app-2");
@@ -2173,11 +2213,11 @@ mod tests {
             );
 
             logic
-                .create_pod(make_pod_spec("first", "sleep 60"))
+                .create_pod(make_pod_spec("first", Script::runs()))
                 .await
                 .unwrap();
             let err = logic
-                .create_pod(make_pod_spec("second", "sleep 60"))
+                .create_pod(make_pod_spec("second", Script::runs()))
                 .await
                 .unwrap_err();
             assert!(matches!(err, LogicError::CapacityExceeded { max: 1 }));
@@ -2205,7 +2245,7 @@ mod tests {
             // in the store in a terminal phase (as it would between completion
             // and the control plane's delete).
             logic
-                .create_pod(make_pod_spec("first", "exit 0"))
+                .create_pod(make_pod_spec("first", Script::exits(0)))
                 .await
                 .unwrap();
             wait_for_terminal(&logic, "first").await;
@@ -2213,7 +2253,7 @@ mod tests {
             // With max_pods=1 the old store.len() gate would reject this. A
             // terminal pod holds no resources, so the second pod is admitted.
             let snap = logic
-                .create_pod(make_pod_spec("second", "sleep 60"))
+                .create_pod(make_pod_spec("second", Script::runs()))
                 .await
                 .unwrap();
             assert_eq!(snap.status.phase, PodPhase::Pending);
@@ -2228,7 +2268,7 @@ mod tests {
         async fn list_pod_statuses_carries_uid() {
             let (logic, _, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("app", "sleep 60"))
+                .create_pod(make_pod_spec("app", Script::runs()))
                 .await
                 .unwrap();
 
@@ -2247,7 +2287,7 @@ mod tests {
         async fn monitor_transitions_to_running() {
             let (logic, _, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("app", "sleep 60"))
+                .create_pod(make_pod_spec("app", Script::runs()))
                 .await
                 .unwrap();
 
@@ -2264,7 +2304,7 @@ mod tests {
         async fn monitor_transitions_to_succeeded() {
             let (logic, _, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("app", "exit 0"))
+                .create_pod(make_pod_spec("app", Script::exits(0)))
                 .await
                 .unwrap();
 
@@ -2276,7 +2316,7 @@ mod tests {
         async fn monitor_transitions_to_failed() {
             let (logic, _, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("app", "exit 1"))
+                .create_pod(make_pod_spec("app", Script::exits(1)))
                 .await
                 .unwrap();
 
@@ -2288,7 +2328,7 @@ mod tests {
         async fn monitor_keeps_runtime_after_natural_completion() {
             let (logic, _, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("app", "exit 0"))
+                .create_pod(make_pod_spec("app", Script::exits(0)))
                 .await
                 .unwrap();
             let id = PodId::new("default", "app", "uid-app");
@@ -2349,14 +2389,14 @@ mod tests {
             let (logic, _, _) = make_logic_with_store();
             let layout = logic.executor_provider.layout().clone();
 
-            let mut first = make_pod_spec_uid("app", "uid-1", "echo first");
+            let mut first = make_pod_spec_uid("app", "uid-1", Script::prints(["first"]));
             first.metadata.creation_timestamp = Some("2026-10-19T14:00:00Z".into());
             let first_state = layout.state_dir(&first);
             logic.create_pod(first).await.unwrap();
             assert_eq!(wait_for_terminal(&logic, "app").await, PodPhase::Succeeded);
             logic.delete_pod("default", "app", None).await.unwrap();
 
-            let mut second = make_pod_spec_uid("app", "uid-2", "echo second");
+            let mut second = make_pod_spec_uid("app", "uid-2", Script::prints(["second"]));
             second.metadata.creation_timestamp = Some("2026-10-19T15:00:00Z".into());
             let second_state = layout.state_dir(&second);
             logic.create_pod(second).await.unwrap();
@@ -2387,7 +2427,7 @@ mod tests {
         #[tokio::test]
         async fn a_pod_without_a_creation_time_is_stamped_at_admission() {
             let (logic, _, _) = make_logic_with_store();
-            let spec = make_pod_spec("app", "sleep 60");
+            let spec = make_pod_spec("app", Script::runs());
             assert!(spec.metadata.creation_timestamp.is_none());
 
             let snap = logic.create_pod(spec).await.unwrap();
@@ -2412,7 +2452,7 @@ mod tests {
         async fn monitor_reaps_data_dirs_of_succeeded_pod() {
             let (logic, _, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("app", "exit 0"))
+                .create_pod(make_pod_spec("app", Script::exits(0)))
                 .await
                 .unwrap();
             let id = PodId::new("default", "app", "uid-app");
@@ -2444,7 +2484,7 @@ mod tests {
         async fn monitor_keeps_data_dirs_of_failed_pod() {
             let (logic, _, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("app", "exit 1"))
+                .create_pod(make_pod_spec("app", Script::exits(1)))
                 .await
                 .unwrap();
             let id = PodId::new("default", "app", "uid-app");
@@ -2464,7 +2504,7 @@ mod tests {
         #[tokio::test]
         async fn reap_ttl_annotation_defers_reaping_a_succeeded_pod() {
             let (logic, _, _) = make_logic_with_store();
-            let mut spec = make_pod_spec("app", "exit 0");
+            let mut spec = make_pod_spec("app", Script::exits(0));
             spec.metadata.annotations.insert(
                 ANN_POD_DATA_REAP_TTL_ON_POD_SUCCESS.to_string(),
                 "1h".to_string(),
@@ -2487,7 +2527,7 @@ mod tests {
         #[tokio::test]
         async fn never_reap_ttl_keeps_data_dirs_indefinitely() {
             let (logic, _, _) = make_logic_with_store();
-            let mut spec = make_pod_spec("app", "exit 0");
+            let mut spec = make_pod_spec("app", Script::exits(0));
             spec.metadata.annotations.insert(
                 ANN_POD_DATA_REAP_TTL_ON_POD_SUCCESS.to_string(),
                 TTL_NEVER.to_string(),
@@ -2512,7 +2552,7 @@ mod tests {
         async fn cleanup_ttls_file_written_at_pod_start() {
             let (logic, _, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("app", "sleep 60"))
+                .create_pod(make_pod_spec("app", Script::runs()))
                 .await
                 .unwrap();
             let id = PodId::new("default", "app", "uid-app");
@@ -2543,7 +2583,7 @@ mod tests {
         #[tokio::test]
         async fn cleanup_ttls_file_records_annotation_override() {
             let (logic, _, _) = make_logic_with_store();
-            let mut spec = make_pod_spec("app", "exit 0");
+            let mut spec = make_pod_spec("app", Script::exits(0));
             spec.metadata.annotations.insert(
                 ANN_POD_DATA_REAP_TTL_ON_POD_FAILURE.to_string(),
                 "45m".to_string(),
@@ -2567,7 +2607,7 @@ mod tests {
         async fn succeeded_pod_is_finalized_as_succeeded() {
             let (logic, _, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("app", "exit 0"))
+                .create_pod(make_pod_spec("app", Script::exits(0)))
                 .await
                 .unwrap();
             let id = PodId::new("default", "app", "uid-app");
@@ -2589,7 +2629,7 @@ mod tests {
         async fn failed_pod_is_finalized_as_failed() {
             let (logic, _, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("app", "exit 1"))
+                .create_pod(make_pod_spec("app", Script::exits(1)))
                 .await
                 .unwrap();
             let id = PodId::new("default", "app", "uid-app");
@@ -2668,7 +2708,7 @@ mod tests {
         async fn get_pod_both_views() {
             let (logic, _, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("app", "sleep 60"))
+                .create_pod(make_pod_spec("app", Script::runs()))
                 .await
                 .unwrap();
 
@@ -2689,7 +2729,7 @@ mod tests {
         async fn get_pod_status_returns_current() {
             let (logic, _, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("app", "sleep 60"))
+                .create_pod(make_pod_spec("app", Script::runs()))
                 .await
                 .unwrap();
 
@@ -2708,15 +2748,15 @@ mod tests {
         async fn list_pods_multiple() {
             let (logic, _, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("a", "sleep 60"))
+                .create_pod(make_pod_spec("a", Script::runs()))
                 .await
                 .unwrap();
             logic
-                .create_pod(make_pod_spec("b", "sleep 60"))
+                .create_pod(make_pod_spec("b", Script::runs()))
                 .await
                 .unwrap();
             logic
-                .create_pod(make_pod_spec("c", "sleep 60"))
+                .create_pod(make_pod_spec("c", Script::runs()))
                 .await
                 .unwrap();
 
@@ -2728,15 +2768,15 @@ mod tests {
         async fn list_pods_in_namespace_filters() {
             let (logic, _, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec_ns("ns1", "a", "sleep 60"))
+                .create_pod(make_pod_spec_ns("ns1", "a", Script::runs()))
                 .await
                 .unwrap();
             logic
-                .create_pod(make_pod_spec_ns("ns1", "b", "sleep 60"))
+                .create_pod(make_pod_spec_ns("ns1", "b", Script::runs()))
                 .await
                 .unwrap();
             logic
-                .create_pod(make_pod_spec_ns("ns2", "c", "sleep 60"))
+                .create_pod(make_pod_spec_ns("ns2", "c", Script::runs()))
                 .await
                 .unwrap();
 
@@ -2775,7 +2815,7 @@ mod tests {
         async fn delete_terminal_pod_removes_from_store() {
             let (logic, store, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("app", "exit 0"))
+                .create_pod(make_pod_spec("app", Script::exits(0)))
                 .await
                 .unwrap();
 
@@ -2796,7 +2836,7 @@ mod tests {
         async fn delete_running_pod_kills_and_removes() {
             let (logic, store, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("app", "sleep 60"))
+                .create_pod(make_pod_spec("app", Script::runs()))
                 .await
                 .unwrap();
 
@@ -2830,7 +2870,7 @@ mod tests {
                 shutdown_tx,
             );
             logic
-                .create_pod(make_pod_spec("app", "sleep 60"))
+                .create_pod(make_pod_spec("app", Script::runs()))
                 .await
                 .unwrap();
 
@@ -2841,14 +2881,17 @@ mod tests {
             wait_for_removal(&store, "app").await;
         }
 
-        // A container that ignores SIGTERM and only dies on SIGKILL — so the
-        // time to terminate (and thus removal) tracks the grace the kill
-        // path used. `wait_for_removal`'s 10s timeout is the discriminator:
-        // it only completes if the *short* grace was applied.
-        const SIGTERM_PROOF: &str = "trap '' TERM; while true; do sleep 0.2; done";
+        // A container that ignores the graceful stop and only dies when it is
+        // force-killed — so the time to terminate (and thus removal) tracks
+        // the grace the kill path used. `wait_for_removal`'s 10s timeout is
+        // the discriminator: it only completes if the *short* grace was
+        // applied.
+        fn stop_proof() -> Script {
+            Script::runs().ignoring_stop()
+        }
 
-        fn pod_spec_grace(name: &str, cmd: &str, grace_secs: Option<u64>) -> PodSpec {
-            let mut spec = make_pod_spec(name, cmd);
+        fn pod_spec_grace(name: &str, script: Script, grace_secs: Option<u64>) -> PodSpec {
+            let mut spec = make_pod_spec(name, script);
             spec.spec.termination_grace_period_seconds = grace_secs;
             spec
         }
@@ -2875,7 +2918,7 @@ mod tests {
                 shutdown_tx,
             );
             logic
-                .create_pod(pod_spec_grace("app", SIGTERM_PROOF, Some(1)))
+                .create_pod(pod_spec_grace("app", stop_proof(), Some(1)))
                 .await
                 .unwrap();
 
@@ -2892,7 +2935,7 @@ mod tests {
             // must win — otherwise removal would time out.
             let (logic, store, _) = make_logic_with_store();
             logic
-                .create_pod(pod_spec_grace("app", SIGTERM_PROOF, Some(30)))
+                .create_pod(pod_spec_grace("app", stop_proof(), Some(30)))
                 .await
                 .unwrap();
 
@@ -2909,7 +2952,7 @@ mod tests {
         async fn delete_idempotent_disruption() {
             let (logic, _, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("app", "sleep 60"))
+                .create_pod(make_pod_spec("app", Script::runs()))
                 .await
                 .unwrap();
 
@@ -2937,7 +2980,7 @@ mod tests {
         async fn delete_already_removed_is_ok() {
             let (logic, _, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("app", "exit 0"))
+                .create_pod(make_pod_spec("app", Script::exits(0)))
                 .await
                 .unwrap();
 
@@ -2957,15 +3000,15 @@ mod tests {
 
             // Create three pods: fast exit, slow, failing
             logic
-                .create_pod(make_pod_spec("fast", "exit 0"))
+                .create_pod(make_pod_spec("fast", Script::exits(0)))
                 .await
                 .unwrap();
             logic
-                .create_pod(make_pod_spec("slow", SLEEP_60))
+                .create_pod(make_pod_spec("slow", Script::runs()))
                 .await
                 .unwrap();
             logic
-                .create_pod(make_pod_spec("fail", "exit 1"))
+                .create_pod(make_pod_spec("fail", Script::exits(1)))
                 .await
                 .unwrap();
 
@@ -3001,11 +3044,11 @@ mod tests {
         async fn shutdown_terminates_running_pods() {
             let (logic, _, shutdown_tx) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("a", "sleep 60"))
+                .create_pod(make_pod_spec("a", Script::runs()))
                 .await
                 .unwrap();
             logic
-                .create_pod(make_pod_spec("b", "sleep 60"))
+                .create_pod(make_pod_spec("b", Script::runs()))
                 .await
                 .unwrap();
 
@@ -3024,7 +3067,7 @@ mod tests {
         async fn stream_logs_after_completion() {
             let (logic, _, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("logger", "echo hello-world"))
+                .create_pod(make_pod_spec("logger", Script::prints(["hello-world"])))
                 .await
                 .unwrap();
 
@@ -3050,14 +3093,11 @@ mod tests {
         #[tokio::test]
         async fn stream_logs_with_tail_lines() {
             let (logic, _, _) = make_logic_with_store();
-            // Print 10 lines.
-            #[cfg(windows)]
-            const TEN_LINES: &str = "for %i in (1 2 3 4 5 6 7 8 9 10) do @echo line-%i";
-            #[cfg(not(windows))]
-            const TEN_LINES: &str = "for i in 1 2 3 4 5 6 7 8 9 10; do echo line-$i; done";
-
             logic
-                .create_pod(make_pod_spec("tailer", TEN_LINES))
+                .create_pod(make_pod_spec(
+                    "tailer",
+                    Script::prints((1..=10).map(|i| format!("line-{i}"))),
+                ))
                 .await
                 .unwrap();
 
@@ -3090,7 +3130,10 @@ mod tests {
         async fn stream_logs_follow_stops_on_terminal() {
             let (logic, _, _) = make_logic_with_store();
             logic
-                .create_pod(make_pod_spec("follower", "echo follow-me && sleep 1"))
+                .create_pod(make_pod_spec(
+                    "follower",
+                    Script::prints(["follow-me"]).then_pause(Duration::from_secs(1)),
+                ))
                 .await
                 .unwrap();
 
@@ -3252,7 +3295,7 @@ mod tests {
             let (logic, provider, _tx) = make_logic_with_file_store(secret_dir);
 
             logic
-                .create_pod(make_pod_spec("app", "echo hello"))
+                .create_pod(make_pod_spec("app", Script::prints(["hello"])))
                 .await
                 .unwrap();
             let id = PodId::new("default", "app", "uid-app");
@@ -3289,7 +3332,7 @@ mod tests {
             let secret_dir = temp_dir("delete-now");
             let (logic, provider, _tx) = make_logic_with_file_store(secret_dir);
 
-            let mut spec = make_pod_spec("app", "exit 0");
+            let mut spec = make_pod_spec("app", Script::exits(0));
             spec.metadata.annotations.insert(
                 ANN_POD_DIR_DELETE_TTL_POD_SUCCESS_ON_POD_DELETE.to_string(),
                 "0s".to_string(),
@@ -3339,6 +3382,7 @@ mod tests {
             secret_name: &str,
             active_deadline_seconds: Option<u64>,
         ) -> PodSpec {
+            let script = Script::prints(["ok"]);
             PodSpec {
                 metadata: PodMetadata {
                     namespace: "default".to_string(),
@@ -3349,8 +3393,8 @@ mod tests {
                 spec: PodSpecBody {
                     containers: vec![Container {
                         name: "main".to_string(),
-                        command: shell_cmd("echo ok"),
-                        env: vec![EnvVar {
+                        command: script.command(),
+                        env: [EnvVar {
                             name: "PASS".to_string(),
                             value: None,
                             value_from: Some(EnvVarSource {
@@ -3361,7 +3405,10 @@ mod tests {
                                 }),
                                 ..Default::default()
                             }),
-                        }],
+                        }]
+                        .into_iter()
+                        .chain(script.env())
+                        .collect(),
                         ..Default::default()
                     }],
                     active_deadline_seconds,
@@ -3408,7 +3455,7 @@ mod tests {
         #[tokio::test]
         async fn executable_path_too_long_for_windows_fails_preparation() {
             let (logic, _, _) = make_logic_with_store();
-            let mut pod = make_pod_spec("long", "exit 0");
+            let mut pod = make_pod_spec("long", Script::exits(0));
             pod.spec.containers[0].command = vec![format!(
                 "$(KM_CONTAINER_ROOT)/{}/x.exe",
                 "a".repeat(crate::pod::prepare::WINDOWS_EXECUTABLE_PATH_LIMIT)
@@ -3540,11 +3587,11 @@ mod tests {
             // Two pods on the same PodLogic — both should pick up the
             // registered task.
             logic
-                .create_pod(make_pod_spec("a", "exit 0"))
+                .create_pod(make_pod_spec("a", Script::exits(0)))
                 .await
                 .unwrap();
             logic
-                .create_pod(make_pod_spec("b", "exit 0"))
+                .create_pod(make_pod_spec("b", Script::exits(0)))
                 .await
                 .unwrap();
             wait_for_terminal(&logic, "a").await;
@@ -3560,7 +3607,7 @@ mod tests {
         #[tokio::test]
         async fn create_pod_rejects_optional_true() {
             let (logic, _, _) = make_logic_with_store();
-            let mut pod = make_pod_spec("rejected", "exit 0");
+            let mut pod = make_pod_spec("rejected", Script::exits(0));
             pod.spec.containers[0].env.push(EnvVar {
                 name: "X".to_string(),
                 value: None,

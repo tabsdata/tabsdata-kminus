@@ -298,7 +298,7 @@ mod tests {
     #[cfg(unix)]
     use crate::process::executor::{DevNullOutput, ExecutorHandle, ProcessExecutor};
     #[cfg(unix)]
-    use crate::testutils::{HELPER_IGNORE_SIGTERM, HELPER_SLEEP, HELPER_VAR, helper_command};
+    use crate::testutils::{HELPER_IGNORE_STOP, HELPER_SLEEP, HELPER_VAR, helper_command};
 
     /// Bounded polling for a process appearing in, or leaving, the table.
     #[cfg(unix)]
@@ -601,7 +601,7 @@ mod tests {
     #[serial]
     async fn terminate_orphans_is_graceful_and_kill_orphans_escalates() {
         let prefix = pod_prefix("stubborn-pod", "uid-1");
-        let handle = spawn_helper(&container_token(&prefix, "main"), HELPER_IGNORE_SIGTERM).await;
+        let handle = spawn_helper(&container_token(&prefix, "main"), HELPER_IGNORE_STOP).await;
         let pid = handle.pid();
         assert!(wait_visible(&prefix).await, "token must be visible");
 
