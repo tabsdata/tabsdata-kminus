@@ -480,7 +480,14 @@ func finalizeTerminatingPods(
 	}
 }
 
+// ignoreHangup catches SIGHUP rather than calling signal.Ignore: an ignored
+// disposition would be inherited by anything this process executes.
+func ignoreHangup() {
+	signal.Notify(make(chan os.Signal, 1), syscall.SIGHUP)
+}
+
 func main() {
+	ignoreHangup()
 	flag.Parse()
 
 	// Resolve --kubeconfig from env if not set

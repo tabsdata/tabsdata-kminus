@@ -1321,7 +1321,14 @@ func (m *etcdMaintainer) defrag(ctx context.Context, why string, size, inUse int
 }
 
 func main() {
+	ignoreHangup()
 	os.Exit(run())
+}
+
+// ignoreHangup catches SIGHUP rather than calling signal.Ignore: an ignored
+// disposition is inherited across exec, and the children must keep theirs.
+func ignoreHangup() {
+	signal.Notify(make(chan os.Signal, 1), syscall.SIGHUP)
 }
 
 func run() int {

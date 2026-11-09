@@ -1692,10 +1692,14 @@ async fn arm_and_wait_for_shutdown(
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    let mut sighup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
     let _ = armed.send(());
-    tokio::select! {
-        _ = sigterm.recv() => "SIGTERM".to_string(),
-        _ = sigint.recv() => "SIGINT (Ctrl+C)".to_string(),
+    loop {
+        tokio::select! {
+            _ = sigterm.recv() => return "SIGTERM".to_string(),
+            _ = sigint.recv() => return "SIGINT (Ctrl+C)".to_string(),
+            _ = sighup.recv() => info!("Ignoring SIGHUP: km outlives the terminal that started it"),
+        }
     }
 }
 

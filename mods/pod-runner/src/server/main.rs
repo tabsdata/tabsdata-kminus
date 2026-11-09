@@ -299,15 +299,24 @@ async fn wait_for_shutdown_signal() {
     let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let mut sigquit = signal(SignalKind::quit()).expect("install SIGQUIT handler");
-    tokio::select! {
-        _ = sigint.recv() => {
-            info!("Received SIGINT (Ctrl+C). Initiating graceful stop...");
-        }
-        _ = sigterm.recv() => {
-            info!("Received SIGTERM. Initiating graceful stop...");
-        }
-        _ = sigquit.recv() => {
-            info!("Received SIGQUIT. Initiating forceful stop...");
+    let mut sighup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
+    loop {
+        tokio::select! {
+            _ = sigint.recv() => {
+                info!("Received SIGINT (Ctrl+C). Initiating graceful stop...");
+                return;
+            }
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM. Initiating graceful stop...");
+                return;
+            }
+            _ = sigquit.recv() => {
+                info!("Received SIGQUIT. Initiating forceful stop...");
+                return;
+            }
+            _ = sighup.recv() => {
+                info!("Ignoring SIGHUP: pod-runner outlives the terminal that started it");
+            }
         }
     }
 }
