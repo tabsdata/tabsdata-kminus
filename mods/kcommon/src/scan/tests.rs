@@ -216,6 +216,7 @@ fn still_carries_confirms_the_exact_token_and_only_that() {
     let _ = helper.wait();
 }
 
+#[cfg(unix)]
 #[test]
 #[serial(kcommon_sweep)]
 fn terminate_found_asks_gracefully() {
@@ -228,11 +229,26 @@ fn terminate_found_asks_gracefully() {
 
     // SIGTERM's default disposition terminates the helper; the wait status
     // shows it went by signal, not by its own exit.
-    #[cfg(unix)]
     assert!(killed(&mut helper), "SIGTERM should have ended the helper");
-    #[cfg(windows)]
-    {
-        let _ = helper.kill();
-        let _ = helper.wait();
-    }
+}
+
+#[cfg(windows)]
+#[test]
+#[serial(kcommon_sweep)]
+fn terminate_found_asks_nobody_on_windows() {
+    // The helper shares this run's console and leads no process group, so
+    // a console event aimed at it would reach the whole test run.
+    let token = dead_owner_token("graceful");
+    let mut helper = spawn_helper(&token);
+    assert!(wait_visible(&token));
+    let found = Scan::load().unwrap().under(KM_KILL_TOKEN_VAR, &token);
+
+    assert_eq!(terminate_found(&found), 0);
+    assert!(
+        helper.try_wait().expect("poll helper").is_none(),
+        "nothing may have been asked of the helper"
+    );
+
+    let _ = helper.kill();
+    let _ = helper.wait();
 }

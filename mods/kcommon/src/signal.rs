@@ -90,9 +90,12 @@ pub fn force_kill(pid: u32) {
 
 /// Ask a single process to shut down: SIGTERM, or on Windows `CTRL_BREAK`
 /// to the group `pid` leads — which also asks any descendants still in
-/// that group, and asks nobody when `pid` never led one (a stray that is
-/// no leader cannot be addressed by a console event; the force stage is
-/// what stops it).
+/// that group.
+///
+/// On Windows `pid` must lead a process group. Windows has no way to ask
+/// whether it does, and a console event aimed at a process that leads
+/// none goes to every process attached to that console, the caller's
+/// own tree included.
 pub fn send_sigterm_pid(pid: u32) {
     #[cfg(unix)]
     {
@@ -111,11 +114,10 @@ pub fn send_sigterm_pid(pid: u32) {
 /// group it leads.
 ///
 /// Delivery on Windows takes two hops (see [`ctrl_break_helper_hook`]),
-/// and lands only on a group leader — which everything spawned by this
-/// stack is (`CREATE_NEW_PROCESS_GROUP`). A process launched by hand from
-/// a terminal leads no group, receives nothing, and burns its grace
-/// before the force stage; its own terminal's Ctrl+C is how it stops
-/// gracefully.
+/// and `pid` must lead a process group, as everything this stack spawns
+/// does (`CREATE_NEW_PROCESS_GROUP`): aimed at a process that leads none,
+/// such as one launched by hand from a terminal, the event goes to every
+/// process attached to its console (see [`send_sigterm_pid`]).
 pub fn request_graceful(pid: u32) {
     #[cfg(unix)]
     {

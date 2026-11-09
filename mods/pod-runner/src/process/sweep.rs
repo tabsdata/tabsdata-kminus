@@ -146,7 +146,8 @@ where
 pub struct Orphans {
     found: Vec<Found>,
     /// When [`Self::terminate`] signalled the set, so [`Self::await_exit`]
-    /// can count the grace from there rather than from its own call.
+    /// can count the grace from there rather than from its own call. Unset
+    /// while nobody was signalled: there is then nothing to wait for.
     terminated_at: Option<tokio::time::Instant>,
 }
 
@@ -204,9 +205,10 @@ impl Orphans {
     /// SIGTERM each one, so it shuts down inside the same grace period
     /// its container gets. Returns how many were signalled.
     pub fn terminate(&mut self) -> usize {
-        self.terminated_at = Some(tokio::time::Instant::now());
+        let asked_at = tokio::time::Instant::now();
         let signalled = terminate_found(&self.found);
         if signalled > 0 {
+            self.terminated_at = Some(asked_at);
             debug!(
                 signalled,
                 "SIGTERM sent to processes that escaped their container's process group",

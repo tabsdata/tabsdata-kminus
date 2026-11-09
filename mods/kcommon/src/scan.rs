@@ -137,7 +137,21 @@ pub fn still_carries(pid: u32, var: &str, expected: &str) -> bool {
 /// never its group: an escapee that called `setsid` is normally the top
 /// of its own tree (a postgres postmaster, not a backend) and knows how
 /// to stop what it started. Returns how many were asked.
+///
+/// Asks nobody on Windows: a found process need not lead a process group,
+/// and a console event aimed at one that does not reaches everything on
+/// its console (see [`signal::send_sigterm_pid`]), so the force stage
+/// stops them all.
 pub fn terminate_found(found: &[Found]) -> usize {
+    if cfg!(windows) {
+        if !found.is_empty() {
+            debug!(
+                count = found.len(),
+                "Not asking escapees to stop: Windows cannot single them out"
+            );
+        }
+        return 0;
+    }
     let mut asked = 0;
     for f in found {
         if !signal::is_pid_alive(f.pid) {

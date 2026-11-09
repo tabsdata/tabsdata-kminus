@@ -129,15 +129,20 @@ fn the_token_reaches_the_child_environment() {
 
 #[test]
 fn stop_asks_first_and_a_cooperative_child_goes_gracefully() {
-    let tracked = spawn(MODE_SLEEP, "graceful");
-    // The graceful ask is delivered on Windows by re-exec'ing the current
-    // binary as a console-event helper (see signal::ctrl_break_helper_hook).
-    // libtest owns a test binary's main, so the hook never runs here and the
-    // stop can only reach the force stage: the grace is burned by design, not
-    // by a regression. Leave none to burn.
+    // On Windows the ask is a CTRL_BREAK to the group the child leads, so it
+    // runs as km runs a component: leading its own group in a console of its
+    // own. A child sharing this run's console would take the event to every
+    // process on it.
     #[cfg(windows)]
-    let grace = Duration::ZERO;
+    let tracked = Tracked::spawn_in_own_console(
+        helper_command(MODE_SLEEP),
+        None,
+        KM_KILL_TOKEN_VAR,
+        &run().scope("graceful"),
+    )
+    .expect("spawn tracked helper");
     #[cfg(not(windows))]
+    let tracked = spawn(MODE_SLEEP, "graceful");
     let grace = Duration::from_secs(30);
 
     let started = Instant::now();
@@ -152,8 +157,16 @@ fn stop_asks_first_and_a_cooperative_child_goes_gracefully() {
     #[cfg(unix)]
     assert_eq!(exit, Exit::Signal(15), "ended by the SIGTERM it was sent");
     #[cfg(windows)]
-    assert!(matches!(exit, Exit::Code(_)));
+    assert_eq!(
+        exit,
+        Exit::Code(STATUS_CONTROL_C_EXIT),
+        "ended by the CTRL_BREAK it was sent"
+    );
 }
+
+/// What a process ended by a console control event exits with.
+#[cfg(windows)]
+const STATUS_CONTROL_C_EXIT: i32 = 0xC000_013A_u32 as i32;
 
 #[cfg(unix)]
 #[test]
