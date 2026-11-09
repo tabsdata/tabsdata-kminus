@@ -266,7 +266,7 @@ pub async fn kill_dead_runner_orphans() -> usize {
 ///
 /// Test-only: the sweeps act on exactly this set, and an end-to-end test
 /// has to observe an escapee before the sweep reaps it.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) async fn orphan_pids(pod_prefix: &str) -> Vec<u32> {
     Orphans::find(pod_prefix)
         .await

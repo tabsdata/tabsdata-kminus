@@ -679,9 +679,8 @@ async fn execute_tcp_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use crate::spec::pod::ExecAction;
-    use crate::spec::pod::{HttpGetAction, TcpSocketAction};
+    use crate::spec::pod::{ExecAction, HttpGetAction, TcpSocketAction};
+    use crate::testutils::Script;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -989,17 +988,14 @@ mod tests {
     }
 
     // -- execute_exec_probe_interruptible ------------------------------------
-    //
-    // Exec probes shell out to `sh`, so the whole block is Unix-only.
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn exec_probe_exit_zero_is_success() {
         let (_sh_tx, mut shutdown_rx) = shutdown_pair();
         let (_st_tx, mut stop_rx) = stop_pair();
 
         let result = execute_exec_probe_interruptible(
-            &["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+            &Script::exits(0).standalone_command(),
             "c",
             Path::new(""),
             PROBE_LIVENESS,
@@ -1012,14 +1008,13 @@ mod tests {
         assert_eq!(result, Some(true));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn exec_probe_exit_nonzero_is_failure() {
         let (_sh_tx, mut shutdown_rx) = shutdown_pair();
         let (_st_tx, mut stop_rx) = stop_pair();
 
         let result = execute_exec_probe_interruptible(
-            &["sh".to_string(), "-c".to_string(), "exit 1".to_string()],
+            &Script::exits(1).standalone_command(),
             "c",
             Path::new(""),
             PROBE_LIVENESS,
@@ -1032,7 +1027,6 @@ mod tests {
         assert_eq!(result, Some(false));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn exec_probe_empty_command_is_failure() {
         let (_sh_tx, mut shutdown_rx) = shutdown_pair();
@@ -1052,7 +1046,6 @@ mod tests {
         assert_eq!(result, Some(false));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn exec_probe_spawn_failure_is_failure() {
         let (_sh_tx, mut shutdown_rx) = shutdown_pair();
@@ -1073,7 +1066,6 @@ mod tests {
         assert_eq!(result, Some(false));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn exec_probe_timeout_kills_and_fails() {
         let (_sh_tx, mut shutdown_rx) = shutdown_pair();
@@ -1081,7 +1073,7 @@ mod tests {
 
         let start = tokio::time::Instant::now();
         let result = execute_exec_probe_interruptible(
-            &["sh".to_string(), "-c".to_string(), "sleep 10".to_string()],
+            &Script::runs().standalone_command(),
             "c",
             Path::new(""),
             PROBE_LIVENESS,
@@ -1100,7 +1092,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn exec_probe_stop_signal_returns_none() {
         let (_sh_tx, mut shutdown_rx) = shutdown_pair();
@@ -1114,7 +1105,7 @@ mod tests {
 
         let start = tokio::time::Instant::now();
         let result = execute_exec_probe_interruptible(
-            &["sh".to_string(), "-c".to_string(), "sleep 10".to_string()],
+            &Script::runs().standalone_command(),
             "c",
             Path::new(""),
             PROBE_LIVENESS,
@@ -1138,7 +1129,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn exec_probe_shutdown_signal_returns_none() {
         let (sh_tx, mut shutdown_rx) = shutdown_pair();
@@ -1151,7 +1141,7 @@ mod tests {
 
         let start = tokio::time::Instant::now();
         let result = execute_exec_probe_interruptible(
-            &["sh".to_string(), "-c".to_string(), "sleep 10".to_string()],
+            &Script::runs().standalone_command(),
             "c",
             Path::new(""),
             PROBE_LIVENESS,
@@ -1177,7 +1167,6 @@ mod tests {
 
     // -- execute_probe_interruptible -----------------------------------------
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn interruptible_dispatches_to_exec() {
         let (_sh_tx, mut shutdown_rx) = shutdown_pair();
@@ -1185,7 +1174,7 @@ mod tests {
 
         let probe = Probe {
             exec_action: Some(ExecAction {
-                command: vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+                command: Script::exits(0).standalone_command(),
             }),
             ..Default::default()
         };

@@ -2078,31 +2078,48 @@ fn update_readiness_conditions(st: &mut PodState) {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[cfg(unix)] // All pod executor tests use Unix shell commands (sh, echo, sleep, etc.)
 mod tests {
-    use std::path::Path;
-
     use super::*;
     use crate::spec::pod::{EnvVar, PodMetadata, PodSpecBody};
-    use crate::testutils::test_dir;
+    use crate::testutils::{Script, test_dir};
 
     fn shutdown() -> (watch::Sender<()>, watch::Receiver<()>) {
         watch::channel(())
     }
 
-    fn container(name: &str, cmd: &str) -> Container {
+    fn container(name: &str, script: Script) -> Container {
         Container {
             name: name.to_string(),
-            command: vec!["sh".to_string(), "-c".to_string(), cmd.to_string()],
+            command: script.command(),
+            env: script.env(),
             ..Default::default()
         }
     }
 
-    fn sidecar(name: &str, cmd: &str) -> Container {
+    fn sidecar(name: &str, script: Script) -> Container {
         Container {
             restart_policy: Some("Always".to_string()),
-            ..container(name, cmd)
+            ..container(name, script)
         }
+    }
+
+    /// Exits with 0 after `ms` milliseconds.
+    fn sleeps(ms: u64) -> Script {
+        Script::exits(0).then_pause(Duration::from_millis(ms))
+    }
+
+    /// A port nothing listens on once this returns.
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// The `<log_dir>/<container>/0.log` of a container that has finished.
+    fn container_log(log_dir: &std::path::Path, container: &str) -> String {
+        std::fs::read_to_string(log_dir.join(container).join("0.log")).unwrap()
     }
 
     /// A pod spec with a unique uid.
@@ -2162,7 +2179,7 @@ mod tests {
     #[tokio::test]
     async fn test_single_container_succeeds() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", Script::exits(0))]))
             .spawn(rx)
             .await
             .unwrap();
@@ -2172,7 +2189,7 @@ mod tests {
     #[tokio::test]
     async fn test_single_container_fails() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 1")]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", Script::exits(1))]))
             .spawn(rx)
             .await
             .unwrap();
@@ -2195,9 +2212,9 @@ mod tests {
         let mut h = PodExecutor::new(pod_spec(
             vec![],
             vec![
-                container("a", "exit 0"),
-                container("b", "exit 0"),
-                container("c", "exit 0"),
+                container("a", Script::exits(0)),
+                container("b", Script::exits(0)),
+                container("c", Script::exits(0)),
             ],
         ))
         .spawn(rx)
@@ -2211,7 +2228,10 @@ mod tests {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(
             vec![],
-            vec![container("ok", "exit 0"), container("fail", "exit 42")],
+            vec![
+                container("ok", Script::exits(0)),
+                container("fail", Script::exits(42)),
+            ],
         ))
         .spawn(rx)
         .await
@@ -2224,7 +2244,7 @@ mod tests {
     #[tokio::test]
     async fn test_events_contain_started_and_completed() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", Script::exits(0))]))
             .spawn(rx)
             .await
             .unwrap();
@@ -2245,7 +2265,7 @@ mod tests {
     #[tokio::test]
     async fn test_events_contain_failed_container() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("bad", "exit 7")]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("bad", Script::exits(7))]))
             .spawn(rx)
             .await
             .unwrap();
@@ -2260,7 +2280,7 @@ mod tests {
     #[tokio::test]
     async fn test_events_contain_phase_transitions() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", Script::exits(0))]))
             .spawn(rx)
             .await
             .unwrap();
@@ -2283,7 +2303,7 @@ mod tests {
     #[tokio::test]
     async fn test_event_status_snapshot_is_current() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", Script::exits(0))]))
             .spawn(rx)
             .await
             .unwrap();
@@ -2299,7 +2319,7 @@ mod tests {
     #[tokio::test]
     async fn test_container_ready_event_no_readiness_probe() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "sleep 0.1")]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", sleeps(100))]))
             .spawn(rx)
             .await
             .unwrap();
@@ -2317,8 +2337,8 @@ mod tests {
         let marker = dir.join("init_done");
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(
-            vec![container("init", &format!("touch {}", marker.display()))],
-            vec![container("main", &format!("test -f {}", marker.display()))],
+            vec![container("init", Script::exits(0).creating(&marker))],
+            vec![container("main", Script::exits(0).requiring(&marker))],
         ))
         .spawn(rx)
         .await
@@ -2330,8 +2350,8 @@ mod tests {
     async fn test_init_container_failure_prevents_main() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(
-            vec![container("init", "exit 1")],
-            vec![container("main", "exit 0")],
+            vec![container("init", Script::exits(1))],
+            vec![container("main", Script::exits(0))],
         ))
         .spawn(rx)
         .await
@@ -2358,14 +2378,6 @@ mod tests {
         Arc::new(pod)
     }
 
-    fn failing_until(attempts_file: &Path, failures: u32) -> String {
-        format!(
-            "n=$(cat {file} 2>/dev/null || echo 0); n=$((n + 1)); echo $n > {file}; \
-             [ $n -gt {failures} ]",
-            file = attempts_file.display(),
-        )
-    }
-
     fn back_offs(events: &[PodEvent]) -> usize {
         events
             .iter()
@@ -2378,8 +2390,11 @@ mod tests {
         let dir = test_dir!();
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec_restarting(
-            vec![container("init", &failing_until(&dir.join("attempts"), 2))],
-            vec![container("main", "exit 0")],
+            vec![container(
+                "init",
+                Script::exits(0).failing_first(2, dir.join("attempts")),
+            )],
+            vec![container("main", Script::exits(0))],
             RestartPolicy::Always,
         ))
         .max_restarts(5)
@@ -2409,8 +2424,8 @@ mod tests {
     async fn test_init_container_stops_restarting_after_the_maximum() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec_restarting(
-            vec![container("init", "exit 1")],
-            vec![container("main", "exit 0")],
+            vec![container("init", Script::exits(1))],
+            vec![container("main", Script::exits(0))],
             RestartPolicy::Always,
         ))
         .max_restarts(2)
@@ -2439,8 +2454,8 @@ mod tests {
         for restart_policy in [RestartPolicy::Never, RestartPolicy::OnFailure] {
             let (_tx, rx) = shutdown();
             let mut h = PodExecutor::new(pod_spec_restarting(
-                vec![container("init", "exit 1")],
-                vec![container("main", "exit 0")],
+                vec![container("init", Script::exits(1))],
+                vec![container("main", Script::exits(0))],
                 restart_policy,
             ))
             .max_restarts(5)
@@ -2478,13 +2493,10 @@ mod tests {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(
             vec![
-                container("init1", &format!("touch {}", f1.display())),
-                container(
-                    "init2",
-                    &format!("test -f {} && touch {}", f1.display(), f2.display()),
-                ),
+                container("init1", Script::exits(0).creating(&f1)),
+                container("init2", Script::exits(0).requiring(&f1).creating(&f2)),
             ],
-            vec![container("main", &format!("test -f {}", f2.display()))],
+            vec![container("main", Script::exits(0).requiring(&f2))],
         ))
         .spawn(rx)
         .await
@@ -2500,14 +2512,8 @@ mod tests {
         let marker = dir.join("sidecar_alive");
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(
-            vec![sidecar(
-                "sidecar",
-                &format!("touch {} && sleep 60", marker.display()),
-            )],
-            vec![container(
-                "main",
-                &format!("sleep 0.3 && test -f {}", marker.display()),
-            )],
+            vec![sidecar("sidecar", Script::runs().creating(&marker))],
+            vec![container("main", sleeps(300).requiring(&marker))],
         ))
         .spawn(rx)
         .await
@@ -2519,8 +2525,8 @@ mod tests {
     async fn test_sidecar_terminated_after_main_exits() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(
-            vec![sidecar("sidecar", "sleep 60")],
-            vec![container("main", "exit 0")],
+            vec![sidecar("sidecar", Script::runs())],
+            vec![container("main", Script::exits(0))],
         ))
         .spawn(rx)
         .await
@@ -2537,7 +2543,7 @@ mod tests {
     #[tokio::test]
     async fn test_kill_terminates_running_containers() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("long", "sleep 60")]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("long", Script::runs())]))
             .spawn(rx)
             .await
             .unwrap();
@@ -2563,9 +2569,9 @@ mod tests {
         let mut h = PodExecutor::new(pod_spec(
             vec![],
             vec![
-                container("a", "sleep 60"),
-                container("b", "sleep 60"),
-                container("c", "sleep 60"),
+                container("a", Script::runs()),
+                container("b", Script::runs()),
+                container("c", Script::runs()),
             ],
         ))
         .spawn(rx)
@@ -2591,8 +2597,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_shutdown_kills_running_containers() {
+        crate::testutils::ensure_console();
         let (tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("long", "sleep 60")]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("long", Script::runs())]))
             .spawn(rx)
             .await
             .unwrap();
@@ -2613,10 +2620,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_shutdown_during_init() {
+        crate::testutils::ensure_console();
         let (tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(
-            vec![container("slow-init", "sleep 60")],
-            vec![container("main", "exit 0")],
+            vec![container("slow-init", Script::runs())],
+            vec![container("main", Script::exits(0))],
         ))
         .spawn(rx)
         .await
@@ -2635,7 +2643,7 @@ mod tests {
     #[tokio::test]
     async fn test_status_updated_on_wait() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", Script::exits(0))]))
             .spawn(rx)
             .await
             .unwrap();
@@ -2647,7 +2655,7 @@ mod tests {
     #[tokio::test]
     async fn test_live_status() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "sleep 0.5")]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", sleeps(500))]))
             .spawn(rx)
             .await
             .unwrap();
@@ -2675,7 +2683,10 @@ mod tests {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(
             vec![],
-            vec![container("ok", "exit 0"), container("fail", "exit 3")],
+            vec![
+                container("ok", Script::exits(0)),
+                container("fail", Script::exits(3)),
+            ],
         ))
         .spawn(rx)
         .await
@@ -2704,8 +2715,8 @@ mod tests {
     async fn test_init_container_statuses_in_final_status() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(
-            vec![container("init", "exit 0")],
-            vec![container("main", "exit 0")],
+            vec![container("init", Script::exits(0))],
+            vec![container("main", Script::exits(0))],
         ))
         .spawn(rx)
         .await
@@ -2726,29 +2737,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_pod_level_env_vars() {
-        let dir = test_dir!();
-        let out = dir.join("env.txt");
+        let dir = test_dir!("logs");
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(
             vec![],
-            vec![container(
-                "main",
-                &format!("echo $MY_POD_VAR > {}", out.display()),
-            )],
+            vec![container("main", Script::shows_env(["MY_POD_VAR"]))],
         ))
         .env("MY_POD_VAR", "pod_value")
+        .log_dir(&dir)
         .spawn(rx)
         .await
         .unwrap();
         let _ = h.wait_for_completion().await;
-        assert!(std::fs::read_to_string(&out).unwrap().contains("pod_value"));
+        let log = container_log(&dir, "main");
+        assert!(log.contains("MY_POD_VAR=pod_value"), "{log}");
     }
 
     #[tokio::test]
     async fn test_container_level_env_vars() {
-        let dir = test_dir!();
-        let out = dir.join("env.txt");
-        let mut c = container("main", &format!("echo $CONTAINER_VAR > {}", out.display()));
+        let dir = test_dir!("logs");
+        let mut c = container("main", Script::shows_env(["CONTAINER_VAR"]));
         c.env.push(EnvVar {
             name: "CONTAINER_VAR".to_string(),
             value: Some("cv".to_string()),
@@ -2756,11 +2764,13 @@ mod tests {
         });
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
+            .log_dir(&dir)
             .spawn(rx)
             .await
             .unwrap();
         let _ = h.wait_for_completion().await;
-        assert!(std::fs::read_to_string(&out).unwrap().contains("cv"));
+        let log = container_log(&dir, "main");
+        assert!(log.contains("CONTAINER_VAR=cv"), "{log}");
     }
 
     // -- orphan sweep --------------------------------------------------------
@@ -2804,15 +2814,23 @@ mod tests {
         })
     }
 
+    /// The kill token a [`Script::shows_env`] container wrote to its log.
+    fn shown_token(log: &str) -> &str {
+        let shown = format!("{}=", sweep::PR_KILL_TOKEN_VAR);
+        log.lines()
+            .find_map(|line| line.split_once(&shown))
+            .map(|(_, token)| token.trim())
+            .unwrap_or_else(|| panic!("no token shown in: {log}"))
+    }
+
     #[tokio::test]
     async fn test_kill_token_injected_into_container_env() {
-        let dir = test_dir!();
-        let out = dir.join("token.txt");
+        let dir = test_dir!("logs");
         let pod = pod_spec(
             vec![],
             vec![container(
                 "main",
-                &format!("echo ${} > {}", sweep::PR_KILL_TOKEN_VAR, out.display()),
+                Script::shows_env([sweep::PR_KILL_TOKEN_VAR]),
             )],
         );
         let expected = sweep::container_token(
@@ -2820,23 +2838,18 @@ mod tests {
             "main",
         );
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod).spawn(rx).await.unwrap();
+        let mut h = PodExecutor::new(pod).log_dir(&dir).spawn(rx).await.unwrap();
         let _ = h.wait_for_completion().await;
 
         // A process can always read its own environment — the platform
         // restrictions only apply to reading someone else's.
-        let written = std::fs::read_to_string(&out).unwrap();
-        assert_eq!(written.trim(), expected);
+        assert_eq!(shown_token(&container_log(&dir, "main")), expected);
     }
 
     #[tokio::test]
     async fn test_pod_spec_cannot_shadow_the_kill_token() {
-        let dir = test_dir!();
-        let out = dir.join("token.txt");
-        let mut c = container(
-            "main",
-            &format!("echo ${} > {}", sweep::PR_KILL_TOKEN_VAR, out.display()),
-        );
+        let dir = test_dir!("logs");
+        let mut c = container("main", Script::shows_env([sweep::PR_KILL_TOKEN_VAR]));
         c.env.push(EnvVar {
             name: sweep::PR_KILL_TOKEN_VAR.to_string(),
             value: Some("hijacked".to_string()),
@@ -2848,12 +2861,11 @@ mod tests {
             "main",
         );
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod).spawn(rx).await.unwrap();
+        let mut h = PodExecutor::new(pod).log_dir(&dir).spawn(rx).await.unwrap();
         let _ = h.wait_for_completion().await;
 
-        let written = std::fs::read_to_string(&out).unwrap();
         assert_eq!(
-            written.trim(),
+            shown_token(&container_log(&dir, "main")),
             expected,
             "a pod spec must not be able to shadow the token",
         );
@@ -2869,7 +2881,6 @@ mod tests {
     #[serial_test::serial]
     async fn test_pod_kill_reaps_process_that_escaped_container_group() {
         use crate::testutils::{HELPER_DAEMONIZE, HELPER_VAR, helper_command};
-        use nix::unistd::{Pid as NixPid, getpgid};
 
         let mut c = Container {
             name: "main".to_string(),
@@ -2898,19 +2909,23 @@ mod tests {
 
         // They are in different process groups, so no single group signal
         // can reach both: whichever of the two the group kill targets, the
-        // other survives it.
-        let pgids: Vec<i32> = pids
-            .iter()
-            .map(|pid| {
-                getpgid(Some(NixPid::from_raw(*pid as i32)))
-                    .expect("pgid")
-                    .as_raw()
-            })
-            .collect();
-        assert_ne!(
-            pgids[0], pgids[1],
-            "the daemonised process must have left the container's group",
-        );
+        // other survives it. Windows offers no group query to assert it by.
+        #[cfg(unix)]
+        {
+            use nix::unistd::{Pid as NixPid, getpgid};
+            let pgids: Vec<i32> = pids
+                .iter()
+                .map(|pid| {
+                    getpgid(Some(NixPid::from_raw(*pid as i32)))
+                        .expect("pgid")
+                        .as_raw()
+                })
+                .collect();
+            assert_ne!(
+                pgids[0], pgids[1],
+                "the daemonised process must have left the container's group",
+            );
+        }
 
         h.kill(Duration::from_secs(1));
         let _ = h.wait_for_completion().await;
@@ -2981,11 +2996,14 @@ mod tests {
     async fn test_log_dir_captures_output() {
         let dir = test_dir!("logs");
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "echo hello_pod")]))
-            .log_dir(&dir)
-            .spawn(rx)
-            .await
-            .unwrap();
+        let mut h = PodExecutor::new(pod_spec(
+            vec![],
+            vec![container("main", Script::prints(["hello_pod"]))],
+        ))
+        .log_dir(&dir)
+        .spawn(rx)
+        .await
+        .unwrap();
         let _ = h.wait_for_completion().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -3000,7 +3018,7 @@ mod tests {
         use crate::spec::pod::VolumeMount;
 
         let dir = test_dir!("logs-ro-warning");
-        let mut c = container("main", "echo container_output");
+        let mut c = container("main", Script::prints(["container_output"]));
         c.volume_mounts = vec![
             VolumeMount {
                 name: "ro-vol".to_string(),
@@ -3054,7 +3072,7 @@ mod tests {
         // The orchestrator doesn't drive restarts yet (always
         // restart_count=0), so this exercises the seam restarts will use.
         let dir = test_dir!("logs-ro-warning-restart");
-        let mut c = container("main", "true");
+        let mut c = container("main", Script::exits(0));
         c.volume_mounts = vec![VolumeMount {
             name: "ro-vol".to_string(),
             mount_path: "/mounts/input".to_string(),
@@ -3128,7 +3146,7 @@ mod tests {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(
             vec![],
-            vec![container("main", "echo first && echo second")],
+            vec![container("main", Script::prints(["first", "second"]))],
         ))
         .log_dir(&dir)
         .spawn(rx)
@@ -3142,7 +3160,7 @@ mod tests {
             .stream(None, ContainerLogOptions::default())
             .unwrap();
         let out = collect_stream(stream, 10).await;
-        assert_eq!(out, "first\nsecond\n");
+        assert!(out.ends_with("\nfirst\nsecond\n"), "{out}");
 
         // With timestamps, each line is "<RFC3339Nano ts> <message>".
         let stream = log_handle
@@ -3155,7 +3173,7 @@ mod tests {
             )
             .unwrap();
         let out = collect_stream(stream, 10).await;
-        let first = out.lines().next().unwrap();
+        let first = out.lines().find(|line| line.ends_with(" first")).unwrap();
         let (ts, msg) = first.split_once(' ').unwrap();
         assert!(
             ts.ends_with('Z') && ts.contains('T'),
@@ -3171,7 +3189,9 @@ mod tests {
         // rotates several times while the stream is following.
         let c = container(
             "main",
-            "i=0; while [ $i -lt 30 ]; do echo line-$i; i=$((i+1)); sleep 0.05; done; echo done-marker",
+            Script::prints(["line-{i}"])
+                .ticking(Duration::from_millis(50))
+                .repeated(30),
         );
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
@@ -3201,9 +3221,9 @@ mod tests {
             "expected rotation to have occurred"
         );
         // …and the follow stream kept delivering lines written after it,
-        // all the way to the final marker in the freshest file.
+        // all the way to the final line in the freshest file.
         assert!(
-            out.contains("done-marker"),
+            out.contains("line-30\n"),
             "follow stream lost data after rotation; got: {out}"
         );
     }
@@ -3213,7 +3233,7 @@ mod tests {
     #[tokio::test]
     async fn test_drop_aborts_orchestrator() {
         let (_tx, rx) = shutdown();
-        let h = PodExecutor::new(pod_spec(vec![], vec![container("long", "sleep 60")]))
+        let h = PodExecutor::new(pod_spec(vec![], vec![container("long", Script::runs())]))
             .spawn(rx)
             .await
             .unwrap();
@@ -3230,8 +3250,8 @@ mod tests {
         let mut h = PodExecutor::new(pod_spec(
             vec![],
             vec![
-                container("slow", "sleep 2 && exit 0"),
-                container("fast", "exit 0"),
+                container("slow", sleeps(2000)),
+                container("fast", Script::exits(0)),
             ],
         ))
         .spawn(rx)
@@ -3261,14 +3281,28 @@ mod tests {
     // Container crash scenarios
     // ========================================================================
 
+    #[cfg(unix)]
+    fn shell_container(name: &str, cmd: &str) -> Container {
+        Container {
+            name: name.to_string(),
+            command: vec!["sh".to_string(), "-c".to_string(), cmd.to_string()],
+            ..Default::default()
+        }
+    }
+
+    // Unix only: a death by signal, which leaves no exit code.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_container_killed_by_signal() {
         // Container kills itself with SIGKILL — no exit code
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("crash", "kill -KILL $$")]))
-            .spawn(rx)
-            .await
-            .unwrap();
+        let mut h = PodExecutor::new(pod_spec(
+            vec![],
+            vec![shell_container("crash", "kill -KILL $$")],
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
         let events = collect_events(&mut h).await;
 
         assert!(events.iter().any(|e| matches!(&e.kind,
@@ -3282,9 +3316,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_container_segfault() {
+    async fn test_container_crash() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("segv", "kill -SEGV $$")]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("crash", Script::aborts())]))
             .spawn(rx)
             .await
             .unwrap();
@@ -3293,15 +3327,24 @@ mod tests {
         assert_eq!(phase, PodPhase::Failed);
     }
 
+    /// How a crashed process is reported: a Unix crash is a death by signal,
+    /// with no exit code (-1); on Windows the NTSTATUS that ended it is the
+    /// code, and `abort` ends a Rust process with STATUS_STACK_BUFFER_OVERRUN.
+    const CRASH_EXIT: i32 = if cfg!(windows) {
+        0xC000_0409_u32 as i32
+    } else {
+        -1
+    };
+
     #[tokio::test]
     async fn test_multiple_containers_some_crash() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(
             vec![],
             vec![
-                container("ok", "exit 0"),
-                container("crash", "kill -KILL $$"),
-                container("also-ok", "exit 0"),
+                container("ok", Script::exits(0)),
+                container("crash", Script::aborts()),
+                container("also-ok", Script::exits(0)),
             ],
         ))
         .spawn(rx)
@@ -3324,7 +3367,7 @@ mod tests {
             .unwrap();
         assert!(ok.is_terminated());
         assert!(crash.is_terminated());
-        assert_eq!(crash.terminated_exit_code(), Some(-1));
+        assert_eq!(crash.terminated_exit_code(), Some(CRASH_EXIT));
     }
 
     // ========================================================================
@@ -3336,7 +3379,7 @@ mod tests {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(
             vec![],
-            vec![container("stubborn", "trap '' TERM; sleep 60")],
+            vec![container("stubborn", Script::runs().ignoring_stop())],
         ))
         .spawn(rx)
         .await
@@ -3361,12 +3404,13 @@ mod tests {
     // terminationGracePeriodSeconds wired to the kill path
     // ========================================================================
 
-    // A container that ignores SIGTERM and only dies on SIGKILL: the shell
-    // traps TERM, and the re-looping `sleep` means the single group-SIGTERM
-    // (which kills the current child sleep) doesn't end the process — only
-    // the SIGKILL fired after the grace deadline does. So the time from the
+    // A container that ignores SIGTERM and only dies on SIGKILL: neither the
+    // SIGTERM to the process nor the one to its group ends it — only the
+    // SIGKILL fired after the grace deadline does. So the time from the
     // kill decision to container exit tracks the grace the executor used.
-    const SIGTERM_PROOF_CMD: &str = "trap '' TERM; while true; do sleep 0.2; done";
+    fn sigterm_proof() -> Script {
+        Script::runs().ignoring_stop()
+    }
 
     #[tokio::test]
     async fn test_pod_grace_honored_on_probe_kill() {
@@ -3376,7 +3420,7 @@ mod tests {
         // pod only goes terminal after the SIGKILL fired at the grace
         // deadline. The pod asks for a 1s grace while the runner default is
         // 30s — completion must land on the pod's 1s budget.
-        let mut c = container_with_liveness_exec("main", SIGTERM_PROOF_CMD, "exit 1");
+        let mut c = container_with_liveness_exec("main", sigterm_proof(), Script::exits(1));
         // Fail fast: one failed check ~1s in triggers the kill.
         c.liveness_probe.as_mut().unwrap().failure_threshold = 1;
 
@@ -3407,10 +3451,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_kill_during_init() {
+        crate::testutils::ensure_console();
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(
-            vec![container("slow-init", "sleep 60")],
-            vec![container("main", "exit 0")],
+            vec![container("slow-init", Script::runs())],
+            vec![container("main", Script::exits(0))],
         ))
         .spawn(rx)
         .await
@@ -3440,8 +3485,8 @@ mod tests {
     async fn test_init_container_crash() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(
-            vec![container("init-crash", "kill -KILL $$")],
-            vec![container("main", "exit 0")],
+            vec![container("init-crash", Script::aborts())],
+            vec![container("main", Script::exits(0))],
         ))
         .spawn(rx)
         .await
@@ -3467,8 +3512,8 @@ mod tests {
     async fn test_sidecar_ignores_sigterm_force_killed() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(
-            vec![sidecar("stubborn-sidecar", "trap '' TERM; sleep 60")],
-            vec![container("main", "sleep 0.3 && exit 0")],
+            vec![sidecar("stubborn-sidecar", Script::runs().ignoring_stop())],
+            vec![container("main", sleeps(300))],
         ))
         .spawn(rx)
         .await
@@ -3493,7 +3538,7 @@ mod tests {
     async fn test_sidecar_only_no_main_containers() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(
-            vec![sidecar("sidecar", "sleep 60")],
+            vec![sidecar("sidecar", Script::runs())],
             vec![], // no main containers
         ))
         .spawn(rx)
@@ -3521,7 +3566,7 @@ mod tests {
             ..Default::default()
         };
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("ok", "sleep 60"), bad]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("ok", Script::runs()), bad]))
             .spawn(rx)
             .await
             .unwrap();
@@ -3538,10 +3583,13 @@ mod tests {
             ..Default::default()
         };
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![bad], vec![container("main", "exit 0")]))
-            .spawn(rx)
-            .await
-            .unwrap();
+        let mut h = PodExecutor::new(pod_spec(
+            vec![bad],
+            vec![container("main", Script::exits(0))],
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
 
         let phase = h.wait_for_completion().await.unwrap();
         assert_eq!(phase, PodPhase::Failed);
@@ -3553,12 +3601,19 @@ mod tests {
 
     use crate::spec::pod::{ExecAction, HttpGetAction, Probe, TcpSocketAction};
 
+    /// An exec probe action running `probe`.
+    fn exec(probe: Script) -> Option<ExecAction> {
+        Some(ExecAction {
+            command: probe.standalone_command(),
+        })
+    }
+
     /// Create a container with an exec readiness probe.
-    fn container_with_readiness_exec(name: &str, cmd: &str, probe_cmd: &str) -> Container {
+    fn container_with_readiness_exec(name: &str, script: Script, probe: Script) -> Container {
         Container {
             readiness_probe: Some(Probe {
                 exec_action: Some(ExecAction {
-                    command: vec!["sh".to_string(), "-c".to_string(), probe_cmd.to_string()],
+                    command: probe.standalone_command(),
                 }),
                 initial_delay_seconds: 0,
                 period_seconds: 1,
@@ -3567,16 +3622,16 @@ mod tests {
                 failure_threshold: 3,
                 ..Default::default()
             }),
-            ..container(name, cmd)
+            ..container(name, script)
         }
     }
 
     /// Create a container with an exec liveness probe.
-    fn container_with_liveness_exec(name: &str, cmd: &str, probe_cmd: &str) -> Container {
+    fn container_with_liveness_exec(name: &str, script: Script, probe: Script) -> Container {
         Container {
             liveness_probe: Some(Probe {
                 exec_action: Some(ExecAction {
-                    command: vec!["sh".to_string(), "-c".to_string(), probe_cmd.to_string()],
+                    command: probe.standalone_command(),
                 }),
                 initial_delay_seconds: 0,
                 period_seconds: 1,
@@ -3585,16 +3640,16 @@ mod tests {
                 failure_threshold: 2,
                 ..Default::default()
             }),
-            ..container(name, cmd)
+            ..container(name, script)
         }
     }
 
     /// Create a container with an exec startup probe.
-    fn container_with_startup_exec(name: &str, cmd: &str, probe_cmd: &str) -> Container {
+    fn container_with_startup_exec(name: &str, script: Script, probe: Script) -> Container {
         Container {
             startup_probe: Some(Probe {
                 exec_action: Some(ExecAction {
-                    command: vec!["sh".to_string(), "-c".to_string(), probe_cmd.to_string()],
+                    command: probe.standalone_command(),
                 }),
                 initial_delay_seconds: 0,
                 period_seconds: 1,
@@ -3603,7 +3658,7 @@ mod tests {
                 failure_threshold: 3,
                 ..Default::default()
             }),
-            ..container(name, cmd)
+            ..container(name, script)
         }
     }
 
@@ -3612,10 +3667,11 @@ mod tests {
         // Container runs, readiness probe succeeds → ContainerReady event
         let dir = test_dir!();
         let marker = dir.join("ready");
-        let cmd = format!("touch {} && sleep 5", marker.display());
-        let probe_cmd = format!("test -f {}", marker.display());
-
-        let c = container_with_readiness_exec("app", &cmd, &probe_cmd);
+        let c = container_with_readiness_exec(
+            "app",
+            sleeps(5000).creating(&marker),
+            Script::exits(0).requiring(&marker),
+        );
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
             .spawn(rx)
@@ -3647,15 +3703,18 @@ mod tests {
         // then container creates it and probe passes.
         let dir = test_dir!();
         let marker = dir.join("ready_later");
-        let cmd = format!("sleep 2 && touch {} && sleep 5", marker.display());
-        let probe_cmd = format!("test -f {}", marker.display());
-
-        let c = container_with_readiness_exec("app", &cmd, &probe_cmd);
+        let c =
+            container_with_readiness_exec("app", sleeps(7000), Script::exits(0).requiring(&marker));
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
             .spawn(rx)
             .await
             .unwrap();
+        let later = marker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            std::fs::write(later, "").unwrap();
+        });
 
         let mut probe_results = Vec::new();
         let mut got_ready = false;
@@ -3693,7 +3752,7 @@ mod tests {
     #[tokio::test]
     async fn test_liveness_probe_failure_kills_container() {
         // Liveness probe always fails → container killed after threshold
-        let c = container_with_liveness_exec("app", "sleep 60", "exit 1");
+        let c = container_with_liveness_exec("app", Script::runs(), Script::exits(1));
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
             .spawn(rx)
@@ -3714,17 +3773,10 @@ mod tests {
         // Readiness probe should only run after startup passes.
         let dir = test_dir!();
         let marker = dir.join("started");
-        let cmd = format!("touch {} && sleep 5", marker.display());
 
-        let mut c = container("app", &cmd);
+        let mut c = container("app", sleeps(5000).creating(&marker));
         c.startup_probe = Some(Probe {
-            exec_action: Some(ExecAction {
-                command: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!("test -f {}", marker.display()),
-                ],
-            }),
+            exec_action: exec(Script::exits(0).requiring(&marker)),
             initial_delay_seconds: 0,
             period_seconds: 1,
             timeout_seconds: 2,
@@ -3733,9 +3785,7 @@ mod tests {
             ..Default::default()
         });
         c.readiness_probe = Some(Probe {
-            exec_action: Some(ExecAction {
-                command: vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
-            }),
+            exec_action: exec(Script::exits(0)),
             initial_delay_seconds: 0,
             period_seconds: 1,
             timeout_seconds: 2,
@@ -3787,7 +3837,7 @@ mod tests {
     #[tokio::test]
     async fn test_startup_probe_failure_kills_container() {
         // Startup probe always fails → container killed after threshold
-        let c = container_with_startup_exec("app", "sleep 60", "exit 1");
+        let c = container_with_startup_exec("app", Script::runs(), Script::exits(1));
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
             .spawn(rx)
@@ -3802,10 +3852,11 @@ mod tests {
     #[tokio::test]
     async fn test_tcp_probe_on_listening_port() {
         // Start a container that listens on a port, TCP probe connects
+        let port = free_port();
         let c = Container {
             readiness_probe: Some(Probe {
                 tcp_socket: Some(TcpSocketAction {
-                    port: Some(18765),
+                    port: Some(port),
                     host: "127.0.0.1".to_string(),
                 }),
                 initial_delay_seconds: 0,
@@ -3815,8 +3866,7 @@ mod tests {
                 failure_threshold: 10,
                 ..Default::default()
             }),
-            // nc -l listens on the port
-            ..container("app", "nc -l 18765 & sleep 5")
+            ..container("app", sleeps(5000).listening(port))
         };
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
@@ -3845,7 +3895,8 @@ mod tests {
     #[tokio::test]
     async fn test_probe_logs_to_file() {
         let dir = test_dir!("logs");
-        let c = container_with_readiness_exec("app", "sleep 3", "echo probe_output && exit 0");
+        let c =
+            container_with_readiness_exec("app", sleeps(3000), Script::prints(["probe_output"]));
 
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
@@ -3893,7 +3944,7 @@ mod tests {
     async fn test_no_probes_no_events() {
         // Container without probes should not emit ProbeResult events
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "sleep 0.5")]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", sleeps(500))]))
             .spawn(rx)
             .await
             .unwrap();
@@ -3916,7 +3967,7 @@ mod tests {
         let c = Container {
             readiness_probe: Some(Probe {
                 tcp_socket: Some(TcpSocketAction {
-                    port: Some(19999),
+                    port: Some(free_port()),
                     host: "127.0.0.1".to_string(),
                 }),
                 initial_delay_seconds: 0,
@@ -3926,7 +3977,7 @@ mod tests {
                 failure_threshold: 100, // high so it doesn't kill
                 ..Default::default()
             }),
-            ..container("app", "sleep 2")
+            ..container("app", sleeps(2000))
         };
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
@@ -3956,7 +4007,7 @@ mod tests {
     #[tokio::test]
     async fn test_exec_probe_nonzero_exit_is_failure() {
         // Exec probe returns exit code 2 → probe failure
-        let c = container_with_readiness_exec("app", "sleep 3", "exit 2");
+        let c = container_with_readiness_exec("app", sleeps(3000), Script::exits(2));
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
             .spawn(rx)
@@ -3983,7 +4034,7 @@ mod tests {
     #[tokio::test]
     async fn test_liveness_failure_actually_terminates_process() {
         // Verify the container process is actually dead after liveness kills it
-        let c = container_with_liveness_exec("app", "sleep 60", "exit 1");
+        let c = container_with_liveness_exec("app", Script::runs(), Script::exits(1));
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
             .spawn(rx)
@@ -4016,9 +4067,7 @@ mod tests {
         // Probe should NOT run (initial delay not elapsed).
         let c = Container {
             readiness_probe: Some(Probe {
-                exec_action: Some(ExecAction {
-                    command: vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
-                }),
+                exec_action: exec(Script::exits(0)),
                 initial_delay_seconds: 5, // 5 second delay
                 period_seconds: 1,
                 timeout_seconds: 1,
@@ -4026,7 +4075,7 @@ mod tests {
                 failure_threshold: 3,
                 ..Default::default()
             }),
-            ..container("app", "sleep 1")
+            ..container("app", sleeps(1000))
         };
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
@@ -4057,35 +4106,24 @@ mod tests {
         // Container with both startup and readiness probes
         let dir = test_dir!();
         let marker = dir.join("alive");
-        let cmd = format!("touch {} && sleep 10", marker.display());
 
-        let mut c = container("app", &cmd);
+        let mut c = container("app", sleeps(10_000).creating(&marker));
         c.startup_probe = Some(Probe {
-            exec_action: Some(ExecAction {
-                command: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!("test -f {}", marker.display()),
-                ],
-            }),
+            exec_action: exec(Script::exits(0).requiring(&marker)),
             period_seconds: 1,
             success_threshold: 1,
             failure_threshold: 5,
             ..Default::default()
         });
         c.readiness_probe = Some(Probe {
-            exec_action: Some(ExecAction {
-                command: vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
-            }),
+            exec_action: exec(Script::exits(0)),
             period_seconds: 1,
             success_threshold: 1,
             failure_threshold: 3,
             ..Default::default()
         });
         c.liveness_probe = Some(Probe {
-            exec_action: Some(ExecAction {
-                command: vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
-            }),
+            exec_action: exec(Script::exits(0)),
             period_seconds: 1,
             success_threshold: 1,
             failure_threshold: 3,
@@ -4139,7 +4177,7 @@ mod tests {
     #[tokio::test]
     async fn test_probe_stops_when_container_exits() {
         // Container exits quickly, probe should stop (not hang)
-        let c = container_with_readiness_exec("app", "exit 0", "exit 0");
+        let c = container_with_readiness_exec("app", Script::exits(0), Script::exits(0));
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
             .spawn(rx)
@@ -4156,11 +4194,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_probe_with_server() {
-        // Find a free port to avoid conflicts with other tests or services
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
+        let port = free_port();
 
         let c = Container {
             readiness_probe: Some(Probe {
@@ -4176,13 +4210,7 @@ mod tests {
                 failure_threshold: 15,
                 ..Default::default()
             }),
-            ..container(
-                "app",
-                &format!(
-                    "python3 -m http.server {} 2>/dev/null || python -m SimpleHTTPServer {} 2>/dev/null || sleep 10",
-                    port, port
-                ),
-            )
+            ..container("app", Script::runs().listening(port))
         };
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
@@ -4216,8 +4244,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_probe_interrupted_by_shutdown() {
+        crate::testutils::ensure_console();
         // Long-running exec probe should be killed when shutdown fires
-        let c = container_with_readiness_exec("app", "sleep 60", "sleep 60");
+        let c = container_with_readiness_exec("app", Script::runs(), Script::runs());
         let (tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
             .spawn(rx)
@@ -4250,7 +4279,7 @@ mod tests {
     async fn test_probe_interrupted_by_container_exit() {
         // Container exits while probe is running — probe task should stop
         // Use a readiness probe that sleeps longer than the container
-        let c = container_with_readiness_exec("app", "sleep 0.5", "sleep 60");
+        let c = container_with_readiness_exec("app", sleeps(500), Script::runs());
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
             .spawn(rx)
@@ -4265,7 +4294,7 @@ mod tests {
     #[tokio::test]
     async fn test_probe_interrupted_by_kill() {
         // Kill during long probe execution
-        let c = container_with_readiness_exec("app", "sleep 60", "sleep 60");
+        let c = container_with_readiness_exec("app", Script::runs(), Script::runs());
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
             .spawn(rx)
@@ -4297,7 +4326,7 @@ mod tests {
     #[tokio::test]
     async fn test_exec_probe_empty_command() {
         // Exec probe with empty command should fail (not crash)
-        let mut c = container("app", "sleep 3");
+        let mut c = container("app", sleeps(3000));
         c.readiness_probe = Some(Probe {
             exec_action: Some(ExecAction { command: vec![] }),
             period_seconds: 1,
@@ -4334,7 +4363,7 @@ mod tests {
             readiness_probe: Some(Probe {
                 http_get: Some(HttpGetAction {
                     path: "/".to_string(),
-                    port: Some(19998),
+                    port: Some(free_port()),
                     host: "127.0.0.1".to_string(),
                 }),
                 period_seconds: 1,
@@ -4342,7 +4371,7 @@ mod tests {
                 failure_threshold: 100,
                 ..Default::default()
             }),
-            ..container("app", "sleep 2")
+            ..container("app", sleeps(2000))
         };
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
@@ -4371,11 +4400,25 @@ mod tests {
     #[tokio::test]
     async fn test_http_probe_non_200_response() {
         // HTTP server returns 404 → probe fails
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream.read(&mut [0u8; 1024]).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
         let c = Container {
             readiness_probe: Some(Probe {
                 http_get: Some(HttpGetAction {
                     path: "/nonexistent_path_404".to_string(),
-                    port: Some(18767),
+                    port: Some(port),
                     host: "127.0.0.1".to_string(),
                 }),
                 initial_delay_seconds: 1,
@@ -4385,11 +4428,7 @@ mod tests {
                 failure_threshold: 100,
                 ..Default::default()
             }),
-            // python http.server returns 404 for missing paths
-            ..container(
-                "app",
-                "python3 -m http.server 18767 2>/dev/null || sleep 10",
-            )
+            ..container("app", Script::runs())
         };
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
@@ -4416,6 +4455,7 @@ mod tests {
 
         h.kill(Duration::from_secs(1));
         let _ = h.wait_for_completion().await;
+        server.abort();
     }
 
     #[tokio::test]
@@ -4425,19 +4465,9 @@ mod tests {
         let dir = test_dir!();
         let marker = dir.join("ready_toggle");
 
-        // Create marker, then remove it after 2s
-        let cmd = format!(
-            "touch {} && sleep 2 && rm -f {} && sleep 10",
-            marker.display(),
-            marker.display()
-        );
-        let probe_cmd = format!("test -f {}", marker.display());
-
         let c = Container {
             readiness_probe: Some(Probe {
-                exec_action: Some(ExecAction {
-                    command: vec!["sh".to_string(), "-c".to_string(), probe_cmd],
-                }),
+                exec_action: exec(Script::exits(0).requiring(&marker)),
                 initial_delay_seconds: 0,
                 period_seconds: 1,
                 timeout_seconds: 2,
@@ -4445,13 +4475,18 @@ mod tests {
                 failure_threshold: 2, // 2 failures to toggle not-ready
                 ..Default::default()
             }),
-            ..container("app", &cmd)
+            ..container("app", sleeps(12_000).creating(&marker))
         };
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
             .spawn(rx)
             .await
             .unwrap();
+        let gone = marker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let _ = std::fs::remove_file(gone);
+        });
 
         let mut readiness_changes = Vec::new();
         let result = tokio::time::timeout(Duration::from_secs(15), async {
@@ -4500,9 +4535,7 @@ mod tests {
         // (not one per 500ms tick)
         let c = Container {
             readiness_probe: Some(Probe {
-                exec_action: Some(ExecAction {
-                    command: vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
-                }),
+                exec_action: exec(Script::exits(0)),
                 initial_delay_seconds: 0,
                 period_seconds: 2, // every 2 seconds
                 timeout_seconds: 1,
@@ -4510,7 +4543,7 @@ mod tests {
                 failure_threshold: 100,
                 ..Default::default()
             }),
-            ..container("app", "sleep 5")
+            ..container("app", sleeps(5000))
         };
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
@@ -4553,7 +4586,7 @@ mod tests {
                 },
                 spec: PodSpecBody {
                     init_containers: vec![],
-                    containers: vec![container(&format!("c-{}", i), "sleep 1")],
+                    containers: vec![container(&format!("c-{}", i), sleeps(1000))],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -4590,21 +4623,21 @@ mod tests {
             .map(|i| {
                 let (init, containers) = match i % 3 {
                     // No init, no sidecar
-                    0 => (vec![], vec![container(&format!("app-{}", i), "sleep 1")]),
+                    0 => (vec![], vec![container(&format!("app-{}", i), sleeps(1000))]),
                     // Init containers + sidecar
                     1 => (
                         vec![
-                            container(&format!("init-{}", i), "sleep 0"),
-                            sidecar(&format!("sc-{}", i), "trap exit TERM; sleep 3600 & wait $!"),
+                            container(&format!("init-{}", i), Script::exits(0)),
+                            sidecar(&format!("sc-{}", i), Script::runs()),
                         ],
-                        vec![container(&format!("app-{}", i), "sleep 1")],
+                        vec![container(&format!("app-{}", i), sleeps(1000))],
                     ),
                     // Multiple main containers
                     _ => (
                         vec![],
                         vec![
-                            container(&format!("a-{}", i), "sleep 1"),
-                            container(&format!("b-{}", i), "exit 1"),
+                            container(&format!("a-{}", i), sleeps(1000)),
+                            container(&format!("b-{}", i), Script::exits(1)),
                         ],
                     ),
                 };
@@ -4659,7 +4692,7 @@ mod tests {
     #[tokio::test]
     async fn test_lifecycle_tracks_successful_run() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", Script::exits(0))]))
             .spawn(rx)
             .await
             .unwrap();
@@ -4678,7 +4711,7 @@ mod tests {
     #[tokio::test]
     async fn test_lifecycle_tracks_failed_run() {
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 7")]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", Script::exits(7))]))
             .spawn(rx)
             .await
             .unwrap();
@@ -4695,8 +4728,8 @@ mod tests {
     async fn test_lifecycle_tracks_init_failure() {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(
-            vec![container("init", "exit 1")],
-            vec![container("main", "exit 0")],
+            vec![container("init", Script::exits(1))],
+            vec![container("main", Script::exits(0))],
         ))
         .spawn(rx)
         .await
@@ -4721,7 +4754,7 @@ mod tests {
     async fn test_lifecycle_tracks_readiness_probe() {
         use crate::pod::lifecycle::{ProbeKind, ProbePhase};
         let (_tx, rx) = shutdown();
-        let c = container_with_readiness_exec("app", "sleep 2", "true");
+        let c = container_with_readiness_exec("app", sleeps(2000), Script::exits(0));
         let mut h = PodExecutor::new(pod_spec(vec![], vec![c]))
             .spawn(rx)
             .await
@@ -4751,7 +4784,10 @@ mod tests {
         let (_tx, rx) = shutdown();
         let mut h = PodExecutor::new(pod_spec(
             vec![],
-            vec![container("a", "exit 0"), container("b", "exit 0")],
+            vec![
+                container("a", Script::exits(0)),
+                container("b", Script::exits(0)),
+            ],
         ))
         .spawn(rx)
         .await
@@ -4856,7 +4892,7 @@ mod tests {
         });
 
         let dir = test_dir!();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", Script::exits(0))]))
             .work_dir(&dir)
             .register_task(task)
             .spawn(rx)
@@ -4884,6 +4920,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_observes_runner_shutdown() {
+        crate::testutils::ensure_console();
         let (tx, rx) = shutdown();
         let started = Arc::new(AtomicBool::new(false));
         let via_kill = Arc::new(AtomicBool::new(false));
@@ -4898,7 +4935,7 @@ mod tests {
         });
 
         // Long-running container so the pod doesn't complete on its own.
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "sleep 30")]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", Script::runs())]))
             .register_task(task)
             .spawn(rx)
             .await
@@ -4941,7 +4978,7 @@ mod tests {
             spawn_count: Arc::clone(&count),
         });
 
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", Script::exits(0))]))
             .register_task(a)
             .register_task(b)
             .register_task(c)
@@ -4963,7 +5000,7 @@ mod tests {
             aborted: Arc::clone(&aborted),
         });
 
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", Script::exits(0))]))
             .shutdown_grace_period(Duration::from_millis(200))
             .register_task(task)
             .spawn(rx)
@@ -4984,7 +5021,7 @@ mod tests {
     async fn pod_with_no_registered_tasks_works_unchanged() {
         // Sanity: the task pathway must not affect pods without tasks.
         let (_tx, rx) = shutdown();
-        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", "exit 0")]))
+        let mut h = PodExecutor::new(pod_spec(vec![], vec![container("main", Script::exits(0))]))
             .spawn(rx)
             .await
             .unwrap();
@@ -4999,7 +5036,7 @@ mod tests {
             aborted: Arc::clone(&aborted),
         });
 
-        let h = PodExecutor::new(pod_spec(vec![], vec![container("main", "sleep 30")]))
+        let h = PodExecutor::new(pod_spec(vec![], vec![container("main", Script::runs())]))
             .register_task(task)
             .spawn(rx)
             .await

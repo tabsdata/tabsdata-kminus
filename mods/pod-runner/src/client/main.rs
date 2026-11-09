@@ -840,6 +840,31 @@ mod tests {
         }
     }
 
+    /// Argument that turns [`test_sleeper_process`] into a sleeper. libtest
+    /// takes it as one more name filter, which matches no test.
+    const SLEEPER_ARG: &str = "KPR_TEST_SLEEPER";
+
+    /// Re-executed by the tests below as a long-running container that
+    /// needs no shell or system command; a no-op in an ordinary run.
+    #[test]
+    fn test_sleeper_process() {
+        if std::env::args().any(|arg| arg == SLEEPER_ARG) {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    /// A container command that keeps running for a minute.
+    fn sleeper_cmd() -> Vec<String> {
+        vec![
+            std::env::current_exe()
+                .expect("test binary path")
+                .to_string_lossy()
+                .into_owned(),
+            "test_sleeper_process".to_string(),
+            SLEEPER_ARG.to_string(),
+        ]
+    }
+
     /// Start a test HTTP server on a random port, return the base URL.
     async fn start_test_server() -> (String, tokio::sync::watch::Sender<()>) {
         let store = Arc::new(MemoryStore::new());
@@ -880,7 +905,11 @@ mod tests {
     }
 
     fn write_pod_yaml(dir: &std::path::Path, name: &str, cmd: &str) -> String {
-        let cmd_json = serde_json::to_string(&shell_cmd(cmd)).unwrap();
+        write_pod_yaml_command(dir, name, &shell_cmd(cmd))
+    }
+
+    fn write_pod_yaml_command(dir: &std::path::Path, name: &str, command: &[String]) -> String {
+        let cmd_json = serde_json::to_string(command).unwrap();
         let yaml = format!(
             r#"metadata:
   namespace: default
@@ -901,8 +930,13 @@ spec:
     /// Like `write_pod_yaml` but with an explicit uid (and a uid-derived
     /// filename so two specs for the same name don't clobber each other).
     /// Used to exercise same-name/different-uid incarnations.
-    fn write_pod_yaml_uid(dir: &std::path::Path, name: &str, uid: &str, cmd: &str) -> String {
-        let cmd_json = serde_json::to_string(&shell_cmd(cmd)).unwrap();
+    fn write_pod_yaml_uid(
+        dir: &std::path::Path,
+        name: &str,
+        uid: &str,
+        command: &[String],
+    ) -> String {
+        let cmd_json = serde_json::to_string(command).unwrap();
         let yaml = format!(
             r#"metadata:
   namespace: default
@@ -942,14 +976,14 @@ spec:
         let dir = std::env::temp_dir().join(format!("td-prc-dup-{}", std::process::id()));
 
         // First incarnation, live.
-        let file = write_pod_yaml_uid(&dir, "dup", "uid-dup-1", "sleep 60");
+        let file = write_pod_yaml_uid(&dir, "dup", "uid-dup-1", &sleeper_cmd());
         let code = cmd_create(&client, &url, &file).await;
         assert_eq!(code, EXIT_OK);
 
         // Same name, different uid, old pod still live → the server
         // rejects with a Conflict (it terminates the old pod so a later
         // retry can proceed once it is reaped).
-        let file2 = write_pod_yaml_uid(&dir, "dup", "uid-dup-2", "sleep 60");
+        let file2 = write_pod_yaml_uid(&dir, "dup", "uid-dup-2", &sleeper_cmd());
         let code = cmd_create(&client, &url, &file2).await;
         assert_eq!(code, EXIT_SERVER_ERROR);
 
@@ -961,7 +995,7 @@ spec:
         let (url, _tx) = start_test_server().await;
         let client = test_client();
         let dir = std::env::temp_dir().join(format!("td-prc-idem-{}", std::process::id()));
-        let file = write_pod_yaml(&dir, "idem", "sleep 60");
+        let file = write_pod_yaml_command(&dir, "idem", &sleeper_cmd());
 
         // Re-submitting the very same pod (same namespace/name/uid) is a
         // redelivery, not a second incarnation — the server returns the
@@ -1058,7 +1092,7 @@ spec:
         let (url, _tx) = start_test_server().await;
         let client = test_client();
         let dir = std::env::temp_dir().join(format!("td-prc-get-{}", std::process::id()));
-        let file = write_pod_yaml(&dir, "get-me", "sleep 60");
+        let file = write_pod_yaml_command(&dir, "get-me", &sleeper_cmd());
 
         cmd_create(&client, &url, &file).await;
 
@@ -1084,7 +1118,7 @@ spec:
         let (url, _tx) = start_test_server().await;
         let client = test_client();
         let dir = std::env::temp_dir().join(format!("td-prc-status-{}", std::process::id()));
-        let file = write_pod_yaml(&dir, "stat-me", "sleep 60");
+        let file = write_pod_yaml_command(&dir, "stat-me", &sleeper_cmd());
 
         cmd_create(&client, &url, &file).await;
 
@@ -1120,8 +1154,8 @@ spec:
         let client = test_client();
         let dir = std::env::temp_dir().join(format!("td-prc-list-{}", std::process::id()));
 
-        let f1 = write_pod_yaml(&dir, "list-a", "sleep 60");
-        let f2 = write_pod_yaml(&dir, "list-b", "sleep 60");
+        let f1 = write_pod_yaml_command(&dir, "list-a", &sleeper_cmd());
+        let f2 = write_pod_yaml_command(&dir, "list-b", &sleeper_cmd());
         cmd_create(&client, &url, &f1).await;
         cmd_create(&client, &url, &f2).await;
 

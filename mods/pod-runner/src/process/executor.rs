@@ -986,7 +986,6 @@ impl ExecutorHandle {
     /// `JoinError` — manufacturing the state that killed pod-runner in
     /// the field. Test-only.
     #[cfg(test)]
-    #[cfg(unix)]
     pub(crate) fn abort_monitor(&self) {
         self.wait_handle.abort();
     }
@@ -1863,7 +1862,6 @@ mod program_key_tests {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[cfg(unix)] // All process executor tests use Unix shell commands (sh, echo, sleep, etc.)
 mod tests {
     use super::*;
     use std::fs;
@@ -1871,7 +1869,13 @@ mod tests {
 
     use serial_test::serial;
 
-    use crate::testutils::test_dir;
+    use crate::testutils::{Script, test_dir};
+
+    fn executor(script: &Script) -> ProcessExecutor {
+        ProcessExecutor::new(script.program())
+            .args(script.args())
+            .envs(script.vars())
+    }
 
     /// Create a shutdown receiver for tests that don't need to trigger shutdown.
     /// The sender is leaked to prevent `changed()` from returning immediately.
@@ -1885,8 +1889,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_echo() {
-        let mut handle = ProcessExecutor::new("echo")
-            .arg("hello")
+        let mut handle = executor(&Script::prints(["hello"]))
             .output(DevNullOutput)
             .spawn(shutdown())
             .await
@@ -1898,8 +1901,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_exit_code() {
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "exit 42"])
+        let mut handle = executor(&Script::exits(42))
             .spawn(shutdown())
             .await
             .unwrap();
@@ -1910,8 +1912,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pid_is_nonzero() {
-        let mut handle = ProcessExecutor::new("echo")
-            .arg("hi")
+        let mut handle = executor(&Script::prints(["hi"]))
             .spawn(shutdown())
             .await
             .unwrap();
@@ -1924,11 +1925,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_returns_cached_value() {
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "exit 7"])
-            .spawn(shutdown())
-            .await
-            .unwrap();
+        let mut handle = executor(&Script::exits(7)).spawn(shutdown()).await.unwrap();
 
         let first = handle.wait().await.unwrap();
         let second = handle.wait().await.unwrap();
@@ -1940,11 +1937,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_wait_none_while_running() {
-        let mut handle = ProcessExecutor::new("sleep")
-            .arg("10")
-            .spawn(shutdown())
-            .await
-            .unwrap();
+        let mut handle = executor(&Script::runs()).spawn(shutdown()).await.unwrap();
 
         assert!(handle.try_wait().is_none());
         handle.kill(Duration::ZERO).await;
@@ -1952,10 +1945,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_wait_some_after_exit() {
-        let mut handle = ProcessExecutor::new("true")
-            .spawn(shutdown())
-            .await
-            .unwrap();
+        let mut handle = executor(&Script::exits(0)).spawn(shutdown()).await.unwrap();
 
         // Wait for process to finish
         let _ = handle.wait().await;
@@ -1966,11 +1956,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_kill_with_grace_period() {
-        let mut handle = ProcessExecutor::new("sleep")
-            .arg("60")
-            .spawn(shutdown())
-            .await
-            .unwrap();
+        let mut handle = executor(&Script::runs()).spawn(shutdown()).await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         handle.kill(Duration::from_secs(1)).await;
@@ -1980,11 +1966,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_kill_immediate() {
-        let mut handle = ProcessExecutor::new("sleep")
-            .arg("60")
-            .spawn(shutdown())
-            .await
-            .unwrap();
+        let mut handle = executor(&Script::runs()).spawn(shutdown()).await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         handle.kill(Duration::ZERO).await;
@@ -1994,10 +1976,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_kill_already_exited_is_noop() {
-        let mut handle = ProcessExecutor::new("true")
-            .spawn(shutdown())
-            .await
-            .unwrap();
+        let mut handle = executor(&Script::exits(0)).spawn(shutdown()).await.unwrap();
 
         let _ = handle.wait().await;
         // Should not panic or error
@@ -2006,8 +1985,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_has_exited_follows_the_handle_not_the_pid() {
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "sleep 0.3"])
+        let mut handle = executor(&Script::exits(0).then_pause(Duration::from_millis(300)))
             .spawn(shutdown())
             .await
             .unwrap();
@@ -2029,8 +2007,7 @@ mod tests {
         // survivor stands in for that stranger.
         let dir = test_dir!("kill-after-reap");
         let pidfile = dir.join("survivor.pid");
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", &format!("sleep 30 & echo $! > {}", pidfile.display())])
+        let mut handle = executor(&Script::exits(0).with_child(&pidfile))
             .spawn(shutdown())
             .await
             .unwrap();
@@ -2055,11 +2032,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_kill_after_reaping_keeps_the_exit_code() {
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "exit 7"])
-            .spawn(shutdown())
-            .await
-            .unwrap();
+        let mut handle = executor(&Script::exits(7)).spawn(shutdown()).await.unwrap();
 
         assert_eq!(handle.wait().await.unwrap(), 7);
         handle.kill(Duration::from_secs(1)).await;
@@ -2075,11 +2048,7 @@ mod tests {
         // a kill that is still owed.
         let dir = test_dir!("sigterm-live-group");
         let pidfile = dir.join("member.pid");
-        let mut handle = ProcessExecutor::new("sh")
-            .args([
-                "-c",
-                &format!("sleep 30 & echo $! > {}; sleep 30", pidfile.display()),
-            ])
+        let mut handle = executor(&Script::runs().with_child(&pidfile))
             .spawn(shutdown())
             .await
             .unwrap();
@@ -2119,10 +2088,7 @@ mod tests {
         // handle consumed — the exact state behind the field crashes. Both
         // kill paths must read the cache instead of polling the handle.
         // (Ported from upstream TDKM-139; the gating it exercises is ours.)
-        let mut handle = ProcessExecutor::new("true")
-            .spawn(shutdown())
-            .await
-            .unwrap();
+        let mut handle = executor(&Script::exits(0)).spawn(shutdown()).await.unwrap();
 
         loop {
             tokio::select! {
@@ -2145,11 +2111,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_wait_survives_a_dead_monitor() {
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "sleep 30"])
-            .spawn(shutdown())
-            .await
-            .unwrap();
+        let mut handle = executor(&Script::runs()).spawn(shutdown()).await.unwrap();
 
         handle.abort_monitor();
 
@@ -2175,11 +2137,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_every_entry_point_settles_after_a_dead_monitor() {
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "sleep 30"])
-            .spawn(shutdown())
-            .await
-            .unwrap();
+        let mut handle = executor(&Script::runs()).spawn(shutdown()).await.unwrap();
 
         handle.abort_monitor();
 
@@ -2198,8 +2156,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_cancel_safe_in_select() {
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "sleep 0.2 && exit 3"])
+        let mut handle = executor(&Script::exits(3).then_pause(Duration::from_millis(200)))
             .spawn(shutdown())
             .await
             .unwrap();
@@ -2332,8 +2289,7 @@ mod tests {
         let dir = test_dir!();
         let out = dir.join("out.log");
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "echo $MY_VAR"])
+        let mut handle = executor(&Script::shows_env(["MY_VAR"]))
             .env("MY_VAR", "hello_from_test")
             .output(MergedOutput::new(FileStream::new(&out)))
             .spawn(shutdown())
@@ -2343,7 +2299,7 @@ mod tests {
         let code = handle.wait().await.unwrap();
         assert_eq!(code, 0);
         let content = fs::read_to_string(&out).unwrap();
-        assert!(content.contains("hello_from_test"));
+        assert!(content.contains("MY_VAR=hello_from_test"), "{content}");
     }
 
     #[tokio::test]
@@ -2351,8 +2307,7 @@ mod tests {
         let dir = test_dir!();
         let out = dir.join("out.log");
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "echo $A $B"])
+        let mut handle = executor(&Script::shows_env(["A", "B"]))
             .envs([("A", "aaa"), ("B", "bbb")])
             .output(MergedOutput::new(FileStream::new(&out)))
             .spawn(shutdown())
@@ -2362,8 +2317,8 @@ mod tests {
         let code = handle.wait().await.unwrap();
         assert_eq!(code, 0);
         let content = fs::read_to_string(&out).unwrap();
-        assert!(content.contains("aaa"));
-        assert!(content.contains("bbb"));
+        assert!(content.contains("A=aaa"), "{content}");
+        assert!(content.contains("B=bbb"), "{content}");
     }
 
     #[tokio::test]
@@ -2371,9 +2326,8 @@ mod tests {
         let dir = test_dir!();
         let out = dir.join("out.log");
 
-        // HOME should be absent when propagate_env is false
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "echo \"HOME=${HOME}END\""])
+        // HOME and PATH should be absent when propagate_env is false
+        let mut handle = executor(&Script::shows_env(["HOME", "PATH"]))
             .propagate_env(false)
             .output(MergedOutput::new(FileStream::new(&out)))
             .spawn(shutdown())
@@ -2384,22 +2338,25 @@ mod tests {
         assert_eq!(code, 0);
         let content = fs::read_to_string(&out).unwrap();
         assert!(
-            content.contains("HOME=END"),
-            "HOME should be empty, got: {}",
+            content.contains("HOME unset"),
+            "HOME should be absent, got: {}",
+            content
+        );
+        assert!(
+            content.contains("PATH unset"),
+            "PATH should be absent, got: {}",
             content
         );
     }
 
     #[tokio::test]
     async fn test_empty_value_env_var_is_set_not_unset() {
-        // Mirrors the EMPTY_SECRET_ENVFROM_BUG.md probe (set-vs-unset), but
-        // via the POSIX `${VAR+SET}` builtin so no PATH lookup is needed.
+        // Mirrors the EMPTY_SECRET_ENVFROM_BUG.md probe (set-vs-unset).
         // An empty-valued env var must reach the child as *set-but-empty*.
         let dir = test_dir!();
         let out = dir.join("out.log");
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "echo \"R=${EMPTY_VAR+SET}=${EMPTY_VAR}END\""])
+        let mut handle = executor(&Script::shows_env(["EMPTY_VAR"]))
             .env("EMPTY_VAR", "")
             .propagate_env(false)
             .output(MergedOutput::new(FileStream::new(&out)))
@@ -2410,10 +2367,10 @@ mod tests {
         let code = handle.wait().await.unwrap();
         assert_eq!(code, 0);
         let content = fs::read_to_string(&out).unwrap();
-        // "R=SET=END" => the var is present (SET) and empty. A dropped var
-        // would print "R==END".
+        // "EMPTY_VAR=" => the var is present and empty. A dropped var
+        // would print "EMPTY_VAR unset".
         assert!(
-            content.contains("R=SET=END"),
+            content.contains("EMPTY_VAR=\n"),
             "empty-valued env var must be delivered as set-but-empty, got: {}",
             content
         );
@@ -2423,7 +2380,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_env_var_empty_name_rejected() {
-        let result = ProcessExecutor::new("true")
+        let result = executor(&Script::exits(0))
             .env("", "val")
             .spawn(shutdown())
             .await;
@@ -2435,7 +2392,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_env_var_equals_in_name_rejected() {
-        let result = ProcessExecutor::new("true")
+        let result = executor(&Script::exits(0))
             .env("FOO=BAR", "val")
             .spawn(shutdown())
             .await;
@@ -2447,7 +2404,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_env_var_nul_in_name_rejected() {
-        let result = ProcessExecutor::new("true")
+        let result = executor(&Script::exits(0))
             .env("FOO\0BAR", "val")
             .spawn(shutdown())
             .await;
@@ -2464,8 +2421,7 @@ mod tests {
         let dir = test_dir!();
         let out = dir.join("out.log");
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "pwd"])
+        let mut handle = executor(&Script::shows_cwd())
             .work_dir(&dir)
             .output(MergedOutput::new(FileStream::new(&out)))
             .spawn(shutdown())
@@ -2474,10 +2430,11 @@ mod tests {
 
         let code = handle.wait().await.unwrap();
         assert_eq!(code, 0);
-        let content = fs::read_to_string(&out).unwrap().trim().to_string();
+        let content = fs::read_to_string(&out).unwrap();
+        let content = content.lines().last().unwrap().trim();
         // Resolve symlinks for macOS /private/var vs /var, etc.
         let expected = fs::canonicalize(&dir).unwrap();
-        let actual = fs::canonicalize(&content).unwrap();
+        let actual = fs::canonicalize(content).unwrap();
         assert_eq!(actual, expected);
     }
 
@@ -2485,8 +2442,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_devnull_output() {
-        let mut handle = ProcessExecutor::new("echo")
-            .arg("should be discarded")
+        let mut handle = executor(&Script::prints(["should be discarded"]))
             .output(DevNullOutput)
             .spawn(shutdown())
             .await
@@ -2502,8 +2458,7 @@ mod tests {
         let dir = test_dir!();
         let out = dir.join("merged.log");
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "echo out_line && echo err_line >&2"])
+        let mut handle = executor(&Script::prints(["out_line"]).with_stderr(["err_line"]))
             .output(MergedOutput::new(FileStream::new(&out)))
             .spawn(shutdown())
             .await
@@ -2521,7 +2476,7 @@ mod tests {
     // bytes on every line.
     //
     // Each line is written as two halves with the *other* stream's write
-    // in between (`printf` is unbuffered for fd != tty). That forces
+    // in between, each half flushed on its own. That forces
     // multi-poll `read_line` calls and gives the select! a chance to
     // cancel a partially-completed read.
     #[tokio::test]
@@ -2530,19 +2485,12 @@ mod tests {
         let out = dir.join("merged.log");
 
         const N: usize = 2000;
-        let script = format!(
-            "i=1; while [ $i -le {n} ]; do \
-                printf 'OUT_%d_' $i; \
-                printf 'ERR_%d_part1_' $i >&2; \
-                printf 'tail\\n'; \
-                printf 'tail\\n' >&2; \
-                i=$((i+1)); \
-             done",
-            n = N
-        );
+        let script = Script::prints(["OUT_{i}_tail"])
+            .with_stderr(["ERR_{i}_part1_tail"])
+            .repeated(N as u64)
+            .interleaved();
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", &script])
+        let mut handle = executor(&script)
             .output(MergedOutput::new(FileStream::new(&out)))
             .spawn(shutdown())
             .await
@@ -2571,8 +2519,7 @@ mod tests {
         let dir = test_dir!("logs");
         let log = dir.join("app.log");
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "for i in $(seq 1 10); do echo line_$i; done"])
+        let mut handle = executor(&Script::prints((1..=10).map(|i| format!("line_{i}"))))
             .output(MergedOutput::new(RollingFileStream::new(&log, 40, 10)))
             .spawn(shutdown())
             .await
@@ -2603,12 +2550,13 @@ mod tests {
         let dir = test_dir!("logs");
         let log = dir.join("app.log");
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "for i in $(seq 1 30); do echo line_number_$i; done"])
-            .output(MergedOutput::new(RollingFileStream::new(&log, 30, 3)))
-            .spawn(shutdown())
-            .await
-            .unwrap();
+        let mut handle = executor(&Script::prints(
+            (1..=30).map(|i| format!("line_number_{i}")),
+        ))
+        .output(MergedOutput::new(RollingFileStream::new(&log, 30, 3)))
+        .spawn(shutdown())
+        .await
+        .unwrap();
 
         assert_eq!(handle.wait().await.unwrap(), 0);
         // max_files=3 means: app.log, app.log.1, app.log.2
@@ -2625,12 +2573,13 @@ mod tests {
         let dir = test_dir!("logs");
         let log = dir.join("app.log");
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "for i in $(seq 1 20); do echo line_number_$i; done"])
-            .output(MergedOutput::new(RollingFileStream::new(&log, 30, 10)))
-            .spawn(shutdown())
-            .await
-            .unwrap();
+        let mut handle = executor(&Script::prints(
+            (1..=20).map(|i| format!("line_number_{i}")),
+        ))
+        .output(MergedOutput::new(RollingFileStream::new(&log, 30, 10)))
+        .spawn(shutdown())
+        .await
+        .unwrap();
 
         assert_eq!(handle.wait().await.unwrap(), 0);
         // Current file should exist
@@ -2658,8 +2607,7 @@ mod tests {
         let stdout_log = dir.join("stdout.log");
         let stderr_log = dir.join("stderr.log");
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "echo out_only && echo err_only >&2"])
+        let mut handle = executor(&Script::prints(["out_only"]).with_stderr(["err_only"]))
             .output(SplitOutput::new(
                 FileStream::new(&stdout_log),
                 FileStream::new(&stderr_log),
@@ -2699,8 +2647,7 @@ mod tests {
         let dir = test_dir!();
         let stderr_log = dir.join("stderr.log");
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "echo out_discarded && echo err_kept >&2"])
+        let mut handle = executor(&Script::prints(["out_discarded"]).with_stderr(["err_kept"]))
             .output(SplitOutput::new(
                 DevNullStream,
                 FileStream::new(&stderr_log),
@@ -2722,8 +2669,7 @@ mod tests {
         let a = dir.join("a.log");
         let b = dir.join("b.log");
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "echo tee_test_line"])
+        let mut handle = executor(&Script::prints(["tee_test_line"]))
             .output(MergedOutput::new(TeeStream::new(
                 FileStream::new(&a),
                 FileStream::new(&b),
@@ -2747,8 +2693,7 @@ mod tests {
         let rolling_log = rolling_dir.join("app.log");
         let copy_log = dir.join("copy.log");
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "for i in $(seq 1 5); do echo line_$i; done"])
+        let mut handle = executor(&Script::prints((1..=5).map(|i| format!("line_{i}"))))
             .output(MergedOutput::new(TeeStream::new(
                 RollingFileStream::new(&rolling_log, 50, 10),
                 FileStream::new(&copy_log),
@@ -2775,8 +2720,7 @@ mod tests {
         let dir = test_dir!();
         let log = dir.join("merged.log");
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "echo direct_out && echo direct_err >&2"])
+        let mut handle = executor(&Script::prints(["direct_out"]).with_stderr(["direct_err"]))
             .die_with_parent(false)
             .output(DirectFileOutput::merged(&log))
             .spawn(shutdown())
@@ -2806,8 +2750,7 @@ mod tests {
         let out = dir.join("stdout.log");
         let err = dir.join("stderr.log");
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "echo split_out && echo split_err >&2"])
+        let mut handle = executor(&Script::prints(["split_out"]).with_stderr(["split_err"]))
             .die_with_parent(false)
             .output(DirectFileOutput::new(Some(&out), Some(&err)))
             .spawn(shutdown())
@@ -2828,8 +2771,7 @@ mod tests {
         let dir = test_dir!();
         let out = dir.join("stdout.log");
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "echo only_out && echo discard_err >&2"])
+        let mut handle = executor(&Script::prints(["only_out"]).with_stderr(["discard_err"]))
             .die_with_parent(false)
             .output(DirectFileOutput::new(Some(&out), None::<PathBuf>))
             .spawn(shutdown())
@@ -2848,8 +2790,7 @@ mod tests {
         let dir = test_dir!();
         let log = dir.join("merged.log");
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "echo direct_out"])
+        let mut handle = executor(&Script::prints(["direct_out"]))
             .die_with_parent(false)
             .output(
                 DirectFileOutput::merged(&log)
@@ -2862,18 +2803,19 @@ mod tests {
         assert_eq!(handle.wait().await.unwrap(), 0);
         tokio::time::sleep(Duration::from_millis(200)).await;
         let content = fs::read_to_string(&log).unwrap();
-        let mut lines = content.lines();
-        assert_eq!(lines.next(), Some("WARNING: header line"));
-        assert!(lines.next().unwrap().contains("direct_out"));
+        let (first, rest) = content.split_once('\n').unwrap();
+        assert_eq!(first, "WARNING: header line");
+        assert!(rest.contains("direct_out"), "{content}");
     }
 
     // -- DirectFileOutput validation -----------------------------------------
 
     #[tokio::test]
     async fn test_direct_file_rejects_die_with_parent_true() {
-        let result = ProcessExecutor::new("true")
+        let dir = test_dir!();
+        let result = executor(&Script::exits(0))
             .die_with_parent(true)
-            .output(DirectFileOutput::merged("/tmp/nope.log"))
+            .output(DirectFileOutput::merged(dir.join("nope.log")))
             .spawn(shutdown())
             .await;
 
@@ -2883,7 +2825,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_direct_file_rejects_none_none() {
-        let result = ProcessExecutor::new("true")
+        let result = executor(&Script::exits(0))
             .die_with_parent(false)
             .output(DirectFileOutput::new(None::<PathBuf>, None::<PathBuf>))
             .spawn(shutdown())
@@ -2900,12 +2842,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_direct_file_rejects_same_path() {
-        let result = ProcessExecutor::new("true")
+        let same = test_dir!().join("same.log");
+        let result = executor(&Script::exits(0))
             .die_with_parent(false)
-            .output(DirectFileOutput::new(
-                Some("/tmp/same.log"),
-                Some("/tmp/same.log"),
-            ))
+            .output(DirectFileOutput::new(Some(&same), Some(&same)))
             .spawn(shutdown())
             .await;
 
@@ -2917,7 +2857,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merged_rejects_die_with_parent_false() {
-        let result = ProcessExecutor::new("true")
+        let result = executor(&Script::exits(0))
             .die_with_parent(false)
             .output(MergedOutput::new(DevNullStream))
             .spawn(shutdown())
@@ -2929,7 +2869,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_split_rejects_die_with_parent_false() {
-        let result = ProcessExecutor::new("true")
+        let result = executor(&Script::exits(0))
             .die_with_parent(false)
             .output(SplitOutput::new(DevNullStream, DevNullStream))
             .spawn(shutdown())
@@ -2947,8 +2887,7 @@ mod tests {
         let log = dir.join("shutdown.log");
         let (tx, rx) = watch::channel(());
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "while true; do echo tick; sleep 0.1; done"])
+        let mut handle = executor(&Script::prints(["tick"]).ticking(Duration::from_millis(100)))
             .output(MergedOutput::new(FileStream::new(&log)))
             .spawn(rx)
             .await
@@ -2979,18 +2918,18 @@ mod tests {
         let err = dir.join("stderr.log");
         let (tx, rx) = watch::channel(());
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args([
-                "-c",
-                "while true; do echo out_tick; echo err_tick >&2; sleep 0.1; done",
-            ])
-            .output(SplitOutput::new(
-                FileStream::new(&out),
-                FileStream::new(&err),
-            ))
-            .spawn(rx)
-            .await
-            .unwrap();
+        let mut handle = executor(
+            &Script::prints(["out_tick"])
+                .with_stderr(["err_tick"])
+                .ticking(Duration::from_millis(100)),
+        )
+        .output(SplitOutput::new(
+            FileStream::new(&out),
+            FileStream::new(&err),
+        ))
+        .spawn(rx)
+        .await
+        .unwrap();
 
         tokio::time::sleep(Duration::from_millis(500)).await;
         tx.send(()).unwrap();
@@ -3008,8 +2947,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_output_is_devnull() {
-        let mut handle = ProcessExecutor::new("echo")
-            .arg("no output config")
+        let mut handle = executor(&Script::prints(["no output config"]))
             .spawn(shutdown())
             .await
             .unwrap();
@@ -3021,8 +2959,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_detached_with_devnull() {
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "exit 0"])
+        let mut handle = executor(&Script::exits(0))
             .die_with_parent(false)
             .output(DevNullOutput)
             .spawn(shutdown())
@@ -3042,8 +2979,7 @@ mod tests {
         let b = dir.join("b.log");
         let c = dir.join("c.log");
 
-        let mut handle = ProcessExecutor::new("echo")
-            .arg("triple")
+        let mut handle = executor(&Script::prints(["triple"]))
             .output(MergedOutput::new(TeeStream::new(
                 FileStream::new(&a),
                 TeeStream::new(FileStream::new(&b), FileStream::new(&c)),
@@ -3253,8 +3189,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_wait_poll_until_done() {
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "sleep 0.2"])
+        let mut handle = executor(&Script::exits(0).then_pause(Duration::from_millis(200)))
             .spawn(shutdown())
             .await
             .unwrap();
@@ -3278,9 +3213,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_kill_escalates_to_sigkill() {
-        // Spawn a process that traps SIGTERM
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "trap '' TERM; sleep 60"])
+        // Spawn a process that ignores SIGTERM
+        let mut handle = executor(&Script::runs().ignoring_stop())
             .spawn(shutdown())
             .await
             .unwrap();
@@ -3367,15 +3301,13 @@ mod tests {
     // Process killed by signal (not exit code)
     // ========================================================================
 
+    // Only a Unix signal death leaves a process without an exit code.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_process_killed_by_signal_returns_minus_one() {
         // A process killed by SIGKILL has no exit code — code() returns None,
         // which we map to -1.
-        let mut handle = ProcessExecutor::new("sleep")
-            .arg("60")
-            .spawn(shutdown())
-            .await
-            .unwrap();
+        let mut handle = executor(&Script::runs()).spawn(shutdown()).await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         // Send SIGKILL directly
@@ -3384,6 +3316,21 @@ mod tests {
         assert_eq!(code, -1, "signal death should return -1");
     }
 
+    #[tokio::test]
+    async fn test_process_crash_reports_how_it_ended() {
+        // A Unix crash is a death by signal, with no exit code (-1); on
+        // Windows the NTSTATUS that ended the process is the code.
+        let expected = if cfg!(windows) {
+            0xC000_0409_u32 as i32
+        } else {
+            -1
+        };
+        let mut handle = executor(&Script::aborts()).spawn(shutdown()).await.unwrap();
+        assert_eq!(handle.wait().await.unwrap(), expected);
+    }
+
+    // Only a Unix signal death leaves a process without an exit code.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_process_segfault_returns_minus_one() {
         // Simulate a crash via SIGSEGV — process has no exit code
@@ -3417,8 +3364,8 @@ mod tests {
         let dir = test_dir!("pid-create");
         let pid_dir = dir.join("pids");
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "sleep 10"])
+        let script = Script::runs();
+        let mut handle = executor(&script)
             .pid_dir(&pid_dir)
             .spawn(shutdown())
             .await
@@ -3429,7 +3376,7 @@ mod tests {
         assert!(pid_file.exists(), "PID file should exist after spawn");
 
         let content = fs::read_to_string(&pid_file).unwrap();
-        assert_eq!(content, "sh");
+        assert_eq!(content, script.program());
 
         handle.kill(Duration::ZERO).await;
         let _ = handle.wait().await;
@@ -3440,8 +3387,7 @@ mod tests {
         let dir = test_dir!("pid-exit");
         let pid_dir = dir.join("pids");
 
-        let mut handle = ProcessExecutor::new("sh")
-            .args(["-c", "exit 0"])
+        let mut handle = executor(&Script::exits(0))
             .pid_dir(&pid_dir)
             .spawn(shutdown())
             .await
@@ -3462,12 +3408,7 @@ mod tests {
         let dir = test_dir!("pid-stale");
         let pid_dir = dir.join("pids");
 
-        // Spawn a long-running process.
-        // Use "sleep" directly (not "sh -c sleep") so the PID file program
-        // name matches what `ps` reports — "sh -c sleep 300" is racy because
-        // sh may exec into sleep, changing the process command name.
-        let mut handle = ProcessExecutor::new("sleep")
-            .args(["300"])
+        let mut handle = executor(&Script::runs())
             .pid_dir(&pid_dir)
             .die_with_parent(false)
             .output(DevNullOutput)
@@ -3478,7 +3419,7 @@ mod tests {
         let pid = handle.pid();
         assert!(is_pid_alive(pid));
 
-        // cleanup_stale_pids should kill it (PID file says "sleep", process is "sleep")
+        // cleanup_stale_pids should kill it (the PID file names the program it runs)
         let killed = cleanup_stale_pids(&pid_dir);
         assert_eq!(killed, 1, "should report 1 killed");
 
@@ -3557,8 +3498,7 @@ mod tests {
         let mut slow_spawns = 0u32;
         for i in 0..n {
             let t_spawn = std::time::Instant::now();
-            let h = ProcessExecutor::new("sh")
-                .args(["-c", "while true; do echo hello; sleep 1; done"])
+            let h = executor(&Script::prints(["hello"]).ticking(Duration::from_secs(1)))
                 .output_boxed(output_fn(i))
                 .spawn(shutdown())
                 .await
