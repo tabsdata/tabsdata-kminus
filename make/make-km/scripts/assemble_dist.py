@@ -8,6 +8,8 @@ import subprocess
 import sys
 import time
 
+from fetch_k8s_deps import detect_platform
+
 COPY_TIMEOUT_SECONDS = 60
 COPY_RETRY_INTERVAL_SECONDS = 2
 
@@ -100,20 +102,16 @@ def main():
         else:
             print(f"Rust binary not found (skipped): '{source}'")
 
-    cache_folder = os.path.join(km_root, "mods", "control-plane", "cache")
-    if os.path.isdir(cache_folder):
-        for platform_folder in sorted(os.listdir(cache_folder)):
-            platform_path = os.path.join(cache_folder, platform_folder)
-            if not os.path.isdir(platform_path):
-                continue
-            for dependency in KUBERNETES_DEPENDENCIES:
-                source = os.path.join(platform_path, f"{dependency}{exe_suffix}")
-                if os.path.isfile(source):
-                    name = KUBERNETES_RENAMES.get(dependency, dependency)
-                    destination = os.path.join(
-                        distribution_folder, f"{name}{exe_suffix}"
-                    )
-                    copy_verified(source, destination)
+    os_name, arch = detect_platform()
+    platform_path = os.path.join(
+        km_root, "mods", "control-plane", "cache", f"{os_name}-{arch}"
+    )
+    for dependency in KUBERNETES_DEPENDENCIES:
+        source = os.path.join(platform_path, f"{dependency}{exe_suffix}")
+        if os.path.isfile(source):
+            name = KUBERNETES_RENAMES.get(dependency, dependency)
+            destination = os.path.join(distribution_folder, f"{name}{exe_suffix}")
+            copy_verified(source, destination)
 
     if native_binaries:
         print(f"Native check: running check on {len(native_binaries)} binaries")

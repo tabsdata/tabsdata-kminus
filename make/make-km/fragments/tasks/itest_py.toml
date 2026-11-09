@@ -41,7 +41,11 @@ script = [
     end
     suite_folder = set "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/mods/control-plane/src/itest"
     previous_python_path = get_env PYTHONPATH
-    set_env PYTHONPATH "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/test${separator}${suite_folder}${separator}${previous_python_path}"
+    python_path = set "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/test${separator}${suite_folder}"
+    if not is_empty ${previous_python_path}
+        python_path = set "${python_path}${separator}${previous_python_path}"
+    end
+    set_env PYTHONPATH ${python_path}
     set_env TD_BIN_FOLDER "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/target/dist"
 
     cd "${suite_folder}"
@@ -153,7 +157,11 @@ script = [
     end
     suite_folder = set "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/mods/virtual-kubelet/src/itest"
     previous_python_path = get_env PYTHONPATH
-    set_env PYTHONPATH "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/test${separator}${suite_folder}${separator}${previous_python_path}"
+    python_path = set "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/test${separator}${suite_folder}"
+    if not is_empty ${previous_python_path}
+        python_path = set "${python_path}${separator}${previous_python_path}"
+    end
+    set_env PYTHONPATH ${python_path}
     set_env TD_BIN_FOLDER "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/target/dist"
 
     cd "${suite_folder}"
@@ -265,7 +273,11 @@ script = [
     end
     suite_folder = set "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/mods/pod-runner/tests"
     previous_python_path = get_env PYTHONPATH
-    set_env PYTHONPATH "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/test${separator}${suite_folder}${separator}${previous_python_path}"
+    python_path = set "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/test${separator}${suite_folder}"
+    if not is_empty ${previous_python_path}
+        python_path = set "${python_path}${separator}${previous_python_path}"
+    end
+    set_env PYTHONPATH ${python_path}
     set_env TD_BIN_FOLDER "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/target/dist"
 
     cd "${suite_folder}"
@@ -377,7 +389,11 @@ script = [
     end
     suite_folder = set "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/mods/kminus/tests"
     previous_python_path = get_env PYTHONPATH
-    set_env PYTHONPATH "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/test${separator}${suite_folder}${separator}${previous_python_path}"
+    python_path = set "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/test${separator}${suite_folder}"
+    if not is_empty ${previous_python_path}
+        python_path = set "${python_path}${separator}${previous_python_path}"
+    end
+    set_env PYTHONPATH ${python_path}
     set_env TD_BIN_FOLDER "${PROJECT_TABSDATA_KM_ROOT_FOLDER}/target/dist"
 
     cd "${suite_folder}"

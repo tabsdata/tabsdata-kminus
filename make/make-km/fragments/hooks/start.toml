@@ -118,12 +118,10 @@ script = [
             python_version = trim ${python_version.stdout}
             echo "🐵 CI Core python version: ${python_version}"
 
-            python_path = exec which python
-            python_path = trim ${python_path.stdout}
+            python_path = which python
             echo "🐵 CI python path: ${python_path}"
 
-            pip_path = exec which pip
-            pip_path = trim ${pip_path.stdout}
+            pip_path = which pip
             echo "🐵 CI pip path: ${pip_path}"
         end
     end

@@ -55,9 +55,12 @@ def run(cmd, **kwargs):
 
 def ensure_setup_envtest():
     """Ensure setup-envtest is installed, return its path."""
-    gobin = subprocess.check_output(["go", "env", "GOPATH"], text=True).strip()
-    gobin = os.path.join(gobin, "bin")
-    envtest_bin = os.path.join(gobin, "setup-envtest")
+    gobin = subprocess.check_output(["go", "env", "GOBIN"], text=True).strip()
+    if not gobin:
+        gopath = subprocess.check_output(["go", "env", "GOPATH"], text=True).strip()
+        gobin = os.path.join(gopath.split(os.pathsep)[0], "bin")
+    ext = ".exe" if sys.platform == "win32" else ""
+    envtest_bin = os.path.join(gobin, f"setup-envtest{ext}")
 
     if not os.path.isfile(envtest_bin):
         print("Installing setup-envtest...")
@@ -116,6 +119,8 @@ def clone_k8s_source(source_dir, full_version):
     run([
         "git",
         "clone",
+        "--config",
+        "core.longpaths=true",
         "--depth",
         "1",
         "--branch",
