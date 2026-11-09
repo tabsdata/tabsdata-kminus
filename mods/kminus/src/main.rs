@@ -1429,6 +1429,9 @@ fn command_stop(args: StopArgs) {
             println!("Stopping Tabsdata K- (K minus) [km pid={pid}]...");
             // Signal the foreground `km start` and let its own shutdown
             // thread drive the orderly teardown, then wait for it to exit.
+            // On Windows the stop event comes first: it reaches km however
+            // it was started, where a CTRL_BREAK needs km to own a console.
+            kcommon::stopevent::signal_stop(&paths.workdir.to_string_lossy());
             stop_recorded(&paths.pids, BIN_KM, STOP_WAIT);
             // Asked of the PID file again rather than of the number: km
             // removes its file on a clean exit, so a still-verifying entry
@@ -1678,9 +1681,9 @@ fn command_restart(args: StartArgs) {
 
 /// Install the SIGINT/SIGTERM (Ctrl+C/Ctrl+Break) handlers, signal that
 /// they are armed via `armed`, then resolve when a signal arrives. On
-/// Windows, listen for both Ctrl+C and Ctrl+Break — `tdkserver stop`
-/// requests graceful shutdown via `GenerateConsoleCtrlEvent(
-/// CTRL_BREAK_EVENT, ...)`, which only fires `ctrl_break`.
+/// Windows, listen for Ctrl+C, Ctrl+Break (what a graceful stop raises
+/// in km's console, see `kcommon::signal`) and the instance's stop event
+/// (what `km stop` and tdkserver set, see `kcommon::stopevent`).
 #[cfg(unix)]
 async fn arm_and_wait_for_shutdown(
     armed: std::sync::mpsc::Sender<()>,
