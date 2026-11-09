@@ -379,28 +379,11 @@ fn collect_descendants(root: u32) -> Vec<u32> {
 /// and also reaches reparented processes, which no parent walk can.
 #[cfg(target_os = "macos")]
 pub fn kill_descendants(root: u32) {
-    let descendants = collect_descendants(root);
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{self, Signal};
-        use nix::unistd::Pid as NixPid;
-        for pid in &descendants {
-            let _ = signal::kill(NixPid::from_raw(-(*pid as i32)), Signal::SIGKILL);
-            let _ = signal::kill(NixPid::from_raw(*pid as i32), Signal::SIGKILL);
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        for pid in &descendants {
-            let mut command = Command::new("taskkill.exe");
-            apply_detached_flags(&mut command);
-            let _ = command
-                .arg("/PID")
-                .arg(pid.to_string())
-                .arg("/T")
-                .arg("/F")
-                .status();
-        }
+    use nix::sys::signal::{self, Signal};
+    use nix::unistd::Pid as NixPid;
+    for pid in collect_descendants(root) {
+        let _ = signal::kill(NixPid::from_raw(-(pid as i32)), Signal::SIGKILL);
+        let _ = signal::kill(NixPid::from_raw(pid as i32), Signal::SIGKILL);
     }
 }
 

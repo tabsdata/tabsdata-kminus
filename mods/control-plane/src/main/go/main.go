@@ -25,6 +25,7 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -530,7 +531,10 @@ type childProcess struct {
 // childProcessName normalises a process name for comparison, trimming the
 // Windows executable suffix so one spelling works on every platform.
 func childProcessName(name string) string {
-	return strings.TrimSuffix(name, ".exe")
+	if n := len(name) - len(".exe"); n > 0 && strings.EqualFold(name[n:], ".exe") {
+		return name[:n]
+	}
+	return name
 }
 
 // processGone reports whether a recorded child is no longer running.
@@ -1479,7 +1483,7 @@ func run() int {
 
 	// Determine extension based on OS
 	ext := ""
-	if os.Getenv("GOOS") == "windows" || os.PathSeparator == '\\' {
+	if runtime.GOOS == "windows" {
 		ext = ".exe"
 	}
 
