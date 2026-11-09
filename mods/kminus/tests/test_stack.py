@@ -9,6 +9,7 @@ K8s API, and verify execution through restart cycles.
 """
 
 import base64
+import sys
 import time
 
 from conftest import KminusProcess
@@ -126,8 +127,8 @@ class TestPodSurvivesRestart:
                                 containers=[V1Container(
                                     name="worker",
                                     image="/dev/null",
-                                    command=["sh", "-c"],
-                                    args=["echo 'post-restart done'"],
+                                    command=[sys.executable, "-c"],
+                                    args=["print('post-restart done')"],
                                 )],
                                 tolerations=[V1Toleration(
                                     key="virtual-kubelet.io/provider",
@@ -179,8 +180,8 @@ class TestPodSurvivesRestart:
                     containers=[V1Container(
                         name="main",
                         image="/dev/null",
-                        command=["sh", "-c"],
-                        args=["sleep 120"],
+                        command=[sys.executable, "-c"],
+                        args=["import time; time.sleep(120)"],
                     )],
                     tolerations=[V1Toleration(
                         key="virtual-kubelet.io/provider",

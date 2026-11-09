@@ -30,13 +30,20 @@ spec:
           value: $(KM_CONTAINER_ROOT)
         - name: MARKER
           value: $(ROOT)/marker.txt
-      command: ["sh", "-c"]
+      command: ["python", "-c"]
       args:
         - |
-          set -e
-          [ -n "$ROOT" ] || { echo "ROOT unset"; exit 1; }
-          [ -d "$ROOT" ] || { echo "ROOT not a dir: $ROOT"; exit 2; }
-          [ "$MARKER" = "$ROOT/marker.txt" ] || { echo "MARKER mismatch: $MARKER"; exit 3; }
-          echo "container-root-marker" > "$(ROOT)/marker.txt"
-          [ -f "$MARKER" ] || { echo "marker not written: $MARKER"; exit 4; }
-          echo "OK"
+          import os, sys
+          root = os.environ.get('ROOT', '')
+          marker = os.environ.get('MARKER', '')
+          if not root:
+              print('ROOT unset'); sys.exit(1)
+          if not os.path.isdir(root):
+              print(f'ROOT not a dir: {root}'); sys.exit(2)
+          if marker != root + '/marker.txt':
+              print(f'MARKER mismatch: {marker}'); sys.exit(3)
+          with open(os.path.join(r'$(ROOT)', 'marker.txt'), 'w', encoding='utf-8', newline='\n') as f:
+              f.write('container-root-marker\n')
+          if not os.path.isfile(marker):
+              print(f'marker not written: {marker}'); sys.exit(4)
+          print('OK')

@@ -16,11 +16,15 @@ spec:
   initContainers:
     - name: sidecar-proxy
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["while true; do sleep 1; done"]
+      command: ["python", "-c"]
+      args:
+        - |
+          import time
+          while True:
+              time.sleep(1)
       restartPolicy: Always
   containers:
     - name: app
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["echo 'app with sidecar'"]
+      command: ["python", "-c"]
+      args: ["print('app with sidecar')"]

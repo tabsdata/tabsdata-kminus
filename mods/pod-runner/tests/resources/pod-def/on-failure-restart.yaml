@@ -14,5 +14,5 @@ spec:
   containers:
     - name: app
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["echo 'on-failure pod'"]
+      command: ["python", "-c"]
+      args: ["print('on-failure pod')"]

@@ -5,6 +5,7 @@
 """Integration tests for pod-runner server endpoints."""
 
 import os
+import sys
 
 
 class TestServerStartup:
@@ -58,7 +59,10 @@ class TestPodEndpoints:
             "spec": {
                 "containers": [{
                     "name": "main",
-                    "command": ["sh", "-c", "echo hello && sleep 30"],
+                    "command": [
+                        sys.executable, "-c",
+                        "import time; print('hello', flush=True); time.sleep(30)",
+                    ],
                 }],
             },
         }

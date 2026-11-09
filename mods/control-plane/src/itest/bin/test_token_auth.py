@@ -37,7 +37,7 @@ def _read_tokens_csv(config_dir):
     import csv
 
     path = os.path.join(config_dir, "tokens.csv")
-    with open(path, newline="") as f:
+    with open(path, encoding="utf-8", newline="") as f:
         return {row[1]: row[0] for row in csv.reader(f) if len(row) >= 2}
 
 
@@ -68,7 +68,7 @@ class TestKubeconfigsUseTokens:
     def test_kubeconfigs_have_token_auth(self, control_plane):
         tokens = _read_tokens_csv(control_plane.config_dir)
         for name in KUBECONFIGS:
-            with open(os.path.join(control_plane.config_dir, name)) as f:
+            with open(os.path.join(control_plane.config_dir, name), encoding="utf-8") as f:
                 config = yaml.safe_load(f)
             user = config["users"][0]["user"]
             assert "client-certificate-data" not in user

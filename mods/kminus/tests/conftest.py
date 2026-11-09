@@ -5,15 +5,18 @@
 import os
 import signal
 import subprocess
+import sys
 import time
 
 import pytest
 
 from itest_common import (  # noqa: F401
+    binary,
     find_free_port,
     get_session_id,
-    pytest_collection_modifyitems,
     pytest_configure,
+    request_stop,
+    start_process,
 )
 from kminus_testlib import TARGET_DIR, make_test_dir
 
@@ -33,10 +36,7 @@ def bin_dir():
 
 @pytest.fixture(scope="session")
 def km_bin(bin_dir):
-    path = os.path.join(bin_dir, "km")
-    if not os.path.isfile(path):
-        pytest.skip(f"km binary not found at {path}")
-    return path
+    return binary(bin_dir, "km")
 
 
 class KminusProcess:
@@ -90,7 +90,7 @@ class KminusProcess:
         # for below is emitted. cargo-make sets RUST_LOG=error in
         # output.env, which would otherwise suppress it.
         env = {**os.environ, "RUST_LOG": "info"}
-        self.process = subprocess.Popen(
+        self.process = start_process(
             args,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -103,7 +103,7 @@ class KminusProcess:
                 tail = ""
                 if os.path.isfile(log_path):
                     try:
-                        with open(log_path) as f:
+                        with open(log_path, encoding="utf-8", errors="replace") as f:
                             tail = f.read()[-2000:]
                     except OSError:
                         pass
@@ -113,11 +113,11 @@ class KminusProcess:
                 )
             if os.path.isfile(log_path):
                 try:
-                    with open(log_path) as f:
+                    with open(log_path, "rb") as f:
                         f.seek(last_pos)
                         chunk = f.read()
                         last_pos = f.tell()
-                    if "K- ready" in chunk:
+                    if b"K- ready" in chunk:
                         return
                 except OSError:
                     pass
@@ -130,7 +130,12 @@ class KminusProcess:
     def stop(self, timeout=20):
         if self.process is None:
             return
-        self.process.send_signal(signal.SIGINT)
+        # Ctrl+C, as from km's own terminal; CTRL_BREAK on Windows, where
+        # km handles both alike and a Ctrl+C cannot be aimed at one group.
+        if sys.platform == "win32":
+            request_stop(self.process)
+        else:
+            self.process.send_signal(signal.SIGINT)
         try:
             self.process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:

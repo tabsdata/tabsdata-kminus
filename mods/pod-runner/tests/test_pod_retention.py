@@ -110,7 +110,7 @@ def wait_for_path(path, present=True, timeout=15):
 
 
 def read_marker(path):
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return f.read().strip()
 
 
@@ -187,7 +187,7 @@ class TestReaping:
         # is reaped at once (0s on success), so read the state dir's half.
         s = state_dir(pod_runner, ns, name, uid)
         assert wait_for_path(os.path.join(s, CLEANUP_TTLS_FILE))
-        with open(os.path.join(s, CLEANUP_TTLS_FILE)) as f:
+        with open(os.path.join(s, CLEANUP_TTLS_FILE), encoding="utf-8") as f:
             ttls = json.load(f)
 
         assert ttls["deleteTtlOnFailure"] == {
@@ -204,7 +204,7 @@ class TestReaping:
         wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Succeeded"})
 
         d = data_dir(pod_runner, ns, name, uid)
-        with open(os.path.join(d, CLEANUP_TTLS_FILE)) as f:
+        with open(os.path.join(d, CLEANUP_TTLS_FILE), encoding="utf-8") as f:
             ttls = json.load(f)
         assert ttls["reapTtlOnSuccess"] == {
             "raw": "1h", "secs": 3600, "source": "annotation",
@@ -284,7 +284,7 @@ class TestFailureRetention:
 
     def test_failed_pod_keeps_its_data_dir(self, pod_runner, mtls_client):
         name, ns, uid = submit_annotated(
-            mtls_client, pod_runner, {}, args=["exit 1"]
+            mtls_client, pod_runner, {}, args=["import sys; sys.exit(1)"]
         )
         wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Failed"})
 
@@ -301,7 +301,7 @@ class TestFailureRetention:
         self, pod_runner, mtls_client
     ):
         name, ns, uid = submit_annotated(
-            mtls_client, pod_runner, {}, args=["echo boom >&2; exit 3"]
+            mtls_client, pod_runner, {}, args=["import sys; print('boom', file=sys.stderr); sys.exit(3)"]
         )
         wait_for_pod_phase(mtls_client, pod_runner, ns, name, {"Failed"})
         d = state_dir(pod_runner, ns, name, uid)
@@ -360,7 +360,7 @@ class TestIncarnations:
             d = os.path.join(parent, stamp)
             assert os.path.isdir(os.path.join(d, "log"))
             assert os.path.exists(os.path.join(d, "store", "original-spec.json"))
-            with open(os.path.join(d, CLEANUP_TTLS_FILE)) as f:
+            with open(os.path.join(d, CLEANUP_TTLS_FILE), encoding="utf-8") as f:
                 assert "deleteTtlOnSuccess" in json.load(f), \
                     "each incarnation carries its own delete TTLs"
             assert os.path.exists(os.path.join(d, DELETE_ON_FILE))

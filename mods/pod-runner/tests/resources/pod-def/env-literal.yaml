@@ -14,8 +14,11 @@ spec:
   containers:
     - name: app
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["echo \"GREETING=$GREETING MODE=$MODE\""]
+      command: ["python", "-c"]
+      args:
+        - |
+          import os
+          print(f"GREETING={os.environ.get('GREETING', '')} MODE={os.environ.get('MODE', '')}")
       env:
         - name: GREETING
           value: hello-world

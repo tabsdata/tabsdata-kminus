@@ -13,12 +13,13 @@ import time
 import psutil
 import pytest
 
+from itest_common import request_stop, start_process
+
 CHILDREN = ("etcd", "kube-apiserver", "kube-controller-manager")
 
-pytestmark = pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="Windows has no SIGTERM to deliver to a running process",
-)
+# How a process ends when the stop arrives before it handles one: SIGTERM's
+# default action, or CTRL_BREAK's on Windows (STATUS_CONTROL_C_EXIT).
+ENDED_BY_STOP = 0xC000013A if sys.platform == "win32" else -signal.SIGTERM
 
 
 def _pid_files(pids_dir):
@@ -36,7 +37,7 @@ def _pid_files(pids_dir):
 
 def _start(control_plane_bin, test_dir, free_port_pair, output=subprocess.DEVNULL):
     api_port, kcm_port = free_port_pair
-    return subprocess.Popen(
+    return start_process(
         [
             control_plane_bin,
             "-port", str(api_port),
@@ -49,7 +50,7 @@ def _start(control_plane_bin, test_dir, free_port_pair, output=subprocess.DEVNUL
 
 
 def _stop_and_check(process, pids_dir, seen, exit_codes=(0,)):
-    process.send_signal(signal.SIGTERM)
+    request_stop(process)
     process.wait(timeout=120)
     seen.update(_pid_files(pids_dir))
     survivors = [
@@ -59,8 +60,10 @@ def _stop_and_check(process, pids_dir, seen, exit_codes=(0,)):
         and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
     ]
     for pid in seen:
-        if psutil.pid_exists(pid):
-            os.kill(pid, signal.SIGKILL)
+        try:
+            psutil.Process(pid).kill()
+        except psutil.NoSuchProcess:
+            pass
     assert process.returncode in exit_codes, f"control-plane exited with {process.returncode}"
     assert not survivors, f"children left running: {survivors}"
     assert not _pid_files(pids_dir), "child PID files left behind"
@@ -74,7 +77,7 @@ def test_stop_before_any_child(control_plane_bin, test_dir, free_port_pair):
     process = _start(control_plane_bin, test_dir, free_port_pair)
     # Before its handler is installed the process just ends, which is safe:
     # nothing has been started yet.
-    _stop_and_check(process, _pids_dir(test_dir), {}, exit_codes=(0, -signal.SIGTERM))
+    _stop_and_check(process, _pids_dir(test_dir), {}, exit_codes=(0, ENDED_BY_STOP))
 
 
 def test_stop_once_etcd_and_api_server_run(control_plane_bin, test_dir, free_port_pair):

@@ -22,15 +22,28 @@ spec:
   containers:
     - name: writer
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["echo 'shared-data' > $KM_CONTAINER_ROOT/mounts/shared/marker.txt"]
+      command: ["python", "-c"]
+      args:
+        - |
+          import os
+          with open(os.path.join(os.environ['KM_CONTAINER_ROOT'], 'mounts', 'shared', 'marker.txt'), 'w', encoding='utf-8', newline='\n') as f:
+              f.write('shared-data\n')
       volumeMounts:
         - name: shared-vol
           mountPath: /mounts/shared
     - name: reader
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["i=0; while [ $i -lt 50 ]; do if [ -f $KM_CONTAINER_ROOT/mounts/shared/marker.txt ]; then grep -q 'shared-data' $KM_CONTAINER_ROOT/mounts/shared/marker.txt; exit $?; fi; i=$((i+1)); sleep 0.2; done; exit 1"]
+      command: ["python", "-c"]
+      args:
+        - |
+          import os, sys, time
+          marker = os.path.join(os.environ['KM_CONTAINER_ROOT'], 'mounts', 'shared', 'marker.txt')
+          for _ in range(50):
+              if os.path.isfile(marker):
+                  with open(marker, encoding='utf-8') as f:
+                      sys.exit(0 if 'shared-data' in f.read() else 1)
+              time.sleep(0.2)
+          sys.exit(1)
       volumeMounts:
         - name: shared-vol
           mountPath: /mounts/shared

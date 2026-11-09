@@ -15,5 +15,8 @@ spec:
   containers:
     - name: app
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["i=0; while [ $i -lt 10 ]; do echo line-$i; i=$((i+1)); done"]
+      command: ["python", "-c"]
+      args:
+        - |
+          for i in range(10):
+              print(f"line-{i}")

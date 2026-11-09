@@ -20,8 +20,18 @@ spec:
   containers:
     - name: app
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["cat $KM_CONTAINER_ROOT/mounts/input/data.txt && echo 'wrote' > $KM_CONTAINER_ROOT/mounts/scratch/output.txt && echo 'wrote-to-host' > $KM_CONTAINER_ROOT/mounts/output/from-pod.txt"]
+      command: ["python", "-c"]
+      args:
+        - |
+          import os, sys
+          root = os.environ['KM_CONTAINER_ROOT']
+          for parts in [('mounts', 'input', 'data.txt')]:
+              with open(os.path.join(root, *parts), 'rb') as f:
+                  sys.stdout.buffer.write(f.read())
+          with open(os.path.join(os.environ['KM_CONTAINER_ROOT'], 'mounts', 'scratch', 'output.txt'), 'w', encoding='utf-8', newline='\n') as f:
+              f.write('wrote\n')
+          with open(os.path.join(os.environ['KM_CONTAINER_ROOT'], 'mounts', 'output', 'from-pod.txt'), 'w', encoding='utf-8', newline='\n') as f:
+              f.write('wrote-to-host\n')
       volumeMounts:
         - name: input-vol
           mountPath: /mounts/input

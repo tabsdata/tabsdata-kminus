@@ -19,18 +19,29 @@ spec:
   initContainers:
     - name: setup
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["echo 'init-setup done'"]
+      command: ["python", "-c"]
+      args: ["print('init-setup done')"]
     - name: sidecar-logger
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["while true; do sleep 1; done"]
+      command: ["python", "-c"]
+      args:
+        - |
+          import time
+          while True:
+              time.sleep(1)
       restartPolicy: Always
   containers:
     - name: main
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["echo \"MSG=$MSG\" && echo 'main wrote' > $KM_CONTAINER_ROOT/mounts/scratch/main.txt && sleep 2 && echo 'main done'"]
+      command: ["python", "-c"]
+      args:
+        - |
+          import os, time
+          print(f"MSG={os.environ.get('MSG', '')}", flush=True)
+          with open(os.path.join(os.environ['KM_CONTAINER_ROOT'], 'mounts', 'scratch', 'main.txt'), 'w', encoding='utf-8', newline='\n') as f:
+              f.write('main wrote\n')
+          time.sleep(2)
+          print('main done')
       env:
         - name: MSG
           value: kitchen-sink-test
@@ -39,13 +50,13 @@ spec:
           mountPath: /mounts/scratch
       readinessProbe:
         exec:
-          command: ["true"]
+          command: ["python", "-c", "pass"]
         initialDelaySeconds: 0
         periodSeconds: 1
     - name: helper
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["echo 'helper done'"]
+      command: ["python", "-c"]
+      args: ["print('helper done')"]
   volumes:
     - name: scratch
       emptyDir: {}

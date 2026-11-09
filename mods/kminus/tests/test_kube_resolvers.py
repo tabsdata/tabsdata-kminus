@@ -15,6 +15,7 @@ which means the container could read the resolved value at the expected
 location.
 """
 
+import sys
 import time
 import uuid
 
@@ -35,9 +36,26 @@ def _wait_for_job(batch_client, name, namespace="default", timeout=60):
     raise TimeoutError(f"Job {name} did not complete within {timeout}s")
 
 
+def _check(*, env=None, set_empty=(), files=None):
+    """Python that exits 0 only when each variable in `env` holds its value,
+    each in `set_empty` is set but empty, and each file under the container
+    root holds its value (trailing newlines aside, as `$(cat ...)` reads it)."""
+    return (
+        "import os, sys\n"
+        "root = os.environ.get('KM_CONTAINER_ROOT', '')\n"
+        "def read(path):\n"
+        "    with open(os.path.join(root, *path.strip('/').split('/')), encoding='utf-8') as f:\n"
+        "        return f.read().rstrip('\\n')\n"
+        f"ok = all(os.environ.get(k) == v for k, v in {dict(env or {})!r}.items())\n"
+        f"ok = ok and all(os.environ.get(k, None) == '' for k in {list(set_empty)!r})\n"
+        f"ok = ok and all(read(p) == v for p, v in {dict(files or {})!r}.items())\n"
+        "sys.exit(0 if ok else 1)\n"
+    )
+
+
 def _job_body(name, container_args, *, env=None, env_from=None,
               volumes=None, volume_mounts=None):
-    """Build a minimal V1Job that runs a `sh -c` command on tdknode."""
+    """Build a minimal V1Job that runs Python `container_args` on tdknode."""
     from kubernetes.client import (
         V1Job, V1JobSpec, V1PodTemplateSpec, V1PodSpec,
         V1Container, V1ObjectMeta, V1Toleration,
@@ -46,7 +64,7 @@ def _job_body(name, container_args, *, env=None, env_from=None,
     container = V1Container(
         name="probe",
         image="/dev/null",
-        command=["sh", "-c"],
+        command=[sys.executable, "-c"],
         args=[container_args],
         env=env,
         env_from=env_from,
@@ -100,7 +118,7 @@ class TestSecretEnvResolution:
             job = _job_body(
                 job_name,
                 # exits 0 only if DB_PASS resolved correctly
-                "[ \"$DB_PASS\" = \"s3cret-pw\" ]",
+                _check(env={"DB_PASS": "s3cret-pw"}),
                 env=[V1EnvVar(
                     name="DB_PASS",
                     value_from=V1EnvVarSource(
@@ -147,11 +165,7 @@ class TestSecretEnvResolution:
 
         try:
             job_name = _unique_name("sec-empty-job")
-            check = (
-                '[ "$USER" = "admin" ] && '
-                '[ "${EMPTY_PASS+SET}" = "SET" ] && '
-                '[ -z "$EMPTY_PASS" ]'
-            )
+            check = _check(env={"USER": "admin"}, set_empty=["EMPTY_PASS"])
             job = _job_body(
                 job_name,
                 check,
@@ -190,7 +204,7 @@ class TestSecretEnvResolution:
             job_name = _unique_name("sec-envfrom")
             job = _job_body(
                 job_name,
-                "[ \"$USER\" = \"admin\" ] && [ \"$TOKEN\" = \"abc123\" ]",
+                _check(env={"USER": "admin", "TOKEN": "abc123"}),
                 env_from=[V1EnvFromSource(
                     secret_ref=V1SecretEnvSource(name=secret_name),
                 )],
@@ -236,7 +250,7 @@ class TestConfigMapEnvResolution:
             job_name = _unique_name("cm-env")
             job = _job_body(
                 job_name,
-                "[ \"$DB_HOST\" = \"db.local\" ]",
+                _check(env={"DB_HOST": "db.local"}),
                 env=[V1EnvVar(
                     name="DB_HOST",
                     value_from=V1EnvVarSource(
@@ -277,7 +291,7 @@ class TestConfigMapEnvResolution:
             job_name = _unique_name("cm-envfrom")
             job = _job_body(
                 job_name,
-                "[ \"$FEATURE_X\" = \"enabled\" ] && [ \"$MAX_RETRIES\" = \"3\" ]",
+                _check(env={"FEATURE_X": "enabled", "MAX_RETRIES": "3"}),
                 env_from=[V1EnvFromSource(
                     config_map_ref=V1ConfigMapEnvSource(name=cm_name),
                 )],
@@ -326,10 +340,10 @@ class TestConfigMapVolumeMount:
             # container root, so the container reads the files via the
             # injected $KM_CONTAINER_ROOT env var rather than the K8s-style
             # absolute path.
-            check = (
-                f"[ \"$(cat $KM_CONTAINER_ROOT{mount_path}/app.conf)\" = \"setting=value\" ] && "
-                f"[ \"$(cat $KM_CONTAINER_ROOT{mount_path}/log.yaml)\" = \"level: info\" ]"
-            )
+            check = _check(files={
+                f"{mount_path}/app.conf": "setting=value",
+                f"{mount_path}/log.yaml": "level: info",
+            })
             job = _job_body(
                 job_name,
                 check,
@@ -387,10 +401,10 @@ class TestProjectedConfigMapVolume:
             job_name = _unique_name("proj-job")
             # Each source projects its key to a nested path; both land flat
             # under the single mount directory.
-            check = (
-                f"[ \"$(cat $KM_CONTAINER_ROOT{mount_path}/apiserver/apiserver.yaml)\" = \"AAA\" ] && "
-                f"[ \"$(cat $KM_CONTAINER_ROOT{mount_path}/apiserver/apiserver.log.yaml)\" = \"BBB\" ]"
-            )
+            check = _check(files={
+                f"{mount_path}/apiserver/apiserver.yaml": "AAA",
+                f"{mount_path}/apiserver/apiserver.log.yaml": "BBB",
+            })
             job = _job_body(
                 job_name,
                 check,
@@ -460,9 +474,7 @@ class TestProjectedConfigMapVolume:
             job_name = _unique_name("col-job")
             # Both sources project a "shared.yaml" key into the same dir; the
             # later source (cm_second) wins. pod-runner logs a warning too.
-            check = (
-                f"[ \"$(cat $KM_CONTAINER_ROOT{mount_path}/shared.yaml)\" = \"SECOND\" ]"
-            )
+            check = _check(files={f"{mount_path}/shared.yaml": "SECOND"})
             job = _job_body(
                 job_name,
                 check,

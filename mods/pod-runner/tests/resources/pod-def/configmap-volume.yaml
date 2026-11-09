@@ -26,8 +26,14 @@ spec:
   containers:
     - name: app
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["cat $KM_CONTAINER_ROOT/configmaps/db-config/host && cat $KM_CONTAINER_ROOT/configmaps/db-config/port"]
+      command: ["python", "-c"]
+      args:
+        - |
+          import os, sys
+          root = os.environ['KM_CONTAINER_ROOT']
+          for parts in [('configmaps', 'db-config', 'host'), ('configmaps', 'db-config', 'port')]:
+              with open(os.path.join(root, *parts), 'rb') as f:
+                  sys.stdout.buffer.write(f.read())
       volumeMounts:
         - name: config
           mountPath: /configmaps/db-config

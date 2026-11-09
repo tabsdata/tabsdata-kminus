@@ -11,6 +11,7 @@ virtual-kubelet schedules them onto the pod-runner node, and pod-runner
 executes them as native processes.
 """
 
+import sys
 import time
 import uuid
 
@@ -41,8 +42,8 @@ class TestJob:
                             V1Container(
                                 name="worker",
                                 image="/dev/null",
-                                command=["sh", "-c"],
-                                args=["echo 'job done'"],
+                                command=[sys.executable, "-c"],
+                                args=["print('job done')"],
                             ),
                         ],
                         tolerations=[
@@ -103,8 +104,8 @@ class TestCronJob:
                                     V1Container(
                                         name="greeter",
                                         image="/dev/null",
-                                        command=["sh", "-c"],
-                                        args=["echo 'cron hello'"],
+                                        command=[sys.executable, "-c"],
+                                        args=["print('cron hello')"],
                                     ),
                                 ],
                                 tolerations=[

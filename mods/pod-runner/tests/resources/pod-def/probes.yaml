@@ -16,18 +16,23 @@ spec:
   containers:
     - name: app
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["echo 'healthy' && sleep 3 && echo 'done'"]
+      command: ["python", "-c"]
+      args:
+        - |
+          import time
+          print('healthy', flush=True)
+          time.sleep(3)
+          print('done')
       livenessProbe:
         exec:
-          command: ["true"]
+          command: ["python", "-c", "pass"]
         initialDelaySeconds: 0
         periodSeconds: 1
         timeoutSeconds: 5
         failureThreshold: 3
       readinessProbe:
         exec:
-          command: ["true"]
+          command: ["python", "-c", "pass"]
         initialDelaySeconds: 0
         periodSeconds: 1
         timeoutSeconds: 5

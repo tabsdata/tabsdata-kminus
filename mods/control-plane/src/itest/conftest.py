@@ -8,8 +8,8 @@ import pytest
 
 from itest_common import (  # noqa: F401
     ControlPlaneProcess,
+    binary,
     find_free_port,
-    pytest_collection_modifyitems,
     pytest_configure,
     start_on_free_ports,
 )
@@ -42,10 +42,7 @@ def bin_dir():
 
 @pytest.fixture(scope="session")
 def control_plane_bin(bin_dir):
-    path = os.path.join(bin_dir, "control-plane")
-    if not os.path.isfile(path):
-        pytest.skip(f"control-plane binary not found at {path}")
-    return path
+    return binary(bin_dir, "control-plane")
 
 
 @pytest.fixture

@@ -16,8 +16,11 @@ spec:
   containers:
     - name: app
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["echo \"DB_HOST=$DB_HOST FEATURE_X=$FEATURE_X\""]
+      command: ["python", "-c"]
+      args:
+        - |
+          import os
+          print(f"DB_HOST={os.environ.get('DB_HOST', '')} FEATURE_X={os.environ.get('FEATURE_X', '')}")
       env:
         - name: DB_HOST
           valueFrom:

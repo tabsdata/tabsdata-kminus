@@ -4,6 +4,8 @@
 """Shared integration test utilities for all subprojects.
 
 Provides:
+- binary / start_process / request_stop: find, start and stop km binaries
+  the same way on every platform
 - ControlPlaneProcess: manages a control-plane binary for tests
 - find_free_port: find an available TCP port on localhost
 - start_on_free_ports: start a server on free ports, again if one was taken
@@ -29,16 +31,39 @@ def pytest_configure(config):
     )
 
 
-def pytest_collection_modifyitems(config, items):
-    if sys.platform != "win32":
-        return
-    # Tracked gap: the suites start the binaries by their POSIX names and stop
-    # them with POSIX signals; skipping says so instead of "binary not found".
-    skip = pytest.mark.skip(
-        reason="km integration tests are not ported to Windows: POSIX binary names and signals"
-    )
-    for item in items:
-        item.add_marker(skip)
+# ---------------------------------------------------------------------------
+# Binaries and processes
+# ---------------------------------------------------------------------------
+
+
+def binary(bin_dir: str, name: str) -> str:
+    """Path of the km binary `name` in `bin_dir`; fails when it is missing."""
+    path = os.path.join(bin_dir, name + (".exe" if sys.platform == "win32" else ""))
+    if not os.path.isfile(path):
+        pytest.fail(f"{name} binary not found at {path}")
+    return path
+
+
+def start_process(args, **kwargs) -> subprocess.Popen:
+    """Start a binary that request_stop can stop gracefully.
+
+    On Windows that takes a process group of its own: a CTRL_BREAK is aimed
+    at a group, and the child shares this process's console for it to travel.
+    """
+    if sys.platform == "win32":
+        kwargs["creationflags"] = (
+            kwargs.get("creationflags", 0) | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+    return subprocess.Popen(args, **kwargs)
+
+
+def request_stop(process: subprocess.Popen) -> None:
+    """Ask a process started by start_process to shut down: SIGTERM, or
+    CTRL_BREAK on Windows, which every km binary handles the same way."""
+    if sys.platform == "win32":
+        process.send_signal(signal.CTRL_BREAK_EVENT)
+    else:
+        process.send_signal(signal.SIGTERM)
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +163,7 @@ class ControlPlaneProcess:
             "-workdir", self.work_dir,
         ] + self.extra_args
 
-        self.process = subprocess.Popen(
+        self.process = start_process(
             args,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -167,7 +192,7 @@ class ControlPlaneProcess:
     def stop(self, timeout=15):
         if self.process is None:
             return
-        self.process.send_signal(signal.SIGTERM)
+        request_stop(self.process)
         try:
             self.process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:

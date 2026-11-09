@@ -10,6 +10,7 @@ HTTP API. All pod definitions are loaded from resources/pod-def/.
 
 import json
 import os
+import sys
 import tempfile
 import time
 
@@ -102,7 +103,7 @@ class TestMounts:
         # hostPath output directory.
         host_dir = os.path.join(test_dir, "host_input")
         os.makedirs(host_dir, exist_ok=True)
-        with open(os.path.join(host_dir, "data.txt"), "w") as f:
+        with open(os.path.join(host_dir, "data.txt"), "w", encoding="utf-8", newline="") as f:
             f.write("test-data-from-host")
         host_out = os.path.join(test_dir, "host_output")
         os.makedirs(host_out, exist_ok=True)
@@ -122,7 +123,7 @@ class TestMounts:
         # through the container's RW mount must land in the host directory.
         out_file = os.path.join(host_out, "from-pod.txt")
         assert os.path.exists(out_file), "write through hostPath mount missing"
-        with open(out_file) as f:
+        with open(out_file, encoding="utf-8") as f:
             assert "wrote-to-host" in f.read()
 
     def test_read_only_mount_warning_at_log_start(self, pod_runner,
@@ -210,7 +211,10 @@ class TestContainerLogs:
         # line, closing only once the pod is terminal.
         pod = load_pod_def("log-lines")
         pod["spec"]["containers"][0]["args"] = [
-            "i=0; while [ $i -lt 5 ]; do echo tick-$i; i=$((i+1)); sleep 1; done"
+            "import time\n"
+            "for i in range(5):\n"
+            "    print(f'tick-{i}', flush=True)\n"
+            "    time.sleep(1)\n"
         ]
         name, ns = submit_pod(mtls_client, pod_runner, pod)
         wait_for_pod_phase(mtls_client, pod_runner, ns, name,
@@ -346,8 +350,8 @@ class TestDelete:
     def test_delete_running_pod(self, pod_runner, mtls_client):
         pod = load_pod_def("single-container")
         # Make it long-running
-        pod["spec"]["containers"][0]["command"] = ["sh", "-c"]
-        pod["spec"]["containers"][0]["args"] = ["sleep 60"]
+        pod["spec"]["containers"][0]["command"] = [sys.executable, "-c"]
+        pod["spec"]["containers"][0]["args"] = ["import time; time.sleep(60)"]
         name, ns = submit_pod(mtls_client, pod_runner, pod)
         time.sleep(2)
 
@@ -382,8 +386,8 @@ class TestResolverWait:
                 "containers": [{
                     "name": "app",
                     "image": "/dev/null",
-                    "command": ["sh", "-c"],
-                    "args": ["echo $X"],
+                    "command": [sys.executable, "-c"],
+                    "args": ["import os; print(os.environ.get('X', ''))"],
                     "env": [{
                         "name": "X",
                         "valueFrom": {
@@ -428,7 +432,7 @@ class TestResolverWait:
             # Let the preparer fail at least once and enter its first
             # backoff (500ms) before we materialize the secret file.
             time.sleep(1.0)
-            with open(secret_path, "w") as f:
+            with open(secret_path, "w", encoding="utf-8", newline="") as f:
                 f.write("stringData:\n  k: top-secret\n")
             data = wait_for_pod_phase(
                 mtls_client, pod_runner, ns, name, {"Succeeded"}, timeout=20,
@@ -460,8 +464,11 @@ class TestResolverWait:
                 "containers": [{
                     "name": "app",
                     "image": "/dev/null",
-                    "command": ["sh", "-c"],
-                    "args": ["cat $KM_CONTAINER_ROOT/configs/app.yaml"],
+                    "command": [sys.executable, "-c"],
+                    "args": [
+                        "import os, sys; sys.stdout.buffer.write(open(os.path.join("
+                        "os.environ['KM_CONTAINER_ROOT'], 'configs', 'app.yaml'), 'rb').read())"
+                    ],
                     "volumeMounts": [{
                         "name": "cfg", "mountPath": "/configs", "readOnly": True,
                     }],
@@ -477,7 +484,7 @@ class TestResolverWait:
             # Let the preparer fail at least once and enter backoff before the
             # configMap materializes.
             time.sleep(1.0)
-            with open(cm_path, "w") as f:
+            with open(cm_path, "w", encoding="utf-8", newline="") as f:
                 f.write("data:\n  app.yaml: \"ready\"\n")
             data = wait_for_pod_phase(
                 mtls_client, pod_runner, ns, name, {"Succeeded"}, timeout=20,
@@ -551,7 +558,7 @@ class TestUnsupportedSpec:
                 "restartPolicy": "Never",
                 "containers": [{
                     "name": "app", "image": "/dev/null",
-                    "command": ["sh", "-c"], "args": ["true"],
+                    "command": [sys.executable, "-c"], "args": ["pass"],
                 }],
             },
         }
@@ -594,7 +601,7 @@ class TestUnsupportedSpec:
             {"name": "data", "mountPath": "/mounts/data"}
         ]
         pod["spec"]["containers"][0]["livenessProbe"] = {
-            "exec": {"command": ["true"]}, "periodSeconds": 1,
+            "exec": {"command": [sys.executable, "-c", "pass"]}, "periodSeconds": 1,
         }
         name, ns = submit_pod(mtls_client, pod_runner, pod)
         data = wait_for_pod_phase(mtls_client, pod_runner, ns, name,

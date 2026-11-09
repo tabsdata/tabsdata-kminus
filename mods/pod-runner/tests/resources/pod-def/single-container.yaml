@@ -14,5 +14,5 @@ spec:
   containers:
     - name: app
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["echo 'hello from single-container'"]
+      command: ["python", "-c"]
+      args: ["print('hello from single-container')"]

@@ -12,6 +12,7 @@ pod-runner executes it as a native process and the Deployment reports the
 replicas available.
 """
 
+import sys
 import time
 import uuid
 
@@ -53,8 +54,8 @@ def _deployment(name, replicas):
                         V1Container(
                             name="app",
                             image="/dev/null",
-                            command=["sh", "-c"],
-                            args=["while true; do sleep 1; done"],
+                            command=[sys.executable, "-c"],
+                            args=["import time\nwhile True:\n    time.sleep(1)"],
                         ),
                     ],
                     tolerations=[

@@ -3,7 +3,6 @@
 #
 
 import os
-import signal
 import subprocess
 import time
 
@@ -12,10 +11,12 @@ import yaml
 
 from itest_common import (  # noqa: F401
     ControlPlaneProcess,
+    binary,
     get_session_id,
-    pytest_collection_modifyitems,
     pytest_configure,
+    request_stop,
     start_on_free_ports,
+    start_process,
 )
 from mock_pod_runner import MockPodRunner
 from virtual_kubelet_testlib import TARGET_DIR, make_test_dir
@@ -46,18 +47,12 @@ def bin_dir():
 
 @pytest.fixture(scope="session")
 def control_plane_bin(bin_dir):
-    path = os.path.join(bin_dir, "control-plane")
-    if not os.path.isfile(path):
-        pytest.skip(f"control-plane binary not found at {path}")
-    return path
+    return binary(bin_dir, "control-plane")
 
 
 @pytest.fixture(scope="session")
 def virtual_kubelet_bin(bin_dir):
-    path = os.path.join(bin_dir, "virtual-kubelet")
-    if not os.path.isfile(path):
-        pytest.skip(f"virtual-kubelet binary not found at {path}")
-    return path
+    return binary(bin_dir, "virtual-kubelet")
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +105,7 @@ class VirtualKubeletProcess:
         self.process = None
 
     def start(self, timeout=30):
-        self.process = subprocess.Popen(
+        self.process = start_process(
             [
                 self.binary,
                 "--kubeconfig", self.kubeconfig,
@@ -142,14 +137,14 @@ class VirtualKubeletProcess:
             if self.process.poll() is not None:
                 log_content = ""
                 if os.path.isfile(log_path):
-                    with open(log_path) as f:
+                    with open(log_path, encoding="utf-8", errors="replace") as f:
                         log_content = f.read()
                 raise RuntimeError(
                     f"virtual-kubelet exited with code {self.process.returncode}\n"
                     f"log: {log_content}"
                 )
             if os.path.isfile(log_path):
-                with open(log_path) as f:
+                with open(log_path, encoding="utf-8", errors="replace") as f:
                     if "Starting pod controller" in f.read():
                         time.sleep(3)
                         return
@@ -160,7 +155,7 @@ class VirtualKubeletProcess:
     def stop(self, timeout=10):
         if self.process is None:
             return
-        self.process.send_signal(signal.SIGTERM)
+        request_stop(self.process)
         try:
             self.process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -175,7 +170,7 @@ def write_prconfig(path, pod_runner_url, node_name="test-vk-node", namespace="de
         "namespace": namespace,
         "server": {"tls": {"insecure-skip-tls-verify": True}},
     }
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         yaml.dump(config, f)
     return path
 

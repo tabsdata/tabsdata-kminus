@@ -14,13 +14,13 @@ spec:
   containers:
     - name: writer
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["echo 'output-from-writer'"]
+      command: ["python", "-c"]
+      args: ["print('output-from-writer')"]
     - name: reader
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["echo 'output-from-reader'"]
+      command: ["python", "-c"]
+      args: ["print('output-from-reader')"]
     - name: worker
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["echo 'output-from-worker'"]
+      command: ["python", "-c"]
+      args: ["print('output-from-worker')"]

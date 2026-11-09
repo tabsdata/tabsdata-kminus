@@ -14,14 +14,14 @@ spec:
   initContainers:
     - name: init-a
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["echo 'init-a done'"]
+      command: ["python", "-c"]
+      args: ["print('init-a done')"]
     - name: init-b
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["echo 'init-b done'"]
+      command: ["python", "-c"]
+      args: ["print('init-b done')"]
   containers:
     - name: app
       image: /dev/null
-      command: ["sh", "-c"]
-      args: ["echo 'app started after inits'"]
+      command: ["python", "-c"]
+      args: ["print('app started after inits')"]

@@ -30,9 +30,14 @@ spec:
   containers:
     - name: app
       image: /dev/null
-      command: ["sh", "-c"]
+      command: ["python", "-c"]
       args:
-        - "cat $KM_CONTAINER_ROOT/configs/apiserver/apiserver.yaml && cat $KM_CONTAINER_ROOT/configs/apiserver/apiserver.log.yaml"
+        - |
+          import os, sys
+          root = os.environ['KM_CONTAINER_ROOT']
+          for parts in [('configs', 'apiserver', 'apiserver.yaml'), ('configs', 'apiserver', 'apiserver.log.yaml')]:
+              with open(os.path.join(root, *parts), 'rb') as f:
+                  sys.stdout.buffer.write(f.read())
       volumeMounts:
         - name: configmap-configs
           mountPath: /configs

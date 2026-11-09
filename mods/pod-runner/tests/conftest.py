@@ -18,19 +18,21 @@ import base64
 import http.client
 import json
 import os
-import signal
 import ssl
 import subprocess
+import sys
 import time
 import uuid
 
 import pytest
 import yaml
 
-from itest_common import (  # noqa: F401
+from itest_common import (
+    binary,
     get_session_id,
-    pytest_collection_modifyitems,
+    request_stop,
     start_on_free_ports,
+    start_process,
 )
 from pod_runner_testlib import TARGET_DIR, make_test_dir
 
@@ -67,10 +69,7 @@ def bin_dir():
 
 @pytest.fixture(scope="session")
 def pod_runner_bin(bin_dir):
-    path = os.path.join(bin_dir, "pod-runner")
-    if not os.path.isfile(path):
-        pytest.skip(f"pod-runner binary not found at {path}")
-    return path
+    return binary(bin_dir, "pod-runner")
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +117,7 @@ class PodRunnerProcess:
         # we poll for below is emitted. cargo-make sets RUST_LOG=error
         # in output.env, which would otherwise suppress it.
         env = {**os.environ, "RUST_LOG": "info"}
-        self.process = subprocess.Popen(
+        self.process = start_process(
             args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
         )
 
@@ -128,7 +127,7 @@ class PodRunnerProcess:
                 tail = ""
                 if os.path.isfile(log_path):
                     try:
-                        with open(log_path) as f:
+                        with open(log_path, encoding="utf-8", errors="replace") as f:
                             tail = f.read()[-2000:]
                     except OSError:
                         pass
@@ -138,11 +137,11 @@ class PodRunnerProcess:
                 )
             if os.path.isfile(log_path):
                 try:
-                    with open(log_path) as f:
+                    with open(log_path, "rb") as f:
                         f.seek(last_pos)
                         chunk = f.read()
                         last_pos = f.tell()
-                    if "Server listening" in chunk:
+                    if b"Server listening" in chunk:
                         return
                 except OSError:
                     pass
@@ -155,7 +154,7 @@ class PodRunnerProcess:
     def stop(self, timeout=15):
         if self.process is None:
             return
-        self.process.send_signal(signal.SIGTERM)
+        request_stop(self.process)
         try:
             self.process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -184,7 +183,7 @@ class MtlsClient:
     """Simple mTLS HTTP client using vk-prconfig.yaml credentials."""
 
     def __init__(self, vk_prconfig_path, work_dir):
-        with open(vk_prconfig_path) as f:
+        with open(vk_prconfig_path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
 
         certs_dir = os.path.join(work_dir, "_certs")
@@ -272,7 +271,7 @@ def _write_file_resolver_prsysconfig(configdir):
         },
         "nodeEnvsResolver": {"type": "none"},
     }
-    with open(os.path.join(configdir, "prsysconfig.yaml"), "w") as f:
+    with open(os.path.join(configdir, "prsysconfig.yaml"), "w", encoding="utf-8") as f:
         yaml.safe_dump(prsysconfig, f)
 
 
@@ -311,15 +310,30 @@ def unique_name(prefix="test"):
 def load_pod_def(name, **replacements):
     """Load a pod definition YAML, apply template replacements, assign unique name."""
     path = os.path.join(RESOURCES_DIR, "pod-def", f"{name}.yaml")
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         text = f.read()
     for key, value in replacements.items():
         text = text.replace(f"{{{{{key}}}}}", str(value))
     pod = yaml.safe_load(text)
+    _run_python_as_this_interpreter(pod)
     pod_name = unique_name(name)
     pod["metadata"]["name"] = pod_name
     pod["metadata"]["uid"] = unique_name("uid")
     return pod
+
+
+def _run_python_as_this_interpreter(pod):
+    """Templates name `python`; run it as the interpreter running the tests,
+    which exists on every platform under this exact path."""
+    spec = pod["spec"]
+    for container in spec.get("initContainers", []) + spec.get("containers", []):
+        commands = [container.get("command")] + [
+            container.get(probe, {}).get("exec", {}).get("command")
+            for probe in ("livenessProbe", "readinessProbe", "startupProbe")
+        ]
+        for command in commands:
+            if command and command[0] == "python":
+                command[0] = sys.executable
 
 
 def submit_pod(mtls_client, pod_runner, pod_def):

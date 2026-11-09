@@ -20,14 +20,14 @@ class TestKubeconfigGeneration:
 
     def test_admin_kubeconfig_has_valid_server(self, control_plane):
         path = os.path.join(control_plane.config_dir, "kubeconfig.yaml")
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             config = yaml.safe_load(f)
         server = config["clusters"][0]["cluster"]["server"]
         assert f":{control_plane.port}" in server
 
     def test_vk_kubeconfig_has_valid_server(self, control_plane):
         path = os.path.join(control_plane.config_dir, "vk-kubeconfig.yaml")
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             config = yaml.safe_load(f)
         server = config["clusters"][0]["cluster"]["server"]
         assert f":{control_plane.port}" in server
