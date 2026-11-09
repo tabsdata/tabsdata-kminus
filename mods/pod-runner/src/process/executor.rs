@@ -1641,41 +1641,28 @@ fn write_pid_file(pid_dir: &Path, pid: u32, program: &str) -> io::Result<PathBuf
     Ok(path)
 }
 
-/// Get the command name for a running process by PID.
-///
-/// Returns `None` if the process doesn't exist or the command can't be
-/// determined.
-fn get_pid_command(pid: u32) -> Option<String> {
-    #[cfg(unix)]
-    {
-        let output = std::process::Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "comm="])
-            .output()
-            .ok()?;
-        if output.status.success() {
-            let cmd = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if cmd.is_empty() { None } else { Some(cmd) }
-        } else {
-            None
-        }
+/// The form of a program's file name that two spellings of the same
+/// program share: on Windows, without case or a trailing `.exe`, since a
+/// spec says `python` for what runs as `Python.exe`.
+fn program_key(name: &std::ffi::OsStr) -> String {
+    let name = Path::new(name)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    if cfg!(windows) {
+        let lower = name.to_lowercase();
+        lower.strip_suffix(".exe").unwrap_or(&lower).to_string()
+    } else {
+        name.into_owned()
     }
-    #[cfg(windows)]
-    {
-        let output = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
-            .output()
-            .ok()?;
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            // CSV format: "image_name","pid",...
-            text.split(',')
-                .next()
-                .map(|s| s.trim().trim_matches('"').to_string())
-                .filter(|s| !s.is_empty() && s != "INFO:")
-        } else {
-            None
-        }
-    }
+}
+
+/// Whether the process at `pid` runs `expected`, the program as its PID
+/// file recorded it (a bare name or a path).
+fn runs_program(pid: u32, expected: &str) -> bool {
+    let expected = program_key(std::ffi::OsStr::new(expected.trim()));
+    kcommon::identity::process_names(pid)
+        .is_some_and(|names| names.iter().any(|name| program_key(name) == expected))
 }
 
 /// Scan the PID directory for stale PID files from a previous run.
@@ -1728,24 +1715,7 @@ pub fn cleanup_stale_pids(pid_dir: &Path) -> u32 {
         };
 
         if is_pid_alive(pid) {
-            // Check if the running process matches the expected command
-            let matches = get_pid_command(pid)
-                .map(|cmd| {
-                    // Compare basenames: the PID file may store a full path
-                    // while ps returns just the command name, or vice versa.
-                    let expected_base = Path::new(expected_program.trim())
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy();
-                    let running_base = Path::new(cmd.trim())
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy();
-                    expected_base == running_base
-                })
-                .unwrap_or(false);
-
-            if matches {
+            if runs_program(pid, &expected_program) {
                 debug!(
                     pid,
                     program = expected_program.trim(),
@@ -1767,6 +1737,47 @@ pub fn cleanup_stale_pids(pid_dir: &Path) -> u32 {
     }
 
     killed
+}
+
+#[cfg(test)]
+mod program_key_tests {
+    use std::ffi::OsStr;
+
+    use super::{program_key, runs_program};
+
+    #[test]
+    fn a_path_and_its_bare_name_share_a_key() {
+        let path = std::path::Path::new("opt").join("pg").join("postgres");
+        assert_eq!(
+            program_key(path.as_os_str()),
+            program_key(OsStr::new("postgres"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ignores_case_and_the_exe_extension() {
+        assert_eq!(
+            program_key(OsStr::new(r"C:\Python\Python.EXE")),
+            program_key(OsStr::new("python"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_keeps_case() {
+        assert_ne!(
+            program_key(OsStr::new("Python")),
+            program_key(OsStr::new("python"))
+        );
+    }
+
+    #[test]
+    fn this_process_runs_its_own_executable() {
+        let exe = std::env::current_exe().expect("test binary");
+        assert!(runs_program(std::process::id(), &exe.to_string_lossy()));
+        assert!(!runs_program(std::process::id(), "no-such-program"));
+    }
 }
 
 // ---------------------------------------------------------------------------

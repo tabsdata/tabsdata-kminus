@@ -130,3 +130,15 @@ fn parse_owner_ignores_a_uniqueness_suffix() {
         Some((4711, "20260823T173004Z"))
     );
 }
+
+#[test]
+fn process_names_include_this_process_executable() {
+    let exe = std::env::current_exe().expect("test binary");
+    let names = process_names(std::process::id()).expect("own process is listed");
+    assert!(
+        names
+            .iter()
+            .any(|name| Some(name.as_os_str()) == exe.file_name()),
+        "{names:?} should include {exe:?}",
+    );
+}

@@ -84,6 +84,32 @@ pub fn process_start_time(pid: u32) -> Result<Option<u64>, sysinfo::Error> {
     Ok(system.process(pid).map(|p| p.start_time()))
 }
 
+/// The names `pid` runs under: its executable's file name, where readable,
+/// and the process name the system reports. `None` when no such process
+/// exists or the process table cannot be read. Either can be the one a
+/// caller knows: Linux cuts the process name at 15 characters, and the
+/// executable path resolves symlinks.
+pub fn process_names(pid: u32) -> Option<Vec<std::ffi::OsString>> {
+    let mut system = System::new().ok()?;
+    let pid = Pid::from_u32(pid);
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        false,
+        ProcessRefreshKind::nothing()
+            .without_tasks()
+            .with_exe(sysinfo::UpdateKind::OnlyIfNotSet),
+    );
+    let process = system.process(pid)?;
+    let executable = process.exe().and_then(|path| path.file_name());
+    Some(
+        executable
+            .into_iter()
+            .chain(std::iter::once(process.name()))
+            .map(ToOwned::to_owned)
+            .collect(),
+    )
+}
+
 /// Whether a live process holds `pid` and started at `stamp` — the one
 /// question a bare liveness check cannot answer. A zombie reads as gone:
 /// it is still listed with its original start time, but nothing can be
