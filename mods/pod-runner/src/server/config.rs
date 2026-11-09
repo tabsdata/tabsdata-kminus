@@ -93,6 +93,21 @@ fn parse_port_from_url(url: &str) -> u16 {
     }
 }
 
+fn parse_host_from_url(url: &str) -> String {
+    let after_scheme = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host);
+    match host {
+        "" | "localhost" => DEFAULT_ADDRESS.to_string(),
+        host => host.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PRConfig
 // ---------------------------------------------------------------------------
@@ -271,6 +286,13 @@ impl PRConfig {
         parse_port_from_url(&self.metrics_url)
     }
 
+    /// Host the metrics server binds: the metrics URL's, with `localhost`
+    /// pinned to IPv4 loopback so that the bind and the clients agree on
+    /// one address family.
+    pub fn metrics_host(&self) -> String {
+        parse_host_from_url(&self.metrics_url)
+    }
+
     /// Whether TLS is fully configured (cert + key + client CA).
     /// Always true when auto-generated.
     pub fn tls_configured(&self) -> bool {
@@ -424,5 +446,23 @@ mod tests {
         };
         assert_eq!(DefaultExecutorProvider::from(&pr).layout, pr.pod_layout);
         assert_eq!(FileStoreConfig::from(&pr).layout, pr.pod_layout);
+    }
+
+    #[test]
+    fn metrics_bind_on_the_metrics_url_host() {
+        assert_eq!(parse_host_from_url("http://10.0.0.5:3001"), "10.0.0.5");
+        assert_eq!(
+            parse_host_from_url("http://127.0.0.1:3001/metrics"),
+            "127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn metrics_bind_on_ipv4_loopback_for_localhost_or_no_host() {
+        assert_eq!(
+            parse_host_from_url("http://localhost:3001"),
+            DEFAULT_ADDRESS
+        );
+        assert_eq!(parse_host_from_url(""), DEFAULT_ADDRESS);
     }
 }

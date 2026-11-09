@@ -15,17 +15,22 @@ use tracing::{info, warn};
 
 use super::Metrics;
 
-/// Spawn the metrics HTTP server on the given port.
+/// Spawn the metrics HTTP server on the given host and port.
 ///
 /// Serves `GET /metrics` in Prometheus text format. Refreshes gauges
 /// (memory, uptime, tokio tasks) on each scrape. Shuts down when
 /// the shutdown signal fires.
-pub async fn serve_metrics(port: u16, metrics: Arc<Metrics>, mut shutdown_rx: watch::Receiver<()>) {
+pub async fn serve_metrics(
+    host: &str,
+    port: u16,
+    metrics: Arc<Metrics>,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
     let app = Router::new()
         .route("/metrics", get(handle_metrics))
         .with_state(metrics);
 
-    let addr = format!("0.0.0.0:{port}");
+    let addr = format!("{host}:{port}");
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {

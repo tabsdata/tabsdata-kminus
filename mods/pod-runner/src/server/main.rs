@@ -173,10 +173,12 @@ async fn main() {
     // Spawn metrics server
     let metrics_port = pr_config.metrics_port();
     if metrics_port > 0 {
+        let metrics_host = pr_config.metrics_host();
         let metrics_shutdown = shutdown_tx.subscribe();
         let metrics_clone = Arc::clone(&metrics);
         tokio::spawn(async move {
             pod_runner::metrics::server::serve_metrics(
+                &metrics_host,
                 metrics_port,
                 metrics_clone,
                 metrics_shutdown,
