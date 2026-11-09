@@ -142,3 +142,30 @@ fn process_names_include_this_process_executable() {
         "{names:?} should include {exe:?}",
     );
 }
+
+#[test]
+fn the_formats_match_the_identity_contract() {
+    let contract = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/contract/identity.tsv"
+    ))
+    .expect("identity contract");
+    for line in contract.lines().filter(|line| !line.is_empty()) {
+        let row: Vec<&str> = line.split('\t').collect();
+        match row[0] {
+            "var" => assert_eq!(crate::token::KM_KILL_TOKEN_VAR, row[2]),
+            "stamp" => assert_eq!(owner_stamp(row[1].parse().unwrap()), row[2]),
+            "unknown_stamp" => assert_eq!(UNKNOWN_STAMP, row[1]),
+            "owner" => {
+                let expected = row.get(2).map(|pid| (pid.parse().unwrap(), row[3]));
+                assert_eq!(parse_owner(row[1]), expected, "{line}");
+            }
+            "token" => {
+                let (pid, stamp) = parse_owner(crate::token::owner_of(row[1])).unwrap();
+                assert_eq!(format!("{pid}{OWNER_SEP}{stamp}"), row[2]);
+            }
+            "path" | "pid_file" => {}
+            kind => panic!("unknown contract row {kind:?}"),
+        }
+    }
+}

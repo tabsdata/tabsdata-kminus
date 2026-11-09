@@ -1,0 +1,11 @@
+var	km_kill_token	TD_KM_KILL_TOKEN
+stamp	0	19700101T000000Z
+stamp	1787506204	20260823T173004Z
+unknown_stamp	00000000T000000Z
+owner	4711@20260823T173004Z	4711	20260823T173004Z
+owner	4711@20260823T173004Z.042	4711	20260823T173004Z
+owner	not-an-owner
+token	4711@20260823T173004Z.042/km/pod-runner	4711@20260823T173004Z
+path	km_pids	data/km/pids
+path	km_run_token	data/km/run-token
+pid_file	4711	4711.km

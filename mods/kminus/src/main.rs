@@ -2388,4 +2388,35 @@ mod tests {
         assert_eq!(paths.logdir, paths.workdir.join(LOG_DIR));
         fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn the_layout_matches_the_identity_contract() {
+        let contract = fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../kcommon/contract/identity.tsv"
+        ))
+        .expect("identity contract");
+        for line in contract.lines().filter(|line| !line.is_empty()) {
+            let row: Vec<&str> = line.split('\t').collect();
+            match (row[0], row.get(1).copied()) {
+                ("path", Some("km_pids")) => assert_eq!(
+                    system::pid::pids_dir(Path::new(""), system::pid::BIN_KM),
+                    Path::new(row[2])
+                ),
+                ("path", Some("km_run_token")) => {
+                    assert_eq!(run_token_file(Path::new("")), Path::new(row[2]))
+                }
+                ("path", kind) => panic!("unknown contract path {kind:?}"),
+                ("pid_file", Some(sample)) => {
+                    let dir = tempdir();
+                    let pid = std::process::id();
+                    system::pid::write_pid(&dir, system::pid::BIN_KM, pid);
+                    let name = row[2].replace(sample, &pid.to_string());
+                    assert!(dir.join(name).is_file(), "{line}");
+                    fs::remove_dir_all(&dir).ok();
+                }
+                _ => {}
+            }
+        }
+    }
 }
