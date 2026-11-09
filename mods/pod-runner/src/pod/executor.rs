@@ -321,8 +321,9 @@ impl PodHandle {
     /// [`wait()`](PodHandle::wait) and look for `ContainerFailed` /
     /// `ContainerSucceeded` / `Completed` events.
     pub fn kill(&self, grace_period: Duration) {
-        let _ = self.kill_watch_tx.send(true);
+        // The grace first: a phase that sees the flag finds it queued.
         let _ = self.kill_tx.try_send(grace_period);
+        let _ = self.kill_watch_tx.send(true);
     }
 
     /// Create a [`PodKillHandle`] — a clonable, lightweight handle that
@@ -397,8 +398,9 @@ impl PodKillHandle {
     /// Same mechanism as [`PodHandle::kill()`] — broadcasts to all
     /// orchestrator phases.
     pub fn kill(&self, grace_period: Duration) {
-        let _ = self.kill_watch_tx.send(true);
+        // The grace first: a phase that sees the flag finds it queued.
         let _ = self.kill_tx.try_send(grace_period);
+        let _ = self.kill_watch_tx.send(true);
     }
 
     /// Mark the pod as a disruption target on the live lifecycle. The
@@ -1226,13 +1228,25 @@ async fn run_orchestrator(
     }
 }
 
+/// The grace for stopping what the init phase started: the shortest one a
+/// pending kill asked for, otherwise the configured one. A kill during init
+/// is noticed through `kill_watch`; the grace it carries waits in `kill_rx`,
+/// which only the monitoring phase reads, and init never gets there.
+fn init_stop_grace(kill_rx: &mut mpsc::Receiver<Duration>, config: &ContainerConfig) -> Duration {
+    let mut requested: Option<Duration> = None;
+    while let Ok(grace) = kill_rx.try_recv() {
+        requested = Some(requested.map_or(grace, |shortest| shortest.min(grace)));
+    }
+    requested.unwrap_or(config.shutdown_grace_period)
+}
+
 /// Drive the pod through its phases and return once it is terminal.
 async fn run_pod(
     pod: Arc<PodSpec>,
     state: Arc<Mutex<PodState>>,
     config: Arc<ContainerConfig>,
     event_tx: mpsc::Sender<PodEvent>,
-    kill_rx: mpsc::Receiver<Duration>,
+    mut kill_rx: mpsc::Receiver<Duration>,
     mut kill_watch: watch::Receiver<bool>,
     mut shutdown: watch::Receiver<()>,
 ) {
@@ -1270,7 +1284,7 @@ async fn run_pod(
         warn!("Init containers failed: {}", e);
         kill_all_in_state(
             &state,
-            config.shutdown_grace_period,
+            init_stop_grace(&mut kill_rx, &config),
             config.kill_token_prefix.as_deref(),
         )
         .await;
@@ -1285,7 +1299,7 @@ async fn run_pod(
     if shutdown.has_changed().unwrap_or(true) || *kill_watch.borrow() {
         kill_all_in_state(
             &state,
-            config.shutdown_grace_period,
+            init_stop_grace(&mut kill_rx, &config),
             config.kill_token_prefix.as_deref(),
         )
         .await;
@@ -3448,6 +3462,35 @@ mod tests {
     // ========================================================================
     // Kill during init phase
     // ========================================================================
+
+    #[tokio::test]
+    async fn test_kill_during_init_honours_the_requested_grace() {
+        crate::testutils::ensure_console();
+        let (_tx, rx) = shutdown();
+        let mut h = PodExecutor::new(pod_spec(
+            vec![container("stubborn-init", Script::runs().ignoring_stop())],
+            vec![container("main", Script::exits(0))],
+        ))
+        .shutdown_grace_period(Duration::from_secs(30))
+        .spawn(rx)
+        .await
+        .unwrap();
+
+        loop {
+            let ev = h.wait().await.unwrap();
+            if matches!(&ev.kind, PodEventKind::ContainerStarted { name, .. } if name == "stubborn-init")
+            {
+                break;
+            }
+        }
+
+        // The init container ignores the graceful stop, so only the forced
+        // kill after the grace ends it: 1s asked for, not the 30s default.
+        h.kill(Duration::from_secs(1));
+        let result = tokio::time::timeout(Duration::from_secs(10), h.wait_for_completion()).await;
+        assert!(result.is_ok(), "the kill must use its own 1s grace");
+        assert_eq!(result.unwrap().unwrap(), PodPhase::Failed);
+    }
 
     #[tokio::test]
     async fn test_kill_during_init() {
