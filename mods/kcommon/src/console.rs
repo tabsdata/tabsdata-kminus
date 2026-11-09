@@ -198,7 +198,9 @@ mod windows {
             };
             // SAFETY: `buffer` is `size` bytes, as the call above asked for.
             if unsafe { InitializeProcThreadAttributeList(list.raw(), 1, 0, &mut size) } == 0 {
-                return Err(io::Error::last_os_error());
+                let error = io::Error::last_os_error();
+                list.buffer.clear();
+                return Err(error);
             }
             // SAFETY: `handles` outlives the list's use, which ends when
             // `CreateProcessW` returns in `spawn`.
