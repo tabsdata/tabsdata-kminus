@@ -226,9 +226,42 @@ impl StreamConfig for RollingFileStream {
             path: self.path,
             file,
             current_size: 0,
-            max_size: self.max_size_bytes,
+            schedule: RotationSchedule::new(self.max_size_bytes),
             max_files: self.max_files,
         }))
+    }
+}
+
+/// When a rolling log next tries to rotate: after `max_size` bytes, or,
+/// after rotations that failed, sooner each time (half, a quarter, an
+/// eighth, then a sixteenth of it), staying at a sixteenth until one
+/// succeeds.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RotationSchedule {
+    max_size: u64,
+    failures: u32,
+}
+
+impl RotationSchedule {
+    /// No rotation ever when `max_size` is 0.
+    pub(crate) fn new(max_size: u64) -> Self {
+        Self {
+            max_size,
+            failures: 0,
+        }
+    }
+
+    /// Whether `written` bytes since the last attempt call for one.
+    pub(crate) fn due(&self, written: u64) -> bool {
+        self.max_size > 0 && written >= (self.max_size >> self.failures.min(4)).max(1)
+    }
+
+    pub(crate) fn failed(&mut self) {
+        self.failures = self.failures.saturating_add(1);
+    }
+
+    pub(crate) fn succeeded(&mut self) {
+        self.failures = 0;
     }
 }
 
@@ -236,7 +269,7 @@ struct RollingStreamWriter {
     path: PathBuf,
     file: std::fs::File,
     current_size: u64,
-    max_size: u64,
+    schedule: RotationSchedule,
     max_files: usize,
 }
 
@@ -248,9 +281,14 @@ impl RollingStreamWriter {
 
     /// Rotate files: shift numbered files up by one, move current to .1,
     /// delete anything beyond max_files, and open a fresh current file.
+    ///
+    /// When the current file cannot be moved aside (on Windows, while
+    /// another process holds it), it is kept and appended to rather than
+    /// truncated, and rotation is tried again as [`RotationSchedule`] says.
     fn rotate(&mut self) -> io::Result<()> {
         use std::io::Write;
         self.file.flush()?;
+        self.current_size = 0;
 
         // max_files includes the current file, so rolled files go 1..=max_rolled.
         let max_rolled = self.max_files.saturating_sub(1);
@@ -272,12 +310,20 @@ impl RollingStreamWriter {
             }
 
             // Move current → .1
-            let _ = std::fs::rename(&self.path, self.rolled_path(1));
+            if let Err(error) = std::fs::rename(&self.path, self.rolled_path(1)) {
+                warn!(
+                    path = %self.path.display(),
+                    %error,
+                    "Cannot rotate the log; appending to it",
+                );
+                self.schedule.failed();
+                return Ok(());
+            }
         }
 
         // Open fresh current file (truncates if max_rolled == 0)
         self.file = std::fs::File::create(&self.path)?;
-        self.current_size = 0;
+        self.schedule.succeeded();
         Ok(())
     }
 }
@@ -292,7 +338,7 @@ impl StreamWriter for RollingStreamWriter {
         }
         self.current_size += line.len() as u64;
 
-        if self.max_size > 0 && self.current_size >= self.max_size {
+        if self.schedule.due(self.current_size) {
             self.rotate()?;
         }
         Ok(())
@@ -1737,6 +1783,38 @@ pub fn cleanup_stale_pids(pid_dir: &Path) -> u32 {
     }
 
     killed
+}
+
+#[cfg(test)]
+mod rotation_schedule_tests {
+    use super::RotationSchedule;
+
+    #[test]
+    fn each_failure_halves_the_wait_down_to_a_sixteenth() {
+        let mut schedule = RotationSchedule::new(1600);
+        assert!(!schedule.due(1599));
+        assert!(schedule.due(1600));
+        for wait in [800, 400, 200, 100, 100, 100] {
+            schedule.failed();
+            assert!(!schedule.due(wait - 1), "not due before {wait}");
+            assert!(schedule.due(wait), "due at {wait}");
+        }
+    }
+
+    #[test]
+    fn a_success_restores_the_full_size() {
+        let mut schedule = RotationSchedule::new(1600);
+        schedule.failed();
+        schedule.failed();
+        schedule.succeeded();
+        assert!(!schedule.due(1599));
+        assert!(schedule.due(1600));
+    }
+
+    #[test]
+    fn a_zero_size_never_rotates() {
+        assert!(!RotationSchedule::new(0).due(u64::MAX));
+    }
 }
 
 #[cfg(test)]

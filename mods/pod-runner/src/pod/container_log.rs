@@ -33,7 +33,7 @@ use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::pod::executor::PodState;
-use crate::process::executor::{LogStream, StreamConfig, StreamWriter};
+use crate::process::executor::{LogStream, RotationSchedule, StreamConfig, StreamWriter};
 
 // ---------------------------------------------------------------------------
 // Read-only mount warning
@@ -456,21 +456,34 @@ impl StreamConfig for ContainerLogStream {
 
         // If a file for this restart_count already exists (e.g. from
         // an interrupted previous run), shift it into the rotation
-        // so we start fresh.
+        // so we start fresh — or, when it cannot be moved aside, keep it
+        // and append rather than truncate it.
+        let mut kept = false;
         if path.exists()
             && std::fs::metadata(&path)
                 .map(|m| m.len() > 0)
                 .unwrap_or(false)
+            && let Err(error) = shift_files(&path, self.max_files)
         {
-            shift_files(&path, self.max_files);
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "Cannot rotate the previous container log; appending to it",
+            );
+            kept = true;
         }
 
-        let file = std::fs::File::create(&path)?;
+        let file = if kept {
+            std::fs::OpenOptions::new().append(true).open(&path)?
+        } else {
+            std::fs::File::create(&path)?
+        };
+        let current_size = file.metadata()?.len();
         let mut writer = ContainerLogWriter {
             path,
             file,
-            current_size: 0,
-            max_size: self.max_size_bytes,
+            current_size,
+            schedule: RotationSchedule::new(self.max_size_bytes),
             max_files: self.max_files,
         };
         for line in &self.header_lines {
@@ -544,7 +557,7 @@ impl StreamConfig for ProbeLogStream {
             path,
             file,
             current_size,
-            max_size: self.max_size_bytes,
+            schedule: RotationSchedule::new(self.max_size_bytes),
             max_files: self.max_files,
         }))
     }
@@ -566,17 +579,30 @@ struct ContainerLogWriter {
     path: PathBuf,
     file: std::fs::File,
     current_size: u64,
-    max_size: u64,
+    schedule: RotationSchedule,
     max_files: usize,
 }
 
 impl ContainerLogWriter {
     /// Rotate: delete oldest, shift `.N-1` → `.N`, current → `.1`, fresh current.
+    ///
+    /// When the current file cannot be moved aside (on Windows, while
+    /// another process holds it), it is kept and appended to rather than
+    /// truncated, and rotation is tried again as [`RotationSchedule`] says.
     fn rotate(&mut self) -> io::Result<()> {
         self.file.flush()?;
-        shift_files(&self.path, self.max_files);
-        self.file = std::fs::File::create(&self.path)?;
         self.current_size = 0;
+        if let Err(error) = shift_files(&self.path, self.max_files) {
+            tracing::warn!(
+                path = %self.path.display(),
+                %error,
+                "Cannot rotate the container log; appending to it",
+            );
+            self.schedule.failed();
+            return Ok(());
+        }
+        self.file = std::fs::File::create(&self.path)?;
+        self.schedule.succeeded();
         Ok(())
     }
 }
@@ -597,17 +623,14 @@ impl StreamWriter for ContainerLogWriter {
         self.file.write_all(prefix.as_bytes())?;
         self.current_size += prefix.len() as u64;
 
-        // Strip trailing newline from the message (we add our own)
-        let msg = if line.ends_with(b"\n") {
-            &line[..line.len() - 1]
-        } else {
-            line
-        };
+        // Strip the line ending, `\r\n` included (we add our own)
+        let msg = line.strip_suffix(b"\n").unwrap_or(line);
+        let msg = msg.strip_suffix(b"\r").unwrap_or(msg);
         self.file.write_all(msg)?;
         self.file.write_all(b"\n")?;
         self.current_size += msg.len() as u64 + 1;
 
-        if self.max_size > 0 && self.current_size >= self.max_size {
+        if self.schedule.due(self.current_size) {
             self.rotate()?;
         }
         Ok(())
@@ -627,13 +650,16 @@ impl StreamWriter for ContainerLogWriter {
 ///
 /// Used both during rotation (within a run) and when opening a log file
 /// that already exists (from a previous interrupted run).
-fn shift_files(path: &PathBuf, max_files: usize) {
+///
+/// Fails only when the current file cannot be moved to `.1`; the caller
+/// must then keep it rather than recreate it, which would truncate it.
+fn shift_files(path: &PathBuf, max_files: usize) -> io::Result<()> {
     let max_rolled = max_files.saturating_sub(1);
 
     if max_rolled == 0 {
         // max_files=1: only current file, no rolled files kept.
         // Just leave the current file to be overwritten by the caller.
-        return;
+        return Ok(());
     }
 
     // Delete the oldest rolled file if at capacity
@@ -652,7 +678,7 @@ fn shift_files(path: &PathBuf, max_files: usize) {
     }
 
     // Move current → .1
-    let _ = std::fs::rename(path, PathBuf::from(format!("{}.1", path.display())));
+    std::fs::rename(path, PathBuf::from(format!("{}.1", path.display())))
 }
 
 // ---------------------------------------------------------------------------
@@ -985,6 +1011,58 @@ mod tests {
         assert_eq!(s, "\nno newline");
     }
 
+    #[test]
+    fn a_crlf_line_is_logged_without_its_carriage_return() {
+        let dir = test_dir!();
+        let stream = Box::new(ContainerLogStream::new(&dir, "main", 0, 1024, 5));
+        let mut writer = stream.open().unwrap();
+        writer
+            .write_line(b"from windows\r\n", LogStream::Stdout)
+            .unwrap();
+        writer.flush().unwrap();
+
+        let content = std::fs::read(dir.join("main").join("0.log")).unwrap();
+        assert!(content.ends_with(b" F from windows\n"), "{content:?}");
+    }
+
+    /// A log whose `.1` slot is a non-empty folder: moving the current file
+    /// there fails on every platform, as a held file does on Windows.
+    fn blocked_rotation(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        let slot = dir.join(format!("{name}.1"));
+        std::fs::create_dir_all(&slot).unwrap();
+        std::fs::write(slot.join("occupied"), "x").unwrap();
+        path
+    }
+
+    #[test]
+    fn a_failed_rotation_keeps_the_current_log() {
+        let dir = test_dir!();
+        let path = blocked_rotation(&dir, "test.log");
+        std::fs::write(&path, "original\n").unwrap();
+
+        assert!(shift_files(&path, 2).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original\n");
+    }
+
+    #[test]
+    fn a_writer_that_cannot_rotate_keeps_appending() {
+        let dir = test_dir!();
+        blocked_rotation(&dir.join("main"), "0.log");
+        let stream = Box::new(ContainerLogStream::new(&dir, "main", 0, 64, 2));
+        let mut writer = stream.open().unwrap();
+        for line in ["first line of output\n", "second line of output\n"] {
+            writer
+                .write_line(line.as_bytes(), LogStream::Stdout)
+                .unwrap();
+        }
+        writer.flush().unwrap();
+
+        let content = std::fs::read_to_string(dir.join("main").join("0.log")).unwrap();
+        assert!(content.contains("first line"), "{content}");
+        assert!(content.contains("second line"), "{content}");
+    }
+
     // -- shift_files (unit tests) --------------------------------------------
 
     #[test]
@@ -993,7 +1071,7 @@ mod tests {
         let path = dir.join("test.log");
         std::fs::write(&path, "original\n").unwrap();
 
-        shift_files(&path, 5);
+        shift_files(&path, 5).unwrap();
 
         assert!(!path.exists(), "original should be renamed");
         let rolled = dir.join("test.log.1");
@@ -1015,7 +1093,7 @@ mod tests {
         std::fs::write(dir.join("test.log.2"), "rolled-2\n").unwrap();
         std::fs::write(&path, "current\n").unwrap();
 
-        shift_files(&path, 5);
+        shift_files(&path, 5).unwrap();
 
         assert!(!path.exists());
         assert!(
@@ -1044,7 +1122,7 @@ mod tests {
         std::fs::write(dir.join("test.log.2"), "r2\n").unwrap();
         std::fs::write(&path, "current\n").unwrap();
 
-        shift_files(&path, 3); // max=3: current + .1 + .2
+        shift_files(&path, 3).unwrap(); // max=3: current + .1 + .2
 
         // .2 (oldest) should have been deleted, then rebuilt from shift
         assert!(
@@ -1066,7 +1144,7 @@ mod tests {
         let path = dir.join("test.log");
         std::fs::write(&path, "content\n").unwrap();
 
-        shift_files(&path, 1);
+        shift_files(&path, 1).unwrap();
 
         // max_files=1: no rolled files, current should still exist
         assert!(path.exists());
