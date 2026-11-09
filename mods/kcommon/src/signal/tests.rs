@@ -149,18 +149,12 @@ fn own_console_group_sleeper() -> crate::console::OwnConsoleChild {
     crate::console::OwnConsoleChild::spawn(&c, None).expect("spawn sleeper")
 }
 
-/// When the env var is set, this test *is* the console-event helper.
-/// libtest owns a test binary's `main`, so `ctrl_break_helper_hook` can
-/// never run here; the re-exec hop goes through a test filter instead
-/// (see `ctrl_break_reaches_a_child_in_its_own_console`). Without the env
-/// var it asserts nothing and passes.
+/// Hosts the console-event helper in this test binary: the re-exec that
+/// [`request_graceful`] runs selects this test by its name.
 #[cfg(windows)]
 #[test]
-fn helper_reexec_entry() {
-    if let Ok(pid) = std::env::var("KCOMMON_TEST_CTRL_BREAK_PID") {
-        let pid: u32 = pid.parse().expect("pid in env var");
-        std::process::exit(ctrl_break_group(pid));
-    }
+fn kcommon_ctrl_break_helper() {
+    ctrl_break_helper_hook();
 }
 
 #[cfg(windows)]
@@ -170,21 +164,7 @@ fn ctrl_break_reaches_a_child_in_its_own_console() {
     let pid = child.id();
     assert!(is_pid_alive(pid));
 
-    // The graceful ask, delivered the way request_graceful delivers it:
-    // a separate console-less process attaches to the target's console
-    // and raises CTRL_BREAK for its group.
-    let exe = std::env::current_exe().expect("test exe");
-    let status = Command::new(exe)
-        .args(["signal::tests::helper_reexec_entry", "--exact"])
-        .env("KCOMMON_TEST_CTRL_BREAK_PID", pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("run helper");
-    assert!(
-        status.success(),
-        "helper could not attach and raise CTRL_BREAK: exit {status:?}",
-    );
+    request_graceful(pid);
 
     // CTRL_BREAK's default handler exits the process.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

@@ -149,8 +149,13 @@ pub fn send_sigterm_group(pid: u32) {
 }
 
 /// argv[1] that turns a re-exec of the current binary into the console
-/// event helper (see [`ctrl_break_helper_hook`]).
-pub const CTRL_BREAK_HELPER_ARG: &str = "__kcommon-ctrl-break";
+/// event helper (see [`ctrl_break_helper_hook`]). It is also a valid test
+/// name, which is how a test binary hosts the helper.
+pub const CTRL_BREAK_HELPER_ARG: &str = "kcommon_ctrl_break_helper";
+
+/// Variable carrying the PID whose group the helper raises `CTRL_BREAK` for.
+/// Not an argument: a test binary would read it as a test-name filter.
+pub const CTRL_BREAK_PID_VAR: &str = "KCOMMON_CTRL_BREAK_PID";
 
 /// Turn this invocation into the Windows console-event helper when argv
 /// asks for it; return immediately otherwise.
@@ -166,15 +171,18 @@ pub const CTRL_BREAK_HELPER_ARG: &str = "__kcommon-ctrl-break";
 /// as ordinary CLI arguments and the graceful request silently asks
 /// nobody.
 ///
-/// A no-op on Unix. Cargo-test binaries cannot install it (libtest owns
-/// their `main`), so stop paths exercised under `cargo test` on Windows
-/// skip straight to the force stage.
+/// A test binary, whose `main` libtest owns, hosts the helper with a test
+/// of its own named [`CTRL_BREAK_HELPER_ARG`] that calls this: the re-exec
+/// selects that test by name. Without one, its stops skip straight to the
+/// force stage. A no-op on Unix.
 pub fn ctrl_break_helper_hook() {
     #[cfg(windows)]
     {
-        let mut args = std::env::args();
-        if args.nth(1).as_deref() == Some(CTRL_BREAK_HELPER_ARG) {
-            let code = match args.next().and_then(|a| a.parse::<u32>().ok()) {
+        if std::env::args().nth(1).as_deref() == Some(CTRL_BREAK_HELPER_ARG) {
+            let code = match std::env::var(CTRL_BREAK_PID_VAR)
+                .ok()
+                .and_then(|pid| pid.parse::<u32>().ok())
+            {
                 Some(pid) => ctrl_break_group(pid),
                 None => 2,
             };
@@ -227,7 +235,7 @@ fn spawn_ctrl_break_helper(pid: u32) {
     // the target's.
     match std::process::Command::new(exe)
         .arg(CTRL_BREAK_HELPER_ARG)
-        .arg(pid.to_string())
+        .env(CTRL_BREAK_PID_VAR, pid.to_string())
         .creation_flags(DETACHED_PROCESS)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

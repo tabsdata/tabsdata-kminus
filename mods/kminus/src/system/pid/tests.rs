@@ -480,3 +480,12 @@ fn write_pid_survives_an_unwritable_destination() {
     assert_eq!(recorded(&pids, "alpha"), Recorded::Absent);
     fs::remove_dir_all(&dir).ok();
 }
+
+/// Hosts kcommon's console-event helper in this test binary, so a graceful
+/// stop a test runs on Windows reaches its target (see
+/// `kcommon::signal::ctrl_break_helper_hook`).
+#[cfg(windows)]
+#[test]
+fn kcommon_ctrl_break_helper() {
+    kcommon::signal::ctrl_break_helper_hook();
+}
