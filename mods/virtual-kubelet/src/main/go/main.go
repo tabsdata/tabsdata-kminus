@@ -1078,8 +1078,8 @@ func buildKubeConfig(kubeconfigPath string) (*rest.Config, error) {
 		return config, nil
 	}
 
-	if home := os.Getenv("HOME"); home != "" {
-		return clientcmd.BuildConfigFromFlags("", home+"/.kube/config")
+	if home, err := os.UserHomeDir(); err == nil {
+		return clientcmd.BuildConfigFromFlags("", filepath.Join(home, ".kube", "config"))
 	}
 
 	return nil, fmt.Errorf("no kubeconfig found")
