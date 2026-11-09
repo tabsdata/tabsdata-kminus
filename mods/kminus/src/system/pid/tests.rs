@@ -257,13 +257,27 @@ fn stderr_log_names_file_after_bin() {
     assert_eq!(p, PathBuf::from("/tmp/logs/pod-runner.err"));
 }
 
+/// Start `text`'s writer the way km starts a component, and wait for it.
+fn run_component(text: &str, logdir: &Path, bin: &str) -> kcommon::tracked::Exit {
+    let run = kcommon::token::Run::current();
+    spawn_component(
+        stderr_writer(text),
+        logdir,
+        bin,
+        kcommon::token::KM_KILL_TOKEN_VAR,
+        &run.scope(bin),
+    )
+    .expect("spawn")
+    .wait()
+}
+
 #[test]
-fn capture_stderr_writes_child_stderr_to_file() {
+fn spawn_component_writes_child_stderr_to_file() {
     let logdir = tempdir();
-    let mut command = stderr_writer("boom");
-    capture_stderr(&mut command, &logdir, "alpha");
-    let mut child = command.spawn().expect("spawn");
-    assert!(child.wait().expect("wait").success());
+    assert_eq!(
+        run_component("boom", &logdir, "alpha"),
+        kcommon::tracked::Exit::Code(0)
+    );
 
     let captured = fs::read_to_string(stderr_log(&logdir, "alpha")).expect("read capture");
     assert!(
@@ -275,19 +289,16 @@ fn capture_stderr_writes_child_stderr_to_file() {
 }
 
 #[test]
-fn capture_stderr_creates_missing_logdir() {
+fn spawn_component_creates_missing_logdir() {
     let logdir = tempdir().join("nested").join("deeper");
-    let mut command = stderr_writer("hello");
-    capture_stderr(&mut command, &logdir, "beta");
-    let mut child = command.spawn().expect("spawn");
-    let _ = child.wait();
+    run_component("hello", &logdir, "beta");
 
     assert!(stderr_log(&logdir, "beta").exists());
     fs::remove_dir_all(&logdir).ok();
 }
 
 #[test]
-fn capture_stderr_truncates_previous_run() {
+fn spawn_component_truncates_previous_run() {
     let logdir = tempdir();
     let path = stderr_log(&logdir, "gamma");
     fs::create_dir_all(&logdir).unwrap();
@@ -295,10 +306,7 @@ fn capture_stderr_truncates_previous_run() {
 
     // The file describes one run, so a fresh spawn must not append to
     // whatever the previous one left behind.
-    let mut command = stderr_writer("fresh");
-    capture_stderr(&mut command, &logdir, "gamma");
-    let mut child = command.spawn().expect("spawn");
-    let _ = child.wait();
+    run_component("fresh", &logdir, "gamma");
 
     let captured = fs::read_to_string(&path).expect("read capture");
     assert!(!captured.contains("stale"), "got {:?}", captured);
@@ -307,7 +315,7 @@ fn capture_stderr_truncates_previous_run() {
 }
 
 #[test]
-fn capture_stderr_falls_back_when_logdir_unusable() {
+fn spawn_component_falls_back_when_logdir_unusable() {
     // A path whose parent is a regular file can be neither created nor
     // opened, which must leave the spawn working rather than failing it.
     let dir = tempdir();
@@ -315,10 +323,7 @@ fn capture_stderr_falls_back_when_logdir_unusable() {
     fs::write(&blocker, "x").unwrap();
     let logdir = blocker.join("logs");
 
-    let mut command = stderr_writer("ignored");
-    capture_stderr(&mut command, &logdir, "delta");
-    let mut child = command.spawn().expect("spawn must still succeed");
-    let _ = child.wait();
+    run_component("ignored", &logdir, "delta");
 
     assert!(!stderr_log(&logdir, "delta").exists());
     fs::remove_dir_all(&dir).ok();

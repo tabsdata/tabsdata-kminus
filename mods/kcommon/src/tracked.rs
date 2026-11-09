@@ -88,8 +88,27 @@ impl Tracked {
     /// Everything else about the command stays the caller's configuration.
     pub fn spawn(mut cmd: Command, var: &str, token: &Run) -> io::Result<Tracked> {
         cmd.env(var, token.as_str());
-        let child = cmd.spawn()?;
-        let pid = child.id();
+        Self::watch(Process::Std(cmd.spawn()?), token)
+    }
+
+    /// [`Self::spawn`], in a hidden console of its own that leads a new
+    /// process group: what a long-lived Windows child needs for a graceful
+    /// stop to reach it (see [`crate::console`]). Standard error goes to
+    /// `stderr`; standard input and output to `NUL`.
+    #[cfg(windows)]
+    pub fn spawn_in_own_console(
+        mut cmd: Command,
+        stderr: Option<&std::fs::File>,
+        var: &str,
+        token: &Run,
+    ) -> io::Result<Tracked> {
+        cmd.env(var, token.as_str());
+        let child = crate::console::OwnConsoleChild::spawn(&cmd, stderr)?;
+        Self::watch(Process::OwnConsole(child), token)
+    }
+
+    fn watch(process: Process, token: &Run) -> io::Result<Tracked> {
+        let pid = process.id();
         debug!(pid, token = token.as_str(), "Tracked child spawned");
 
         let (commands, mailbox) = mpsc::channel();
@@ -97,7 +116,7 @@ impl Tracked {
         let monitor_cell = Arc::clone(&cell);
         thread::Builder::new()
             .name(format!("tracked-{pid}"))
-            .spawn(move || monitor(child, pid, mailbox, monitor_cell))?;
+            .spawn(move || monitor(process, pid, mailbox, monitor_cell))?;
 
         Ok(Tracked {
             pid,
@@ -155,6 +174,39 @@ impl Tracked {
         // returning the settled outcome.
         let _ = self.commands.send(Cmd::Stop { grace });
         self.wait()
+    }
+}
+
+/// The child a monitor owns.
+enum Process {
+    Std(Child),
+    #[cfg(windows)]
+    OwnConsole(crate::console::OwnConsoleChild),
+}
+
+impl Process {
+    fn id(&self) -> u32 {
+        match self {
+            Process::Std(child) => child.id(),
+            #[cfg(windows)]
+            Process::OwnConsole(child) => child.id(),
+        }
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        match self {
+            Process::Std(child) => child.try_wait(),
+            #[cfg(windows)]
+            Process::OwnConsole(child) => child.try_wait(),
+        }
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        match self {
+            Process::Std(child) => child.kill(),
+            #[cfg(windows)]
+            Process::OwnConsole(child) => child.kill(),
+        }
     }
 }
 
@@ -231,7 +283,7 @@ impl Drop for PublishOnDrop {
 /// further checks: a signal is only ever sent between `try_wait` returning
 /// `None` and the next reap attempt, and an unreaped child — running,
 /// or zombie — still pins its number on both platforms.
-fn monitor(mut child: Child, pid: u32, mailbox: Receiver<Cmd>, cell: Arc<OutcomeCell>) {
+fn monitor(mut child: Process, pid: u32, mailbox: Receiver<Cmd>, cell: Arc<OutcomeCell>) {
     let publish_guard = PublishOnDrop(Arc::clone(&cell));
     let mut deadline: Option<Instant> = None;
     let mut forced = false;
@@ -275,10 +327,15 @@ fn monitor(mut child: Child, pid: u32, mailbox: Receiver<Cmd>, cell: Arc<Outcome
             && Instant::now() >= d
         {
             warn!(pid, "Grace expired, killing tracked child");
-            // Handle first (cannot misfire), then the group it leads. The
-            // group signal is safe: the reap attempt is this loop's next
-            // iteration, so the child's number is still pinned.
+            // The tree before the handle on Windows: `taskkill /T` finds the
+            // descendants through a live parent. Safe either way, because the
+            // reap attempt is this loop's next iteration, so the child's
+            // number is still pinned.
+            #[cfg(windows)]
+            signal::force_kill_group(pid);
+            // Handle first on Unix (cannot misfire), then the group it leads.
             let _ = child.kill();
+            #[cfg(unix)]
             if signal::leads_own_group(pid) {
                 signal::force_kill_group(pid);
             }

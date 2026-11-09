@@ -5,9 +5,11 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
+use kcommon::token::Run;
+use kcommon::tracked::Tracked;
 use kcommon::{identity, signal};
 use tracing::{info, warn};
 
@@ -176,17 +178,43 @@ pub fn apply_detached_flags(command: &mut Command) {
     }
 }
 
-/// Apply OS-specific creation flags for a long-running subprocess that
-/// must survive terminal close and accept targeted graceful shutdown.
-/// On Windows this sets `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`;
-/// on Unix this puts the child in its own process group.
-pub fn apply_subprocess_flags(command: &mut Command) {
-    #[cfg(target_os = "windows")]
+/// Start a long-lived component under a [`Tracked`] monitor, carrying
+/// its kill token in `var`, with standard output discarded and standard
+/// error in its log (see [`capture_stderr`]).
+///
+/// A component must outlive the terminal km was started from and still be
+/// reachable by a graceful stop. On Unix it leads its own process group
+/// ([`apply_subprocess_flags`]). On Windows it gets a hidden console of its
+/// own (see `kcommon::console`): no terminal can close it, and the
+/// CTRL_BREAK helper can attach to it — which `CREATE_NO_WINDOW` left
+/// impossible, so every stop used to burn its grace and end in a kill.
+pub fn spawn_component(
+    command: Command,
+    logdir: &Path,
+    bin: &str,
+    var: &str,
+    token: &Run,
+) -> std::io::Result<Tracked> {
+    #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
-        command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+        let stderr = open_stderr_log(logdir, bin);
+        Tracked::spawn_in_own_console(command, stderr.as_ref(), var, token)
     }
+    #[cfg(not(windows))]
+    {
+        let mut command = command;
+        capture_stderr(&mut command, logdir, bin);
+        apply_subprocess_flags(&mut command);
+        Tracked::spawn(command, var, token)
+    }
+}
+
+/// Apply OS-specific creation flags for a long-running subprocess that
+/// must survive terminal close and accept targeted graceful shutdown: on
+/// Unix this puts the child in its own process group. Windows components
+/// go through [`spawn_component`] instead.
+#[cfg(not(windows))]
+pub fn apply_subprocess_flags(command: &mut Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -236,24 +264,29 @@ pub fn stderr_log(logdir: &Path, bin: &str) -> PathBuf {
 /// Best effort: a file that cannot be opened leaves the stream discarded
 /// instead of failing the start, since losing a diagnostic is a smaller
 /// harm than refusing to boot over one.
+#[cfg(not(windows))]
 pub fn capture_stderr(command: &mut Command, logdir: &Path, bin: &str) {
+    use std::process::Stdio;
+
     command.stdout(Stdio::null());
+    command.stderr(open_stderr_log(logdir, bin).map_or_else(Stdio::null, Stdio::from));
+}
+
+/// [`stderr_log`], created afresh; `None`, with a warning, when it cannot
+/// be (see [`capture_stderr`] for why that is not fatal).
+fn open_stderr_log(logdir: &Path, bin: &str) -> Option<fs::File> {
     let path = stderr_log(logdir, bin);
     let _ = fs::create_dir_all(logdir);
-    match fs::File::create(&path) {
-        Ok(file) => {
-            command.stderr(Stdio::from(file));
-        }
-        Err(e) => {
+    fs::File::create(&path)
+        .inspect_err(|e| {
             warn!(
                 bin,
                 path = %path.display(),
                 error = %e,
                 "Cannot capture stderr; discarding it",
             );
-            command.stderr(Stdio::null());
-        }
-    }
+        })
+        .ok()
 }
 
 /// Ask the process a PID file records to stop, wait up to `grace` for it
@@ -299,7 +332,9 @@ pub fn stop_recorded(dir: &Path, name: &str, grace: Duration) {
     }
 
     warn!(name, pid, "Grace period expired, killing");
-    if signal::leads_own_group(pid) {
+    // Windows has no group-leadership query; its group kill is a tree kill,
+    // which reaches the descendants a single kill would orphan.
+    if cfg!(windows) || signal::leads_own_group(pid) {
         signal::force_kill_group(pid);
     } else {
         signal::force_kill(pid);

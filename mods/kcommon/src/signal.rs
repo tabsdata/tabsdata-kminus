@@ -7,11 +7,14 @@
 //! get wrong twice. On Unix a negative PID addresses a process *group*.
 //! On Windows a process group exists for exactly one purpose — being the
 //! addressee of a console control event — and that event can only be
-//! raised from inside the target's console, which no long-lived process
-//! here shares (every spawn gets its own hidden console). The graceful
-//! calls therefore re-exec the current binary as a short-lived helper
-//! that attaches to the target's console and raises `CTRL_BREAK` there;
-//! see [`ctrl_break_helper_hook`]. The force calls need none of this:
+//! raised from inside the target's console. km starts each component in a
+//! hidden console of its own (see [`crate::console`]), and whatever a
+//! component starts shares it in a group of its own, so no stopper shares
+//! its target's console. The graceful calls therefore re-exec the current
+//! binary as a short-lived helper that attaches to the target's console
+//! and raises `CTRL_BREAK` there; see [`ctrl_break_helper_hook`]. A target
+//! with no console at all (`CREATE_NO_WINDOW`) cannot be reached and stops
+//! by the force stage. The force calls need none of this:
 //! `TerminateProcess` per PID, `taskkill /F /T` for a tree.
 //!
 //! None of these can tell whether the PID is still the one you meant.
@@ -153,8 +156,8 @@ pub const CTRL_BREAK_HELPER_ARG: &str = "__kcommon-ctrl-break";
 /// asks for it; return immediately otherwise.
 ///
 /// `GenerateConsoleCtrlEvent` only reaches process groups attached to the
-/// *caller's* console, and every process this stack spawns owns a hidden
-/// console of its own (`CREATE_NO_WINDOW`), so no supervisor can raise
+/// *caller's* console, and every component of this stack runs in a hidden
+/// console of its own (see [`crate::console`]), so no supervisor can raise
 /// the event directly. The graceful calls instead re-exec the current
 /// binary as a short-lived, console-less helper that attaches to the
 /// target's console and raises `CTRL_BREAK` there. Every binary that

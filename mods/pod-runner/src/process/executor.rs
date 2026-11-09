@@ -1347,15 +1347,23 @@ impl ProcessExecutor {
         #[cfg(windows)]
         {
             // The Windows shape of the setsid/setpgid block above: each
-            // container tree gets its own hidden console and leads its own
-            // process group. The group is what a graceful CTRL_BREAK (see
-            // kcommon::signal) can be aimed at; the private console keeps
-            // that event from spilling into the runner or sibling
-            // containers, which sharing our console would allow.
+            // container tree leads its own process group, which is what a
+            // graceful CTRL_BREAK (see kcommon::signal) is aimed at. The
+            // event only travels through a console, so the container shares
+            // ours (km gives the runner a hidden one, see kcommon::console);
+            // a group-targeted CTRL_BREAK reaches that group alone, never
+            // the runner or a sibling. A runner with no console cannot share
+            // one, and a console child of such a parent would get a visible
+            // window of its own, so it then runs windowless, as before, and
+            // stops by the force stage alone.
+            use windows_sys::Win32::System::Console::GetConsoleWindow;
             use windows_sys::Win32::System::Threading::{
                 CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
             };
-            cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+            // SAFETY: no arguments; it only reports the caller's console.
+            let has_console = !unsafe { GetConsoleWindow() }.is_null();
+            let windowless = if has_console { 0 } else { CREATE_NO_WINDOW };
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | windowless);
         }
 
         cmd.kill_on_drop(self.die_with_parent);

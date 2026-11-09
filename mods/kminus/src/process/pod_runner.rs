@@ -11,11 +11,10 @@ use tracing::info;
 use crate::config::KmSysConfig;
 use crate::loglevel::LogLevel;
 use kcommon::token::{KM_KILL_TOKEN_VAR, Run};
-use kcommon::tracked::Tracked;
 
 use crate::system::components::Components;
 use crate::system::heartbeat::{self, heartbeat_file};
-use crate::system::pid::{apply_subprocess_flags, capture_stderr, write_pid};
+use crate::system::pid::{spawn_component, write_pid};
 use crate::system::proc::resolve_binary;
 
 /// Binary name for the pod-runner subprocess.
@@ -102,9 +101,7 @@ pub fn start(
     if let Some(dir) = imagesdir {
         command.args(["--imagesdir", dir]);
     }
-    capture_stderr(&mut command, logdir, BIN);
-    apply_subprocess_flags(&mut command);
-    let pr = Tracked::spawn(command, KM_KILL_TOKEN_VAR, &run.scope(BIN))
+    let pr = spawn_component(command, logdir, BIN, KM_KILL_TOKEN_VAR, &run.scope(BIN))
         .unwrap_or_else(|e| panic!("Failed to start {}: {}", BIN, e));
 
     let pid = pr.pid();

@@ -906,7 +906,7 @@ func killAndWait(pid int) {
 	if err != nil {
 		return
 	}
-	proc.Signal(syscall.SIGTERM)
+	requestStopPid(pid)
 	if waitForDeath(pid, 5*time.Second) {
 		return
 	}
@@ -1651,7 +1651,7 @@ func run() int {
 		// and skip the whole dance when it has already exited and been reaped.
 		if kcmCmd != nil && kcmCmd.Process != nil && !processGone(kcmName, kcmCmd.Process.Pid) {
 			info("[+] Stopping kube-controller-manager...")
-			if err := kcmCmd.Process.Signal(syscall.SIGTERM); err != nil {
+			if err := requestStop(kcmCmd.Process); err != nil {
 				warn("cannot signal kube-controller-manager: %v", err)
 			}
 			select {
@@ -1767,6 +1767,7 @@ func run() int {
 	)
 	kcmCmd.Stdout = kcmLog
 	kcmCmd.Stderr = kcmLog
+	kcmCmd.SysProcAttr = ownGroup()
 
 	if err := kcmCmd.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to start kube-controller-manager: %v\n", err)

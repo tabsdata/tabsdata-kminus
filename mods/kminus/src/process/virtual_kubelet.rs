@@ -8,12 +8,11 @@ use std::process::Command;
 use tracing::info;
 
 use kcommon::token::{KM_KILL_TOKEN_VAR, Run};
-use kcommon::tracked::Tracked;
 
 use crate::config::KmSysConfig;
 use crate::system::components::Components;
 use crate::system::heartbeat::{self, heartbeat_file};
-use crate::system::pid::{apply_subprocess_flags, capture_stderr, pids_dir, write_pid};
+use crate::system::pid::{pids_dir, spawn_component, write_pid};
 use crate::system::proc::resolve_binary;
 
 /// Binary name for the virtual-kubelet subprocess.
@@ -69,9 +68,7 @@ pub fn start(
             "--heartbeat-secs",
             &heartbeat_secs,
         ]);
-    capture_stderr(&mut command, logdir, BIN);
-    apply_subprocess_flags(&mut command);
-    let vk = Tracked::spawn(command, KM_KILL_TOKEN_VAR, &run.scope(BIN))
+    let vk = spawn_component(command, logdir, BIN, KM_KILL_TOKEN_VAR, &run.scope(BIN))
         .unwrap_or_else(|e| panic!("Failed to start {}: {}", BIN, e));
 
     let pid = vk.pid();

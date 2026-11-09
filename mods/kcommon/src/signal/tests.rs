@@ -125,24 +125,34 @@ fn leads_own_group_is_always_false_on_windows() {
     assert!(!leads_own_group(std::process::id()));
 }
 
-/// A sleeper that owns a hidden console and leads its own process group —
-/// the shape of every process this stack spawns on Windows.
+/// When set, [`sleeper_entry`] sleeps instead of passing at once.
 #[cfg(windows)]
-fn own_console_group_sleeper() -> std::process::Child {
-    use std::os::windows::process::CommandExt;
-    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+const SLEEPER_VAR: &str = "KCOMMON_TEST_SLEEPER";
 
-    let mut c = Command::new("cmd");
-    c.args(["/C", "ping -n 31 127.0.0.1"]);
-    c.stdout(Stdio::null()).stderr(Stdio::null());
-    c.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-    c.spawn().expect("spawn sleeper")
+/// When the env var is set, this test is a sleeper with default console
+/// event handling, so a CTRL_BREAK ends it. Without it, it passes at once.
+#[cfg(windows)]
+#[test]
+fn sleeper_entry() {
+    if std::env::var_os(SLEEPER_VAR).is_some() {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+}
+
+/// A sleeper started the way km starts a component: in a hidden console
+/// of its own, leading its own process group.
+#[cfg(windows)]
+fn own_console_group_sleeper() -> crate::console::OwnConsoleChild {
+    let mut c = Command::new(std::env::current_exe().expect("test exe"));
+    c.args(["signal::tests::sleeper_entry", "--exact"]);
+    c.env(SLEEPER_VAR, "1");
+    crate::console::OwnConsoleChild::spawn(&c, None).expect("spawn sleeper")
 }
 
 /// When the env var is set, this test *is* the console-event helper.
 /// libtest owns a test binary's `main`, so `ctrl_break_helper_hook` can
 /// never run here; the re-exec hop goes through a test filter instead
-/// (see `ctrl_break_reaches_a_no_window_process_group`). Without the env
+/// (see `ctrl_break_reaches_a_child_in_its_own_console`). Without the env
 /// var it asserts nothing and passes.
 #[cfg(windows)]
 #[test]
@@ -155,14 +165,7 @@ fn helper_reexec_entry() {
 
 #[cfg(windows)]
 #[test]
-#[ignore = "CREATE_NO_WINDOW leaves the child with no console (\"the console \
-            handle for the application is not set\"), so AttachConsole cannot \
-            reach it and ctrl_break_group returns 3. The flag is deliberate — \
-            it is what keeps a spawned child alive when its launching terminal \
-            closes — so the graceful console-event ask is a no-op for such a \
-            child and the force stage ends it. Run with --ignored if the \
-            delivery mechanism is ever reworked."]
-fn ctrl_break_reaches_a_no_window_process_group() {
+fn ctrl_break_reaches_a_child_in_its_own_console() {
     let mut child = own_console_group_sleeper();
     let pid = child.id();
     assert!(is_pid_alive(pid));
@@ -190,8 +193,7 @@ fn ctrl_break_reaches_a_no_window_process_group() {
             break;
         }
         if std::time::Instant::now() > deadline {
-            force_kill(pid);
-            let _ = child.wait();
+            let _ = child.kill();
             panic!("CTRL_BREAK did not stop the target within 10s");
         }
         std::thread::sleep(std::time::Duration::from_millis(50));

@@ -4,6 +4,7 @@
 
 //! Components shared between the km binaries.
 
+pub mod console;
 pub mod identity;
 pub mod panic;
 pub mod scan;
