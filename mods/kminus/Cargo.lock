@@ -350,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "kcommon"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "chrono",
  "nix",
@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "km"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "clap",
  "dunce",
