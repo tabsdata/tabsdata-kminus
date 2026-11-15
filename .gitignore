@@ -2,8 +2,6 @@
 # Copyright 2026 Tabsdata Inc.
 #
 
-.tdcommit
-
 setup-cache/
 __pycache__/
 __pypackages__/
