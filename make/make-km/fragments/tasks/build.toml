@@ -1,0 +1,64 @@
+#
+# Copyright 2026 Tabsdata Inc.
+#
+
+[tasks.__km__build]
+plugin = "td-task-tracker"
+category = "03 - Build"
+private = true
+script_runner = "@duckscript"
+script = [
+    '''
+    !include_files ./make/make-os/libraries/log.ds
+
+    on_ga = get_env TD_ON_GA
+    if eq ${on_ga} "true"
+        info "✈️ Skipping km assembly: the workflow assembles km in its own step"
+        exit 0
+    end
+
+    km_primary = get_env TD_KM_PROJECT_PRIMARY_NAME
+    km_alternate = get_env TD_KM_PROJECT_ALTERNATE_NAME
+    km_root = set "${PROJECT_TABSDATA_ROOT_FOLDER}../${km_primary}"
+    km_root_exists = is_directory ${km_root}
+    if not ${km_root_exists}
+        km_root = set "${PROJECT_TABSDATA_ROOT_FOLDER}../${km_alternate}"
+        km_root_exists = is_directory ${km_root}
+    end
+    if not ${km_root_exists}
+        warn "‼️ No km checkout next to this repository ('${km_primary}' or '${km_alternate}'); skipping km assembly"
+        exit 0
+    end
+
+    km_target = get_env td-target
+    km_portable_linux = get_env td-portable-linux
+    km_toolchain = get_env td-toolchain
+
+    info "🧱 Running km assembly..."
+    with_permit_saved = get_env TD_WITH_PERMIT
+    duckscript_log_level_saved = get_env DUCKSCRIPT_LOG_LEVEL
+    python_log_level_saved = get_env PYTHON_LOG_LEVEL
+    set_env TD_WITH_PERMIT "false"
+    set_env DUCKSCRIPT_LOG_LEVEL "error"
+    set_env PYTHON_LOG_LEVEL "ERROR"
+    cd ${km_root}
+    exec --fail-on-error cargo make --env profile=assembly --env td-target=${km_target} --env td-portable-linux=${km_portable_linux} --env td-toolchain=${km_toolchain} assembly
+    with_permit_saved_empty = is_empty ${with_permit_saved}
+    if ${with_permit_saved_empty}
+        unset_env TD_WITH_PERMIT
+    else
+        set_env TD_WITH_PERMIT ${with_permit_saved}
+    end
+    duckscript_log_level_saved_empty = is_empty ${duckscript_log_level_saved}
+    if ${duckscript_log_level_saved_empty}
+        unset_env DUCKSCRIPT_LOG_LEVEL
+    else
+        set_env DUCKSCRIPT_LOG_LEVEL ${duckscript_log_level_saved}
+    end
+    python_log_level_saved_empty = is_empty ${python_log_level_saved}
+    if ${python_log_level_saved_empty}
+        unset_env PYTHON_LOG_LEVEL
+    else
+        set_env PYTHON_LOG_LEVEL ${python_log_level_saved}
+    end
+    ''']
