@@ -1,6 +1,6 @@
 module control-plane
 
-go 1.26.10
+go 1.26.11
 
 require (
 	github.com/shirou/gopsutil/v4 v4.26.10
