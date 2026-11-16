@@ -78,10 +78,10 @@ will re-populate it.
 
 ## Prerequisites
 
-- **Go** — any installed version; the build sets `GOTOOLCHAIN=go1.26.10`
+- **Go** — any installed version; the build sets `GOTOOLCHAIN=go1.26.11`
   (`TABSDATA_GO_VERSION` in `make/make-km/fragments/shared/Makeroot.toml`,
   which os and ee load too), so Go runs exactly
-  1.26.10, downloading it once if the installed version differs
+  1.26.11, downloading it once if the installed version differs
 - **Git** — for cloning the Kubernetes source
 - **setup-envtest** — installed automatically on first build via
   `go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.19`
