@@ -16,7 +16,7 @@ Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md).
 ## Bug Reports and Feature Requests
 
 To report bugs and to request new features, use
-[GitHub Issues](https://github.com/tabsdata/tabsdata-kubernetes/issues).
+[GitHub Issues](https://github.com/tabsdata/tabsdata-kminus/issues).
 
 Before creating a bug report or a feature request, check whether the issue has already been
 reported. If it has, add a comment to the original issue.

@@ -10,7 +10,7 @@
 <div align="center">
     <a href="https://tabsdata.com">Tabsdata</a> |
     <a href="https://github.com/tabsdata/tabsdata">tabsdata</a> |
-    <a href="https://github.com/tabsdata/tabsdata-kubernetes">GitHub Repository</a>
+    <a href="https://github.com/tabsdata/tabsdata-kminus">GitHub Repository</a>
 </div>
 
 # KMinus

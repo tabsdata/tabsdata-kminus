@@ -14,7 +14,7 @@ Copyright 2026 Tabsdata Inc.
 Don't report security vulnerabilities through public GitHub issues, pull requests or discussions.
 
 Report them privately instead, with
-[Report a vulnerability](https://github.com/tabsdata/tabsdata-kubernetes/security/advisories/new), in the
+[Report a vulnerability](https://github.com/tabsdata/tabsdata-kminus/security/advisories/new), in the
 Security tab of this repository. Include as much of the following as you can:
 
 - The affected component, and the version or commit you found the issue in

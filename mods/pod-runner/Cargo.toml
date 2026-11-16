@@ -19,7 +19,7 @@ authors = [
 ]
 homepage = "https://www.tabsdata.com"
 publish = false
-repository = "https://github.com/tabsdata/tabsdata-km"
+repository = "https://github.com/tabsdata/tabsdata-kminus"
 rust-version = "1.99.1"
 
 [lints.clippy]

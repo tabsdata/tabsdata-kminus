@@ -12,6 +12,6 @@ Copyright 2026 Tabsdata Inc.
 - To learn how KMinus works and how to build it, read the [README](README.md) and
   [Developing KMinus](DEVELOPING.md).
 - To report a bug or to suggest an improvement, search the
-  [existing issues](https://github.com/tabsdata/tabsdata-kubernetes/issues) first, then open a new one if
+  [existing issues](https://github.com/tabsdata/tabsdata-kminus/issues) first, then open a new one if
   nothing matches.
 - To report a security vulnerability, follow the [Security Policy](SECURITY.md).
