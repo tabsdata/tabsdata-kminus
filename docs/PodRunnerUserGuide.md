@@ -2,7 +2,12 @@
   Copyright 2026 Tabsdata Inc.
 -->
 
-# Pod Runner -- User Guide
+<div align="center">
+    <img src="../assets/images/tabsdata-logo-for-light-theme.svg#gh-light-mode-only" alt="Tabsdata" width="500">
+    <img src="../assets/images/tabsdata-logo-for-dark-theme.svg#gh-dark-mode-only" alt="Tabsdata" width="500">
+</div>
+
+# Pod Runner: User Guide
 
 ## Quick Start
 

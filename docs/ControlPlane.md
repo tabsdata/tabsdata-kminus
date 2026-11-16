@@ -2,6 +2,11 @@
   Copyright 2026 Tabsdata Inc.
 -->
 
+<div align="center">
+    <img src="../assets/images/tabsdata-logo-for-light-theme.svg#gh-light-mode-only" alt="Tabsdata" width="500">
+    <img src="../assets/images/tabsdata-logo-for-dark-theme.svg#gh-dark-mode-only" alt="Tabsdata" width="500">
+</div>
+
 # Control Plane
 
 The control-plane binary (`control-plane`) runs a local Kubernetes control
