@@ -2,7 +2,12 @@
   Copyright 2026 Tabsdata Inc.
 -->
 
-# Kminus Readiness and Liveness
+<div align="center">
+    <img src="../assets/images/tabsdata-logo-for-light-theme.svg#gh-light-mode-only" alt="Tabsdata" width="500">
+    <img src="../assets/images/tabsdata-logo-for-dark-theme.svg#gh-dark-mode-only" alt="Tabsdata" width="500">
+</div>
+
+# KMinus: Readiness and Liveness
 
 ## Scope
 

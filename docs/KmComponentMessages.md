@@ -1,4 +1,13 @@
-# km Component Messages
+<!--
+  Copyright 2026 Tabsdata Inc.
+-->
+
+<div align="center">
+    <img src="../assets/images/tabsdata-logo-for-light-theme.svg#gh-light-mode-only" alt="Tabsdata" width="500">
+    <img src="../assets/images/tabsdata-logo-for-dark-theme.svg#gh-dark-mode-only" alt="Tabsdata" width="500">
+</div>
+
+# KMinus: Component Messages
 
 How a component tells the operator something at startup or shutdown, and how
 km collects and prints it.
