@@ -555,14 +555,7 @@ mod tests {
     use std::fs;
 
     fn setup_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "pod-runner-rs2-test-volumes-{}-{}",
-            name,
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::testutils::unique_test_dir(&format!("pod/resolver/volumes/{name}"))
     }
 
     fn make_pod(containers: Vec<Container>, volumes: Vec<Volume>) -> PodSpec {

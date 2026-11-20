@@ -409,8 +409,7 @@ mod tests {
     /// Start a test server on a random port, return the address.
     async fn start_server() -> (std::net::SocketAddr, watch::Sender<()>) {
         let store = Arc::new(MemoryStore::new());
-        let base = std::env::temp_dir()
-            .join(format!("pod-runner-rs2-test-server-{}", std::process::id(),));
+        let base = crate::testutils::unique_test_dir("server/app");
         let provider = Arc::new(DefaultExecutorProvider {
             layout: crate::store::layout::PodLayout::new(&base),
             pid_dir: base.join("pids"),

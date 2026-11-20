@@ -240,14 +240,7 @@ mod tests {
     use std::fs;
 
     fn setup_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "pod-runner-rs2-test-env-{}-{}",
-            name,
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::testutils::unique_test_dir(&format!("pod/resolver/env/{name}"))
     }
 
     fn make_pod_with_envs(containers: Vec<Container>) -> PodSpec {

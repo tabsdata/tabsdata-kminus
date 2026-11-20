@@ -353,13 +353,7 @@ mod tests {
     use crate::spec::pod::{Container, EnvVar, MASKED_ENV_VALUE, PodMetadata, PodSpecBody};
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "pod-runner-rs2-test-{}-{}",
-            name,
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        dir
+        crate::testutils::unique_test_dir(&format!("store/file/{name}"))
     }
 
     fn make_store(name: &str) -> FileStore {

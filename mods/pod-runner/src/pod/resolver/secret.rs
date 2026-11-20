@@ -295,14 +295,7 @@ mod tests {
     use std::fs;
 
     fn setup_secret_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "pod-runner-rs2-test-secrets-{}-{}",
-            name,
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::testutils::unique_test_dir(&format!("pod/resolver/secrets/{name}"))
     }
 
     fn cancel_channel() -> (watch::Sender<()>, watch::Receiver<()>) {

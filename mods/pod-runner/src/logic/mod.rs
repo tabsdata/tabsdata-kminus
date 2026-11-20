@@ -1580,9 +1580,6 @@ mod tests {
         }
     }
 
-    use std::sync::atomic::AtomicU64;
-    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-
     /// The state dir of the only incarnation of pod `name`.
     fn only_state_dir(provider: &dyn ExecutorProvider, name: &str) -> PathBuf {
         let name_dir = provider.layout().log_pod_dir(name);
@@ -1598,12 +1595,7 @@ mod tests {
 
     fn make_provider() -> Arc<DefaultExecutorProvider> {
         crate::testutils::init_test_tracing();
-        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!(
-            "pod-runner-rs2-test-logic-{}-{}",
-            std::process::id(),
-            n,
-        ));
+        let base = crate::testutils::unique_test_dir("logic/provider");
         Arc::new(DefaultExecutorProvider {
             layout: PodLayout::new(&base),
             pid_dir: base.join("pids"),
@@ -1776,10 +1768,7 @@ mod tests {
 
     #[test]
     fn executor_provider_creates_directories() {
-        let base = std::env::temp_dir().join(format!(
-            "pod-runner-rs2-test-provider-{}",
-            std::process::id(),
-        ));
+        let base = crate::testutils::unique_test_dir("logic/provider-dirs");
         let provider = DefaultExecutorProvider {
             layout: PodLayout::new(&base),
             pid_dir: base.join("pids"),
@@ -3186,16 +3175,7 @@ mod tests {
         use crate::spec::pod::{EnvVar, EnvVarSource, KeyRef};
 
         fn temp_dir(name: &str) -> std::path::PathBuf {
-            let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let d = std::env::temp_dir().join(format!(
-                "pod-runner-rs2-test-prep-{}-{}-{}",
-                std::process::id(),
-                name,
-                n,
-            ));
-            let _ = std::fs::remove_dir_all(&d);
-            std::fs::create_dir_all(&d).unwrap();
-            d
+            crate::testutils::unique_test_dir(&format!("logic/prep/{name}"))
         }
 
         /// Build a logic whose store writes specs and statuses into each

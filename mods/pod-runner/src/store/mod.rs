@@ -586,13 +586,7 @@ mod tests {
     // -- FileStore tests via the shared test suite --
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "pod-runner-rs2-test-{}-{}",
-            name,
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+        crate::testutils::unique_test_dir(&format!("store/{name}"))
     }
 
     fn make_file_store(name: &str) -> FileStore {

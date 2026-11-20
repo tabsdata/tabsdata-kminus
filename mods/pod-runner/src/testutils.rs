@@ -25,6 +25,7 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -127,6 +128,17 @@ pub fn subdir(base: &Path, name: &str) -> PathBuf {
     let d = base.join(name);
     fs::create_dir_all(&d).unwrap();
     d
+}
+
+/// Create a test directory under `target/testrun.<ts>/<name>/` that no
+/// other run, process or call shares, for helpers that cannot call
+/// [`test_dir!`] from the test itself. The session timestamp tells runs
+/// apart, and the process id and a counter tell processes and calls apart,
+/// so a test never finds what an earlier one left behind.
+pub fn unique_test_dir(name: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    make_test_dir(&format!("{name}/{}-{n}", std::process::id()))
 }
 
 // ---------------------------------------------------------------------------

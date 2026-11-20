@@ -227,14 +227,7 @@ mod tests {
     use std::fs;
 
     fn setup_cm_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "pod-runner-rs2-test-configmaps-{}-{}",
-            name,
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::testutils::unique_test_dir(&format!("pod/resolver/configmaps/{name}"))
     }
 
     fn cancel_channel() -> (watch::Sender<()>, watch::Receiver<()>) {
