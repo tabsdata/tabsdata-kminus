@@ -313,7 +313,7 @@ def load_pod_def(name, **replacements):
     with open(path, encoding="utf-8") as f:
         text = f.read()
     for key, value in replacements.items():
-        text = text.replace(f"{{{{{key}}}}}", str(value))
+        text = text.replace(f"{{{{{key}}}}}", json.dumps(str(value))[1:-1])
     pod = yaml.safe_load(text)
     _run_python_as_this_interpreter(pod)
     pod_name = unique_name(name)
