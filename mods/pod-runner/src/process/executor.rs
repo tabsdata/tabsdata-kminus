@@ -997,13 +997,18 @@ impl ExecutorHandle {
     /// stopping through `pg_ctl`, say — cannot complete that handshake if
     /// the same signal reaches the children directly, and dies leaving
     /// whatever it owns behind. Descendants are the force stage's job.
-    pub fn send_sigterm(&self) {
+    ///
+    /// Returns false when the request could not be delivered, leaving the
+    /// caller nothing to wait for; true otherwise, an exited process
+    /// included.
+    pub fn send_sigterm(&self) -> bool {
         if self.has_exited() {
             debug!(pid = self.pid, "SIGTERM skipped: already exited");
-            return;
+            return true;
         }
-        send_sigterm_pid(self.pid);
-        debug!(pid = self.pid, "SIGTERM sent to process");
+        let asked = send_sigterm_pid(self.pid);
+        debug!(pid = self.pid, asked, "SIGTERM sent to process");
+        asked
     }
 
     /// Stop the process, escalating only as far as it has to: SIGTERM to
@@ -1044,19 +1049,26 @@ impl ExecutorHandle {
             );
         } else {
             let pid = self.pid;
-            send_sigterm_pid(pid);
+            // A request that could not be delivered leaves nothing to wait
+            // for: straight to SIGKILL.
+            let asked = send_sigterm_pid(pid);
             let sigterm_elapsed = kill_start.elapsed();
             debug!(
                 pid,
+                asked,
                 sigterm_ms = sigterm_elapsed.as_millis(),
                 "Kill: SIGTERM sent to process"
             );
 
-            let exit_code = tokio::select! {
-                result = &mut self.wait_handle => {
-                    Some(result.unwrap_or(-1))
+            let exit_code = if asked {
+                tokio::select! {
+                    result = &mut self.wait_handle => {
+                        Some(result.unwrap_or(-1))
+                    }
+                    _ = tokio::time::sleep(grace_period) => None,
                 }
-                _ = tokio::time::sleep(grace_period) => None,
+            } else {
+                None
             };
             let wait_elapsed = kill_start.elapsed();
 
@@ -1073,18 +1085,25 @@ impl ExecutorHandle {
                 // group before forcing: a root that never forwarded the
                 // signal leaves children that have still had no chance to
                 // shut down cleanly, and SIGKILL gives them none.
-                warn!(
-                    pid,
-                    grace_ms = wait_elapsed.as_millis(),
-                    "Kill: grace period expired, sending SIGTERM to group",
-                );
-                send_sigterm_group(pid);
-
-                let exit_code = tokio::select! {
-                    result = &mut self.wait_handle => {
-                        Some(result.unwrap_or(-1))
+                let exit_code = if asked {
+                    warn!(
+                        pid,
+                        grace_ms = wait_elapsed.as_millis(),
+                        "Kill: grace period expired, sending SIGTERM to group",
+                    );
+                    if send_sigterm_group(pid) {
+                        tokio::select! {
+                            result = &mut self.wait_handle => {
+                                Some(result.unwrap_or(-1))
+                            }
+                            _ = tokio::time::sleep(grace_period) => None,
+                        }
+                    } else {
+                        None
                     }
-                    _ = tokio::time::sleep(grace_period) => None,
+                } else {
+                    warn!(pid, "Kill: SIGTERM could not be delivered");
+                    None
                 };
 
                 if let Some(code) = exit_code {

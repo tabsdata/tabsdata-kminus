@@ -1163,11 +1163,12 @@ async fn kill_container(name: &str, state: &Mutex<PodState>, grace_period: Durat
 }
 
 /// Send SIGTERM to a container without waiting for exit. Brief lock.
-async fn sigterm_container(name: &str, state: &Mutex<PodState>) {
+/// Returns false when the request could not be delivered.
+async fn sigterm_container(name: &str, state: &Mutex<PodState>) -> bool {
     let st = state.lock().await;
-    if let Some(handle) = st.handles.get(name) {
-        handle.send_sigterm();
-    }
+    st.handles
+        .get(name)
+        .is_none_or(|handle| handle.send_sigterm())
 }
 
 // ---------------------------------------------------------------------------
@@ -2019,7 +2020,13 @@ async fn terminate_sidecars(
     // Send SIGTERM to all sidecars — they start shutting down concurrently.
     for name in &sidecar_names {
         debug!(container = name.as_str(), "Sending SIGTERM to sidecar");
-        sigterm_container(name, state).await;
+        if !sigterm_container(name, state).await {
+            warn!(
+                container = name.as_str(),
+                "SIGTERM could not be delivered to sidecar — force killing"
+            );
+            kill_container(name, state, Duration::ZERO).await;
+        }
     }
 
     // Wait for each to exit. Since SIGTERM was already sent to all,

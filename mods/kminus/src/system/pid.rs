@@ -321,17 +321,18 @@ pub fn stop_recorded(dir: &Path, name: &str, grace: Duration) {
         grace_secs = grace.as_secs(),
         "Requesting graceful shutdown"
     );
-    signal::request_graceful(pid);
-
-    let deadline = Instant::now() + grace;
-    while Instant::now() < deadline {
-        if matches!(recorded(dir, name), Recorded::Absent | Recorded::Stale(_)) {
-            return;
+    if signal::request_graceful(pid) {
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if matches!(recorded(dir, name), Recorded::Absent | Recorded::Stale(_)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        warn!(name, pid, "Grace period expired, killing");
+    } else {
+        warn!(name, pid, "Could not request a graceful shutdown, killing");
     }
-
-    warn!(name, pid, "Grace period expired, killing");
     // Windows has no group-leadership query; its group kill is a tree kill,
     // which reaches the descendants a single kill would orphan.
     if cfg!(windows) || signal::leads_own_group(pid) {

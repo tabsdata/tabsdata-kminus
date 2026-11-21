@@ -90,63 +90,67 @@ pub fn force_kill(pid: u32) {
 
 /// Ask a single process to shut down: SIGTERM, or on Windows `CTRL_BREAK`
 /// to the group `pid` leads — which also asks any descendants still in
-/// that group.
+/// that group. Returns whether the request was delivered.
 ///
 /// On Windows `pid` must lead a process group. Windows has no way to ask
 /// whether it does, and a console event aimed at a process that leads
 /// none goes to every process attached to that console, the caller's
 /// own tree included.
-pub fn send_sigterm_pid(pid: u32) {
+pub fn send_sigterm_pid(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        let _ = nix::sys::signal::kill(
+        nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid as i32),
             nix::sys::signal::Signal::SIGTERM,
-        );
+        )
+        .is_ok()
     }
     #[cfg(windows)]
     {
-        spawn_ctrl_break_helper(pid);
+        spawn_ctrl_break_helper(pid)
     }
 }
 
 /// Ask a process to shut down: SIGTERM, or on Windows `CTRL_BREAK` to the
-/// group it leads.
+/// group it leads. Returns whether the request was delivered.
 ///
 /// Delivery on Windows takes two hops (see [`ctrl_break_helper_hook`]),
 /// and `pid` must lead a process group, as everything this stack spawns
 /// does (`CREATE_NEW_PROCESS_GROUP`): aimed at a process that leads none,
 /// such as one launched by hand from a terminal, the event goes to every
 /// process attached to its console (see [`send_sigterm_pid`]).
-pub fn request_graceful(pid: u32) {
+pub fn request_graceful(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        let _ = nix::sys::signal::kill(
+        nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid as i32),
             nix::sys::signal::Signal::SIGTERM,
-        );
+        )
+        .is_ok()
     }
     #[cfg(windows)]
     {
-        spawn_ctrl_break_helper(pid);
+        spawn_ctrl_break_helper(pid)
     }
 }
 
 /// Send SIGTERM to the entire process group led by `pid` (see
 /// [`leads_own_group`]); on Windows, `CTRL_BREAK` to that group — a
 /// console event is group-addressed by nature, so this and
-/// [`request_graceful`] converge there.
-pub fn send_sigterm_group(pid: u32) {
+/// [`request_graceful`] converge there. Returns whether the request was
+/// delivered.
+pub fn send_sigterm_group(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        let _ = nix::sys::signal::kill(
+        nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(-(pid as i32)),
             nix::sys::signal::Signal::SIGTERM,
-        );
+        )
+        .is_ok()
     }
     #[cfg(windows)]
     {
-        spawn_ctrl_break_helper(pid);
+        spawn_ctrl_break_helper(pid)
     }
 }
 
@@ -193,6 +197,19 @@ pub fn ctrl_break_helper_hook() {
     }
 }
 
+/// Helper exit code when `pid`'s console cannot be attached to: the target
+/// is gone, never had a console, or is too young to have one yet.
+#[cfg(windows)]
+const HELPER_NOT_ATTACHED: i32 = 3;
+
+/// Attempts at reaching a target the helper could not attach to while it
+/// is still alive, [`HELPER_RETRY_DELAY`] apart.
+#[cfg(windows)]
+const HELPER_ATTEMPTS: u32 = 12;
+
+#[cfg(windows)]
+const HELPER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Attach to `pid`'s console and raise `CTRL_BREAK` for the group `pid`
 /// leads. Only runs inside the re-exec'd helper: attaching means first
 /// detaching from your own console, which only a process with nothing
@@ -207,7 +224,7 @@ fn ctrl_break_group(pid: u32) -> i32 {
         // Spawned console-less, but harmless to make sure of it.
         FreeConsole();
         if AttachConsole(pid) == 0 {
-            return 3; // target gone, or never had a console
+            return HELPER_NOT_ATTACHED;
         }
         // The event must not stop the helper itself.
         SetConsoleCtrlHandler(None, 1);
@@ -218,40 +235,63 @@ fn ctrl_break_group(pid: u32) -> i32 {
     }
 }
 
-/// Run the console-event helper against `pid`'s group. Best-effort like
-/// every graceful ask: a failure here means the target burns its grace,
-/// not that it survives, so it is logged and swallowed.
+/// Run the console-event helper against `pid`'s group, and tell whether
+/// it raised the event. A failure is logged and left to the caller, which
+/// forces the stop at once rather than wait out a grace nobody was asked
+/// to use.
+///
+/// A target asked to stop right after it was spawned may not have its
+/// console yet, so a failed attach is tried again while the target lives.
+/// Nothing else is retried: past the attach, the event may have been
+/// raised, and a second one could cut short the shutdown the first began.
 #[cfg(windows)]
-fn spawn_ctrl_break_helper(pid: u32) {
+fn spawn_ctrl_break_helper(pid: u32) -> bool {
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::Threading::DETACHED_PROCESS;
 
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
-            tracing::debug!(pid, error = %e, "Cannot locate own binary for Ctrl+Break helper");
-            return;
+            tracing::warn!(pid, error = %e, "Cannot locate own binary for Ctrl+Break helper");
+            return false;
         }
     };
-    // DETACHED_PROCESS: born with no console at all, free to attach to
-    // the target's.
-    match std::process::Command::new(exe)
-        .arg(CTRL_BREAK_HELPER_ARG)
-        .env(CTRL_BREAK_PID_VAR, pid.to_string())
-        .creation_flags(DETACHED_PROCESS)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-    {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            tracing::debug!(pid, code = ?status.code(), "Ctrl+Break helper could not deliver");
-        }
-        Err(e) => {
-            tracing::debug!(pid, error = %e, "Cannot spawn Ctrl+Break helper");
+    for attempt in 1..=HELPER_ATTEMPTS {
+        // DETACHED_PROCESS: born with no console at all, free to attach to
+        // the target's.
+        match std::process::Command::new(&exe)
+            .arg(CTRL_BREAK_HELPER_ARG)
+            .env(CTRL_BREAK_PID_VAR, pid.to_string())
+            .creation_flags(DETACHED_PROCESS)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => return true,
+            Ok(status)
+                if status.code() == Some(HELPER_NOT_ATTACHED)
+                    && attempt < HELPER_ATTEMPTS
+                    && is_pid_alive(pid) =>
+            {
+                tracing::debug!(
+                    pid,
+                    attempt,
+                    "Ctrl+Break helper could not attach yet; retrying"
+                );
+                std::thread::sleep(HELPER_RETRY_DELAY);
+            }
+            Ok(status) => {
+                tracing::warn!(pid, attempt, code = ?status.code(), "Ctrl+Break helper could not deliver");
+                return false;
+            }
+            Err(e) => {
+                tracing::warn!(pid, error = %e, "Cannot spawn Ctrl+Break helper");
+                return false;
+            }
         }
     }
+    false
 }
 
 /// Send SIGKILL to the entire process group led by `pid`.

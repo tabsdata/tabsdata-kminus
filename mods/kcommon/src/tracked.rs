@@ -316,8 +316,12 @@ fn monitor(mut child: Process, pid: u32, mailbox: Receiver<Cmd>, cell: Arc<Outco
                     deadline = Some(Instant::now());
                 } else {
                     debug!(pid, grace_secs = grace.as_secs(), "Asking child to stop");
-                    signal::request_graceful(pid);
-                    deadline = Some(Instant::now() + grace);
+                    if signal::request_graceful(pid) {
+                        deadline = Some(Instant::now() + grace);
+                    } else {
+                        warn!(pid, "Child could not be asked to stop; killing it");
+                        deadline = Some(Instant::now());
+                    }
                 }
             }
         }
