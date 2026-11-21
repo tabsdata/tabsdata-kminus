@@ -103,7 +103,7 @@ const LOG_CHUNK_SIZE: usize = 8192;
 const LOG_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Maximum time to wait for a log file to appear before giving up.
-const LOG_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const LOG_WAIT_TIMEOUT: Duration = Duration::from_secs(32);
 
 /// Stream a log file through the sender, reformatting CRI lines into
 /// kubectl-style output (message only, or `<ts> <message>` with
@@ -126,22 +126,20 @@ pub(crate) async fn stream_log_file(
 ) -> Result<(), io::Error> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-    // Wait for the log file to appear (container may not have started yet)
+    // The file is missing until the container starts, and for a moment
+    // whenever a rotation has moved it aside and not yet created it again.
     let deadline = tokio::time::Instant::now() + LOG_WAIT_TIMEOUT;
-    loop {
-        if path.exists() {
-            break;
+    let mut file = loop {
+        match tokio::fs::File::open(path).await {
+            Ok(file) => break file,
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            Err(_) => {}
         }
-        if *kill_watch.borrow() {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
+        if *kill_watch.borrow() || tokio::time::Instant::now() >= deadline {
             return Ok(());
         }
         tokio::time::sleep(LOG_POLL_INTERVAL).await;
-    }
-
-    let mut file = tokio::fs::File::open(path).await?;
+    };
 
     // Handle tail_lines: seek near end and find the start of the last N lines
     if let Some(n) = tail_lines {
@@ -1149,5 +1147,40 @@ mod tests {
         // max_files=1: no rolled files, current should still exist
         assert!(path.exists());
         assert!(!dir.join("test.log.1").exists());
+    }
+
+    // -- stream_log_file -----------------------------------------------------
+
+    #[tokio::test]
+    async fn test_stream_log_file_waits_for_a_missing_file() {
+        let dir = test_dir!();
+        let path = dir.join("0.log");
+        let state = Arc::new(Mutex::new(PodState {
+            lifecycle: crate::pod::lifecycle::PodLifecycle::new(
+                vec![],
+                vec![],
+                "2026-01-01T00:00:00Z",
+            ),
+            handles: std::collections::HashMap::new(),
+        }));
+        let (_kill, mut kill_watch) = tokio::sync::watch::channel(false);
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let recreated = path.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(LOG_POLL_INTERVAL * 3).await;
+            std::fs::write(&recreated, "2026-01-01T00:00:00Z stdout F after\n").unwrap();
+        });
+        stream_log_file(&tx, &path, None, false, false, &state, &mut kill_watch)
+            .await
+            .unwrap();
+        writer.await.unwrap();
+        drop(tx);
+
+        let mut out = String::new();
+        while let Some(chunk) = rx.recv().await {
+            out.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+        }
+        assert_eq!(out, "after\n");
     }
 }
