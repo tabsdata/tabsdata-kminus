@@ -75,9 +75,13 @@ tokio = { version = "1.54.1", features = ["full"] }
 tracing = { version = "0.1.44", features = ["log"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+[dev-dependencies]
+
+ctor = { version = "1.0.14" }
+kcommon = { path = "../kcommon", features = ["test-tracing"] }
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["signal", "process"] }
-
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_System_Threading", "Win32_System_Console"] }

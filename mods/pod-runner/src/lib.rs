@@ -12,6 +12,12 @@ pub mod store;
 pub mod tls;
 pub(crate) mod utils;
 
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn install_test_tracing() {
+    kcommon::test_tracing::install();
+}
+
 /// Package version from Cargo.toml.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

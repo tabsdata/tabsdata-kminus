@@ -1594,7 +1594,6 @@ mod tests {
     }
 
     fn make_provider() -> Arc<DefaultExecutorProvider> {
-        crate::testutils::init_test_tracing();
         let base = crate::testutils::unique_test_dir("logic/provider");
         Arc::new(DefaultExecutorProvider {
             layout: PodLayout::new(&base),

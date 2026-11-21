@@ -10,5 +10,13 @@ pub mod panic;
 pub mod scan;
 pub mod signal;
 pub mod stopevent;
+#[cfg(any(test, feature = "test-tracing"))]
+pub mod test_tracing;
 pub mod token;
 pub mod tracked;
+
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn install_test_tracing() {
+    test_tracing::install();
+}

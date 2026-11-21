@@ -48,6 +48,12 @@ use system::pid::{
 use system::port::{PortCheck, check_ports, port_failures, probe_ports};
 use system::startup;
 
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn install_test_tracing() {
+    kcommon::test_tracing::install();
+}
+
 /// Filename of km's own log file under `<logdir>/`.
 const KM_LOG_FILE: &str = "km.log";
 

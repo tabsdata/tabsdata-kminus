@@ -56,6 +56,10 @@ strip = "debuginfo"
 
 [lib]
 
+[features]
+# The tests' log subscriber (see `test_tracing`), for the km crates' tests
+test-tracing = ["dep:tracing-subscriber"]
+
 [package.metadata.cargo-machete]
 ignored = []
 
@@ -64,10 +68,13 @@ ignored = []
 chrono = { version = "0.4.45" }
 sysinfo = { version = "0.40.1" }
 tracing = { version = "0.1.44", features = ["log"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
 
 [dev-dependencies]
 
+ctor = { version = "1.0.14" }
 serial_test = { version = "4" }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["signal", "process"] }
