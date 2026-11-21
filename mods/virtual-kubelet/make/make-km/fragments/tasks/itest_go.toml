@@ -69,11 +69,11 @@ script = '''
         markers = get_env MARKERS
 
         if eq ${verbose} "false"
-            debug "🚀 pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini=\"filterwarnings=ignore\" -n ${km_workers} --dist=loadgroup bin/ --template=html1/index.html --report=${report_file} -ra --durations=8 -m \"${markers}\""
-            exit_code = exec --get-exit-code pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini="filterwarnings=ignore" -n ${km_workers} --dist=loadgroup bin/ --template=html1/index.html --report=${report_file} -ra --durations=8 -m "${markers}"
+            debug "🚀 pytest --tdx-progress %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini=\"filterwarnings=ignore\" -n ${km_workers} --dist=loadgroup bin/ --template=html1/index.html --report=${report_file} -ra --durations=8 -m \"${markers}\""
+            exit_code = exec --get-exit-code pytest --tdx-progress %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini="filterwarnings=ignore" -n ${km_workers} --dist=loadgroup bin/ --template=html1/index.html --report=${report_file} -ra --durations=8 -m "${markers}"
         else
-            debug "🚀 pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini=\"filterwarnings=ignore\" -v --full-trace --log-level=DEBUG --setup-show -n ${km_workers} --dist=loadgroup bin/ --template=html1/index.html --report=${report_file} -ra --durations=8 -m \"${markers}\""
-            exit_code = exec --get-exit-code pytest -p no:tdx-harvester %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini="filterwarnings=ignore" -v --full-trace --log-level=DEBUG --setup-show -n ${km_workers} --dist=loadgroup bin/ --template=html1/index.html --report=${report_file} -ra --durations=8 -m "${markers}"
+            debug "🚀 pytest %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini=\"filterwarnings=ignore\" -v --full-trace --log-level=DEBUG --setup-show -n ${km_workers} --dist=loadgroup bin/ --template=html1/index.html --report=${report_file} -ra --durations=8 -m \"${markers}\""
+            exit_code = exec --get-exit-code pytest %{td_tb} %{td_fail} --import-mode=importlib --timeout=900 -W ignore::Warning --override-ini="filterwarnings=ignore" -v --full-trace --log-level=DEBUG --setup-show -n ${km_workers} --dist=loadgroup bin/ --template=html1/index.html --report=${report_file} -ra --durations=8 -m "${markers}"
         end
 
         is_zero = eq ${exit_code} "0"
