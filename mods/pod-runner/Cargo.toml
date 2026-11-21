@@ -6,7 +6,7 @@
 description = "Tabsdata Pod Runner: lightweight Kubernetes-style pod executor with HTTP server and CLI client."
 name = "pod-runner"
 edition = "2024"
-version = "2.4.0"
+version = "2.4.1"
 
 authors = [
     "Aleix Lascorz Guiu    (tabsleix)      <aleix@tabsdata.com>",
