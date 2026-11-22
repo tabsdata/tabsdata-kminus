@@ -18,8 +18,11 @@ from itest_common import request_stop, start_process
 CHILDREN = ("etcd", "kube-apiserver", "kube-controller-manager")
 
 # How a process ends when the stop arrives before it handles one: SIGTERM's
-# default action, or CTRL_BREAK's on Windows (STATUS_CONTROL_C_EXIT).
-ENDED_BY_STOP = 0xC000013A if sys.platform == "win32" else -signal.SIGTERM
+# default action or, on Windows, CTRL_BREAK's (STATUS_CONTROL_C_EXIT), and
+# STATUS_DLL_INIT_FAILED when the process is still loading as it arrives.
+ENDED_BY_STOP = (
+    (0xC000013A, 0xC0000142) if sys.platform == "win32" else (-signal.SIGTERM,)
+)
 
 
 def _pid_files(pids_dir):
@@ -77,7 +80,7 @@ def test_stop_before_any_child(control_plane_bin, test_dir, free_port_pair):
     process = _start(control_plane_bin, test_dir, free_port_pair)
     # Before its handler is installed the process just ends, which is safe:
     # nothing has been started yet.
-    _stop_and_check(process, _pids_dir(test_dir), {}, exit_codes=(0, ENDED_BY_STOP))
+    _stop_and_check(process, _pids_dir(test_dir), {}, exit_codes=(0, *ENDED_BY_STOP))
 
 
 def test_stop_once_etcd_and_api_server_run(control_plane_bin, test_dir, free_port_pair):

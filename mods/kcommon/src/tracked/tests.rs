@@ -157,16 +157,22 @@ fn stop_asks_first_and_a_cooperative_child_goes_gracefully() {
     #[cfg(unix)]
     assert_eq!(exit, Exit::Signal(15), "ended by the SIGTERM it was sent");
     #[cfg(windows)]
-    assert_eq!(
-        exit,
-        Exit::Code(STATUS_CONTROL_C_EXIT),
-        "ended by the CTRL_BREAK it was sent"
+    assert!(
+        matches!(
+            exit,
+            Exit::Code(STATUS_CONTROL_C_EXIT) | Exit::Code(STATUS_DLL_INIT_FAILED)
+        ),
+        "ended by the CTRL_BREAK it was sent, got {exit:?}"
     );
 }
 
 /// What a process ended by a console control event exits with.
 #[cfg(windows)]
 const STATUS_CONTROL_C_EXIT: i32 = 0xC000_013A_u32 as i32;
+
+/// What it exits with when the event arrives while it is still loading.
+#[cfg(windows)]
+const STATUS_DLL_INIT_FAILED: i32 = 0xC000_0142_u32 as i32;
 
 #[cfg(unix)]
 #[test]
