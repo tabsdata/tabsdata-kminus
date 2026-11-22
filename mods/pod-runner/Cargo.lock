@@ -2058,6 +2058,7 @@ dependencies = [
  "serde_yaml_ng",
  "serial_test",
  "strum",
+ "sysinfo",
  "tar",
  "thiserror 2.0.21",
  "time",

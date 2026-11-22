@@ -2796,16 +2796,40 @@ mod tests {
 
     // -- orphan sweep --------------------------------------------------------
 
-    /// Poll until `count` processes carry a token under `prefix`.
-    async fn wait_for_orphans(prefix: &str, count: usize) -> Vec<u32> {
+    /// Poll until the process `pid_file` names carries a token under
+    /// `prefix`, and return it with every process that carries one then.
+    async fn wait_for_escapee(prefix: &str, pid_file: &std::path::Path) -> (Option<u32>, Vec<u32>) {
+        let mut escapee = None;
         for _ in 0..100 {
+            escapee = escapee.or_else(|| {
+                std::fs::read_to_string(pid_file)
+                    .ok()
+                    .and_then(|pid| pid.trim().parse().ok())
+            });
             let pids = sweep::orphan_pids(prefix).await;
-            if pids.len() >= count {
-                return pids;
+            if escapee.is_some_and(|escapee| pids.contains(&escapee)) {
+                return (escapee, pids);
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        sweep::orphan_pids(prefix).await
+        (escapee, sweep::orphan_pids(prefix).await)
+    }
+
+    /// `pids` with their process names, for a failure message.
+    fn named(pids: &[u32]) -> Vec<String> {
+        let Ok(mut system) = sysinfo::System::new() else {
+            return pids.iter().map(u32::to_string).collect();
+        };
+        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        pids.iter()
+            .map(|pid| {
+                let name = system
+                    .process(sysinfo::Pid::from_u32(*pid))
+                    .map(|process| process.name().to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "gone".to_string());
+                format!("{pid} ({name})")
+            })
+            .collect()
     }
 
     async fn wait_dead(pid: u32) -> bool {
@@ -2901,8 +2925,10 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_pod_kill_reaps_process_that_escaped_container_group() {
-        use crate::testutils::{HELPER_DAEMONIZE, HELPER_VAR, helper_command};
+        use crate::testutils::{HELPER_DAEMONIZE, HELPER_PID_FILE_VAR, HELPER_VAR, helper_command};
 
+        let dir = test_dir!();
+        let pid_file = dir.join("escapee.pid");
         let mut c = Container {
             name: "main".to_string(),
             command: helper_command(),
@@ -2911,6 +2937,11 @@ mod tests {
         c.env.push(EnvVar {
             name: HELPER_VAR.to_string(),
             value: Some(HELPER_DAEMONIZE.to_string()),
+            value_from: None,
+        });
+        c.env.push(EnvVar {
+            name: HELPER_PID_FILE_VAR.to_string(),
+            value: Some(pid_file.display().to_string()),
             value_from: None,
         });
         let pod = named_pod_spec("escapee-pod", vec![c]);
@@ -2923,27 +2954,32 @@ mod tests {
             .await
             .unwrap();
 
-        // The container plus the process it daemonised, both carrying the
-        // token the sweep matches on.
-        let pids = wait_for_orphans(&prefix, 2).await;
-        assert_eq!(pids.len(), 2, "expected container + escapee, got {pids:?}");
+        // Besides the container and the process it daemonised, the token
+        // is carried by whatever inherits the container's environment: on
+        // Windows, the host of a windowless container's console.
+        let (escapee, pids) = wait_for_escapee(&prefix, &pid_file).await;
+        let escapee = escapee.expect("container should have recorded its daemon's pid");
+        assert!(
+            pids.contains(&escapee) && pids.len() >= 2,
+            "expected the container and escapee {escapee} to carry the token, got {:?}",
+            named(&pids),
+        );
 
-        // They are in different process groups, so no single group signal
-        // can reach both: whichever of the two the group kill targets, the
-        // other survives it. Windows offers no group query to assert it by.
+        // The escapee left the container's process group, so no single
+        // group signal can reach both. Windows offers no group query to
+        // assert it by.
         #[cfg(unix)]
         {
             use nix::unistd::{Pid as NixPid, getpgid};
-            let pgids: Vec<i32> = pids
-                .iter()
-                .map(|pid| {
-                    getpgid(Some(NixPid::from_raw(*pid as i32)))
-                        .expect("pgid")
-                        .as_raw()
-                })
-                .collect();
-            assert_ne!(
-                pgids[0], pgids[1],
+            let pgid = |pid: u32| {
+                getpgid(Some(NixPid::from_raw(pid as i32)))
+                    .expect("pgid")
+                    .as_raw()
+            };
+            assert!(
+                pids.iter()
+                    .filter(|pid| **pid != escapee)
+                    .all(|pid| pgid(*pid) != pgid(escapee)),
                 "the daemonised process must have left the container's group",
             );
         }
@@ -2951,8 +2987,12 @@ mod tests {
         h.kill(Duration::from_secs(1));
         let _ = h.wait_for_completion().await;
 
-        for pid in pids {
-            assert!(wait_dead(pid).await, "pid {pid} outlived its pod");
+        for pid in &pids {
+            assert!(
+                wait_dead(*pid).await,
+                "pid {pid} outlived its pod; token carriers: {:?}",
+                named(&pids),
+            );
         }
     }
 
