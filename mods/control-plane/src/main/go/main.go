@@ -360,6 +360,12 @@ const kcmName = "kube-controller-manager"
 // SIGTERM at shutdown.
 const kcmStopTimeout = 10 * time.Second
 
+// stopArrivalGrace bounds the wait for a stop request to be read after a
+// failure it may have caused: a CTRL_BREAK on Windows, or a terminal's
+// Ctrl+C, reaches etcd and the API server, which share this process's group,
+// as it reaches this process, and they can be gone before it is read here.
+const stopArrivalGrace = time.Second
+
 // envtestStopTimeout bounds envtest's own attempt to stop etcd and the API
 // server at shutdown.
 const envtestStopTimeout = 5 * time.Second
@@ -1331,7 +1337,7 @@ func ignoreHangup() {
 	signal.Notify(make(chan os.Signal, 1), syscall.SIGHUP)
 }
 
-func run() int {
+func run() (code int) {
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 	port := fs.String("port", "6443", "API server listen port")
 	kcmPort := fs.String("kcm-port", "10257", "kube-controller-manager secure port")
@@ -1609,6 +1615,22 @@ func run() int {
 			return false
 		}
 	}
+	stopArrived := func() bool {
+		select {
+		case <-sigChan:
+			info("\n[+] Shutdown requested")
+			return true
+		case <-time.After(stopArrivalGrace):
+			return false
+		}
+	}
+	// Registered first so it runs last, once the children are stopped: a
+	// failure that came with a stop request is that stop, not a fault.
+	defer func() {
+		if code != 0 && stopArrived() {
+			code = 0
+		}
+	}()
 
 	// Cancelled as run returns, after the deferred shutdown below has had its
 	// go: kube-controller-manager is started under it, so a stop that outlives
@@ -1899,6 +1921,9 @@ func run() int {
 	// A child found definitively lost is handled the same wherever it is
 	// noticed: say so, publish it, and stop.
 	lost := func(detail string) {
+		if stopArrived() {
+			return
+		}
 		fail("%s; shutting down the control plane", detail)
 		writeHeartbeat(*heartbeatFile, statusDegraded, detail, warn)
 		exitCode = 1
